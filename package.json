@@ -1,0 +1,25 @@
+{
+  "name": "ana-atendente-virtual",
+  "version": "1.0.0",
+  "description": "Ana — Atendente virtual de agendamento via WhatsApp + ERP interno",
+  "main": "dist/webhookServer.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/webhookServer.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/webhookServer.ts"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.0",
+    "openai": "^4.52.7"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.0",
+    "@types/node": "^20.14.10",
+    "chokidar": "^3.6.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.3"
+  }
+}

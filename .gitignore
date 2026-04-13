@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+node_modules_corrompido_*/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+credentials.json
+
+# Local runtime data
+historico_conversas.json
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
