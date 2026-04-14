@@ -26,6 +26,7 @@ export interface TenantBotConfig {
   aiTemperature: number;
   aiMaxTokens: number;
   openaiApiKey: string | null;
+  botIsAlwaysActive: boolean;
   botActiveStart: string;
   botActiveEnd: string;
   timezone: string;
@@ -42,6 +43,10 @@ function parseNumber(
   if (!value) return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseBoolean(value: string | undefined): boolean {
+  return value === 'true' || value === '1';
 }
 
 function getLegacyConfig(phoneNumberId: string): TenantBotConfig | null {
@@ -63,9 +68,10 @@ function getLegacyConfig(phoneNumberId: string): TenantBotConfig | null {
     greetingMessage: process.env.GREETING_MESSAGE ?? DEFAULT_GREETING_MESSAGE,
     fallbackMessage: process.env.FALLBACK_MESSAGE ?? DEFAULT_FALLBACK_MESSAGE,
     aiModel: process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
-    aiTemperature: parseNumber(process.env.OPENAI_TEMPERATURE, 0.7),
+    aiTemperature: parseNumber(process.env.OPENAI_TEMPERATURE, 0.4),
     aiMaxTokens: parseNumber(process.env.OPENAI_MAX_TOKENS, 500),
     openaiApiKey: null,
+    botIsAlwaysActive: parseBoolean(process.env.BOT_IS_ALWAYS_ACTIVE),
     botActiveStart: process.env.BOT_ACTIVE_START ?? '08:00',
     botActiveEnd: process.env.BOT_ACTIVE_END ?? '20:00',
     timezone: process.env.TIMEZONE ?? 'America/Sao_Paulo',

@@ -34,6 +34,10 @@ function getCurrentTimeInTimezone(timezone: string): string {
 }
 
 function isBotActive(config: TenantBotConfig): boolean {
+  if (config.botIsAlwaysActive) {
+    return true;
+  }
+
   const now = getCurrentTimeInTimezone(config.timezone);
   return now >= config.botActiveStart && now < config.botActiveEnd;
 }

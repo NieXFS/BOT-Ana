@@ -66,7 +66,7 @@ ${config.systemPrompt}`;
 }
 
 function sanitizeTemperature(value: number): number {
-  if (!Number.isFinite(value)) return 0.7;
+  if (!Number.isFinite(value)) return 0.4;
   return Math.min(Math.max(value, 0), 1);
 }
 
