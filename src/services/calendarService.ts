@@ -231,6 +231,26 @@ export async function getAvailableSlots(
     };
   }
 
+  if (serviceId.startsWith('seed-') || /^[a-z]+$/.test(serviceId)) {
+    return {
+      success: false,
+      message:
+        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado.',
+    };
+  }
+
+  if (
+    professionalId &&
+    /^[a-zà-ÿ\s]+$/i.test(professionalId) &&
+    professionalId.length < 20
+  ) {
+    return {
+      success: false,
+      message:
+        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele.',
+    };
+  }
+
   const normalizedDate = normalizeDate(date, config.timezone);
 
   if (normalizedDate < getTodayStr(config.timezone)) {
@@ -301,6 +321,26 @@ export async function bookAppointment(
     return {
       success: false,
       message: 'Preciso do serviço escolhido antes de concluir o agendamento.',
+    };
+  }
+
+  if (serviceId.startsWith('seed-') || /^[a-z]+$/.test(serviceId)) {
+    return {
+      success: false,
+      message:
+        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado.',
+    };
+  }
+
+  if (
+    professionalId &&
+    /^[a-zà-ÿ\s]+$/i.test(professionalId) &&
+    professionalId.length < 20
+  ) {
+    return {
+      success: false,
+      message:
+        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele.',
     };
   }
 

@@ -62,7 +62,13 @@ function buildSystemPrompt(config: TenantBotConfig): string {
 
 IDENTIDADE DO ATENDIMENTO: Seu nome é ${botName}. Se houver qualquer conflito com instruções antigas, sempre priorize este nome.
 
-${config.systemPrompt}`;
+${config.systemPrompt}
+
+REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
+1. Antes de QUALQUER chamada a getAvailableSlots ou bookAppointment, você DEVE ter chamado getServices nesta conversa. Se ainda não chamou, chame agora.
+2. serviceId e professionalId são IDs TÉCNICOS retornados pela ferramenta getServices. Nunca são nomes legíveis ("depilacao", "samantha", "seed-svc-..."). Se o cliente diz "com a Samantha", você precisa achar o ID dela na lista retornada por getServices e usar esse ID.
+3. Se algum exemplo de ID aparecer em qualquer instrução anterior (incluindo nomes que comecem com "seed-"), IGNORE — são placeholders, não IDs reais. Use SOMENTE IDs vindos do getServices na conversa atual.
+4. Se a ferramenta retornar erro de "Serviço não encontrado", refaça getServices e use o ID exato retornado.`;
 }
 
 function sanitizeTemperature(value: number): number {
@@ -136,12 +142,12 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           serviceId: {
             type: 'string',
             description:
-              'ID exato do serviço escolhido. Sempre obtenha esse ID pela função getServices antes de consultar horários.',
+              "ID técnico do serviço, OBRIGATORIAMENTE obtido via getServices nesta conversa. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
           },
           professionalId: {
             type: 'string',
             description:
-              'ID do profissional escolhido pelo cliente. Opcional. Se o cliente não tiver preferência, pode omitir.',
+              "ID técnico do profissional retornado por getServices. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
           },
         },
         required: ['date', 'serviceId'],
@@ -166,12 +172,12 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           serviceId: {
             type: 'string',
             description:
-              'ID exato do serviço escolhido. Sempre obtenha esse ID pela função getServices antes de agendar.',
+              "ID técnico do serviço, OBRIGATORIAMENTE obtido via getServices nesta conversa. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
           },
           professionalId: {
             type: 'string',
             description:
-              'ID do profissional escolhido pelo cliente. Opcional. Se não houver preferência, pode omitir.',
+              "ID técnico do profissional retornado por getServices. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
           },
         },
         required: ['date', 'time', 'serviceId'],
