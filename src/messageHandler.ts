@@ -1,6 +1,7 @@
 import type { TenantBotConfig } from './configProvider';
 import { getReply } from './services/brainService';
 import { buildConversationKey } from './services/contextManager';
+import { tryHandleOptOut } from './services/optOutService';
 import { transcreverAudioBuffer } from './utils/transcriber';
 import {
   sendFreeformMessage,
@@ -113,6 +114,8 @@ export async function handleIncomingMessage(
   }
 
   if (!text.trim()) return;
+
+  if (await tryHandleOptOut(text, from, config)) return;
 
   conversationTracker.markActive(conversationKey);
   console.log(`💬 Mensagem de ${conversationKey} (${name}): "${text}"`);
