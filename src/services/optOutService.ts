@@ -7,21 +7,44 @@ const RECEPS_INTERNAL_API_URL =
 const ERP_API_TOKEN =
   process.env.ERP_API_TOKEN ?? 'minha-chave-secreta-receps-123';
 
-const OPT_OUT_KEYWORDS = [
-  'pare',
-  'parar',
-  'sair',
-  'cancelar',
-  'cancelar inscricao',
-  'nao quero mais',
-  'nao envie mais',
-  'nao receber mais',
-  'remover',
-  'me remove',
-  'descadastrar',
+const STRONG_STOP_KEYWORDS = new Set<string>([
+  'pare', 'parar', 'parem', 'para',
+  'cancelar', 'cancele', 'cancela', 'cancelem',
+  'remover', 'remova', 'remove', 'removam',
+  'descadastrar', 'descadastra', 'descadastre', 'descadastrem', 'descadastro',
+  'sair', 'saia', 'saiam',
+  'stop',
+]);
+
+const COMMS_CONTEXT_KEYWORDS = new Set<string>([
+  'mensagem', 'mensagens',
+  'marketing',
+  'automacao', 'automacoes', 'automatica', 'automaticas', 'automatico', 'automaticos',
+  'envio', 'envios', 'enviar', 'envia', 'envie', 'enviem',
+  'receber', 'recebo', 'recebia',
+  'whatsapp', 'wpp', 'zap', 'zapzap',
+  'propaganda', 'propagandas',
+  'publicidade',
+  'comunicacao', 'comunicacoes', 'comunicado', 'comunicados',
+  'newsletter',
+  'aviso', 'avisos',
+  'lembrete', 'lembretes',
+  'spam',
+]);
+
+const OPT_OUT_PHRASES = [
+  'me remove', 'me removam', 'me remova', 'me retire', 'me retira', 'me retirem',
+  'me descadastra', 'me descadastre', 'me descadastrem',
+  'nao quero mais', 'nao quero receber', 'nao quero mensagem', 'nao quero mensagens',
+  'nao envie mais', 'nao envia mais', 'nao mande mais', 'nao manda mais',
+  'nao receber mais', 'nao quero ser incomodado', 'nao quero ser incomodada',
+  'parar de receber', 'parar com isso', 'para de mandar', 'para de enviar',
+  'sair da lista',
 ];
 
-const MAX_OPT_OUT_WORDS = 6;
+const MAX_OPT_OUT_WORDS = 15;
+const SHORT_MSG_WORDS = 6;
+const VERY_SHORT_MSG_WORDS = 3;
 
 function normalize(text: string): string {
   return text
@@ -31,21 +54,38 @@ function normalize(text: string): string {
     .trim();
 }
 
-function escapeRegex(source: string): string {
-  return source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function hasAny(words: string[], set: Set<string>): boolean {
+  for (const w of words) {
+    if (set.has(w)) return true;
+  }
+  return false;
 }
-
-const OPT_OUT_REGEX = new RegExp(
-  `\\b(?:${OPT_OUT_KEYWORDS.map(escapeRegex).join('|')})\\b`,
-  'i'
-);
 
 export function isOptOutMessage(text: string): boolean {
   if (!text) return false;
+
   const normalized = normalize(text);
-  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+
   if (wordCount === 0 || wordCount > MAX_OPT_OUT_WORDS) return false;
-  return OPT_OUT_REGEX.test(normalized);
+
+  const hasContext = hasAny(words, COMMS_CONTEXT_KEYWORDS);
+
+  for (const phrase of OPT_OUT_PHRASES) {
+    if (normalized.includes(phrase)) {
+      if (wordCount <= SHORT_MSG_WORDS) return true;
+      if (hasContext) return true;
+      break;
+    }
+  }
+
+  const hasStrong = hasAny(words, STRONG_STOP_KEYWORDS);
+  if (!hasStrong) return false;
+
+  if (wordCount <= VERY_SHORT_MSG_WORDS) return true;
+
+  return hasContext;
 }
 
 interface OptOutResponse {
