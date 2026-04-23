@@ -235,7 +235,7 @@ export async function getAvailableSlots(
     return {
       success: false,
       message:
-        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado.',
+        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
     };
   }
 
@@ -247,7 +247,7 @@ export async function getAvailableSlots(
     return {
       success: false,
       message:
-        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele.',
+        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
     };
   }
 
@@ -328,7 +328,7 @@ export async function bookAppointment(
     return {
       success: false,
       message:
-        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado.',
+        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
     };
   }
 
@@ -340,7 +340,7 @@ export async function bookAppointment(
     return {
       success: false,
       message:
-        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele.',
+        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
     };
   }
 

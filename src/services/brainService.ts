@@ -68,7 +68,9 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 1. Antes de QUALQUER chamada a getAvailableSlots ou bookAppointment, você DEVE ter chamado getServices nesta conversa. Se ainda não chamou, chame agora.
 2. serviceId e professionalId são IDs TÉCNICOS retornados pela ferramenta getServices. Nunca são nomes legíveis ("depilacao", "samantha", "seed-svc-..."). Se o cliente diz "com a Samantha", você precisa achar o ID dela na lista retornada por getServices e usar esse ID.
 3. Se algum exemplo de ID aparecer em qualquer instrução anterior (incluindo nomes que comecem com "seed-"), IGNORE — são placeholders, não IDs reais. Use SOMENTE IDs vindos do getServices na conversa atual.
-4. Se a ferramenta retornar erro de "Serviço não encontrado", refaça getServices e use o ID exato retornado.`;
+4. Se a ferramenta retornar erro de "Serviço não encontrado", refaça getServices e use o ID exato retornado.
+5. Os horários retornados por getAvailableSlots são a fonte da verdade. Se o cliente pedir um horário que está na lista (incluindo variações como "15h" = "15:00", "15h30" = "15:30"), prossiga DIRETO para a confirmação. NUNCA invente que está ocupado se o horário aparece na lista. Só diga que está indisponível se a ferramenta retornar erro 409 explicitamente.
+6. Se uma ferramenta retornar uma mensagem começando com INTERNAL_HINT:, siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. NÃO responda ao cliente, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente em nenhuma forma.`;
 }
 
 function sanitizeTemperature(value: number): number {
@@ -249,7 +251,7 @@ export async function getReply(
     ...history,
   ];
 
-  const maxToolRounds = 5;
+  const maxToolRounds = 8;
 
   try {
     for (let round = 0; round < maxToolRounds; round++) {
