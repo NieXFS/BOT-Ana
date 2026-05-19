@@ -1,0 +1,64 @@
+{
+  "1075428132314639:5516991113783": [
+    {
+      "role": "assistant",
+      "content": "Para sexta-feira, dia 20/05, tenho horários disponíveis com a Samantha às 7h, 7h30, 8h, 8h30, 9h, 9h30, 10h, 10h30, 11h, 11h30, 12h, 12h30, 13h, 13h30, 14h, 14h30, 15h, 15h30, 16h, 16h30, 17h, 17h30, 18h, 18h30, 19h e 19h30. \n\nQual horário você prefere?"
+    },
+    {
+      "role": "user",
+      "content": "Olhe para segunda por favor"
+    },
+    {
+      "role": "assistant",
+      "content": "Para segunda-feira, dia 23/05, tenho horários disponíveis com a Samantha às 7h, 7h30, 8h, 8h30, 9h, 9h30, 10h, 10h30, 11h, 11h30, 12h, 12h30, 13h, 13h30, 14h, 14h30, 15h, 15h30, 16h, 16h30, 17h, 17h30, 18h, 18h30, 19h e 19h30. \n\nQual horário você prefere?"
+    },
+    {
+      "role": "user",
+      "content": "As 12"
+    },
+    {
+      "role": "assistant",
+      "content": "Seu agendamento foi confirmado com sucesso para dia 23/05/2026 às 12h para Depilação a Laser com a Samantha. 😊 \n\nSe precisar de mais alguma coisa, é só avisar!"
+    },
+    {
+      "role": "user",
+      "content": "Mas quais serviços a Samantha tem?"
+    },
+    {
+      "role": "assistant",
+      "content": "A Samantha oferece os seguintes serviços: \n\n- Corte de Cabelo, com duração de 60 minutos e preço de R$ 60,00.\n- Depilação a Laser, com duração de 30 minutos e preço de R$ 140,00.\n\nSe precisar de mais informações ou quiser agendar algum desses serviços, é só avisar! 😊"
+    },
+    {
+      "role": "user",
+      "content": "Quero marcar o corte de cabelo para quarta"
+    },
+    {
+      "role": "assistant",
+      "content": "Para quarta-feira, dia 20/05, a Samantha tem horários disponíveis para o Corte de Cabelo às 7h, 7h30, 8h, 8h30, 9h, 9h30, 10h, 10h30, 11h, 11h30, 12h, 12h30, 13h, 13h30, 14h, 14h30, 15h, 15h30, 16h, 16h30, 17h, 17h30, 18h e 18h30. \n\nQual horário você prefere?"
+    },
+    {
+      "role": "user",
+      "content": "14h"
+    },
+    {
+      "role": "assistant",
+      "content": "Vou agendar para você dia 20/05/2026 às 14h para Corte de Cabelo com a Samantha. Tudo certo?"
+    },
+    {
+      "role": "user",
+      "content": "Certo"
+    },
+    {
+      "role": "assistant",
+      "content": "Vi que você já tem outros agendamentos futuros: um para dia 19/05 às 15h30 e outro para dia 23/05 às 12h. \n\nVocê gostaria de: \n1. Manter os dois (este novo + o anterior)\n2. Remarcar (cancelar o anterior e marcar este novo)\n3. Só cancelar o anterior (sem criar este novo)\n4. Pensar e decidir depois\n\nQual opção você prefere?"
+    },
+    {
+      "role": "user",
+      "content": "Cancelar os outros dois"
+    },
+    {
+      "role": "assistant",
+      "content": "Parece que não consegui cancelar os agendamentos anteriores, pois não foram encontrados. Vou encaminhar seu pedido para a equipe, tá bom? Já já eles te ajudam! 😊 \n\nEnquanto isso, seu agendamento para o Corte de Cabelo com a Samantha às 14h do dia 20/05 está confirmado. Se precisar de mais alguma coisa, é só avisar!"
+    }
+  ]
+}

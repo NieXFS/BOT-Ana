@@ -14,12 +14,17 @@ interface MessageBuffer {
   texts: string[];
   name: string;
   timer: NodeJS.Timeout | null;
+  maxWaitTimer: NodeJS.Timeout | null;
+  firstMessageAt: number;
   config: TenantBotConfig;
   from: string;
+  isProcessing: boolean;
+  pendingTexts: string[];
 }
 
 const messageBuffers = new Map<string, MessageBuffer>();
-const DEBOUNCE_TIME_MS = 10_000;
+const DEBOUNCE_TIME_MS = 12_000;
+const MAX_WAIT_TIME_MS = 30_000;
 
 function buildBufferKey(config: TenantBotConfig, from: string): string {
   return `${config.phoneNumberId}:${from}`;
@@ -51,17 +56,55 @@ async function flushBuffer(bufferKey: string): Promise<void> {
   const buffer = messageBuffers.get(bufferKey);
   if (!buffer) return;
 
+  if (buffer.timer) clearTimeout(buffer.timer);
+  if (buffer.maxWaitTimer) clearTimeout(buffer.maxWaitTimer);
+  buffer.timer = null;
+  buffer.maxWaitTimer = null;
+
+  buffer.isProcessing = true;
   const consolidatedText = buffer.texts.join(' ');
+  buffer.texts = [];
   const { name, config, from } = buffer;
-  messageBuffers.delete(bufferKey);
 
   console.log(`🧠 Enviando para ${config.botName} (${bufferKey}): "${consolidatedText}"`);
 
-  const reply = await getReply(from, consolidatedText, name, config);
+  try {
+    const reply = await getReply(from, consolidatedText, name, config);
 
-  await typingDelay(reply);
-  await sendFreeformMessage(from, reply, config);
-  console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
+    await typingDelay(reply);
+    await sendFreeformMessage(from, reply, config);
+    console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
+  } catch (err) {
+    console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+  } finally {
+    const currentBuffer = messageBuffers.get(bufferKey);
+    if (!currentBuffer) return;
+
+    if (currentBuffer.pendingTexts.length > 0) {
+      console.log(
+        `🔄 ${currentBuffer.pendingTexts.length} mensagem(s) pendente(s) pra ${bufferKey}, abrindo novo debounce`
+      );
+      currentBuffer.texts = currentBuffer.pendingTexts;
+      currentBuffer.pendingTexts = [];
+      currentBuffer.isProcessing = false;
+      currentBuffer.firstMessageAt = Date.now();
+
+      currentBuffer.timer = setTimeout(() => {
+        flushBuffer(bufferKey).catch((err) =>
+          console.error(`❌ Erro ao processar mensagens pendentes de ${bufferKey}:`, err)
+        );
+      }, DEBOUNCE_TIME_MS);
+
+      currentBuffer.maxWaitTimer = setTimeout(() => {
+        console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
+        flushBuffer(bufferKey).catch((err) =>
+          console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err)
+        );
+      }, MAX_WAIT_TIME_MS);
+    } else {
+      messageBuffers.delete(bufferKey);
+    }
+  }
 }
 
 export interface CloudMessage {
@@ -131,26 +174,49 @@ export async function handleIncomingMessage(
   const existing = messageBuffers.get(bufferKey);
 
   if (existing) {
-    if (existing.timer) clearTimeout(existing.timer);
-    existing.texts.push(text);
-    existing.name = name;
-    existing.config = config;
+    if (existing.isProcessing) {
+      existing.pendingTexts.push(text);
+      existing.name = name;
+      existing.config = config;
+      console.log(`📥 Mensagem adicionada à fila pendente de ${bufferKey} (Ana processando)`);
+    } else {
+      if (existing.timer) clearTimeout(existing.timer);
+      existing.texts.push(text);
+      existing.name = name;
+      existing.config = config;
+      existing.timer = setTimeout(() => {
+        flushBuffer(bufferKey).catch((err) =>
+          console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err)
+        );
+      }, DEBOUNCE_TIME_MS);
+    }
   } else {
-    messageBuffers.set(bufferKey, {
+    const now = Date.now();
+    const newBuffer: MessageBuffer = {
       texts: [text],
       name,
       timer: null,
+      maxWaitTimer: null,
+      firstMessageAt: now,
       config,
       from,
-    });
+      isProcessing: false,
+      pendingTexts: [],
+    };
+
+    newBuffer.timer = setTimeout(() => {
+      flushBuffer(bufferKey).catch((err) =>
+        console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err)
+      );
+    }, DEBOUNCE_TIME_MS);
+
+    newBuffer.maxWaitTimer = setTimeout(() => {
+      console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
+      flushBuffer(bufferKey).catch((err) =>
+        console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err)
+      );
+    }, MAX_WAIT_TIME_MS);
+
+    messageBuffers.set(bufferKey, newBuffer);
   }
-
-  const entry = messageBuffers.get(bufferKey);
-  if (!entry) return;
-
-  entry.timer = setTimeout(() => {
-    flushBuffer(bufferKey).catch((err) =>
-      console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err)
-    );
-  }, DEBOUNCE_TIME_MS);
 }

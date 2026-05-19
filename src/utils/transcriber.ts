@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import OpenAI from 'openai';
+import { callOpenAIWithRetry } from './openaiRetry';
 
 const clientCache = new Map<string, OpenAI>();
 
@@ -27,11 +28,15 @@ async function transcribeBuffer(
   fs.writeFileSync(tempPath, buffer);
 
   try {
-    const result = await getOpenAIClient(apiKey).audio.transcriptions.create({
-      file: fs.createReadStream(tempPath),
-      model: 'whisper-1',
-      language: 'pt',
-    });
+    const result = await callOpenAIWithRetry(
+      () =>
+        getOpenAIClient(apiKey).audio.transcriptions.create({
+          file: fs.createReadStream(tempPath),
+          model: 'whisper-1',
+          language: 'pt',
+        }),
+      'audio-transcription'
+    );
     return result.text;
   } finally {
     fs.unlinkSync(tempPath);

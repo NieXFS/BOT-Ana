@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import type { TenantBotConfig } from '../configProvider';
 import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
+import { callOpenAIWithRetry } from '../utils/openaiRetry';
 import {
   addMessage,
   buildConversationKey,
@@ -11,6 +12,7 @@ import {
   getServices,
   getAvailableSlots,
   bookAppointment,
+  cancelAppointment,
 } from './calendarService';
 
 const clientCache = new Map<string, OpenAI>();
@@ -41,7 +43,7 @@ function getCurrentYear(timezone: string): number {
   );
 }
 
-function buildSystemPrompt(config: TenantBotConfig): string {
+export async function buildSystemPrompt(config: TenantBotConfig): Promise<string> {
   const now = new Date();
   const today = now.toLocaleDateString('pt-BR', {
     timeZone: config.timezone,
@@ -57,20 +59,47 @@ function buildSystemPrompt(config: TenantBotConfig): string {
   });
   const currentYear = getCurrentYear(config.timezone);
   const botName = config.botName.trim() || 'Ana';
+  const servicesResult = await getServices(config);
+  const servicesBlock =
+    servicesResult.success && servicesResult.services
+      ? `SERVIÇOS DISPONÍVEIS (use estes IDs diretamente nas ferramentas — você NÃO precisa chamar getServices):
+${servicesResult.services
+  .map(
+    (service) =>
+      `- ${service.name} (${service.durationMinutes}min, ${
+        service.priceFormatted ?? 'preço não definido'
+      }) — id: ${service.id}`
+  )
+  .join('\n')}
+
+PROFISSIONAIS DISPONÍVEIS:
+${(servicesResult.professionals ?? [])
+  .map((professional) => `- ${professional.name} — id: ${professional.id}`)
+  .join('\n')}`
+      : '(Não foi possível carregar a lista de serviços agora. Se precisar, chame getServices.)';
 
   return `CONTEXTO TEMPORAL (OBRIGATÓRIO): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Quando o cliente mencionar datas relativas (amanhã, semana que vem, segunda, etc.), calcule a data correta a partir de HOJE. Quando o cliente mencionar apenas dia/mês (ex: "01/04"), SEMPRE assuma o ano ${currentYear}. NUNCA use anos anteriores.
 
 IDENTIDADE DO ATENDIMENTO: Seu nome é ${botName}. Se houver qualquer conflito com instruções antigas, sempre priorize este nome.
 
+${servicesBlock}
+
 ${config.systemPrompt}
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
-1. Antes de QUALQUER chamada a getAvailableSlots ou bookAppointment, você DEVE ter chamado getServices nesta conversa. Se ainda não chamou, chame agora.
-2. serviceId e professionalId são IDs TÉCNICOS retornados pela ferramenta getServices. Nunca são nomes legíveis ("depilacao", "samantha", "seed-svc-..."). Se o cliente diz "com a Samantha", você precisa achar o ID dela na lista retornada por getServices e usar esse ID.
-3. Se algum exemplo de ID aparecer em qualquer instrução anterior (incluindo nomes que comecem com "seed-"), IGNORE — são placeholders, não IDs reais. Use SOMENTE IDs vindos do getServices na conversa atual.
-4. Se a ferramenta retornar erro de "Serviço não encontrado", refaça getServices e use o ID exato retornado.
+1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).
+2. serviceId e professionalId são IDs TÉCNICOS retornados na lista acima (formato cuid, ex: "cmnpffkiq000vl16krhv4ifzg"). Nunca são nomes legíveis ("depilacao", "samantha", "seed-svc-..."). Se o cliente diz "com a Samantha", encontre o ID dela na lista acima.
+3. Se algum exemplo de ID aparecer em qualquer instrução anterior (incluindo nomes que comecem com "seed-"), IGNORE — são placeholders, não IDs reais. Use SOMENTE IDs da lista "SERVIÇOS DISPONÍVEIS" / "PROFISSIONAIS DISPONÍVEIS" acima.
+4. Se a ferramenta retornar erro de "Serviço não encontrado", chame getServices uma vez pra atualizar e use o ID exato retornado.
 5. FONTE DA VERDADE — Os horários retornados por getAvailableSlots são a única fonte da verdade sobre disponibilidade. Se o cliente pedir um horário que ESTÁ na lista (incluindo variações como "15h" = "15:00", "15h30" = "15:30", "às 8 da manhã" = "08:00"), prossiga DIRETO para a confirmação do agendamento. NUNCA, EM HIPÓTESE ALGUMA, invente que está ocupado se o horário aparece na lista retornada pela ferramenta. Só diga que está indisponível se a ferramenta retornar erro 409 explicitamente.
-6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. NÃO responda ao cliente, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente em nenhuma forma.`;
+6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. NÃO responda ao cliente, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente em nenhuma forma.
+7. DETECÇÃO DE AGENDAMENTO EXISTENTE — Quando bookAppointment retornar INTERNAL_HINT informando que o cliente já tem agendamento(s) futuro(s), NÃO crie o novo ainda. Pergunte ao cliente conforme as opções listadas no hint. Aguarde a resposta. Agir conforme:
+   - "Manter os dois": chame bookAppointment de novo com confirmedDuplicate=true e os mesmos demais parâmetros.
+   - "Remarcar (cancelar e marcar este novo)": PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior (o valor dentro de [id: ...]). Após sucesso, chame bookAppointment com confirmedDuplicate=true.
+   - "Só cancelar o anterior": chame cancelAppointment com o ID técnico exato do agendamento anterior (o valor dentro de [id: ...]). NÃO chame bookAppointment.
+   - "Pensar depois": não chame ferramentas. Responda gentilmente e aguarde.
+   - Se houver mais de um agendamento anterior e o cliente escolher remarcar/cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado ANTES de chamar cancelAppointment. Nunca invente appointmentId usando data/hora.
+8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment — encaminhe para a equipe conforme regras de comportamento.`;
 }
 
 function sanitizeTemperature(value: number): number {
@@ -119,7 +148,7 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: 'getServices',
       description:
-        'Lista os serviços cadastrados no ERP, com id, nome, duração, preço e profissionais disponíveis',
+        'Lista os serviços e profissionais cadastrados no ERP. FALLBACK APENAS: você normalmente NÃO precisa chamar essa ferramenta porque a lista atualizada já vem no system prompt. Use apenas se suspeitar que a lista mudou (ex: cliente pediu um serviço que não aparece no prompt).',
       parameters: {
         type: 'object',
         properties: {},
@@ -144,12 +173,12 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           serviceId: {
             type: 'string',
             description:
-              "ID técnico do serviço, OBRIGATORIAMENTE obtido via getServices nesta conversa. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
+              "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
           },
           professionalId: {
             type: 'string',
             description:
-              "ID técnico do profissional retornado por getServices. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
+              "ID técnico do profissional listado em PROFISSIONAIS DISPONÍVEIS no system prompt, ou retornado por getServices apenas como fallback. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
           },
         },
         required: ['date', 'serviceId'],
@@ -174,15 +203,39 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           serviceId: {
             type: 'string',
             description:
-              "ID técnico do serviço, OBRIGATORIAMENTE obtido via getServices nesta conversa. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
+              "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
           },
           professionalId: {
             type: 'string',
             description:
-              "ID técnico do profissional retornado por getServices. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
+              "ID técnico do profissional listado em PROFISSIONAIS DISPONÍVEIS no system prompt, ou retornado por getServices apenas como fallback. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
+          },
+          confirmedDuplicate: {
+            type: 'boolean',
+            description:
+              'Marque como true APENAS quando o cliente confirmou explicitamente que quer manter agendamentos duplicados (no fluxo de detecção de conflito). NUNCA marque como true em outras situações.',
           },
         },
         required: ['date', 'time', 'serviceId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cancelAppointment',
+      description:
+        'Cancela um agendamento futuro do cliente. Use APENAS no fluxo de detecção de agendamento existente (após o cliente escolher remarcar). NUNCA use em outros contextos — cancelamentos avulsos devem ser encaminhados para a equipe.',
+      parameters: {
+        type: 'object',
+        properties: {
+          appointmentId: {
+            type: 'string',
+            description:
+              'ID técnico exato do agendamento a cancelar, conforme retornado no INTERNAL_HINT de detecção de conflito (valor dentro de [id: ...]). Nunca invente usando data/hora. Se houver mais de um agendamento e o cliente não indicou qual, pergunte antes de cancelar.',
+          },
+        },
+        required: ['appointmentId'],
       },
     },
   },
@@ -193,7 +246,8 @@ async function executeFunction(
   args: Record<string, unknown>,
   phone: string,
   userName: string,
-  config: TenantBotConfig
+  config: TenantBotConfig,
+  currentUserMessage: string
 ): Promise<string> {
   try {
     switch (functionName) {
@@ -218,7 +272,17 @@ async function executeFunction(
           phone,
           userName,
           config,
-          typeof args.professionalId === 'string' ? args.professionalId : undefined
+          typeof args.professionalId === 'string' ? args.professionalId : undefined,
+          args.confirmedDuplicate === true
+        );
+        return JSON.stringify(result);
+      }
+      case 'cancelAppointment': {
+        const result = await cancelAppointment(
+          String(args.appointmentId ?? ''),
+          phone,
+          config,
+          currentUserMessage
         );
         return JSON.stringify(result);
       }
@@ -241,13 +305,13 @@ export async function getReply(
   config: TenantBotConfig
 ): Promise<string> {
   const conversationKey = buildConversationKey(config.phoneNumberId, phone);
-  const isFirstContact = !hasConversation(conversationKey);
+  const isFirstContact = !(await hasConversation(conversationKey));
 
-  addMessage(conversationKey, 'user', userMessage);
+  await addMessage(conversationKey, 'user', userMessage);
 
-  const history = getHistory(conversationKey);
+  const history = await getHistory(conversationKey);
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: 'system', content: buildSystemPrompt(config) },
+    { role: 'system', content: await buildSystemPrompt(config) },
     ...history,
   ];
 
@@ -255,14 +319,18 @@ export async function getReply(
 
   try {
     for (let round = 0; round < maxToolRounds; round++) {
-      const response = await getOpenAIClient(config).chat.completions.create({
-        model: config.aiModel,
-        messages,
-        tools: TOOLS,
-        tool_choice: 'auto',
-        temperature: sanitizeTemperature(config.aiTemperature),
-        max_tokens: sanitizeMaxTokens(config.aiMaxTokens),
-      });
+      const response = await callOpenAIWithRetry(
+        () =>
+          getOpenAIClient(config).chat.completions.create({
+            model: config.aiModel,
+            messages,
+            tools: TOOLS,
+            tool_choice: 'auto',
+            temperature: sanitizeTemperature(config.aiTemperature),
+            max_tokens: sanitizeMaxTokens(config.aiMaxTokens),
+          }),
+        `chat-completion tenant=${config.tenantSlug} round=${round + 1}/${maxToolRounds}`
+      );
 
       const choice = response.choices[0];
       const assistantMessage = choice.message;
@@ -280,7 +348,7 @@ export async function getReply(
           config
         );
 
-        addMessage(conversationKey, 'assistant', finalReply);
+        await addMessage(conversationKey, 'assistant', finalReply);
         return finalReply;
       }
 
@@ -292,7 +360,14 @@ export async function getReply(
           `🔧 ${config.botName} chamou função: ${functionName}(${JSON.stringify(args)}) para ${phone}`
         );
 
-        const result = await executeFunction(functionName, args, phone, userName, config);
+        const result = await executeFunction(
+          functionName,
+          args,
+          phone,
+          userName,
+          config,
+          userMessage
+        );
 
         console.log(`📋 Resultado de ${functionName}: ${result}`);
 
@@ -312,6 +387,6 @@ export async function getReply(
     isFirstContact,
     config
   );
-  addMessage(conversationKey, 'assistant', fallbackReply);
+  await addMessage(conversationKey, 'assistant', fallbackReply);
   return fallbackReply;
 }
