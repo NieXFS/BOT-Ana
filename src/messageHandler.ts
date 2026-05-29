@@ -9,6 +9,7 @@ import {
   typingDelay,
 } from './whatsappCloudService';
 import { conversationTracker } from './conversationTracker';
+import { Sentry } from './observability/sentry';
 
 interface MessageBuffer {
   texts: string[];
@@ -75,6 +76,9 @@ async function flushBuffer(bufferKey: string): Promise<void> {
     await sendFreeformMessage(from, reply, config);
     console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
   } catch (err) {
+    Sentry.captureException(err, {
+      tags: { service: 'message_handler', operation: 'flush_buffer' },
+    });
     console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
   } finally {
     const currentBuffer = messageBuffers.get(bufferKey);
@@ -146,6 +150,9 @@ export async function handleIncomingMessage(
       text = await transcreverAudioBuffer(buffer, config.openaiApiKey);
       console.log(`🎙️ Áudio transcrito de ${conversationKey}: "${text}"`);
     } catch (err) {
+      Sentry.captureException(err, {
+        tags: { service: 'message_handler', operation: 'audio_transcription' },
+      });
       console.error(`❌ Falha ao transcrever áudio de ${conversationKey}:`, err);
       await sendFreeformMessage(
         from,

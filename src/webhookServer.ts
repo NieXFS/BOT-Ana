@@ -10,9 +10,14 @@ import {
   CloudContact,
 } from './messageHandler';
 import {
-  metaSignatureMiddleware,
+  botSignatureMiddleware,
   webhookRateLimitMiddleware,
 } from './security';
+import {
+  ensureProcessedMessagesTable,
+  markMessageProcessed,
+  cleanupOldProcessedMessages,
+} from './services/processedMessages';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -64,6 +69,14 @@ async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
   const contacts = value.contacts ?? [];
 
   for (const message of value.messages ?? []) {
+    // Idempotência: a Meta retransmite em timeout/erro. Marca atômico por
+    // message_id; reenvio vira noop (sem resposta/agendamento duplicado).
+    const fresh = await markMessageProcessed(message.id, phoneNumberId);
+    if (!fresh) {
+      console.log(`↩️ Mensagem ${message.id} já processada — ignorando retransmissão da Meta.`);
+      continue;
+    }
+
     const contact = contacts.find((entry) => entry.wa_id === message.from);
 
     // Escopo de isolamento por mensagem: tudo que acontecer dentro do
@@ -104,7 +117,7 @@ app.get('/webhook', (req: Request, res: Response) => {
   res.sendStatus(403);
 });
 
-app.post('/webhook', metaSignatureMiddleware, (req: Request, res: Response) => {
+app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
   res.sendStatus(200);
 
   const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
@@ -131,6 +144,25 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Ana — Atendente Virtual rodando na porta ${PORT}`);
+async function boot(): Promise<void> {
+  // Garante a tabela de idempotência ANTES de aceitar tráfego, e limpa antigos.
+  await ensureProcessedMessagesTable();
+  cleanupOldProcessedMessages()
+    .then((n) => {
+      if (n > 0) console.log(`🧹 ${n} message_id(s) antigos removidos de processed_messages.`);
+    })
+    .catch((err) => {
+      Sentry.captureException(err);
+      console.error('❌ Cleanup de processed_messages falhou:', err);
+    });
+
+  app.listen(PORT, () => {
+    console.log(`🚀 Ana — Atendente Virtual rodando na porta ${PORT}`);
+  });
+}
+
+boot().catch((err) => {
+  Sentry.captureException(err);
+  console.error('❌ Falha no boot da Ana:', err);
+  process.exit(1);
 });

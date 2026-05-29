@@ -50,29 +50,45 @@ export function isValidMetaSignature(
 }
 
 /**
- * Middleware Express: rejeita com 401 payloads sem assinatura válida da Meta.
- * Depende de `req.rawBody` (capturado pelo `verify` do express.json).
- * Se META_APP_SECRET não estiver setado, avisa e DEIXA PASSAR (fail-open).
+ * Middleware Express: verifica o HMAC do forward Receps→Ana.
+ *
+ * O webhook da Ana recebe o payload ENCAMINHADO pelo Receps (não direto da
+ * Meta): Meta → Receps /api/v1/bot/webhook (verifica X-Hub-Signature-256 da
+ * Meta) → forward assinado com RECEPS_BOT_WEBHOOK_SECRET (header X-Bot-Signature)
+ * → Ana. A assinatura da Meta NÃO sobrevive ao reenvio (corpo re-serializado +
+ * header não repassado), então a defesa real deste hop é o segredo do forward.
+ *
+ * Fail-CLOSED em produção: sem RECEPS_BOT_WEBHOOK_SECRET → 503 (não processa
+ * sem segredo). Em dev, segue com aviso pra não travar o ambiente local.
+ * Lê o env em tempo de request (testável / robusto a mudança de ambiente).
  */
-export function metaSignatureMiddleware(
+export function botSignatureMiddleware(
   req: Request,
   res: Response,
   next: NextFunction
 ): void {
-  if (!META_APP_SECRET) {
+  const secret = process.env.RECEPS_BOT_WEBHOOK_SECRET ?? '';
+
+  if (!secret) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error(
+        '❌ RECEPS_BOT_WEBHOOK_SECRET ausente em produção — webhook não configurado (fail-closed).'
+      );
+      res.status(503).json({ error: 'webhook não configurado' });
+      return;
+    }
     console.warn(
-      '⚠️ META_APP_SECRET não configurado — verificação de assinatura DESLIGADA. ' +
-        'Defina META_APP_SECRET para ativar a proteção contra webhooks forjados.'
+      '⚠️ RECEPS_BOT_WEBHOOK_SECRET ausente — verificação do forward DESLIGADA (apenas dev).'
     );
     next();
     return;
   }
 
   const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
-  const signature = req.get('x-hub-signature-256') ?? undefined;
+  const signature = req.get('x-bot-signature') ?? undefined;
 
-  if (!isValidMetaSignature(rawBody, signature, META_APP_SECRET)) {
-    console.warn('⚠️ Webhook com assinatura X-Hub-Signature-256 inválida/ausente — rejeitado (401).');
+  if (!isValidMetaSignature(rawBody, signature, secret)) {
+    console.warn('⚠️ Forward com X-Bot-Signature inválida/ausente — rejeitado (401).');
     res.sendStatus(401);
     return;
   }

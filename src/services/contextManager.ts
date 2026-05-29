@@ -11,7 +11,7 @@ if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL não configurada para persistir o histórico da Ana.');
 }
 
-const pool = new Pool({
+export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: 10,
   idleTimeoutMillis: 30_000,
