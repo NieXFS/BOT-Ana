@@ -6,9 +6,11 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/webhookServer.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/webhookServer.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/webhookServer.ts",
+    "smoke:security": "node scripts/smoke-security.ts"
   },
   "dependencies": {
+    "@sentry/node": "^10.55.0",
     "axios": "^1.7.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.0",

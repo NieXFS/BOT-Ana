@@ -1,4 +1,5 @@
 import axios from 'axios';
+import * as Sentry from '@sentry/node';
 import type { TenantBotConfig } from '../configProvider';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
@@ -12,6 +13,53 @@ const erpApi = axios.create({
     'Content-Type': 'application/json',
   },
 });
+
+/** Mapeia o path do ERP → nome de operação legível pro Sentry. */
+const ERP_OPERATION_BY_PATH: Record<string, string> = {
+  '/api/v1/agenda/info': 'get_services',
+  '/api/v1/agenda/availability': 'get_available_slots',
+  '/api/v1/agenda/cancel': 'cancel_appointment',
+  '/api/v1/agenda/book': 'book_appointment',
+};
+
+// Captura centralizada das falhas de calendar (chamadas ao ERP). Reporta UMA
+// vez por falha, com operação + status, herdando o escopo de isolamento da
+// mensagem (tenantSlug/phoneNumberId/messageId). 409 = corrida de horário
+// (esperada) → reportada como `warning`. Re-rejeita pra não mudar o fluxo.
+erpApi.interceptors.response.use(
+  (response) => response,
+  (error: unknown) => {
+    try {
+      const isAxios = axios.isAxiosError(error);
+      const status = isAxios ? error.response?.status : undefined;
+      const url = isAxios ? error.config?.url ?? '' : '';
+      const operation = ERP_OPERATION_BY_PATH[url] ?? (url || 'erp_request');
+      const isRaceCondition = status === 409;
+
+      Sentry.captureException(error, {
+        level: isRaceCondition ? 'warning' : 'error',
+        tags: {
+          service: 'erp_calendar',
+          operation,
+          erp_status: status ?? 'network',
+          race_condition: isRaceCondition,
+        },
+        contexts: {
+          erp_request: {
+            operation,
+            url,
+            method: isAxios ? error.config?.method ?? null : null,
+            status: status ?? null,
+            kind: isAxios ? (status ? 'http' : 'network') : 'unknown',
+          },
+        },
+      });
+    } catch {
+      // nunca deixa o Sentry quebrar o fluxo do bot
+    }
+    return Promise.reject(error);
+  },
+);
 
 interface ErpService {
   id: string | number;

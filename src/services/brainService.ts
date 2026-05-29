@@ -1,7 +1,9 @@
 import OpenAI from 'openai';
+import * as Sentry from '@sentry/node';
 import type { TenantBotConfig } from '../configProvider';
 import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
 import { callOpenAIWithRetry } from '../utils/openaiRetry';
+import { isCaptured } from '../observability/captured';
 import {
   addMessage,
   buildConversationKey,
@@ -379,6 +381,20 @@ export async function getReply(
       }
     }
   } catch (error) {
+    // Erros do OpenAI já foram capturados no funil (openaiRetry); aqui pegamos
+    // o resto (ex.: falha de persistência de contexto) sem duplicar.
+    if (!isCaptured(error)) {
+      Sentry.captureException(error, {
+        tags: { service: 'brain', operation: 'get_reply' },
+        contexts: {
+          get_reply: {
+            tenant_slug: config.tenantSlug,
+            phone_number_id: config.phoneNumberId,
+            bot_name: config.botName,
+          },
+        },
+      });
+    }
     console.error(`❌ Erro ao gerar resposta da ${config.botName}:`, error);
   }
 

@@ -1,3 +1,6 @@
+import * as Sentry from '@sentry/node';
+import { markCaptured } from '../observability/captured';
+
 type ErrorWithStatus = { status?: number; code?: string; message?: string };
 
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -51,6 +54,29 @@ export async function callOpenAIWithRetry<T>(
             err
           );
         }
+
+        // Funil central de erros do OpenAI (chat-completion + transcrição):
+        // rate limit (429), erro de modelo (4xx), timeouts/5xx esgotados.
+        const errStatus = (err as ErrorWithStatus).status;
+        const errCode = (err as ErrorWithStatus).code;
+        Sentry.captureException(err, {
+          tags: {
+            service: 'openai',
+            openai_status: errStatus ?? 'n/a',
+            retry_exhausted: canRetry,
+          },
+          contexts: {
+            openai: {
+              context,
+              status: errStatus ?? null,
+              code: errCode ?? null,
+              retryable: canRetry,
+              attempts: attempt + 1,
+            },
+          },
+        });
+        markCaptured(err);
+
         throw err;
       }
 
