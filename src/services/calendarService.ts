@@ -24,8 +24,10 @@ const ERP_OPERATION_BY_PATH: Record<string, string> = {
 
 // Captura centralizada das falhas de calendar (chamadas ao ERP). Reporta UMA
 // vez por falha, com operação + status, herdando o escopo de isolamento da
-// mensagem (tenantSlug/phoneNumberId/messageId). 409 = corrida de horário
-// (esperada) → reportada como `warning`. Re-rejeita pra não mudar o fluxo.
+// mensagem (tenantSlug/phoneNumberId/messageId). 409 = corrida de horário e
+// 422 = recusa por regra de negócio (bloqueio/pacote/fora de horário) — ambos
+// ESPERADOS → reportados como `warning`, com o reason machine-readable do corpo
+// pra diagnosticar padrões. Re-rejeita pra não mudar o fluxo.
 erpApi.interceptors.response.use(
   (response) => response,
   (error: unknown) => {
@@ -35,14 +37,21 @@ erpApi.interceptors.response.use(
       const url = isAxios ? error.config?.url ?? '' : '';
       const operation = ERP_OPERATION_BY_PATH[url] ?? (url || 'erp_request');
       const isRaceCondition = status === 409;
+      const isExpectedScheduling = status === 409 || status === 422;
+      const responseData = isAxios ? error.response?.data : undefined;
+      const bookReason =
+        responseData && typeof responseData === 'object' && 'reason' in responseData
+          ? String((responseData as { reason?: unknown }).reason ?? 'n/a')
+          : 'n/a';
 
       Sentry.captureException(error, {
-        level: isRaceCondition ? 'warning' : 'error',
+        level: isExpectedScheduling ? 'warning' : 'error',
         tags: {
           service: 'erp_calendar',
           operation,
           erp_status: status ?? 'network',
           race_condition: isRaceCondition,
+          book_reason: bookReason,
         },
         contexts: {
           erp_request: {
@@ -83,6 +92,9 @@ interface AgendaInfoResponse {
 
 interface AvailabilityResponse {
   availableTimes?: string[];
+  // Grade completa do dia (dentro do funcionamento), independente de ocupação.
+  // Usada por bookAppointment pra distinguir "fora do horário" de "ocupado".
+  scheduleTimes?: string[];
   professionalId?: string | number | null;
 }
 
@@ -129,6 +141,68 @@ type AvailabilityResult = {
   professionalId?: string;
   message?: string;
 };
+
+export type BookFailureReason =
+  | 'blocked'
+  | 'conflict'
+  | 'outside_hours'
+  | 'package_exhausted'
+  | 'other';
+
+export type BookAppointmentResult = {
+  success: boolean;
+  message: string;
+  // Motivo machine-readable quando success=false por causa do horário. Orienta
+  // o próximo passo da Ana (regra de fluxo B do system prompt).
+  reason?: BookFailureReason;
+  // Instrução interna empurrando a Ana a consultar horários reais antes de
+  // sugerir alternativas. Nunca deve ser repassada ao cliente.
+  hint?: string;
+};
+
+// Empurra a Ana a SEMPRE consultar a disponibilidade real antes de oferecer
+// alternativas — em vez de chutar horários vizinhos (Falha 2 do relato).
+const BOOK_ALTERNATIVES_HINT =
+  'Chame getAvailableSlots(date, serviceId, professionalId?) ANTES de sugerir qualquer alternativa e ofereça SOMENTE os horários reais retornados. NUNCA chute horários vizinhos.';
+
+/** Normaliza o reason vindo do ERP (ou infere pelo status) pro enum da Ana. */
+export function normalizeBookReason(
+  serverReason: unknown,
+  status?: number
+): BookFailureReason {
+  if (
+    serverReason === 'blocked' ||
+    serverReason === 'conflict' ||
+    serverReason === 'outside_hours' ||
+    serverReason === 'package_exhausted' ||
+    serverReason === 'other'
+  ) {
+    return serverReason;
+  }
+  if (status === 409) return 'conflict';
+  return 'other';
+}
+
+/** Mensagem (amigável, não-técnica) mostrada ao cliente final por motivo. */
+export function customerMessageForReason(
+  reason: BookFailureReason,
+  professionalName?: string
+): string {
+  switch (reason) {
+    case 'blocked':
+      return professionalName
+        ? `Esse horário está bloqueado na agenda da ${professionalName} (pode ser folga, almoço ou férias).`
+        : 'Esse horário está bloqueado na agenda do profissional (pode ser folga, almoço ou férias).';
+    case 'conflict':
+      return 'Esse horário acabou de ser preenchido.';
+    case 'outside_hours':
+      return 'Esse horário está fora do nosso horário de atendimento.';
+    case 'package_exhausted':
+      return 'O pacote não tem mais sessões disponíveis para esse serviço.';
+    default:
+      return 'Não consegui concluir o agendamento nesse horário.';
+  }
+}
 
 export function invalidateServicesCache(tenantSlug?: string): void {
   if (tenantSlug) servicesCache.delete(tenantSlug);
@@ -469,7 +543,8 @@ export async function getAvailableSlots(
   if (!serviceId?.trim()) {
     return {
       success: false,
-      message: 'Preciso do serviço escolhido para consultar os horários.',
+      message:
+        'INTERNAL_HINT: getAvailableSlots foi chamado sem serviceId. NÃO ofereça horários ainda. Se houver mais de um serviço disponível, liste os serviços ao cliente e pergunte qual ele quer ANTES de consultar horários; depois refaça esta chamada com o serviceId correto. Se houver apenas um serviço, use o id dele.',
     };
   }
 
@@ -698,19 +773,20 @@ export async function bookAppointment(
   config: TenantBotConfig,
   professionalId?: string,
   confirmedDuplicate = false
-): Promise<{ success: boolean; message: string }> {
+): Promise<BookAppointmentResult> {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return { success: false, message: 'Formato de data inválido. Use AAAA-MM-DD.' };
+    return { success: false, reason: 'other', message: 'Formato de data inválido. Use AAAA-MM-DD.' };
   }
 
   if (!/^\d{2}:\d{2}$/.test(time)) {
-    return { success: false, message: 'Formato de horário inválido. Use HH:MM.' };
+    return { success: false, reason: 'other', message: 'Formato de horário inválido. Use HH:MM.' };
   }
 
   if (!serviceId?.trim()) {
     return {
       success: false,
-      message: 'Preciso do serviço escolhido antes de concluir o agendamento.',
+      message:
+        'INTERNAL_HINT: bookAppointment foi chamado sem serviceId. NÃO confirme nada ao cliente. Se há mais de um serviço, pergunte qual ele quer; depois refaça a chamada com o serviceId correto.',
     };
   }
 
@@ -736,24 +812,32 @@ export async function bookAppointment(
 
   const normalizedDate = normalizeDate(date, config.timezone);
 
+  // Resolução fora do try: getServices não lança (trata erro internamente),
+  // e o catch precisa do nome do profissional pra montar a mensagem de bloqueio.
+  const servicesResult = await getServices(config);
+  const services = servicesResult.services ?? [];
+  const professionals = servicesResult.professionals ?? [];
+  const selectedService = getServiceById(services, serviceId);
+  const requestedProfessional = findByExactIdOrUniquePrefix(
+    professionals,
+    professionalId?.trim() ?? ''
+  );
+  const professionalName = requestedProfessional?.name;
+
+  if (!selectedService) {
+    return {
+      success: false,
+      reason: 'other',
+      message:
+        'Não encontrei esse serviço no sistema. Me diga qual serviço você quer e eu verifico de novo.',
+    };
+  }
+
   try {
-    const servicesResult = await getServices(config);
-    const services = servicesResult.services ?? [];
-    const professionals = servicesResult.professionals ?? [];
-    const selectedService = getServiceById(services, serviceId);
-    const requestedProfessional = findByExactIdOrUniquePrefix(
-      professionals,
-      professionalId?.trim() ?? ''
-    );
-
-    if (!selectedService) {
-      return {
-        success: false,
-        message:
-          'Não encontrei esse serviço no sistema. Me diga qual serviço você quer e eu verifico de novo.',
-      };
-    }
-
+    // A disponibilidade já respeita ScheduleBlock (corrigido no ERP). Usamos
+    // availableTimes (livres) + scheduleTimes (grade do dia, p/ distinguir
+    // "fora de horário" de "ocupado/bloqueado"). O motivo exato (bloqueio vs
+    // conflito) vem do POST autoritativo abaixo.
     const availabilityResponse = await erpApi.get<AvailabilityResponse>(
       '/api/v1/agenda/availability',
       {
@@ -772,12 +856,23 @@ export async function bookAppointment(
           (slot): slot is string => typeof slot === 'string'
         )
       : [];
+    const scheduleSlots = Array.isArray(availabilityResponse.data?.scheduleTimes)
+      ? availabilityResponse.data.scheduleTimes.filter(
+          (slot): slot is string => typeof slot === 'string'
+        )
+      : [];
 
-    if (!availableSlots.includes(time)) {
+    const slotIsFree = availableSlots.includes(time);
+    const gridKnown = scheduleSlots.length > 0;
+    const slotInGrid = !gridKnown || scheduleSlots.includes(time);
+
+    // Fora da grade do dia = fora do horário de atendimento. Não tenta agendar.
+    if (!slotIsFree && gridKnown && !slotInGrid) {
       return {
         success: false,
-        message:
-          'Esse horário acabou de ficar indisponível. Me fala outro horário e eu vejo pra você.',
+        reason: 'outside_hours',
+        message: customerMessageForReason('outside_hours'),
+        hint: BOOK_ALTERNATIVES_HINT,
       };
     }
 
@@ -792,6 +887,7 @@ export async function bookAppointment(
     if (!selectedProfessionalId) {
       return {
         success: false,
+        reason: 'other',
         message:
           'Não encontrei um profissional disponível no sistema para concluir esse agendamento.',
       };
@@ -802,7 +898,10 @@ export async function bookAppointment(
       new Date(startTime).getTime() + selectedService.durationMinutes * 60_000
     ).toISOString();
 
-    if (!confirmedDuplicate) {
+    // Detecção de duplicidade só quando vamos REALMENTE criar (slot livre). Se o
+    // slot está ocupado/bloqueado, deixamos o POST recusar e classificar o motivo
+    // — não faz sentido perguntar sobre duplicata pra um horário indisponível.
+    if (slotIsFree && !confirmedDuplicate) {
       const upcoming = await getCustomerUpcomingAppointments(phone, config);
 
       if (upcoming.success && upcoming.appointments && upcoming.appointments.length > 0) {
@@ -824,6 +923,23 @@ export async function bookAppointment(
       }
     }
 
+    // Breadcrumb ANTES do POST: fica no escopo quando o interceptor captura uma
+    // eventual falha, dando contexto (tenant/data/hora/profissional) pro Sentry.
+    Sentry.addBreadcrumb({
+      category: 'booking',
+      type: 'info',
+      level: 'info',
+      message: 'book_attempt',
+      data: {
+        tenantSlug: config.tenantSlug,
+        date: normalizedDate,
+        time,
+        serviceId: selectedService.id,
+        professionalId: selectedProfessionalId,
+        slotWasFree: slotIsFree,
+      },
+    });
+
     await erpApi.post('/api/v1/agenda/book', {
       tenantSlug: config.tenantSlug,
       customerPhone: normalizeWhatsappPhone(phone),
@@ -839,17 +955,26 @@ export async function bookAppointment(
       message: `Agendado com sucesso para ${formatDateBR(normalizedDate)} às ${time}.`,
     };
   } catch (err) {
-    if (axios.isAxiosError(err) && err.response?.status === 409) {
+    // Falha HTTP do POST/availability: o ERP devolve um reason machine-readable
+    // (blocked/conflict/outside_hours/package_exhausted/other). Traduzimos numa
+    // mensagem amigável + hint pra Ana SEMPRE consultar horários reais depois.
+    if (axios.isAxiosError(err) && err.response) {
+      const responseData = err.response.data as { reason?: unknown } | undefined;
+      const reason = normalizeBookReason(responseData?.reason, err.response.status);
       return {
         success: false,
-        message:
-          'Esse horário foi preenchido agora há pouco. Me fala outro horário que eu vejo os próximos disponíveis pra você.',
+        reason,
+        message: customerMessageForReason(reason, professionalName),
+        hint: BOOK_ALTERNATIVES_HINT,
       };
     }
 
+    // Erro de rede / inesperado: transitório, não é problema de horário —
+    // sem hint (consultar horários não ajudaria) e mensagem de "tente de novo".
     console.error('❌ Erro ao criar agendamento no ERP:', err);
     return {
       success: false,
+      reason: 'other',
       message:
         'Tive um problema ao criar o agendamento agora. Pode tentar novamente em instantes?',
     };
