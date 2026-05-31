@@ -8,11 +8,9 @@
     "start": "node dist/webhookServer.js",
     "dev": "ts-node-dev --respawn --transpile-only src/webhookServer.ts",
     "smoke:security": "node scripts/smoke-security.ts",
-    "smoke:booking-reasons": "node scripts/smoke-booking-reasons.ts",
-    "smoke:gemini": "node scripts/smoke-gemini-integration.ts"
+    "smoke:booking-reasons": "node scripts/smoke-booking-reasons.ts"
   },
   "dependencies": {
-    "@google/genai": "^2.7.0",
     "@sentry/node": "^10.55.0",
     "axios": "^1.7.0",
     "dotenv": "^16.4.5",

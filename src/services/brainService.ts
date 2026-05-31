@@ -1,9 +1,8 @@
-import { GoogleGenAI, FunctionCallingConfigMode } from '@google/genai';
-import type { Content, FunctionDeclaration, Part, Tool } from '@google/genai';
+import OpenAI from 'openai';
 import * as Sentry from '@sentry/node';
 import type { TenantBotConfig } from '../configProvider';
 import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
-import { callGeminiWithRetry } from '../utils/geminiRetry';
+import { callOpenAIWithRetry } from '../utils/openaiRetry';
 import { isCaptured } from '../observability/captured';
 import {
   addMessage,
@@ -18,15 +17,13 @@ import {
   cancelAppointment,
 } from './calendarService';
 
-const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+const clientCache = new Map<string, OpenAI>();
 
-const clientCache = new Map<string, GoogleGenAI>();
-
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
+function getOpenAIClient(config: TenantBotConfig): OpenAI {
+  const apiKey = config.openaiApiKey?.trim() || process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY não configurada no ambiente.');
+    throw new Error('OPENAI_API_KEY não configurada para o tenant nem no ambiente global.');
   }
 
   const cached = clientCache.get(apiKey);
@@ -34,18 +31,9 @@ function getGeminiClient(): GoogleGenAI {
     return cached;
   }
 
-  const client = new GoogleGenAI({ apiKey });
+  const client = new OpenAI({ apiKey });
   clientCache.set(apiKey, client);
   return client;
-}
-
-function getGeminiModel(config: TenantBotConfig): string {
-  // config.aiModel vem do ERP e é específico do OpenAI (ex: "gpt-4o-mini"), então
-  // NÃO serve como nome de modelo Gemini. O modelo é controlado por GEMINI_MODEL
-  // (default gemini-2.5-flash). aiTemperature/aiMaxTokens são genéricos e seguem
-  // sendo usados (temperature / maxOutputTokens).
-  void config;
-  return process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
 }
 
 function getCurrentYear(timezone: string): number {
@@ -153,112 +141,112 @@ function maybePrependGreeting(
   return `${greeting}\n\n${reply}`;
 }
 
-// Converte a string JSON devolvida por executeFunction no objeto que o Gemini
-// espera em functionResponse.response (Record<string, unknown>). O conteúdo é o
-// MESMO que o OpenAI recebia como content da tool — só o transporte muda.
-function toFunctionResponseObject(result: string): Record<string, unknown> {
+function parseFunctionArgs(rawArgs: string): Record<string, unknown> {
   try {
-    const parsed = JSON.parse(result);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    return { result: parsed };
+    return JSON.parse(rawArgs || '{}') as Record<string, unknown>;
   } catch {
-    return { result };
+    return {};
   }
 }
 
-// Mesmas 4 ferramentas, mesmas descrições e mesmo JSON Schema de parâmetros do
-// OpenAI — só o formato muda (functionDeclarations + parametersJsonSchema, que
-// aceita JSON Schema padrão). NENHUMA palavra de description/schema foi alterada.
-const FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
+const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
-    name: 'getServices',
-    description:
-      'Lista os serviços e profissionais cadastrados no ERP. FALLBACK APENAS: você normalmente NÃO precisa chamar essa ferramenta porque a lista atualizada já vem no system prompt. Use apenas se suspeitar que a lista mudou (ex: cliente pediu um serviço que não aparece no prompt).',
-    parametersJsonSchema: {
-      type: 'object',
-      properties: {},
-      required: [],
+    type: 'function',
+    function: {
+      name: 'getServices',
+      description:
+        'Lista os serviços e profissionais cadastrados no ERP. FALLBACK APENAS: você normalmente NÃO precisa chamar essa ferramenta porque a lista atualizada já vem no system prompt. Use apenas se suspeitar que a lista mudou (ex: cliente pediu um serviço que não aparece no prompt).',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
     },
   },
   {
-    name: 'getAvailableSlots',
-    description:
-      'Consulta os horários disponíveis para um serviço específico em uma data específica, com opção de profissional',
-    parametersJsonSchema: {
-      type: 'object',
-      properties: {
-        date: {
-          type: 'string',
-          description:
-            'Data no formato YYYY-MM-DD. OBRIGATÓRIO: use o ano atual informado no contexto temporal do system prompt. Se o cliente disser apenas dia/mês, complete com o ano atual. Nunca use anos anteriores.',
+    type: 'function',
+    function: {
+      name: 'getAvailableSlots',
+      description:
+        'Consulta os horários disponíveis para um serviço específico em uma data específica, com opção de profissional',
+      parameters: {
+        type: 'object',
+        properties: {
+          date: {
+            type: 'string',
+            description:
+              'Data no formato YYYY-MM-DD. OBRIGATÓRIO: use o ano atual informado no contexto temporal do system prompt. Se o cliente disser apenas dia/mês, complete com o ano atual. Nunca use anos anteriores.',
+          },
+          serviceId: {
+            type: 'string',
+            description:
+              "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
+          },
+          professionalId: {
+            type: 'string',
+            description:
+              "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
+          },
         },
-        serviceId: {
-          type: 'string',
-          description:
-            "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
-        },
-        professionalId: {
-          type: 'string',
-          description:
-            "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
-        },
+        required: ['date', 'serviceId'],
       },
-      required: ['date', 'serviceId'],
     },
   },
   {
-    name: 'bookAppointment',
-    description:
-      'Agenda um horário no ERP. O telefone e o nome do cliente são preenchidos automaticamente pelo sistema.',
-    parametersJsonSchema: {
-      type: 'object',
-      properties: {
-        date: {
-          type: 'string',
-          description:
-            'Data no formato YYYY-MM-DD. OBRIGATÓRIO: use o ano atual informado no contexto temporal do system prompt. Se o cliente disser apenas dia/mês, complete com o ano atual. Nunca use anos anteriores.',
+    type: 'function',
+    function: {
+      name: 'bookAppointment',
+      description:
+        'Agenda um horário no ERP. O telefone e o nome do cliente são preenchidos automaticamente pelo sistema.',
+      parameters: {
+        type: 'object',
+        properties: {
+          date: {
+            type: 'string',
+            description:
+              'Data no formato YYYY-MM-DD. OBRIGATÓRIO: use o ano atual informado no contexto temporal do system prompt. Se o cliente disser apenas dia/mês, complete com o ano atual. Nunca use anos anteriores.',
+          },
+          time: { type: 'string', description: 'Horário no formato HH:MM' },
+          serviceId: {
+            type: 'string',
+            description:
+              "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
+          },
+          professionalId: {
+            type: 'string',
+            description:
+              "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
+          },
+          confirmedDuplicate: {
+            type: 'boolean',
+            description:
+              'Marque como true APENAS quando o cliente confirmou explicitamente que quer manter agendamentos duplicados (no fluxo de detecção de conflito). NUNCA marque como true em outras situações.',
+          },
         },
-        time: { type: 'string', description: 'Horário no formato HH:MM' },
-        serviceId: {
-          type: 'string',
-          description:
-            "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
-        },
-        professionalId: {
-          type: 'string',
-          description:
-            "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
-        },
-        confirmedDuplicate: {
-          type: 'boolean',
-          description:
-            'Marque como true APENAS quando o cliente confirmou explicitamente que quer manter agendamentos duplicados (no fluxo de detecção de conflito). NUNCA marque como true em outras situações.',
-        },
+        required: ['date', 'time', 'serviceId'],
       },
-      required: ['date', 'time', 'serviceId'],
     },
   },
   {
-    name: 'cancelAppointment',
-    description:
-      'Cancela um agendamento futuro do cliente. Use APENAS no fluxo de detecção de agendamento existente (após o cliente escolher remarcar). NUNCA use em outros contextos — cancelamentos avulsos devem ser encaminhados para a equipe.',
-    parametersJsonSchema: {
-      type: 'object',
-      properties: {
-        appointmentId: {
-          type: 'string',
-          description:
-            'ID técnico exato do agendamento a cancelar, conforme retornado no INTERNAL_HINT de detecção de conflito (valor dentro de [id: ...]). Nunca invente usando data/hora. Se houver mais de um agendamento e o cliente não indicou qual, pergunte antes de cancelar.',
+    type: 'function',
+    function: {
+      name: 'cancelAppointment',
+      description:
+        'Cancela um agendamento futuro do cliente. Use APENAS no fluxo de detecção de agendamento existente (após o cliente escolher remarcar). NUNCA use em outros contextos — cancelamentos avulsos devem ser encaminhados para a equipe.',
+      parameters: {
+        type: 'object',
+        properties: {
+          appointmentId: {
+            type: 'string',
+            description:
+              'ID técnico exato do agendamento a cancelar, conforme retornado no INTERNAL_HINT de detecção de conflito (valor dentro de [id: ...]). Nunca invente usando data/hora. Se houver mais de um agendamento e o cliente não indicou qual, pergunte antes de cancelar.',
+          },
         },
+        required: ['appointmentId'],
       },
-      required: ['appointmentId'],
     },
   },
 ];
-
-const TOOLS: Tool[] = [{ functionDeclarations: FUNCTION_DECLARATIONS }];
 
 async function executeFunction(
   functionName: string,
@@ -328,47 +316,39 @@ export async function getReply(
 
   await addMessage(conversationKey, 'user', userMessage);
 
-  // Histórico persistido é só texto (user/assistant). Converte pro formato Gemini:
-  // 'assistant' -> 'model', content textual -> parts:[{text}]. O system prompt NÃO
-  // entra em contents — vai em config.systemInstruction (mesmo texto de antes).
   const history = await getHistory(conversationKey);
-  const contents: Content[] = history.map((message) => ({
-    role: message.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: message.content }],
-  }));
+  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+    { role: 'system', content: await buildSystemPrompt(config) },
+    ...history,
+  ];
 
-  const systemInstruction = await buildSystemPrompt(config);
-  const model = getGeminiModel(config);
   const maxToolRounds = 8;
 
   try {
     for (let round = 0; round < maxToolRounds; round++) {
-      const response = await callGeminiWithRetry(
+      const response = await callOpenAIWithRetry(
         () =>
-          getGeminiClient().models.generateContent({
-            model,
-            contents,
-            config: {
-              systemInstruction,
-              tools: TOOLS,
-              toolConfig: {
-                functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO },
-              },
-              temperature: sanitizeTemperature(config.aiTemperature),
-              maxOutputTokens: sanitizeMaxTokens(config.aiMaxTokens),
-              // Desliga o "thinking" do 2.5 Flash: paridade com o gpt-4o-mini (que
-              // não pensava) e evita que o orçamento de tokens (maxOutputTokens
-              // baixo) seja consumido pelo raciocínio, deixando a resposta vazia.
-              thinkingConfig: { thinkingBudget: 0 },
-            },
+          getOpenAIClient(config).chat.completions.create({
+            model: config.aiModel,
+            messages,
+            tools: TOOLS,
+            tool_choice: 'auto',
+            temperature: sanitizeTemperature(config.aiTemperature),
+            max_tokens: sanitizeMaxTokens(config.aiMaxTokens),
           }),
-        `gemini-generate tenant=${config.tenantSlug} round=${round + 1}/${maxToolRounds}`
+        `chat-completion tenant=${config.tenantSlug} round=${round + 1}/${maxToolRounds}`
       );
 
-      const functionCalls = response.functionCalls ?? [];
+      const choice = response.choices[0];
+      const assistantMessage = choice.message;
 
-      if (functionCalls.length === 0) {
-        const rawReply = (response.text ?? '').trim();
+      messages.push(assistantMessage);
+
+      if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+        const rawReply =
+          typeof assistantMessage.content === 'string'
+            ? assistantMessage.content.trim()
+            : '';
         const finalReply = maybePrependGreeting(
           rawReply || getFallbackMessage(config),
           isFirstContact,
@@ -379,22 +359,9 @@ export async function getReply(
         return finalReply;
       }
 
-      // Anexa o turno do modelo (com os parts de functionCall) ao histórico em
-      // memória — necessário para o Gemini casar cada functionResponse à chamada.
-      const modelContent = response.candidates?.[0]?.content;
-      if (modelContent) {
-        contents.push(modelContent);
-      } else {
-        contents.push({
-          role: 'model',
-          parts: functionCalls.map((functionCall) => ({ functionCall })),
-        });
-      }
-
-      const functionResponseParts: Part[] = [];
-      for (const functionCall of functionCalls) {
-        const functionName = functionCall.name ?? '';
-        const args = (functionCall.args ?? {}) as Record<string, unknown>;
+      for (const toolCall of assistantMessage.tool_calls) {
+        const functionName = toolCall.function.name;
+        const args = parseFunctionArgs(toolCall.function.arguments || '{}');
 
         console.log(
           `🔧 ${config.botName} chamou função: ${functionName}(${JSON.stringify(args)}) para ${phone}`
@@ -411,19 +378,15 @@ export async function getReply(
 
         console.log(`📋 Resultado de ${functionName}: ${result}`);
 
-        functionResponseParts.push({
-          functionResponse: {
-            name: functionName,
-            response: toFunctionResponseObject(result),
-          },
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: result,
         });
       }
-
-      // O turno com os functionResponse vai como role 'user' (formato do Gemini).
-      contents.push({ role: 'user', parts: functionResponseParts });
     }
   } catch (error) {
-    // Erros do Gemini já foram capturados no funil (geminiRetry); aqui pegamos
+    // Erros do OpenAI já foram capturados no funil (openaiRetry); aqui pegamos
     // o resto (ex.: falha de persistência de contexto) sem duplicar.
     if (!isCaptured(error)) {
       Sentry.captureException(error, {
