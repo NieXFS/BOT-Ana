@@ -91,6 +91,7 @@ ${config.systemPrompt}
 REGRAS DE FLUXO DE ATENDIMENTO (prioridade máxima, leia primeiro):
 A. ESCOLHA DO SERVIÇO — NUNCA assuma qual serviço o cliente quer. Ao INICIAR um novo agendamento, se a mensagem ATUAL não nomear o serviço com clareza (ex.: "quero marcar", "quero marcar para o dia 31", "quero marcar amanhã", "quero remarcar") E houver mais de um item na lista "SERVIÇOS DISPONÍVEIS", você DEVE listar TODOS os serviços disponíveis de forma NEUTRA (texto natural) e perguntar qual ele deseja ANTES de consultar horários (getAvailableSlots) ou agendar. NÃO faça pergunta direcionada como "quer o mesmo serviço de antes?" nem cite só um serviço — apresente as opções e deixe o cliente escolher. NUNCA reaproveite o serviço de um agendamento JÁ CONCLUÍDO, de mensagens antigas ou do histórico desta conversa — cada NOVO pedido recomeça perguntando o serviço (o fato de o cliente ter marcado/citado Depilação antes NÃO significa que o próximo agendamento também é Depilação). Exceção: durante um agendamento EM ANDAMENTO, mantenha o serviço que o cliente já escolheu NESSE mesmo fluxo (não repergunte a cada mensagem). Só siga direto, sem perguntar, se existir exatamente UM serviço disponível.
 B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar success=false por causa do horário (campo reason = "blocked", "conflict" ou "outside_hours"), você DEVE chamar getAvailableSlots (mesma data, serviceId e profissional) ANTES de sugerir qualquer alternativa e oferecer SOMENTE os horários reais que ela retornar. NUNCA chute horários vizinhos (se pediram 15h, não invente 15h30 ou 16h). Se o retorno tiver um campo "hint", siga-o. ATENÇÃO: um retorno "INTERNAL_HINT:" sobre agendamento DUPLICADO NÃO é indisponibilidade de horário — nesse caso siga a regra 7 abaixo e NÃO chame getAvailableSlots.
+C. ESCOLHA DO PROFISSIONAL — Se há 2+ profissionais em "PROFISSIONAIS DISPONÍVEIS" que atendem o serviço pedido E o cliente não disse com quem quer agendar, PERGUNTE: "Quer agendar com algum profissional específico ou tanto faz?". Se o cliente responder "tanto faz" / "qualquer um" / "pode ser qualquer" / similar, chame bookAppointment SEM o campo professionalId — o sistema escolhe automaticamente um profissional livre e te devolve o nome. Se o cliente disser um nome, passe o professionalId correspondente. Se houver apenas 1 profissional, agende direto sem perguntar. SEMPRE confirme ao cliente com QUEM ficou o agendamento (ex.: "Agendado às 15h com a Julia para Corte de cabelo").
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).
@@ -184,7 +185,7 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           professionalId: {
             type: 'string',
             description:
-              "ID técnico do profissional listado em PROFISSIONAIS DISPONÍVEIS no system prompt, ou retornado por getServices apenas como fallback. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
+              "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
           },
         },
         required: ['date', 'serviceId'],
@@ -214,7 +215,7 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           professionalId: {
             type: 'string',
             description:
-              "ID técnico do profissional listado em PROFISSIONAIS DISPONÍVEIS no system prompt, ou retornado por getServices apenas como fallback. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Opcional se o cliente não tem preferência.",
+              "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
           },
           confirmedDuplicate: {
             type: 'boolean',

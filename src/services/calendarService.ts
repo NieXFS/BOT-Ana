@@ -876,22 +876,13 @@ export async function bookAppointment(
       };
     }
 
-    const availabilityProfessionalId =
-      availabilityResponse.data?.professionalId == null
-        ? undefined
-        : String(availabilityResponse.data.professionalId);
-
-    const selectedProfessionalId =
-      requestedProfessional?.id || availabilityProfessionalId || professionals[0]?.id;
-
-    if (!selectedProfessionalId) {
-      return {
-        success: false,
-        reason: 'other',
-        message:
-          'Não encontrei um profissional disponível no sistema para concluir esse agendamento.',
-      };
-    }
+    // Profissional: se o cliente especificou (requestedProfessional resolvido),
+    // mandamos esse id — comportamento estrito (409 se ocupado). Se NÃO
+    // especificou, OMITIMOS o professionalId e o SERVIDOR escolhe um profissional
+    // livre no horário (fix multi-profissional). Antes, a Ana mandava
+    // professionals[0] como default — bug: às vezes o 1º estava ocupado com outro
+    // profissional livre, batendo em 409.
+    const selectedProfessionalId = requestedProfessional?.id;
 
     const startTime = toUtcIso(normalizedDate, time, config.timezone);
     const endTime = new Date(
@@ -935,12 +926,16 @@ export async function bookAppointment(
         date: normalizedDate,
         time,
         serviceId: selectedService.id,
-        professionalId: selectedProfessionalId,
+        professionalId: selectedProfessionalId ?? 'auto',
         slotWasFree: slotIsFree,
       },
     });
 
-    await erpApi.post('/api/v1/agenda/book', {
+    // professionalId undefined é OMITIDO do JSON pelo axios → o servidor resolve
+    // automaticamente um profissional livre.
+    const bookResponse = await erpApi.post<{
+      professional?: { id: string; name?: string };
+    }>('/api/v1/agenda/book', {
       tenantSlug: config.tenantSlug,
       customerPhone: normalizeWhatsappPhone(phone),
       customerName: customerName?.trim() || 'Cliente',
@@ -950,9 +945,15 @@ export async function bookAppointment(
       endTime,
     });
 
+    // Confirma COM QUEM ficou — essencial quando o profissional foi escolhido
+    // automaticamente (cliente disse "tanto faz").
+    const bookedProfessionalName =
+      bookResponse.data?.professional?.name?.trim() || requestedProfessional?.name;
+    const withProfessional = bookedProfessionalName ? ` com ${bookedProfessionalName}` : '';
+
     return {
       success: true,
-      message: `Agendado com sucesso para ${formatDateBR(normalizedDate)} às ${time}.`,
+      message: `Agendado com sucesso para ${formatDateBR(normalizedDate)} às ${time}${withProfessional} para ${selectedService.name}.`,
     };
   } catch (err) {
     // Falha HTTP do POST/availability: o ERP devolve um reason machine-readable
