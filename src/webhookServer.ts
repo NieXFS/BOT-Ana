@@ -144,7 +144,25 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });
 });
 
+// GEMINI_API_KEY é obrigatória pro brainService (chat). Espelha o padrão do
+// RECEPS_BOT_WEBHOOK_SECRET: em produção, fail-closed (aborta o boot com
+// mensagem clara); em dev, warning e segue (DX — respostas falham até configurar).
+function assertGeminiConfigured(): void {
+  if (process.env.GEMINI_API_KEY?.trim()) {
+    return;
+  }
+  const message =
+    'GEMINI_API_KEY ausente — o brainService usa o Google Gemini para gerar as respostas.';
+  if (process.env.NODE_ENV === 'production') {
+    console.error(`❌ ${message} Abortando o boot (fail-closed em produção).`);
+    process.exit(1);
+  }
+  console.warn(`⚠️ ${message} Seguindo em dev — as respostas vão falhar até configurar.`);
+}
+
 async function boot(): Promise<void> {
+  assertGeminiConfigured();
+
   // Garante a tabela de idempotência ANTES de aceitar tráfego, e limpa antigos.
   await ensureProcessedMessagesTable();
   cleanupOldProcessedMessages()
