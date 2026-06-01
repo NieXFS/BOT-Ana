@@ -722,66 +722,74 @@ export async function cancelAppointment(
   }
 
   let resolvedAppointmentId = requestedAppointmentId;
-  const hasTechnicalId = Boolean(extractTechnicalAppointmentId(requestedAppointmentId));
   const upcoming = await getCustomerUpcomingAppointments(phone, config);
 
-  if (upcoming.success && upcoming.appointments && upcoming.appointments.length > 0) {
-    const technicalMatch = findAppointmentByTechnicalId(
-      upcoming.appointments,
-      requestedAppointmentId
-    );
-
-    if (technicalMatch) {
-      resolvedAppointmentId = technicalMatch.id;
-    } else if (!hasTechnicalId) {
-      const dateTimeMatch = findAppointmentByDateTimeReference(
-        upcoming.appointments,
-        requestedAppointmentId,
-        config.timezone
-      );
-      const userExplicitlyReferencedAppointment =
-        dateTimeMatch &&
-        appointmentMatchesUserReference(
-          dateTimeMatch,
-          currentUserMessage,
-          config.timezone
-        );
-
-      if (
-        dateTimeMatch &&
-        (upcoming.appointments.length === 1 || userExplicitlyReferencedAppointment)
-      ) {
-        resolvedAppointmentId = dateTimeMatch.id;
-      } else {
-        const list = upcoming.appointments
-          .slice(0, 5)
-          .map((appointment) => formatAppointmentForHint(appointment, config.timezone))
-          .join('\n- ');
-
-        return {
-          success: false,
-          message: `INTERNAL_HINT: cancelAppointment recebeu "${requestedAppointmentId}", mas appointmentId precisa ser o ID técnico exato do agendamento. Agendamentos futuros atuais:\n- ${list}\n\nHá mais de um agendamento possível ou o parâmetro não é um ID técnico confiável. A mensagem atual do cliente não citou explicitamente esse data/horário. NÃO chame cancelAppointment novamente neste turno. Pergunte ao cliente qual agendamento deve ser cancelado e peça para responder com data e horário. Quando o cliente escolher, chame cancelAppointment com o id técnico correspondente se você tiver o ID; se não tiver, use a data/hora que o cliente acabou de citar. NÃO escolha um agendamento por conta própria.`,
-        };
-      }
-    }
-
-    if (resolvedAppointmentId !== requestedAppointmentId) {
-      const resolvedAppointment = upcoming.appointments.find(
-        (appointment) => appointment.id === resolvedAppointmentId
-      );
-      const resolvedLabel = resolvedAppointment
-        ? formatAppointmentForHint(resolvedAppointment, config.timezone)
-        : resolvedAppointmentId;
-      console.log(
-        `🔎 appointmentId "${requestedAppointmentId}" resolvido para ${resolvedLabel}`
-      );
-    }
-  } else if (!hasTechnicalId) {
+  // GUARDRAIL: o cancelamento SÓ pode mirar um agendamento futuro REAL do cliente.
+  // Não dá pra confiar no id que o modelo passa (no log de prod ele mandou o
+  // serviceId no lugar do appointmentId → ERP 400). Resolvemos o id SEMPRE contra
+  // a lista de upcoming; se não bater, usamos contexto (único futuro / data citada)
+  // ou re-perguntamos — NUNCA mandamos um id não-verificado pro ERP.
+  if (!upcoming.success) {
     return {
       success: false,
       message:
-        'INTERNAL_HINT: cancelAppointment recebeu um appointmentId que não parece ser um ID técnico e não consegui consultar os agendamentos futuros para resolver. Não responda ao cliente como se tivesse cancelado; peça para a equipe ajudar com o cancelamento.',
+        'INTERNAL_HINT: não consegui consultar os agendamentos futuros do cliente agora para confirmar qual cancelar. NÃO responda como se tivesse cancelado; peça desculpas e diga que vai encaminhar para a equipe.',
     };
+  }
+
+  const upcomingAppointments = upcoming.appointments ?? [];
+  if (upcomingAppointments.length === 0) {
+    return {
+      success: false,
+      message:
+        'INTERNAL_HINT: o cliente não tem nenhum agendamento futuro para cancelar. Informe gentilmente que não encontrou agendamento futuro; NÃO diga que cancelou.',
+    };
+  }
+
+  const technicalMatch = findAppointmentByTechnicalId(
+    upcomingAppointments,
+    requestedAppointmentId
+  );
+  if (technicalMatch) {
+    resolvedAppointmentId = technicalMatch.id;
+  } else if (upcomingAppointments.length === 1) {
+    // Id não bateu (ex.: serviceId no lugar do appointmentId), mas só há UM
+    // agendamento futuro → é esse que o cliente quer cancelar no fluxo de remarcação.
+    resolvedAppointmentId = upcomingAppointments[0].id;
+  } else {
+    const dateTimeMatch = findAppointmentByDateTimeReference(
+      upcomingAppointments,
+      requestedAppointmentId,
+      config.timezone
+    );
+    const userExplicitlyReferencedAppointment =
+      dateTimeMatch &&
+      appointmentMatchesUserReference(dateTimeMatch, currentUserMessage, config.timezone);
+
+    if (dateTimeMatch && userExplicitlyReferencedAppointment) {
+      resolvedAppointmentId = dateTimeMatch.id;
+    } else {
+      const list = upcomingAppointments
+        .slice(0, 5)
+        .map((appointment) => formatAppointmentForHint(appointment, config.timezone))
+        .join('\n- ');
+      return {
+        success: false,
+        message: `INTERNAL_HINT: não deu pra identificar com segurança qual agendamento cancelar — o id recebido não corresponde a nenhum agendamento futuro do cliente. Agendamentos futuros:\n- ${list}\n\nPergunte ao cliente qual cancelar (peça data e horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`,
+      };
+    }
+  }
+
+  if (resolvedAppointmentId !== requestedAppointmentId) {
+    const resolvedAppointment = upcomingAppointments.find(
+      (appointment) => appointment.id === resolvedAppointmentId
+    );
+    const resolvedLabel = resolvedAppointment
+      ? formatAppointmentForHint(resolvedAppointment, config.timezone)
+      : resolvedAppointmentId;
+    console.log(
+      `🔎 appointmentId "${requestedAppointmentId}" resolvido para ${resolvedLabel}`
+    );
   }
 
   try {
