@@ -16,6 +16,11 @@ import {
   bookAppointment,
   cancelAppointment,
 } from './calendarService';
+import {
+  serviceSelectionGate,
+  shouldAskServiceUpfront,
+  buildServiceQuestion,
+} from './service-gate';
 
 const clientCache = new Map<string, OpenAI>();
 
@@ -254,9 +259,36 @@ async function executeFunction(
   phone: string,
   userName: string,
   config: TenantBotConfig,
-  currentUserMessage: string
+  currentUserMessage: string,
+  userMessages: string[]
 ): Promise<string> {
   try {
+    // GUARDRAIL B (gate determinístico de serviço): antes de consultar horários
+    // ou agendar, se o tenant tem 2+ serviços, o serviço escolhido precisa estar
+    // ancorado numa escolha EXPLÍCITA recente do cliente — não no histórico. Se
+    // não estiver, bloqueia e manda a Ana perguntar qual serviço. Roda AQUI (não
+    // no calendarService) pra não pegar o getAvailableSlots interno do Guardrail A.
+    if (functionName === 'getAvailableSlots' || functionName === 'bookAppointment') {
+      const servicesResult = await getServices(config);
+      if (
+        servicesResult.success &&
+        servicesResult.services &&
+        servicesResult.services.length >= 2
+      ) {
+        const gate = serviceSelectionGate(
+          String(args.serviceId ?? ''),
+          servicesResult.services,
+          userMessages
+        );
+        if (!gate.ok) {
+          console.log(
+            `🚧 ${config.botName} gate de serviço bloqueou ${functionName} (serviço não escolhido pelo cliente) para ${phone}`
+          );
+          return JSON.stringify({ success: false, message: gate.hintMessage });
+        }
+      }
+    }
+
     switch (functionName) {
       case 'getServices': {
         const result = await getServices(config);
@@ -317,6 +349,31 @@ export async function getReply(
   await addMessage(conversationKey, 'user', userMessage);
 
   const history = await getHistory(conversationKey);
+  // Mensagens do USUÁRIO (cronológicas, a atual por último) — usadas pelo gate de
+  // serviço (Guardrail B) pra checar se o cliente escolheu o serviço de fato.
+  const userMessages = history
+    .filter((message) => message.role === 'user')
+    .map((message) => message.content);
+  // GUARDRAIL B (proativo): novo pedido de agendamento sem serviço escolhido +
+  // tenant com 2+ serviços → o CÓDIGO pergunta o serviço ANTES de chamar o modelo,
+  // pra ele não assumir o serviço pelo histórico (nem em texto). Determinístico.
+  const servicesForGate = await getServices(config);
+  if (
+    servicesForGate.success &&
+    servicesForGate.services &&
+    servicesForGate.services.length >= 2 &&
+    shouldAskServiceUpfront(servicesForGate.services, userMessages)
+  ) {
+    const question = maybePrependGreeting(
+      buildServiceQuestion(servicesForGate.services),
+      isFirstContact,
+      config
+    );
+    console.log(`🚦 ${config.botName} desambiguou o serviço proativamente para ${phone}`);
+    await addMessage(conversationKey, 'assistant', question);
+    return question;
+  }
+
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: 'system', content: await buildSystemPrompt(config) },
     ...history,
@@ -373,7 +430,8 @@ export async function getReply(
           phone,
           userName,
           config,
-          userMessage
+          userMessage,
+          userMessages
         );
 
         console.log(`📋 Resultado de ${functionName}: ${result}`);

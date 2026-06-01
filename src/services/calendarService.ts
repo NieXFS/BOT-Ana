@@ -158,6 +158,11 @@ export type BookAppointmentResult = {
   // Instrução interna empurrando a Ana a consultar horários reais antes de
   // sugerir alternativas. Nunca deve ser repassada ao cliente.
   hint?: string;
+  // GUARDRAIL A: quando o book falha por horário (blocked/conflict/outside_hours),
+  // o PRÓPRIO calendarService já consulta a disponibilidade e devolve os horários
+  // reais aqui — a Ana só repassa, sem chutar horários vizinhos (mata Falha 2 em
+  // código, não dependendo do modelo seguir a regra B em prosa).
+  availableSlots?: string[];
 };
 
 // Empurra a Ana a SEMPRE consultar a disponibilidade real antes de oferecer
@@ -202,6 +207,56 @@ export function customerMessageForReason(
     default:
       return 'Não consegui concluir o agendamento nesse horário.';
   }
+}
+
+/**
+ * GUARDRAIL A — monta a resposta de "horário indisponível" JÁ com os horários
+ * reais embutidos. Em vez de pedir (via prosa/hint) pra Ana chamar
+ * getAvailableSlots e confiar que ela não vai chutar, o código consulta a
+ * disponibilidade aqui e entrega a lista pronta. A Ana só repassa.
+ * Determinístico: o conjunto de horários oferecido = o conjunto real.
+ */
+async function buildUnavailableResult(params: {
+  reason: BookFailureReason;
+  config: TenantBotConfig;
+  date: string; // YYYY-MM-DD (já normalizado)
+  serviceId: string;
+  serviceName: string;
+  professionalId?: string;
+  professionalName?: string;
+}): Promise<BookAppointmentResult> {
+  const { reason, config, date, serviceId, serviceName, professionalId, professionalName } = params;
+  const baseMessage = customerMessageForReason(reason, professionalName);
+  const withProfessional = professionalName ? ` com ${professionalName}` : '';
+
+  let alternatives: string[] = [];
+  try {
+    const availability = await getAvailableSlots(date, serviceId, config, professionalId);
+    if (availability.success && Array.isArray(availability.slots)) {
+      alternatives = availability.slots;
+    }
+  } catch {
+    // Sem alternativas (ERP indisponível) — cai no fallback abaixo.
+  }
+
+  if (alternatives.length > 0) {
+    return {
+      success: false,
+      reason,
+      availableSlots: alternatives,
+      message: `${baseMessage} Tenho estes horários disponíveis para ${serviceName}${withProfessional}: ${alternatives.join(', ')}. Qual deles prefere?`,
+      hint: 'Estes (availableSlots) são os ÚNICOS horários reais disponíveis — já consultados pelo sistema. Ofereça SOMENTE eles, exatamente como vieram. NUNCA invente, arredonde ou acrescente outros horários, e NÃO chame getAvailableSlots de novo.',
+    };
+  }
+
+  // Nenhum horário real nesse dia (tudo ocupado/bloqueado, ou ERP fora).
+  return {
+    success: false,
+    reason,
+    availableSlots: [],
+    message: `${baseMessage} Não encontrei outros horários livres nesse dia para ${serviceName}${withProfessional}. Quer tentar outra data?`,
+    hint: 'Não há horários reais nesse dia. NÃO invente horários — ofereça tentar outra data.',
+  };
 }
 
 export function invalidateServicesCache(tenantSlug?: string): void {
@@ -866,14 +921,18 @@ export async function bookAppointment(
     const gridKnown = scheduleSlots.length > 0;
     const slotInGrid = !gridKnown || scheduleSlots.includes(time);
 
-    // Fora da grade do dia = fora do horário de atendimento. Não tenta agendar.
+    // Fora da grade do dia = fora do horário de atendimento. Não tenta agendar;
+    // já devolve os horários reais do dia (Guardrail A).
     if (!slotIsFree && gridKnown && !slotInGrid) {
-      return {
-        success: false,
+      return await buildUnavailableResult({
         reason: 'outside_hours',
-        message: customerMessageForReason('outside_hours'),
-        hint: BOOK_ALTERNATIVES_HINT,
-      };
+        config,
+        date: normalizedDate,
+        serviceId: selectedService.id,
+        serviceName: selectedService.name,
+        professionalId: requestedProfessional?.id || professionalId?.trim() || undefined,
+        professionalName,
+      });
     }
 
     // Profissional: se o cliente especificou (requestedProfessional resolvido),
@@ -962,6 +1021,19 @@ export async function bookAppointment(
     if (axios.isAxiosError(err) && err.response) {
       const responseData = err.response.data as { reason?: unknown } | undefined;
       const reason = normalizeBookReason(responseData?.reason, err.response.status);
+      // Falha por horário → entrega alternativas reais já consultadas (Guardrail A).
+      if (reason === 'blocked' || reason === 'conflict' || reason === 'outside_hours') {
+        return await buildUnavailableResult({
+          reason,
+          config,
+          date: normalizedDate,
+          serviceId: selectedService.id,
+          serviceName: selectedService.name,
+          professionalId: requestedProfessional?.id || professionalId?.trim() || undefined,
+          professionalName,
+        });
+      }
+      // package_exhausted / other: oferecer horários não resolve.
       return {
         success: false,
         reason,

@@ -8,7 +8,8 @@
     "start": "node dist/webhookServer.js",
     "dev": "ts-node-dev --respawn --transpile-only src/webhookServer.ts",
     "smoke:security": "node scripts/smoke-security.ts",
-    "smoke:booking-reasons": "node scripts/smoke-booking-reasons.ts"
+    "smoke:booking-reasons": "node scripts/smoke-booking-reasons.ts",
+    "smoke:service-gate": "node scripts/smoke-service-gate.ts"
   },
   "dependencies": {
     "@sentry/node": "^10.55.0",
