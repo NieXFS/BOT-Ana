@@ -1,9 +1,9 @@
 import axios from 'axios';
 import * as Sentry from '@sentry/node';
 import type { TenantBotConfig } from '../configProvider';
+import { ERP_API_TOKEN } from '../erpApiToken';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
-const ERP_API_TOKEN = process.env.ERP_API_TOKEN ?? 'minha-chave-secreta-receps-123';
 
 const erpApi = axios.create({
   baseURL: ERP_BASE_URL,

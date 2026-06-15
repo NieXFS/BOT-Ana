@@ -8,8 +8,11 @@
     "start": "node dist/webhookServer.js",
     "dev": "ts-node-dev --respawn --transpile-only src/webhookServer.ts",
     "smoke:security": "node scripts/smoke-security.ts",
-    "smoke:booking-reasons": "node scripts/smoke-booking-reasons.ts",
-    "smoke:service-gate": "node scripts/smoke-service-gate.ts"
+    "smoke:booking-reasons": "npx tsx scripts/smoke-booking-reasons.ts",
+    "smoke:service-gate": "node scripts/smoke-service-gate.ts",
+    "smoke:debounce-flush": "ts-node scripts/smoke-debounce-flush-error.ts",
+    "smoke:scrub-message": "ts-node -T scripts/smoke-ana-scrub-message.ts",
+    "smoke:erp-token": "ts-node -T scripts/smoke-erp-api-token.ts"
   },
   "dependencies": {
     "@sentry/node": "^10.55.0",

@@ -4,9 +4,9 @@ import {
   DEFAULT_FALLBACK_MESSAGE,
   DEFAULT_GREETING_MESSAGE,
 } from './botDefaults';
+import { ERP_API_TOKEN } from './erpApiToken';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
-const ERP_API_TOKEN = process.env.ERP_API_TOKEN ?? 'minha-chave-secreta-receps-123';
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 interface CachedConfig {

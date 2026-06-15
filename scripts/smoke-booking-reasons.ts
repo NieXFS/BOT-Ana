@@ -11,7 +11,12 @@
  *
  * Tudo aqui é determinístico e roda antes de qualquer chamada ao ERP — os
  * guards retornam cedo. O fim-a-fim real (Ana→ERP→OpenAI) é validado no
- * WhatsApp. Rodar: node scripts/smoke-booking-reasons.ts
+ * WhatsApp. Rodar: npx tsx scripts/smoke-booking-reasons.ts
+ *
+ * NB: roda via tsx (não `node`) porque importa o grafo de src/ com imports
+ * relativos SEM extensão (convenção do projeto, ok no build CJS); o ESM nativo
+ * do node exige extensão e quebra ao seguir `../erpApiToken`. O tsx resolve
+ * extensionless + .ts + import.meta.url.
  */
 
 import { readFileSync } from "fs";

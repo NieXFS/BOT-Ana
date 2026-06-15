@@ -39,6 +39,52 @@ function shouldRedactKey(key: string): boolean {
   return SENSITIVE_KEY.test(key) || PHONE_FIELD_KEY.test(key);
 }
 
+/**
+ * M13: scrub de PII embutida numa STRING livre (mensagem de erro, message de
+ * evento/breadcrumb). O scrubDeep só redige por NOME de chave; isto cobre PII
+ * dentro do TEXTO — ex.: um AxiosError cujo `.message`/`.value` carrega
+ * telefone/email/cpf/token. Ordem importa: formatos mascarados (E.164/CPF)
+ * antes do telefone BR cru, e hex longo por último p/ não comer um token já
+ * dentro de um Bearer redigido.
+ *
+ * ReDoS: o e-mail tem parte local que permite `.`, então em entradas
+ * adversariais (`a@a.a.a...`) o retry global é ~quadrático. A defesa REAL é o
+ * teto de comprimento (`MAX_SCRUB_TEXT`) aplicado ANTES das regexes — limita o
+ * pior caso a ~3ms mesmo num payload de 80KB. As demais regexes (telefone/
+ * token) são lineares (repetição limitada + lookarounds). O que passa do teto é
+ * DESCARTADO (removido, não vaza).
+ */
+const RE_EMAIL = /\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b/g;
+// E.164 internacional, tolerando separadores (`+55 11 99999-8888`).
+const RE_E164 = /(?<!\d)\+\d{1,3}(?:[\s.-]?\d){7,14}(?!\d)/g;
+const RE_CPF = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g;
+// Telefone BR com/sem DDD entre parênteses e separadores (`(11) 99999-8888`,
+// `11 3333-4444`, `1199998888`). Lookarounds evitam casar dentro de um número
+// maior. Roda DEPOIS de CPF/E.164 (já redigidos) p/ não sobrepor.
+const RE_BR_PHONE = /(?<!\d)\(?\d{2}\)?[\s.-]?9?\d{4}[\s.-]?\d{4}(?!\d)/g;
+const RE_BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const RE_LONG_HEX = /\b[A-Fa-f0-9]{32,}\b/g;
+
+/** Teto de comprimento p/ bound do tempo de scrubbing (defesa ReDoS). */
+const MAX_SCRUB_TEXT = 2000;
+
+export function scrubText<T extends string | null | undefined>(input: T): T {
+  if (typeof input !== 'string' || input.length === 0) {
+    return input;
+  }
+  const capped =
+    input.length > MAX_SCRUB_TEXT
+      ? `${input.slice(0, MAX_SCRUB_TEXT)}…[truncated]`
+      : input;
+  return capped
+    .replace(RE_EMAIL, REDACTED)
+    .replace(RE_E164, REDACTED)
+    .replace(RE_CPF, REDACTED)
+    .replace(RE_BR_PHONE, REDACTED)
+    .replace(RE_BEARER, 'Bearer [REDACTED]')
+    .replace(RE_LONG_HEX, REDACTED) as T;
+}
+
 function scrubDeep(value: unknown, depth: number, seen: WeakSet<object>): unknown {
   if (value === null || value === undefined || typeof value === 'string') {
     return value;
@@ -122,10 +168,24 @@ export function scrubEvent<T extends Event>(event: T): T {
     if (event.tags) {
       scrubDeep(event.tags, 0, new WeakSet());
     }
+    // M13: scrub de strings livres — o scrubDeep acima só cobre chaves nomeadas.
+    if (typeof event.message === 'string') {
+      event.message = scrubText(event.message);
+    }
+    if (event.exception?.values) {
+      for (const ex of event.exception.values) {
+        if (typeof ex.value === 'string') {
+          ex.value = scrubText(ex.value);
+        }
+      }
+    }
     if (Array.isArray(event.breadcrumbs)) {
       for (const crumb of event.breadcrumbs) {
         if (crumb && crumb.data) {
           scrubDeep(crumb.data, 0, new WeakSet());
+        }
+        if (crumb && typeof crumb.message === 'string') {
+          crumb.message = scrubText(crumb.message);
         }
       }
     }

@@ -1,11 +1,11 @@
 import axios from 'axios';
 import type { TenantBotConfig } from '../configProvider';
 import { sendFreeformMessage, typingDelay } from '../whatsappCloudService';
+import { Sentry } from '../observability/sentry';
+import { ERP_API_TOKEN } from '../erpApiToken';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
-const ERP_API_TOKEN =
-  process.env.ERP_API_TOKEN ?? 'minha-chave-secreta-receps-123';
 
 const STRONG_STOP_KEYWORDS = new Set<string>([
   'pare', 'parar', 'parem', 'para',
@@ -118,6 +118,17 @@ async function callReceps(
         ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
         : error.message
       : String(error);
+    // M10: a falha de opt-out no Receps deixava o cliente "marcado" mas não
+    // registrado — risco LGPD silencioso. Reporta ao Sentry. O telefone do
+    // cliente (customerPhone) NÃO vai nas tags (PII); só o phoneNumberId do
+    // negócio (allowlistado no scrub da Ana).
+    Sentry.captureException(error, {
+      tags: {
+        service: 'ana-opt-out',
+        operation: 'call-receps',
+        phoneNumberId,
+      },
+    });
     console.error(`❌ [optOut] falha ao chamar Receps: ${message}`);
     return null;
   }
@@ -153,6 +164,15 @@ export async function tryHandleOptOut(
     await typingDelay(reply);
     await sendFreeformMessage(from, reply, config);
   } catch (error) {
+    // M10: confirmação de opt-out não enviada = cliente sem feedback de que
+    // foi removido. Reporta ao Sentry sem o número do cliente (PII).
+    Sentry.captureException(error, {
+      tags: {
+        service: 'ana-opt-out',
+        operation: 'send-confirmation',
+        phoneNumberId: config.phoneNumberId,
+      },
+    });
     console.error(`❌ [optOut] falha ao enviar confirmação para ${from}:`, error);
   }
 
