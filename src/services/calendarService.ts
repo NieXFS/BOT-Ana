@@ -75,6 +75,9 @@ interface ErpService {
   name: string;
   durationMinutes: number;
   price?: number | string | null;
+  // FIX 3: ids dos profissionais habilitados PARA ESTE serviço (vem do ERP novo).
+  // Ausente no ERP antigo → tratamos como elegibilidade global (fallback).
+  professionalIds?: (string | number)[];
 }
 
 interface ErpProfessional {
@@ -111,20 +114,23 @@ interface UpcomingAppointmentsResponse {
   appointments?: UpcomingAppointment[];
 }
 
-interface ServiceSummary {
+export interface ServiceSummary {
   id: string;
   name: string;
   durationMinutes: number;
   price: number | null;
   priceFormatted: string | null;
+  // FIX 3: ids (string) dos profissionais habilitados pra este serviço, quando o
+  // ERP os informa. undefined = ERP antigo → fallback pra lista global.
+  professionalIds?: string[];
 }
 
-interface ProfessionalSummary {
+export interface ProfessionalSummary {
   id: string;
   name: string;
 }
 
-type ServicesResult = {
+export type ServicesResult = {
   success: boolean;
   services?: ServiceSummary[];
   professionals?: ProfessionalSummary[];
@@ -336,6 +342,12 @@ function normalizeServices(services: ErpService[] = []): ServiceSummary[] {
           : Number(rawPrice);
       const price = Number.isFinite(parsedPrice) ? parsedPrice : null;
 
+      // FIX 3: só define professionalIds quando o ERP mandou o campo (ERP novo).
+      // Ausente → undefined → fallback global no consumidor.
+      const professionalIds = Array.isArray(service.professionalIds)
+        ? service.professionalIds.map((id) => String(id))
+        : undefined;
+
       return {
         id: String(service.id),
         name: service.name,
@@ -348,6 +360,7 @@ function normalizeServices(services: ErpService[] = []): ServiceSummary[] {
                 style: 'currency',
                 currency: 'BRL',
               }).format(price),
+        professionalIds,
       };
     });
 }
@@ -666,6 +679,23 @@ export async function getAvailableSlots(
     };
   } catch (err) {
     console.error('❌ Erro ao consultar disponibilidade no ERP:', err);
+
+    // FIX 3 (defesa em profundidade): se o ERP recusou com 400 porque o
+    // profissional não atende/está inativo pra este serviço, devolve um
+    // INTERNAL_HINT específico pra Ana oferecer outro habilitado — em vez do
+    // genérico "tive um problema". A hint é interna; nunca repassada ao cliente.
+    if (axios.isAxiosError(err) && err.response?.status === 400) {
+      const erpMessage =
+        typeof err.response.data?.error === 'string' ? err.response.data.error : '';
+      if (/não pode realizar|não está ativo/i.test(erpMessage)) {
+        return {
+          success: false,
+          message:
+            'INTERNAL_HINT: o profissional escolhido NÃO atende o serviço selecionado (ou está inativo). NÃO ofereça horários com ele. Ofereça outro profissional habilitado pra este serviço (veja "Profissionais habilitados" no system prompt) ou, se não houver, avise gentilmente que o serviço está sem profissional disponível no momento. NÃO repasse esta mensagem ao cliente.',
+        };
+      }
+    }
+
     return {
       success: false,
       message:

@@ -16,6 +16,7 @@ import {
   bookAppointment,
   cancelAppointment,
 } from './calendarService';
+import type { ServicesResult } from './calendarService';
 import {
   serviceSelectionGate,
   shouldAskServiceUpfront,
@@ -50,6 +51,80 @@ function getCurrentYear(timezone: string): number {
   );
 }
 
+/**
+ * FIX 3: monta o bloco de SERVIÇOS DISPONÍVEIS do system prompt a partir do
+ * resultado JÁ buscado de getServices (puro/testável, sem rede).
+ *
+ * Dois modos:
+ *  - Elegibilidade por serviço (ERP novo, services[].professionalIds presente):
+ *    lista os profissionais habilitados POR serviço (interseção com a lista
+ *    global ativa) e NÃO repete o bloco global "PROFISSIONAIS DISPONÍVEIS"
+ *    (economia de tokens — os ids já aparecem por serviço). Serviço sem
+ *    profissional habilitado é marcado explicitamente como indisponível.
+ *  - Fallback (ERP antigo, sem professionalIds): formato atual — lista global de
+ *    serviços + bloco "PROFISSIONAIS DISPONÍVEIS".
+ */
+export function buildServicesBlock(servicesResult: ServicesResult): string {
+  if (!servicesResult.success || !servicesResult.services) {
+    return '(Não foi possível carregar a lista de serviços agora. Se precisar, chame getServices.)';
+  }
+
+  const services = servicesResult.services;
+  const professionals = servicesResult.professionals ?? [];
+  const eligibilityAware = services.some(
+    (service) => service.professionalIds !== undefined
+  );
+
+  const header =
+    'SERVIÇOS DISPONÍVEIS (use estes IDs diretamente nas ferramentas — você NÃO precisa chamar getServices):';
+
+  if (!eligibilityAware) {
+    return `${header}
+${services
+  .map(
+    (service) =>
+      `- ${service.name} (${service.durationMinutes}min, ${
+        service.priceFormatted ?? 'preço não definido'
+      }) — id: ${service.id}`
+  )
+  .join('\n')}
+
+PROFISSIONAIS DISPONÍVEIS:
+${professionals
+  .map((professional) => `- ${professional.name} — id: ${professional.id}`)
+  .join('\n')}`;
+  }
+
+  const lines = services.map((service) => {
+    const head = `- ${service.name} (${service.durationMinutes}min, ${
+      service.priceFormatted ?? 'preço não definido'
+    }) — id: ${service.id}`;
+
+    // professionalIds undefined (serviço sem o campo num ERP misto) → cai pra
+    // lista global, pra não bloquear indevidamente.
+    const eligible =
+      service.professionalIds === undefined
+        ? professionals
+        : professionals.filter((professional) =>
+            service.professionalIds!.includes(professional.id)
+          );
+
+    if (eligible.length === 0) {
+      return `${head}
+    Profissionais habilitados: NENHUM no momento — avise o cliente que este serviço está temporariamente sem profissional e NÃO ofereça horários nem agende.`;
+    }
+
+    const eligibleList = eligible
+      .map((professional) => `${professional.name} — id: ${professional.id}`)
+      .join('; ');
+    return `${head}
+    Profissionais habilitados: ${eligibleList}`;
+  });
+
+  return `${header}
+${lines.join('\n')}`;
+}
+
 export async function buildSystemPrompt(config: TenantBotConfig): Promise<string> {
   const now = new Date();
   const today = now.toLocaleDateString('pt-BR', {
@@ -67,23 +142,7 @@ export async function buildSystemPrompt(config: TenantBotConfig): Promise<string
   const currentYear = getCurrentYear(config.timezone);
   const botName = config.botName.trim() || 'Ana';
   const servicesResult = await getServices(config);
-  const servicesBlock =
-    servicesResult.success && servicesResult.services
-      ? `SERVIÇOS DISPONÍVEIS (use estes IDs diretamente nas ferramentas — você NÃO precisa chamar getServices):
-${servicesResult.services
-  .map(
-    (service) =>
-      `- ${service.name} (${service.durationMinutes}min, ${
-        service.priceFormatted ?? 'preço não definido'
-      }) — id: ${service.id}`
-  )
-  .join('\n')}
-
-PROFISSIONAIS DISPONÍVEIS:
-${(servicesResult.professionals ?? [])
-  .map((professional) => `- ${professional.name} — id: ${professional.id}`)
-  .join('\n')}`
-      : '(Não foi possível carregar a lista de serviços agora. Se precisar, chame getServices.)';
+  const servicesBlock = buildServicesBlock(servicesResult);
 
   return `CONTEXTO TEMPORAL (OBRIGATÓRIO): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Quando o cliente mencionar datas relativas (amanhã, semana que vem, segunda, etc.), calcule a data correta a partir de HOJE. Quando o cliente mencionar apenas dia/mês (ex: "01/04"), SEMPRE assuma o ano ${currentYear}. NUNCA use anos anteriores.
 
@@ -96,7 +155,7 @@ ${config.systemPrompt}
 REGRAS DE FLUXO DE ATENDIMENTO (prioridade máxima, leia primeiro):
 A. ESCOLHA DO SERVIÇO — NUNCA assuma qual serviço o cliente quer. Ao INICIAR um novo agendamento, se a mensagem ATUAL não nomear o serviço com clareza (ex.: "quero marcar", "quero marcar para o dia 31", "quero marcar amanhã", "quero remarcar") E houver mais de um item na lista "SERVIÇOS DISPONÍVEIS", você DEVE listar TODOS os serviços disponíveis de forma NEUTRA (texto natural) e perguntar qual ele deseja ANTES de consultar horários (getAvailableSlots) ou agendar. NÃO faça pergunta direcionada como "quer o mesmo serviço de antes?" nem cite só um serviço — apresente as opções e deixe o cliente escolher. NUNCA reaproveite o serviço de um agendamento JÁ CONCLUÍDO, de mensagens antigas ou do histórico desta conversa — cada NOVO pedido recomeça perguntando o serviço (o fato de o cliente ter marcado/citado Depilação antes NÃO significa que o próximo agendamento também é Depilação). Exceção: durante um agendamento EM ANDAMENTO, mantenha o serviço que o cliente já escolheu NESSE mesmo fluxo (não repergunte a cada mensagem). Só siga direto, sem perguntar, se existir exatamente UM serviço disponível.
 B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar success=false por causa do horário (campo reason = "blocked", "conflict" ou "outside_hours"), você DEVE chamar getAvailableSlots (mesma data, serviceId e profissional) ANTES de sugerir qualquer alternativa e oferecer SOMENTE os horários reais que ela retornar. NUNCA chute horários vizinhos (se pediram 15h, não invente 15h30 ou 16h). Se o retorno tiver um campo "hint", siga-o. ATENÇÃO: um retorno "INTERNAL_HINT:" sobre agendamento DUPLICADO NÃO é indisponibilidade de horário — nesse caso siga a regra 7 abaixo e NÃO chame getAvailableSlots.
-C. ESCOLHA DO PROFISSIONAL — Se há 2+ profissionais em "PROFISSIONAIS DISPONÍVEIS" que atendem o serviço pedido E o cliente não disse com quem quer agendar, PERGUNTE: "Quer agendar com algum profissional específico ou tanto faz?". Se o cliente responder "tanto faz" / "qualquer um" / "pode ser qualquer" / similar, chame bookAppointment SEM o campo professionalId — o sistema escolhe automaticamente um profissional livre e te devolve o nome. Se o cliente disser um nome, passe o professionalId correspondente. Se houver apenas 1 profissional, agende direto sem perguntar. SEMPRE confirme ao cliente com QUEM ficou o agendamento (ex.: "Agendado às 15h com a Julia para Corte de cabelo").
+C. ESCOLHA DO PROFISSIONAL — Para o serviço que o cliente escolheu, considere SOMENTE os profissionais listados como "Profissionais habilitados" DAQUELE serviço. (a) 0 habilitados → informe gentilmente que o serviço está temporariamente sem profissional disponível e ofereça outro serviço; NÃO consulte horários nem agende. (b) Exatamente 1 habilitado → NÃO pergunte preferência; agende direto com ele e confirme o nome. (c) 2+ habilitados E o cliente não disse com quem → pergunte "Quer agendar com algum profissional específico ou tanto faz?". Se "tanto faz/qualquer um", chame bookAppointment SEM professionalId (auto-resolve). Se citar um nome, use o professionalId dele. SEMPRE confirme com quem ficou.
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).
@@ -128,7 +187,33 @@ function getFallbackMessage(config: TenantBotConfig): string {
   return config.fallbackMessage?.trim() || DEFAULT_FALLBACK_MESSAGE;
 }
 
-function maybePrependGreeting(
+/**
+ * FIX 1 (saudação dobrada): detecta se a resposta do modelo JÁ abre com uma
+ * saudação/oferta de ajuda. Olha só os ~80 primeiros chars (normalizados:
+ * lowercase, sem acento) pra não casar com "boa noite" no meio de uma frase.
+ * Puro e exportado pra ser testável sem rede.
+ */
+export function replyAlreadyGreets(reply: string): boolean {
+  const head = reply
+    .slice(0, 80)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  // Saudação no início (com fronteira de palavra pra não pegar "oitenta").
+  if (/\b(ola|oi|bom dia|boa tarde|boa noite)\b/.test(head)) {
+    return true;
+  }
+
+  // Oferta de ajuda: "como posso ... ajudar".
+  if (/como posso\b.*\bajudar/.test(head)) {
+    return true;
+  }
+
+  return false;
+}
+
+export function maybePrependGreeting(
   reply: string,
   isFirstContact: boolean,
   config: TenantBotConfig
@@ -140,6 +225,13 @@ function maybePrependGreeting(
   }
 
   if (reply.toLowerCase().includes(greeting.toLowerCase())) {
+    return reply;
+  }
+
+  // FIX 1: se o modelo já saudou/ofereceu ajuda, não cole a saudação na frente
+  // (evita "Como posso ajudar" duplicado). Quando NÃO saúda (ex.: cliente
+  // perguntou preço direto), segue prependando normalmente.
+  if (replyAlreadyGreets(reply)) {
     return reply;
   }
 

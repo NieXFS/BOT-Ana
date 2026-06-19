@@ -12,7 +12,10 @@
     "smoke:service-gate": "node scripts/smoke-service-gate.ts",
     "smoke:debounce-flush": "ts-node scripts/smoke-debounce-flush-error.ts",
     "smoke:scrub-message": "ts-node -T scripts/smoke-ana-scrub-message.ts",
-    "smoke:erp-token": "ts-node -T scripts/smoke-erp-api-token.ts"
+    "smoke:erp-token": "ts-node -T scripts/smoke-erp-api-token.ts",
+    "smoke:greeting-prepend": "npx tsx scripts/smoke-greeting-prepend.ts",
+    "smoke:outside-hours-throttle": "npx tsx scripts/smoke-outside-hours-throttle.ts",
+    "smoke:services-block-eligibility": "npx tsx scripts/smoke-services-block-eligibility.ts"
   },
   "dependencies": {
     "@sentry/node": "^10.55.0",

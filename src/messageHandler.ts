@@ -37,6 +37,30 @@ const FLUSH_FALLBACK_MESSAGE =
 // do mesmo número de negócio.
 const flushRecoveryUntil = new Map<string, number>();
 
+// FIX 2: throttle do aviso de fora-de-horário. Sem isso, mandávamos o aviso 1x
+// POR mensagem recebida → spam (3 mensagens iguais no teste real). Mesma ideia
+// do flushRecoveryUntil: "suprimido até" por CONVERSA (bufferKey).
+const OUTSIDE_HOURS_NOTICE_WINDOW_MS = 4 * 60 * 60 * 1000; // 4h
+const outsideHoursNoticeUntil = new Map<string, number>();
+
+/**
+ * FIX 2: decide se o aviso de fora-de-horário deve ser enviado pra esta conversa
+ * AGORA. Retorna true na 1ª vez (e marca a supressão pelos próximos
+ * OUTSIDE_HOURS_NOTICE_WINDOW_MS); false enquanto dentro da janela. Pura o
+ * suficiente pra smoke (recebe now). Marca o timestamp SÓ quando autoriza.
+ */
+export function shouldSendOutsideHoursNotice(
+  bufferKey: string,
+  now: number = Date.now()
+): boolean {
+  const suppressedUntil = outsideHoursNoticeUntil.get(bufferKey) ?? 0;
+  if (now < suppressedUntil) {
+    return false;
+  }
+  outsideHoursNoticeUntil.set(bufferKey, now + OUTSIDE_HOURS_NOTICE_WINDOW_MS);
+  return true;
+}
+
 export interface FlushDeps {
   getReply: typeof getReply;
   sendReply: (
@@ -254,14 +278,21 @@ export async function handleIncomingMessage(
   conversationTracker.markActive(conversationKey);
   console.log(`💬 Mensagem de ${conversationKey} (${name}): "${text}"`);
 
+  const bufferKey = buildBufferKey(config, from);
+
   if (!isBotActive(config)) {
-    const outsideHoursMessage = buildOutsideHoursMessage(config);
-    await typingDelay(outsideHoursMessage);
-    await sendFreeformMessage(from, outsideHoursMessage, config);
+    // FIX 2: só envia o aviso de fora-de-horário 1x por janela (por conversa),
+    // pra não spammar quem manda várias mensagens seguidas fora do expediente.
+    if (shouldSendOutsideHoursNotice(bufferKey)) {
+      const outsideHoursMessage = buildOutsideHoursMessage(config);
+      await typingDelay(outsideHoursMessage);
+      await sendFreeformMessage(from, outsideHoursMessage, config);
+    } else {
+      console.log(`🟡 [fora-de-horário] aviso suprimido (throttle) para ${bufferKey}`);
+    }
     return;
   }
 
-  const bufferKey = buildBufferKey(config, from);
   const existing = messageBuffers.get(bufferKey);
 
   if (existing) {
@@ -348,4 +379,5 @@ export function __resetFlushStateForTest(): void {
   }
   messageBuffers.clear();
   flushRecoveryUntil.clear();
+  outsideHoursNoticeUntil.clear();
 }
