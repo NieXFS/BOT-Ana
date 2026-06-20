@@ -31,7 +31,7 @@ const ana = { id: 'prof-ana', name: 'Ana Paula' };
 async function main() {
   const { buildServicesBlock } = await import('../src/services/brainService');
 
-  // ===== Caso 1: 1 habilitado por serviço =====
+  // ===== Caso 1: EXATAMENTE 1 habilitado → marcador imperativo de profissional único =====
   const result1: ServicesResult = {
     success: true,
     professionals: [vitin, ana],
@@ -48,9 +48,17 @@ async function main() {
   };
   const block1 = buildServicesBlock(result1);
   record(
-    '(1) lista o profissional habilitado (Vitin) por serviço',
-    /Profissionais habilitados:.*Vitin.*prof-vitin/.test(block1),
+    '(1) 1 habilitado → marcador "Profissional único habilitado: Vitin — id: prof-vitin"',
+    /Profissional único habilitado: Vitin — id: prof-vitin/.test(block1),
     block1
+  );
+  record(
+    '(1) 1 habilitado → instrução "NÃO pergunte preferência" presente',
+    /NÃO pergunte preferência de profissional/.test(block1)
+  );
+  record(
+    '(1) 1 habilitado → NÃO usa o rótulo plural "Profissionais habilitados:"',
+    !block1.includes('Profissionais habilitados:')
   );
   record(
     '(1) NÃO inclui Ana Paula no serviço (não habilitada)',
@@ -59,6 +67,38 @@ async function main() {
   record(
     '(1) modo elegibilidade NÃO repete bloco global "PROFISSIONAIS DISPONÍVEIS"',
     !block1.includes('PROFISSIONAIS DISPONÍVEIS')
+  );
+
+  // ===== Caso 1b: 2+ habilitados → formato plural, SEM marcador de único =====
+  const result1b: ServicesResult = {
+    success: true,
+    professionals: [vitin, ana],
+    services: [
+      {
+        id: 'svc-massagem',
+        name: 'Massagem',
+        durationMinutes: 60,
+        price: 200,
+        priceFormatted: 'R$ 200,00',
+        professionalIds: ['prof-vitin', 'prof-ana'],
+      },
+    ],
+  };
+  const block1b = buildServicesBlock(result1b);
+  record(
+    '(1b) 2+ habilitados → rótulo plural "Profissionais habilitados:" lista os dois',
+    /Profissionais habilitados:.*Vitin — id: prof-vitin.*Ana Paula — id: prof-ana/.test(
+      block1b
+    ),
+    block1b
+  );
+  record(
+    '(1b) 2+ habilitados → NÃO aparece o marcador "Profissional único habilitado"',
+    !block1b.includes('Profissional único habilitado')
+  );
+  record(
+    '(1b) 2+ habilitados → NÃO aparece "NÃO pergunte preferência"',
+    !block1b.includes('NÃO pergunte preferência')
   );
 
   // ===== Caso 2: 0 habilitados (interseção vazia) =====
@@ -82,6 +122,10 @@ async function main() {
     block2.includes('NENHUM no momento') &&
       /NÃO ofereça horários nem agende/.test(block2),
     block2
+  );
+  record(
+    '(2) 0 habilitados → NÃO aparece o marcador "Profissional único habilitado"',
+    !block2.includes('Profissional único habilitado')
   );
 
   // ===== Caso 3: sem professionalIds → formato global antigo =====

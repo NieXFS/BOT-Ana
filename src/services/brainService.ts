@@ -114,6 +114,15 @@ ${professionals
     Profissionais habilitados: NENHUM no momento — avise o cliente que este serviço está temporariamente sem profissional e NÃO ofereça horários nem agende.`;
     }
 
+    // 1 habilitado: marcador IMPERATIVO inline. O mini ignora a regra C(b)
+    // genérica (~1 em 4) e pergunta preferência mesmo com só 1 profissional;
+    // a instrução colada na própria linha do serviço cola muito melhor.
+    if (eligible.length === 1) {
+      const only = eligible[0];
+      return `${head}
+    Profissional único habilitado: ${only.name} — id: ${only.id}. Agende DIRETO com ele(a); NÃO pergunte preferência de profissional.`;
+    }
+
     const eligibleList = eligible
       .map((professional) => `${professional.name} — id: ${professional.id}`)
       .join('; ');
