@@ -2,6 +2,7 @@ import type { TenantBotConfig } from './configProvider';
 import { getReply } from './services/brainService';
 import { buildConversationKey } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
+import { isConversationPaused } from './services/pauseService';
 import { transcreverAudioBuffer } from './utils/transcriber';
 import {
   sendFreeformMessage,
@@ -274,6 +275,17 @@ export async function handleIncomingMessage(
   if (!text.trim()) return;
 
   if (await tryHandleOptOut(text, from, config)) return;
+
+  // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada
+  // (sem OpenAI, sem buffer). FAIL-OPEN: erro/timeout/404 → responde normal.
+  // Opt-out roda ANTES (compliance vale mesmo pausado). NÃO grava no histórico
+  // enquanto pausado: os echoes do humano não entram no histórico da Ana, então
+  // registrar só o lado do cliente confundiria o contexto na volta — mais simples
+  // e seguro ficar 100% em silêncio.
+  if (await isConversationPaused(config.phoneNumberId, from)) {
+    console.log('⏸️ [pausado] Ana não responde (conversa ou salão pausado).');
+    return;
+  }
 
   conversationTracker.markActive(conversationKey);
   console.log(`💬 Mensagem de ${conversationKey} (${name}): "${text}"`);

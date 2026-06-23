@@ -18,6 +18,7 @@ import {
   markMessageProcessed,
   cleanupOldProcessedMessages,
 } from './services/processedMessages';
+import { isEchoChange, handleSmbMessageEchoes } from './echoHandler';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -127,8 +128,22 @@ app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
 
     for (const change of changes) {
       const value = change?.value as CloudWebhookValue | undefined;
+      if (!value) {
+        continue;
+      }
 
-      if (!value?.messages?.length) {
+      // Coexistence: o dono respondeu PELO app do WhatsApp (echo) → pausa a
+      // conversa pra Ana não falar por cima do humano. NÃO é mensagem de cliente,
+      // então não vai pra handleIncomingMessage.
+      if (isEchoChange(change?.field)) {
+        handleSmbMessageEchoes(value, LEGACY_PHONE_NUMBER_ID).catch((err) => {
+          Sentry.captureException(err);
+          console.error('❌ Erro ao processar smb_message_echoes:', err);
+        });
+        continue;
+      }
+
+      if (!value.messages?.length) {
         continue;
       }
 
