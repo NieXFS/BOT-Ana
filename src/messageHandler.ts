@@ -1,6 +1,6 @@
 import type { TenantBotConfig } from './configProvider';
 import { getReply } from './services/brainService';
-import { buildConversationKey } from './services/contextManager';
+import { addMessage, buildConversationKey } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
 import { transcreverAudioBuffer } from './utils/transcriber';
@@ -220,6 +220,49 @@ export async function flushBuffer(
   }
 }
 
+// --- Escuta enquanto pausada (§8.2 / INV-10) ---------------------------------
+// Enquanto pausada, a Ana NÃO responde, mas REGISTRA o inbound do cliente no
+// histórico (como role `user`), pra ter contexto ao retomar. O echo do humano é
+// gravado pelo echoHandler (role `assistant`, prefixo "[atendente] "). Aqui só o
+// lado do cliente. Deps injetáveis pra smoke determinístico (imports ESM frozen
+// impedem spy — mesmo motivo do FlushDeps/EchoDeps).
+
+export interface PausedRecordDeps {
+  recordMessage: (
+    conversationKey: string,
+    role: 'user' | 'assistant',
+    content: string
+  ) => Promise<void>;
+}
+
+const defaultPausedRecordDeps: PausedRecordDeps = { recordMessage: addMessage };
+
+/**
+ * Grava o inbound do cliente recebido durante a pausa (sem chamar o modelo nem
+ * responder). À prova de falha: erro de persistência é capturado no Sentry e
+ * NÃO propaga (a pausa não pode quebrar por causa disso). NUNCA loga o conteúdo
+ * (só o fato) — o scrub vale; sem console.log do texto.
+ */
+export async function recordInboundWhilePaused(
+  conversationKey: string,
+  text: string,
+  config: TenantBotConfig,
+  deps: PausedRecordDeps = defaultPausedRecordDeps
+): Promise<void> {
+  try {
+    await deps.recordMessage(conversationKey, 'user', text);
+  } catch (err) {
+    Sentry.captureException(err, {
+      tags: {
+        service: 'message_handler',
+        operation: 'record_inbound_while_paused',
+        phoneNumberId: config.phoneNumberId,
+        tenantSlug: config.tenantSlug,
+      },
+    });
+  }
+}
+
 export interface CloudMessage {
   from: string;
   id: string;
@@ -278,12 +321,12 @@ export async function handleIncomingMessage(
 
   // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada
   // (sem OpenAI, sem buffer). FAIL-OPEN: erro/timeout/404 → responde normal.
-  // Opt-out roda ANTES (compliance vale mesmo pausado). NÃO grava no histórico
-  // enquanto pausado: os echoes do humano não entram no histórico da Ana, então
-  // registrar só o lado do cliente confundiria o contexto na volta — mais simples
-  // e seguro ficar 100% em silêncio.
+  // Opt-out roda ANTES (compliance vale mesmo pausado). §8.2/INV-10: enquanto
+  // pausada, a Ana NÃO responde mas REGISTRA o inbound no histórico (o echo do
+  // humano é gravado pelo echoHandler) — assim ela tem contexto ao retomar.
   if (await isConversationPaused(config.phoneNumberId, from)) {
-    console.log('⏸️ [pausado] Ana não responde (conversa ou salão pausado).');
+    await recordInboundWhilePaused(conversationKey, text, config);
+    console.log('⏸️ [pausado] Ana não responde; inbound registrado no histórico.');
     return;
   }
 

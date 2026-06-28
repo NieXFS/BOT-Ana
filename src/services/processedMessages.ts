@@ -36,6 +36,19 @@ export async function markMessageProcessed(
   return result.rowCount === 1;
 }
 
+/**
+ * Desfaz markMessageProcessed (apaga o registro do id). Usado SÓ no caminho do
+ * ECHO (§8.2): se a GRAVAÇÃO do echo no histórico falhar DEPOIS de marcar o id, a
+ * marca é desfeita pra a retransmissão da Meta poder reprocessar e gravar — a
+ * captura do echo é o objetivo da feature, então não pode sumir num blip de DB.
+ * Não cria janela de gravação dupla: só desfaz quando a gravação FALHOU (no
+ * sucesso a marca fica). (No caminho do INBOUND a marca é mantida na falha, de
+ * propósito — não re-processa; ver webhookServer.)
+ */
+export async function unmarkMessageProcessed(messageId: string): Promise<void> {
+  await pool.query(`DELETE FROM processed_messages WHERE message_id = $1`, [messageId]);
+}
+
 /** Limpa registros com mais de 7 dias (chamado no boot — sem cron). */
 export async function cleanupOldProcessedMessages(): Promise<number> {
   const result = await pool.query(

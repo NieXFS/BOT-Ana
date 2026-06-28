@@ -12,12 +12,16 @@ import {
 import {
   botSignatureMiddleware,
   webhookRateLimitMiddleware,
+  isValidBearerToken,
 } from './security';
 import {
   ensureProcessedMessagesTable,
   markMessageProcessed,
   cleanupOldProcessedMessages,
 } from './services/processedMessages';
+import { getLastMessageMeta } from './services/contextManager';
+import { decideConversationActivity } from './services/conversationActivity';
+import { ERP_API_TOKEN } from './erpApiToken';
 import { isEchoChange, handleSmbMessageEchoes } from './echoHandler';
 
 interface CloudWebhookMetadata {
@@ -157,6 +161,55 @@ app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
 
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });
+});
+
+/**
+ * GET /internal/conversation-activity?phoneNumberId=&customerPhone= (§8.1/§11)
+ *
+ * O motor de automação do Receps consulta ANTES de cada envio proativo (guarda de
+ * "bom momento"). Auth: Bearer ERP_API_TOKEN (segredo compartilhado Ana↔Receps =
+ * AI_BOT_API_KEY do Receps). A Ana devolve SÓ o que ela sabe (deriva do
+ * histórico) — o estado de PAUSA fica do lado do Receps, então NÃO retornamos
+ * `paused`. NUNCA loga/ecoa o token nem o telefone do cliente (PII).
+ */
+app.get('/internal/conversation-activity', (req: Request, res: Response) => {
+  if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+    res.sendStatus(401);
+    return;
+  }
+
+  const phoneNumberId =
+    typeof req.query.phoneNumberId === 'string' ? req.query.phoneNumberId.trim() : '';
+  const customerPhone =
+    typeof req.query.customerPhone === 'string' ? req.query.customerPhone.trim() : '';
+
+  if (!phoneNumberId || !customerPhone) {
+    res.status(400).json({ error: 'phoneNumberId e customerPhone são obrigatórios.' });
+    return;
+  }
+
+  getLastMessageMeta(phoneNumberId, customerPhone)
+    .then((meta) => {
+      const activity = decideConversationActivity(
+        {
+          lastRole: meta?.role ?? null,
+          lastActivityAtMs: meta?.lastActivityAtMs ?? null,
+        },
+        Date.now()
+      );
+      res.json(activity);
+    })
+    .catch((err) => {
+      Sentry.captureException(err, {
+        tags: {
+          service: 'webhook_server',
+          operation: 'conversation_activity',
+          phoneNumberId,
+        },
+      });
+      console.error('❌ Erro ao consultar conversation-activity:', err);
+      res.status(500).json({ error: 'internal error' });
+    });
 });
 
 async function boot(): Promise<void> {

@@ -97,6 +97,44 @@ export function botSignatureMiddleware(
 }
 
 // ---------------------------------------------------------------------------
+// Auth de API interna (Bearer) — endpoints lidos pelo Receps (ex.:
+// /internal/conversation-activity). Espelha o segredo compartilhado ERP_API_TOKEN
+// (= AI_BOT_API_KEY do Receps).
+// ---------------------------------------------------------------------------
+
+/**
+ * Valida `Authorization: Bearer <token>` contra o segredo esperado, em tempo
+ * constante (não vaza timing). Função pura — recebe header e segredo por
+ * parâmetro pra ser testável. Segredo vazio / header ausente / esquema errado /
+ * tamanho diferente → false.
+ */
+export function isValidBearerToken(
+  authorizationHeader: string | undefined,
+  expectedToken: string
+): boolean {
+  if (!expectedToken || !authorizationHeader) {
+    return false;
+  }
+
+  const prefix = 'Bearer ';
+  if (!authorizationHeader.startsWith(prefix)) {
+    return false;
+  }
+
+  const provided = authorizationHeader.slice(prefix.length).trim();
+  if (!provided) {
+    return false;
+  }
+
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expectedToken);
+  if (a.length !== b.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(a, b);
+}
+
+// ---------------------------------------------------------------------------
 // Rate limit por IP (sliding window counter, in-memory)
 // ---------------------------------------------------------------------------
 

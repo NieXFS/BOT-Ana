@@ -7,10 +7,14 @@
  *
  * NODE_ENV=development ANTES do import: erpApiToken (transitivo via pauseService)
  * não lança em dev; nunca fazemos chamada real (deps mockadas / parser puro).
+ * DATABASE_URL dummy: o echoHandler agora importa o contextManager (gravar o echo
+ * do humano no histórico — §8.2), que exige DATABASE_URL no load; o Pool do pg é
+ * lazy e nunca é usado aqui (deps mockadas / parser puro).
  *
  * Rodar: npx tsx scripts/smoke-echo-handler.ts
  */
 process.env.NODE_ENV = 'development';
+process.env.DATABASE_URL ||= 'postgres://smoke:smoke@127.0.0.1:5432/smoke';
 
 const checks: { name: string; ok: boolean }[] = [];
 function expect(name: string, cond: boolean) {
@@ -80,21 +84,31 @@ async function main() {
   expect('parse: string → []', parseEchoTargets('x').length === 0);
   expect('parse: message_echoes ausente → []', parseEchoTargets({ metadata: { phone_number_id: 'PNID_123' } }).length === 0);
 
-  // Handler dispara a pausa (deps mockadas).
+  // Handler dispara a pausa (deps mockadas). A gravação do echo no histórico
+  // (§8.2) tem smoke próprio (smoke-listen-while-paused) — aqui as deps de
+  // registro são no-ops só pra o handler rodar limpo.
   const calls: { phoneNumberId: string; customerPhone: string }[] = [];
+  const recorded: string[] = [];
   const mockDeps = {
     pauseConversation: async (phoneNumberId: string, customerPhone: string) => {
       calls.push({ phoneNumberId, customerPhone });
+    },
+    markEchoProcessed: async () => true,
+    unmarkEcho: async () => {},
+    recordMessage: async (_key: string, _role: 'user' | 'assistant', content: string) => {
+      recorded.push(content);
     },
   };
   await handleSmbMessageEchoes(value, undefined, mockDeps);
   expect('handler: 1 chamada de pausa', calls.length === 1);
   expect('handler: args corretos (phoneNumberId + cliente)', calls[0]?.phoneNumberId === 'PNID_123' && calls[0]?.customerPhone === '5511CUST1');
+  expect('handler: echo de texto também é gravado no histórico', recorded.length === 1 && recorded[0]?.startsWith('[atendente] ') === true);
 
   // Handler com payload malformado = noop.
   calls.length = 0;
+  recorded.length = 0;
   await handleSmbMessageEchoes({ foo: 'bar' }, undefined, mockDeps);
-  expect('handler: payload malformado = noop', calls.length === 0);
+  expect('handler: payload malformado = noop', calls.length === 0 && recorded.length === 0);
 
   const failed = checks.filter((c) => !c.ok);
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passaram.`);

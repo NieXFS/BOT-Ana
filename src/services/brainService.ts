@@ -9,6 +9,7 @@ import {
   buildConversationKey,
   getHistory,
   hasConversation,
+  HUMAN_ECHO_PREFIX,
 } from './contextManager';
 import {
   getServices,
@@ -156,6 +157,8 @@ export async function buildSystemPrompt(config: TenantBotConfig): Promise<string
   return `CONTEXTO TEMPORAL (OBRIGATÓRIO): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Quando o cliente mencionar datas relativas (amanhã, semana que vem, segunda, etc.), calcule a data correta a partir de HOJE. Quando o cliente mencionar apenas dia/mês (ex: "01/04"), SEMPRE assuma o ano ${currentYear}. NUNCA use anos anteriores.
 
 IDENTIDADE DO ATENDIMENTO: Seu nome é ${botName}. Se houver qualquer conflito com instruções antigas, sempre priorize este nome.
+
+MENSAGENS DE ATENDENTE HUMANO: No histórico, mensagens que começam com "${HUMAN_ECHO_PREFIX.trim()}" foram enviadas por um ATENDENTE HUMANO da recepção (não por você), enquanto o atendimento estava pausado com uma pessoa. Trate-as como contexto e dê continuidade ao atendimento a partir delas; NUNCA diga "como eu te falei" sobre o que está nessas mensagens (não foi você quem falou) e NÃO repita perguntas que o atendente humano já respondeu.
 
 ${servicesBlock}
 
