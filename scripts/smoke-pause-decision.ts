@@ -30,13 +30,16 @@ check('undefined = não pausado', isActivePause(undefined, now) === false);
 check('string vazia = não pausado', isActivePause('', now) === false);
 check('data inválida = não pausado', isActivePause('not-a-date', now) === false);
 
-// isPausedFromState (global vs conversa)
-check('ambos null = não pausado', isPausedFromState({ globalPausedUntil: null, conversationPausedUntil: null }, now) === false);
-check('global futuro = pausado', isPausedFromState({ globalPausedUntil: future, conversationPausedUntil: null }, now) === true);
-check('conversa futuro = pausado', isPausedFromState({ globalPausedUntil: null, conversationPausedUntil: future }, now) === true);
-check('ambos passado = não pausado', isPausedFromState({ globalPausedUntil: past, conversationPausedUntil: past }, now) === false);
-check('global passado + conversa futuro = pausado', isPausedFromState({ globalPausedUntil: past, conversationPausedUntil: future }, now) === true);
-check('ambos futuro = pausado', isPausedFromState({ globalPausedUntil: future, conversationPausedUntil: future }, now) === true);
+// isPausedFromState (global vs conversa vs auto-pausa programada)
+check('todos null = não pausado', isPausedFromState({ globalPausedUntil: null, conversationPausedUntil: null, schedulePausedUntil: null }, now) === false);
+check('global futuro = pausado', isPausedFromState({ globalPausedUntil: future, conversationPausedUntil: null, schedulePausedUntil: null }, now) === true);
+check('conversa futuro = pausado', isPausedFromState({ globalPausedUntil: null, conversationPausedUntil: future, schedulePausedUntil: null }, now) === true);
+check('schedule (programada) futuro = pausado', isPausedFromState({ globalPausedUntil: null, conversationPausedUntil: null, schedulePausedUntil: future }, now) === true);
+check('schedule passado = não pausado', isPausedFromState({ globalPausedUntil: null, conversationPausedUntil: null, schedulePausedUntil: past }, now) === false);
+check('todos passado = não pausado', isPausedFromState({ globalPausedUntil: past, conversationPausedUntil: past, schedulePausedUntil: past }, now) === false);
+check('global passado + conversa futuro = pausado', isPausedFromState({ globalPausedUntil: past, conversationPausedUntil: future, schedulePausedUntil: null }, now) === true);
+check('só schedule futuro (resto passado) = pausado', isPausedFromState({ globalPausedUntil: past, conversationPausedUntil: past, schedulePausedUntil: future }, now) === true);
+check('todos futuro = pausado', isPausedFromState({ globalPausedUntil: future, conversationPausedUntil: future, schedulePausedUntil: future }, now) === true);
 
 if (failures > 0) {
   console.error(`\n❌ ${failures} check(s) falharam.`);

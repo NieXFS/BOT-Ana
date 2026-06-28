@@ -22,6 +22,9 @@ const ECHO_LOCAL_FALLBACK_MS = 60 * 60_000;
 interface PauseCacheEntry {
   globalUntilMs: number | null;
   conversationUntilMs: number | null;
+  // Auto-pausa PROGRAMADA (intervalo "ex.: almoço") decidida no Receps. Carimbo do
+  // fim do intervalo; futuro = pausado. A Ana só consome (não recalcula fuso/dia).
+  scheduleUntilMs: number | null;
   expiresAt: number; // frescor do GET (não é o fim da pausa)
 }
 
@@ -41,7 +44,8 @@ function toMs(value: string | null | undefined): number | null {
 function entryIsPaused(entry: PauseCacheEntry, nowMs: number): boolean {
   return (
     (entry.globalUntilMs !== null && entry.globalUntilMs > nowMs) ||
-    (entry.conversationUntilMs !== null && entry.conversationUntilMs > nowMs)
+    (entry.conversationUntilMs !== null && entry.conversationUntilMs > nowMs) ||
+    (entry.scheduleUntilMs !== null && entry.scheduleUntilMs > nowMs)
   );
 }
 
@@ -76,6 +80,7 @@ async function fetchPauseState(
     return {
       globalPausedUntil: data?.globalPausedUntil ?? null,
       conversationPausedUntil: data?.conversationPausedUntil ?? null,
+      schedulePausedUntil: data?.schedulePausedUntil ?? null,
     };
   } catch (error) {
     // FAIL-OPEN: erro/timeout/404 → null → tratado como NÃO pausado pelo caller.
@@ -121,6 +126,7 @@ export async function pauseConversationByEcho(
   pauseCache.set(key, {
     globalUntilMs: existing?.globalUntilMs ?? null,
     conversationUntilMs: pausedUntilMs ?? now + ECHO_LOCAL_FALLBACK_MS,
+    scheduleUntilMs: existing?.scheduleUntilMs ?? null,
     expiresAt: now + PAUSE_STATE_TTL_MS,
   });
 }
@@ -159,6 +165,7 @@ export async function isConversationPaused(
   pauseCache.set(key, {
     globalUntilMs: toMs(state.globalPausedUntil),
     conversationUntilMs: toMs(state.conversationPausedUntil),
+    scheduleUntilMs: toMs(state.schedulePausedUntil),
     expiresAt: now + PAUSE_STATE_TTL_MS,
   });
   return isPausedFromState(state, now);
