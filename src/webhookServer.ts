@@ -19,6 +19,10 @@ import {
   markMessageProcessed,
   cleanupOldProcessedMessages,
 } from './services/processedMessages';
+import {
+  ensureSalesFollowupsTable,
+  startFollowupPoller,
+} from './services/salesFollowups';
 import { getLastMessageMeta } from './services/contextManager';
 import { decideConversationActivity } from './services/conversationActivity';
 import { ERP_API_TOKEN } from './erpApiToken';
@@ -223,6 +227,11 @@ async function boot(): Promise<void> {
       Sentry.captureException(err);
       console.error('❌ Cleanup de processed_messages falhou:', err);
     });
+
+  // Workstream B (Renata): régua de follow-up. Garante a tabela e liga o poller
+  // de 60s (só toca conversas de VENDA — o receptionist não escreve na tabela).
+  await ensureSalesFollowupsTable();
+  startFollowupPoller();
 
   app.listen(PORT, () => {
     console.log(`🚀 Ana — Atendente Virtual rodando na porta ${PORT}`);

@@ -19,9 +19,15 @@ const configCache = new Map<string, CachedConfig>();
 export interface TenantBotConfig {
   tenantSlug: string;
   botName: string;
+  // Papel do brain (brain registry): "receptionist" (default, caminho atual) |
+  // "sales" (Renata). Tenants antigos (payload sem o campo) → "receptionist".
+  botRole: string;
   systemPrompt: string;
   greetingMessage: string | null;
   fallbackMessage: string | null;
+  // Provider de IA: "openai" (default) | "anthropic" (Renata). Payload sem o
+  // campo (ERP antigo) → "openai".
+  aiProvider: string;
   aiModel: string;
   aiTemperature: number;
   aiMaxTokens: number;
@@ -64,9 +70,11 @@ function getLegacyConfig(phoneNumberId: string): TenantBotConfig | null {
   return {
     tenantSlug: process.env.ERP_TENANT_SLUG ?? 'clinica-bella',
     botName: process.env.BOT_NAME ?? DEFAULT_BOT_NAME,
+    botRole: 'receptionist',
     systemPrompt: DEFAULT_BOT_SYSTEM_PROMPT,
     greetingMessage: process.env.GREETING_MESSAGE ?? DEFAULT_GREETING_MESSAGE,
     fallbackMessage: process.env.FALLBACK_MESSAGE ?? DEFAULT_FALLBACK_MESSAGE,
+    aiProvider: 'openai',
     aiModel: process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
     aiTemperature: parseNumber(process.env.OPENAI_TEMPERATURE, 0.4),
     aiMaxTokens: parseNumber(process.env.OPENAI_MAX_TOKENS, 500),
@@ -104,7 +112,14 @@ export async function getTenantConfig(
     });
 
     if (response.ok) {
-      const data = (await response.json()) as TenantBotConfig;
+      const raw = (await response.json()) as Partial<TenantBotConfig>;
+      // Fallbacks p/ tenants antigos cujo payload não traz os campos novos —
+      // receptionist/openai = comportamento atual, 100% intocado.
+      const data: TenantBotConfig = {
+        ...(raw as TenantBotConfig),
+        botRole: raw.botRole ?? 'receptionist',
+        aiProvider: raw.aiProvider ?? 'openai',
+      };
       configCache.set(cacheKey, {
         data,
         expiresAt: Date.now() + CACHE_TTL_MS,

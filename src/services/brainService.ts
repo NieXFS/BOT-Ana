@@ -23,6 +23,7 @@ import {
   shouldAskServiceUpfront,
   buildServiceQuestion,
 } from './service-gate';
+import { getSalesReply } from './salesBrain';
 
 const clientCache = new Map<string, OpenAI>();
 
@@ -441,7 +442,33 @@ async function executeFunction(
   }
 }
 
+/**
+ * Brain registry (Workstream B): resolve o brain por `botRole`. "sales" → Renata;
+ * qualquer outro valor → recepcionista (caminho atual, 100% intocado). Puro/
+ * exportado pra smoke determinístico.
+ */
+export function resolveBrainRole(config: TenantBotConfig): 'sales' | 'receptionist' {
+  return config.botRole === 'sales' ? 'sales' : 'receptionist';
+}
+
+/**
+ * Despacha por `botRole`. "sales" → Renata (brain de vendas, provider Anthropic).
+ * Qualquer outro valor → recepcionista. Tenants antigos (config sem botRole) já
+ * vêm com "receptionist" (fallback no configProvider), então nada muda pra eles.
+ */
 export async function getReply(
+  phone: string,
+  userMessage: string,
+  userName: string,
+  config: TenantBotConfig
+): Promise<string> {
+  if (resolveBrainRole(config) === 'sales') {
+    return getSalesReply(phone, userMessage, userName, config);
+  }
+  return getReceptionistReply(phone, userMessage, userName, config);
+}
+
+async function getReceptionistReply(
   phone: string,
   userMessage: string,
   userName: string,

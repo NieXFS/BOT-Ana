@@ -3,6 +3,7 @@ import { getReply } from './services/brainService';
 import { addMessage, buildConversationKey } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
+import { markFollowupOptedOut } from './services/salesFollowups';
 import { transcreverAudioBuffer } from './utils/transcriber';
 import {
   sendFreeformMessage,
@@ -71,10 +72,21 @@ export interface FlushDeps {
   ) => Promise<void>;
 }
 
+/**
+ * Simulação de digitação: LIGADA para recepção, DESLIGADA para vendas (Renata).
+ * typingDelay OFF em sales é mitigação B2a (não simular ser humano). Puro/
+ * exportado pra smoke determinístico.
+ */
+export function typingSimEnabled(config: TenantBotConfig): boolean {
+  return config.botRole !== 'sales';
+}
+
 const defaultFlushDeps: FlushDeps = {
   getReply,
   sendReply: async (from, text, config) => {
-    await typingDelay(text);
+    if (typingSimEnabled(config)) {
+      await typingDelay(text);
+    }
     await sendFreeformMessage(from, text, config);
   },
 };
@@ -317,7 +329,14 @@ export async function handleIncomingMessage(
 
   if (!text.trim()) return;
 
-  if (await tryHandleOptOut(text, from, config)) return;
+  if (await tryHandleOptOut(text, from, config)) {
+    // Sales-only: opt-out de compliance também encerra a régua de follow-up da
+    // Renata (o receptionist não tem régua, então nada muda pra ele).
+    if (config.botRole === 'sales') {
+      await markFollowupOptedOut(config.phoneNumberId, from).catch(() => undefined);
+    }
+    return;
+  }
 
   // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada
   // (sem OpenAI, sem buffer). FAIL-OPEN: erro/timeout/404 → responde normal.
