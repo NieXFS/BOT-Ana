@@ -122,6 +122,7 @@ async function main() {
   const nonSalesRow = row({ conversationKey: 'PN2:c', phoneNumberId: 'PN2', customerPhone: 'c', nextAtMs: now - 1 });
 
   const sent: Array<{ to: string; text: string }> = [];
+  const emitted: Array<{ type: string; stage: number | undefined }> = [];
   const persisted: string[] = [];
   const deps: FollowupTickDeps = {
     now: () => now,
@@ -132,6 +133,12 @@ async function main() {
       sent.push({ to, text });
     },
     record: async () => undefined,
+    emitEvent: async (_pn, _phone, type, metadata) => {
+      emitted.push({
+        type,
+        stage: typeof metadata?.stage === 'number' ? metadata.stage : undefined,
+      });
+    },
     persist: async (key) => {
       persisted.push(key);
     },
@@ -143,6 +150,10 @@ async function main() {
   check('texto = toque 0 com nome', sent[0]?.text.includes('Oi, Maria!'));
   check('pausada (b) NÃO recebeu', !sent.some((s) => s.to === 'b'));
   check('não-sales (c) NÃO recebeu', !sent.some((s) => s.to === 'c'));
+  check(
+    'emitiu followup_enviado com stage 0',
+    emitted.length === 1 && emitted[0]?.type === 'followup_enviado' && emitted[0]?.stage === 0
+  );
   check('persistiu avanço só da devida', persisted.length === 1 && persisted[0] === 'PN1:a');
 
   if (failures > 0) {

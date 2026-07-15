@@ -4,6 +4,7 @@ import { addMessage, buildConversationKey } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
 import { markFollowupOptedOut } from './services/salesFollowups';
+import { captureReferral, type CtwaReferral } from './services/salesEvents';
 import { transcreverAudioBuffer } from './utils/transcriber';
 import {
   sendFreeformMessage,
@@ -283,6 +284,7 @@ export interface CloudMessage {
   text?: { body: string };
   audio?: { id: string; mime_type: string };
   button?: { text: string; payload: string };
+  referral?: CtwaReferral;
 }
 
 export interface CloudContact {
@@ -336,6 +338,15 @@ export async function handleIncomingMessage(
       await markFollowupOptedOut(config.phoneNumberId, from).catch(() => undefined);
     }
     return;
+  }
+
+  // C1: o referral só acompanha a primeira mensagem CTWA. Capturamos mesmo se
+  // a conversa estiver pausada, mas exclusivamente no brain de vendas. Não
+  // bloqueia nem altera a resposta da Renata.
+  if (config.botRole === 'sales' && message.referral?.ctwa_clid) {
+    void captureReferral(config.phoneNumberId, from, message.referral).catch(
+      () => undefined
+    );
   }
 
   // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada

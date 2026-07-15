@@ -5,6 +5,7 @@ import { isConversationPaused } from './pauseService';
 import { addMessage } from './contextManager';
 import { sendFreeformMessage } from '../whatsappCloudService';
 import { Sentry } from '../observability/sentry';
+import { emitSalesEvent } from './salesEvents';
 
 /**
  * Régua de FOLLOW-UP da Renata (Workstream B, §B5). Dentro da janela CTWA de 72h,
@@ -163,6 +164,21 @@ export async function scheduleFollowup(
   const key = conversationKey(phoneNumberId, customerPhone);
   const now = new Date();
   const init = initialFollowupState(now.getTime());
+  let previousTouchCount = 0;
+
+  try {
+    const existing = await pool.query<{ touch_count: number }>(
+      `SELECT touch_count FROM sales_followups WHERE conversation_key = $1`,
+      [key]
+    );
+    previousTouchCount = existing.rows[0]?.touch_count ?? 0;
+  } catch (err) {
+    // A leitura de telemetria não pode impedir o upsert original da régua.
+    Sentry.captureException(err, {
+      tags: { service: 'sales-followups', operation: 'schedule-reopen-read', phoneNumberId },
+    });
+  }
+
   try {
     await pool.query(
       `INSERT INTO sales_followups
@@ -187,6 +203,11 @@ export async function scheduleFollowup(
         init.nextAtMs,
       ]
     );
+    if (previousTouchCount > 0) {
+      void emitSalesEvent(phoneNumberId, customerPhone, 'reabriu', {
+        afterTouches: previousTouchCount,
+      }).catch(() => undefined);
+    }
   } catch (err) {
     Sentry.captureException(err, {
       tags: { service: 'sales-followups', operation: 'schedule', phoneNumberId },
@@ -262,6 +283,7 @@ export interface FollowupTickDeps {
   isPaused: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
   send: (to: string, text: string, config: TenantBotConfig) => Promise<void>;
   record: (conversationKey: string, role: 'assistant', content: string) => Promise<void>;
+  emitEvent: typeof emitSalesEvent;
   persist: (
     conversationKey: string,
     advance: { touchCount: number; lastStage: number; nextAtMs: number | null }
@@ -275,6 +297,7 @@ const defaultTickDeps: FollowupTickDeps = {
   isPaused: isConversationPaused,
   send: (to, text, config) => sendFreeformMessage(to, text, config),
   record: (key, role, content) => addMessage(key, role, content),
+  emitEvent: emitSalesEvent,
   persist: persistAdvance,
 };
 
@@ -303,6 +326,11 @@ export async function runFollowupTick(
 
       const text = followupStageText(row.touchCount, row.customerName);
       await deps.send(row.customerPhone, text, config);
+      void deps
+        .emitEvent(row.phoneNumberId, row.customerPhone, 'followup_enviado', {
+          stage: row.touchCount,
+        })
+        .catch(() => undefined);
       await deps
         .record(row.conversationKey, 'assistant', text)
         .catch(() => undefined);

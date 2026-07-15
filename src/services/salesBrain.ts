@@ -18,6 +18,7 @@ import {
   type QualifiedLeadPayload,
 } from './salesTools';
 import { scheduleFollowup } from './salesFollowups';
+import { emitSalesEvent } from './salesEvents';
 
 /**
  * Brain de VENDAS da Renata (Workstream B). Provider Anthropic (claude-sonnet-5),
@@ -264,6 +265,12 @@ async function executeSalesFunction(
           phone,
           salesConfig
         );
+        if (result.success) {
+          void emitSalesEvent(config.phoneNumberId, phone, 'link_enviado', {
+            plan: result.plan,
+            interval: result.interval,
+          }).catch(() => undefined);
+        }
         return JSON.stringify(result);
       }
       case 'registerQualifiedLead': {
@@ -357,6 +364,7 @@ export async function getSalesReply(
   }
 
   const history = await getHistory(conversationKey);
+  const isFirstResponse = !history.some((message) => message.role === 'assistant');
   const messages: Anthropic.MessageParam[] = history.map((m) => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
     content: m.content,
@@ -387,6 +395,11 @@ export async function getSalesReply(
       if (toolUses.length === 0) {
         const reply = extractText(response.content) || getFallbackMessage(config);
         await addMessage(conversationKey, 'assistant', reply);
+        if (isFirstResponse) {
+          void emitSalesEvent(config.phoneNumberId, phone, 'primeira_resposta').catch(
+            () => undefined
+          );
+        }
         return reply;
       }
 
@@ -435,5 +448,10 @@ export async function getSalesReply(
 
   const fallbackReply = getFallbackMessage(config);
   await addMessage(conversationKey, 'assistant', fallbackReply);
+  if (isFirstResponse) {
+    void emitSalesEvent(config.phoneNumberId, phone, 'primeira_resposta').catch(
+      () => undefined
+    );
+  }
   return fallbackReply;
 }
