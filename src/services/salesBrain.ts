@@ -13,6 +13,7 @@ import {
 } from '../salesConfigProvider';
 import {
   buildSignupLink,
+  createPrefilledSignupLink,
   registerQualifiedLead,
   handoffToHuman,
   type QualifiedLeadPayload,
@@ -150,6 +151,33 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'sendPrefilledSignup',
+    description:
+      'Gera o link de cadastro JÁ PREENCHIDO com os dados do lead (e-mail, nome, clínica, plano) — ela só precisa criar a senha. PREFIRA esta tool ao sendSignupLink sempre que você souber o e-mail. Antes de chamar, CONFIRME o e-mail repetindo de volta pra ela ("só confirma pra mim: maria@gmail.com, certo?"). Se ela não quiser dar o e-mail, use o sendSignupLink e não insista. Retorna a URL pra você enviar.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        email: {
+          type: 'string',
+          description: 'E-mail do lead, JÁ CONFIRMADO com ela na conversa.',
+        },
+        name: { type: 'string', description: 'Nome do lead, se souber.' },
+        clinicName: { type: 'string', description: 'Nome da clínica, se souber.' },
+        plan: {
+          type: 'string',
+          description:
+            'Slug do plano ("essencial" ou "pro"; "atendente-ia" está em testes). Use o slug exato do bloco PLANOS.',
+        },
+        interval: {
+          type: 'string',
+          enum: ['monthly', 'annual'],
+          description: 'Cobrança mensal (padrão) ou anual. Omita para mensal.',
+        },
+      },
+      required: ['email', 'plan'],
+    },
+  },
+  {
     name: 'registerQualifiedLead',
     description:
       'Registra o que você descobriu sobre o lead (qualificação). Chame quando a qualificação fechar, mesmo sem venda. O telefone é preenchido automaticamente.',
@@ -271,6 +299,29 @@ async function executeSalesFunction(
             interval: result.interval,
           }).catch(() => undefined);
         }
+        return JSON.stringify(result);
+      }
+      case 'sendPrefilledSignup': {
+        if (!salesConfig) {
+          return JSON.stringify({
+            success: false,
+            message: 'Não consegui gerar o link agora. Tente em instantes.',
+          });
+        }
+        // O evento `link_enviado` sai do Receps neste caminho (o endpoint o
+        // registra junto com o token) — emitir aqui contaria duas vezes.
+        const result = await createPrefilledSignupLink(
+          phone,
+          config.phoneNumberId,
+          {
+            email: String(input.email ?? ''),
+            name: typeof input.name === 'string' ? input.name : undefined,
+            clinicName: typeof input.clinicName === 'string' ? input.clinicName : undefined,
+            plan: String(input.plan ?? ''),
+            interval: typeof input.interval === 'string' ? input.interval : undefined,
+          },
+          salesConfig
+        );
         return JSON.stringify(result);
       }
       case 'registerQualifiedLead': {

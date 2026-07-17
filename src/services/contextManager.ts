@@ -122,6 +122,42 @@ export async function getLastMessageMeta(
   };
 }
 
+/**
+ * Timestamp (ms epoch) da última mensagem RECEBIDA do cliente (role `user`), ou
+ * null se ele nunca escreveu. É a âncora da janela de serviço de 24h do
+ * WhatsApp — que conta a partir do último INBOUND, não da última mensagem da
+ * conversa (um follow-up nosso não reabre janela nenhuma). Por isso NÃO dá pra
+ * reusar `getLastMessageMeta`, que devolve a última mensagem de qualquer papel.
+ * Tolerante ao formato do telefone (ver customerPhoneVariants).
+ */
+export async function getLastInboundAtMs(
+  phoneNumberId: string,
+  customerPhone: string
+): Promise<number | null> {
+  const keys = customerPhoneVariants(customerPhone).map((variant) =>
+    buildConversationKey(phoneNumberId, variant)
+  );
+  if (keys.length === 0) return null;
+
+  const result = await pool.query<{ createdAt: Date }>(
+    `SELECT "createdAt"
+     FROM ana_conversation_history
+     WHERE "conversationKey" = ANY($1) AND "role" = 'user'
+     ORDER BY "createdAt" DESC, "id" DESC
+     LIMIT 1`,
+    [keys]
+  );
+
+  const row = result.rows[0];
+  if (!row) return null;
+
+  const ms =
+    row.createdAt instanceof Date
+      ? row.createdAt.getTime()
+      : Date.parse(String(row.createdAt));
+  return Number.isNaN(ms) ? null : ms;
+}
+
 export async function hasConversation(conversationKey: string): Promise<boolean> {
   const result = await pool.query<{ exists: boolean }>(
     `SELECT EXISTS (

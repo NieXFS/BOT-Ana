@@ -23,6 +23,8 @@ import {
   ensureSalesFollowupsTable,
   startFollowupPoller,
 } from './services/salesFollowups';
+import { handleSalesNotify } from './services/salesNotify';
+import { resetAdminConversation } from './services/adminReset';
 import { getLastMessageMeta } from './services/contextManager';
 import { decideConversationActivity } from './services/conversationActivity';
 import { ERP_API_TOKEN } from './erpApiToken';
@@ -162,6 +164,82 @@ app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
     }
   }
 });
+
+/**
+ * POST /sales-notify (Renata v1.1, D4)
+ *
+ * O Receps avisa que o lead virou trial (a conta ficou pronta). Autenticado
+ * pelo MESMO HMAC do forward do webhook (`RECEPS_BOT_WEBHOOK_SECRET` via
+ * X-Bot-Signature) — fail-closed em produção, igual ao /webhook.
+ *
+ * Responde 200 na hora e processa fora do request: o Receps dispara isso no meio
+ * da criação do trial e não pode ficar esperando o WhatsApp. Body:
+ * `{ customerPhone, event: "trial_started" }`.
+ */
+app.post('/sales-notify', botSignatureMiddleware, (req: Request, res: Response) => {
+  res.sendStatus(200);
+
+  const customerPhone =
+    typeof req.body?.customerPhone === 'string' ? req.body.customerPhone.trim() : '';
+  const event = typeof req.body?.event === 'string' ? req.body.event.trim() : '';
+
+  if (!customerPhone || !event) {
+    console.warn('⚠️ [sales-notify] payload sem customerPhone/event — ignorado.');
+    return;
+  }
+
+  handleSalesNotify(event, customerPhone).catch((err) => {
+    Sentry.captureException(err, {
+      tags: { service: 'webhook_server', operation: 'sales_notify' },
+    });
+    console.error('❌ Erro ao processar sales-notify:', err);
+  });
+});
+
+app.post(
+  '/admin/reset-conversation',
+  botSignatureMiddleware,
+  async (req: Request, res: Response) => {
+    const phoneNumberId =
+      typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId.trim() : '';
+    const customerPhone =
+      typeof req.body?.customerPhone === 'string' ? req.body.customerPhone.trim() : '';
+    const dryRun = req.body?.dryRun;
+
+    if (
+      !phoneNumberId ||
+      !customerPhone ||
+      (dryRun !== undefined && typeof dryRun !== 'boolean')
+    ) {
+      res.status(400).json({
+        error: 'phoneNumberId/customerPhone obrigatórios; dryRun deve ser boolean.',
+      });
+      return;
+    }
+
+    try {
+      const counts = await resetAdminConversation({
+        phoneNumberId,
+        customerPhone,
+        dryRun,
+      });
+      console.info(
+        `[admin-reset] concluído | phoneNumberId=${phoneNumberId} | dryRun=${dryRun === true} | history=${counts.history} | followups=${counts.followups}`
+      );
+      res.status(200).json(counts);
+    } catch (err) {
+      Sentry.captureException(err, {
+        tags: {
+          service: 'webhook_server',
+          operation: 'admin_reset_conversation',
+          phoneNumberId,
+        },
+      });
+      console.error(`[admin-reset] falha | phoneNumberId=${phoneNumberId}`);
+      res.status(500).json({ error: 'internal error' });
+    }
+  }
+);
 
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });

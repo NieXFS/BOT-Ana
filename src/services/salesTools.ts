@@ -22,16 +22,25 @@ const REQUEST_TIMEOUT_MS = 10_000;
 // Atribuição CTWA (Workstream C pluga o ctwa_clid real depois).
 const UTM = 'utm_source=whatsapp&utm_medium=renata&utm_campaign=ctwa';
 
+/**
+ * ⚠️ NUNCA entregue o AxiosError CRU ao Sentry: ele carrega `config.data`, que
+ * aqui é o payload do lead (telefone, e-mail, nome, clínica) — o scrub não
+ * garante remover esse JSON sob a chave genérica `data`. Capturamos um erro
+ * SINTÉTICO, preservando operação e status HTTP sem anexar PII. Mesmo padrão
+ * (e mesma razão) do `capture()` de `salesEvents.ts`.
+ */
 function capture(error: unknown, operation: string, phoneNumberId?: string): void {
-  Sentry.captureException(error, {
+  const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+  const detail = status
+    ? `HTTP ${status}`
+    : axios.isAxiosError(error)
+      ? error.code ?? error.message
+      : String(error);
+
+  Sentry.captureException(new Error(`sales-tools ${operation} failed (${detail})`), {
     tags: { service: 'sales-tools', operation, ...(phoneNumberId ? { phoneNumberId } : {}) },
   });
-  const message = axios.isAxiosError(error)
-    ? error.response?.status
-      ? `HTTP ${error.response.status}`
-      : error.message
-    : String(error);
-  console.error(`❌ [sales-tools] falha em ${operation}: ${message}`);
+  console.error(`❌ [sales-tools] falha em ${operation}: ${detail}`);
 }
 
 /**
@@ -94,6 +103,74 @@ export function buildSignupLink(
 
   const url = `${config.signupBaseUrl}?${UTM}&${params.toString()}`;
   return { success: true, url, plan: plan.slug, interval };
+}
+
+export type PrefilledSignupInput = {
+  email: string;
+  name?: string;
+  clinicName?: string;
+  plan: string;
+  interval?: string;
+};
+
+/**
+ * Link mágico de cadastro pré-preenchido (v1.1): a Renata já coletou e-mail,
+ * nome, clínica e plano — o link leva tudo isso e o lead só cria a senha.
+ *
+ * Valida o plano ANTES da chamada com a MESMA função do `sendSignupLink`
+ * (`buildSignupLink`): plano inexistente/em fase de testes volta a mesma
+ * mensagem e a lista de espera, sem gastar round-trip. O servidor revalida de
+ * qualquer jeito (422) — esta checagem é UX, não segurança.
+ *
+ * O `ctwaClid` NÃO vai daqui: o Receps tira o snapshot do SalesLead, que já tem
+ * a atribuição capturada do referral (C1). O evento `link_enviado` também é
+ * emitido lá — a Ana não emite no caminho do prefill (seria contagem dupla).
+ *
+ * Nunca lança: erro vira { success:false } e a Renata cai no sendSignupLink.
+ */
+export async function createPrefilledSignupLink(
+  phone: string,
+  phoneNumberId: string,
+  input: PrefilledSignupInput,
+  config: SalesConfig
+): Promise<SignupLinkResult> {
+  const validation = buildSignupLink(input.plan, input.interval, phone, config);
+  if (!validation.success) {
+    return validation;
+  }
+
+  try {
+    const { data } = await axios.post<{ url?: string }>(
+      `${RECEPS_INTERNAL_API_URL}/api/v1/bot/signup-prefill`,
+      {
+        customerPhone: phone,
+        email: input.email,
+        name: input.name,
+        clinicName: input.clinicName,
+        plan: validation.plan,
+        interval: validation.interval,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${ERP_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: REQUEST_TIMEOUT_MS,
+      }
+    );
+
+    if (!data?.url) {
+      return { success: false, message: 'Não consegui gerar o link agora.' };
+    }
+
+    return { success: true, url: data.url, plan: validation.plan, interval: validation.interval };
+  } catch (error) {
+    capture(error, 'create-prefilled-signup', phoneNumberId);
+    return {
+      success: false,
+      message: 'Não consegui gerar o link com os dados agora. Mande o link normal de cadastro.',
+    };
+  }
 }
 
 export type QualifiedLeadPayload = {

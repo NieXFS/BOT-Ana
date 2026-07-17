@@ -118,9 +118,35 @@ async function main() {
   const lastTool = SALES_TOOLS[SALES_TOOLS.length - 1];
   check('última tool tem cache_control', (lastTool as { cache_control?: unknown }).cache_control != null);
   check(
-    'toolset = 5 tools esperadas',
+    'toolset = 6 tools esperadas (v1.1: + sendPrefilledSignup)',
     SALES_TOOLS.map((t) => t.name).join(',') ===
-      'getAvailableSlots,scheduleDemo,sendSignupLink,registerQualifiedLead,handoffToHuman'
+      'getAvailableSlots,scheduleDemo,sendSignupLink,sendPrefilledSignup,registerQualifiedLead,handoffToHuman'
+  );
+  // O cache_control mora na ÚLTIMA tool (cacheia todas as definições). Tool nova
+  // entra ANTES do handoffToHuman de propósito — se alguém a pendurar no fim sem
+  // mover o cache_control, o caching das tools morre em silêncio.
+  check('handoffToHuman continua sendo a última (âncora do cache)', lastTool.name === 'handoffToHuman');
+  check(
+    'só a última tool tem cache_control',
+    SALES_TOOLS.filter((t) => (t as { cache_control?: unknown }).cache_control != null).length === 1
+  );
+  check(
+    'sendPrefilledSignup exige e-mail e plano',
+    (() => {
+      const tool = SALES_TOOLS.find((t) => t.name === 'sendPrefilledSignup');
+      const required = (tool?.input_schema as { required?: string[] })?.required ?? [];
+      return required.includes('email') && required.includes('plan');
+    })()
+  );
+  check(
+    'sendPrefilledSignup instrui a CONFIRMAR o e-mail antes de gerar',
+    /confirme o e-mail/i.test(
+      SALES_TOOLS.find((t) => t.name === 'sendPrefilledSignup')?.description ?? ''
+    )
+  );
+  check(
+    'sendSignupLink continua no toolset (fallback de quem não dá e-mail)',
+    SALES_TOOLS.some((t) => t.name === 'sendSignupLink')
   );
   const system = buildSalesSystem(makeConfig('sales', 'M {{PLANOS}} F'), renderPlansBlock(salesConfig));
   check('system[0] (estável) tem cache_control', (system[0] as { cache_control?: unknown }).cache_control != null);

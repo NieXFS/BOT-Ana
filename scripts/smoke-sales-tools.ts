@@ -88,6 +88,15 @@ async function main() {
     captured.push({ path: '/pause-conversation', body: req.body });
     res.json({ pausedUntil: new Date(Date.now() + 3600_000).toISOString() });
   });
+  // v1.1: o endpoint devolve SÓ o token opaco na URL (sem PII, sem utm/cid).
+  app.post('/api/v1/bot/signup-prefill', (req, res) => {
+    captured.push({ path: '/signup-prefill', body: req.body });
+    if (req.body?.plan === 'quebra') {
+      res.status(500).json({ error: 'boom' });
+      return;
+    }
+    res.json({ url: 'https://receps.com.br/cadastro?pf=TOKENOPACO_0123456789abcdefghijklmno' });
+  });
   const server = await new Promise<import('http').Server>((resolve) => {
     const s = app.listen(0, () => resolve(s));
   });
@@ -95,8 +104,13 @@ async function main() {
   process.env.RECEPS_INTERNAL_API_URL = `http://127.0.0.1:${port}`;
 
   // Import DEPOIS de setar a env (o módulo lê a base no load).
-  const { buildSignupLink, registerQualifiedLead, handoffToHuman, hashPhoneForCid } =
-    await import('../src/services/salesTools');
+  const {
+    buildSignupLink,
+    createPrefilledSignupLink,
+    registerQualifiedLead,
+    handoffToHuman,
+    hashPhoneForCid,
+  } = await import('../src/services/salesTools');
 
   const phone = '5516999998888';
 
@@ -122,6 +136,90 @@ async function main() {
 
   const withClid = buildSignupLink('pro', undefined, phone, salesConfig, 'ABC123CLID');
   check('ctwaClid > wa:hash', withClid.success === true && withClid.url.includes('cid=ABC123CLID') && !withClid.url.includes('wa%3A'));
+
+  console.log('▶ createPrefilledSignupLink — v1.1 (contrato HTTP)');
+  captured.length = 0;
+  const prefill = await createPrefilledSignupLink(
+    phone,
+    'PNID',
+    {
+      email: 'maria@clinica.com.br',
+      name: 'Maria',
+      clinicName: 'Clínica Bella',
+      plan: 'pro',
+      interval: 'annual',
+    },
+    salesConfig
+  );
+  check('prefill: success', prefill.success === true);
+  check(
+    'prefill: devolve a URL do servidor (só o token opaco)',
+    prefill.success === true && prefill.url.includes('?pf=') && !prefill.url.includes('utm_')
+  );
+  check(
+    'prefill: URL não carrega e-mail/telefone',
+    prefill.success === true &&
+      !prefill.url.includes('maria@clinica.com.br') &&
+      !prefill.url.includes(phone)
+  );
+  const prefillReq = captured.find((c) => c.path === '/signup-prefill');
+  check('prefill: POST /signup-prefill', !!prefillReq);
+  check('prefill: customerPhone injetado (o modelo não fornece)', prefillReq?.body.customerPhone === phone);
+  check('prefill: e-mail repassado', prefillReq?.body.email === 'maria@clinica.com.br');
+  check('prefill: nome e clínica repassados', prefillReq?.body.name === 'Maria' && prefillReq?.body.clinicName === 'Clínica Bella');
+  check('prefill: plano/intervalo normalizados', prefillReq?.body.plan === 'pro' && prefillReq?.body.interval === 'annual');
+  check(
+    'prefill: NÃO manda ctwaClid (o Receps tira do SalesLead)',
+    prefillReq !== undefined && !('ctwaClid' in prefillReq.body)
+  );
+
+  console.log('▶ createPrefilledSignupLink — guardas de plano (sem round-trip)');
+  captured.length = 0;
+  const prefillBeta = await createPrefilledSignupLink(
+    phone,
+    'PNID',
+    { email: 'x@y.com', plan: 'atendente-ia' },
+    salesConfig
+  );
+  check('prefill beta: recusa', prefillBeta.success === false);
+  check(
+    'prefill beta: MESMA lista de espera do sendSignupLink',
+    prefillBeta.success === false && prefillBeta.waitlistHref === 'https://wa.me/5516991113783'
+  );
+  const prefillInvalid = await createPrefilledSignupLink(
+    phone,
+    'PNID',
+    { email: 'x@y.com', plan: 'inexistente' },
+    salesConfig
+  );
+  check('prefill plano inválido: recusa listando válidos', prefillInvalid.success === false && prefillInvalid.message.includes('essencial'));
+  check(
+    'prefill: plano recusado NÃO chama o servidor',
+    captured.filter((c) => c.path === '/signup-prefill').length === 0
+  );
+
+  console.log('▶ createPrefilledSignupLink — erro do servidor cai no fallback');
+  const prefillBoom = await createPrefilledSignupLink(
+    phone,
+    'PNID',
+    { email: 'x@y.com', plan: 'quebra' },
+    { ...salesConfig, plans: [...salesConfig.plans, { ...salesConfig.plans[2], slug: 'quebra' as never }] }
+  );
+  check('prefill: 500 do servidor não lança', prefillBoom.success === false);
+  check(
+    'prefill: mensagem manda a Renata usar o link normal',
+    prefillBoom.success === false && /link normal/i.test(prefillBoom.message)
+  );
+
+  console.log('▶ regressão: sendSignupLink (fallback) intacto');
+  const stillWorks = buildSignupLink('essencial', undefined, phone, salesConfig);
+  check(
+    'sendSignupLink segue montando a URL com utm+cid como antes',
+    stillWorks.success === true &&
+      stillWorks.url.includes('utm_source=whatsapp&utm_medium=renata&utm_campaign=ctwa') &&
+      stillWorks.url.includes('plan=essencial') &&
+      stillWorks.url.includes('cid=')
+  );
 
   console.log('▶ registerQualifiedLead (contrato HTTP)');
   const reg = await registerQualifiedLead(phone, 'PNID', {
