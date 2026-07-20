@@ -1,3 +1,4 @@
+import axios from 'axios';
 import { pool } from './contextManager';
 import type { TenantBotConfig } from '../configProvider';
 import { getTenantConfig } from '../configProvider';
@@ -6,6 +7,7 @@ import { addMessage } from './contextManager';
 import { sendFreeformMessage } from '../whatsappCloudService';
 import { Sentry } from '../observability/sentry';
 import { emitSalesEvent } from './salesEvents';
+import { ERP_API_TOKEN } from '../erpApiToken';
 
 /**
  * Régua de FOLLOW-UP da Renata (Workstream B, §B5). Dentro da janela CTWA de 72h,
@@ -20,9 +22,18 @@ import { emitSalesEvent } from './salesEvents';
 
 const HOUR_MS = 60 * 60 * 1000;
 const WINDOW_MS = 72 * HOUR_MS;
+const REQUEST_TIMEOUT_MS = 10_000;
+const RECEPS_INTERNAL_API_URL =
+  process.env.RECEPS_INTERNAL_API_URL ?? process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 /** Offsets do anchor (último inbound) até cada toque. Stage k dispara em anchor+OFFSETS[k]. */
 export const FOLLOWUP_OFFSETS_MS = [4 * HOUR_MS, 24 * HOUR_MS, 48 * HOUR_MS];
 export const MAX_TOUCHES = FOLLOWUP_OFFSETS_MS.length;
+/** `last_stage = 100 + touch_count` identifica jornada pós-link sem coluna nova. */
+export const POST_LINK_STAGE_OFFSET = 100;
+
+export type CurrentPrefilledSignupLinkResult =
+  | { success: true; url: string }
+  | { success: false; reason: 'not_found' | 'unavailable' };
 
 export interface FollowupRow {
   conversationKey: string;
@@ -57,12 +68,13 @@ export function initialFollowupState(nowMs: number): {
 }
 
 /**
- * Régua ZERA num novo inbound: anchor/next voltam pro estágio 0, touch_count=0.
- * A janela de 72h (do 1º inbound) é PRESERVADA — nunca mandamos depois dela.
- * opt-out é sticky (não reabre).
+ * Régua ZERA num novo inbound: anchor/next voltam pro toque 0, touch_count=0.
+ * A janela de 72h (do 1º inbound) e o marcador de jornada pós-link são
+ * PRESERVADOS. Opt-out é sticky (não reabre).
  */
 export function rescheduleFollowupState(
-  existing: Pick<FollowupRow, 'windowExpiresAtMs' | 'optedOut'>,
+  existing: Pick<FollowupRow, 'windowExpiresAtMs' | 'optedOut'> &
+    Partial<Pick<FollowupRow, 'lastStage'>>,
   nowMs: number
 ): { anchorAtMs: number; nextAtMs: number; touchCount: number; lastStage: number } | null {
   if (existing.optedOut) {
@@ -72,7 +84,7 @@ export function rescheduleFollowupState(
     anchorAtMs: nowMs,
     nextAtMs: nowMs + FOLLOWUP_OFFSETS_MS[0],
     touchCount: 0,
-    lastStage: 0,
+    lastStage: isPostLinkStage(existing.lastStage ?? 0) ? POST_LINK_STAGE_OFFSET : 0,
   };
 }
 
@@ -97,9 +109,19 @@ export function advanceAfterTouch(row: FollowupRow): {
   const nextOffset = FOLLOWUP_OFFSETS_MS[nextCount];
   return {
     touchCount: nextCount,
-    lastStage: nextCount,
+    lastStage: isPostLinkStage(row.lastStage)
+      ? POST_LINK_STAGE_OFFSET + nextCount
+      : nextCount,
     nextAtMs: nextOffset !== undefined ? row.anchorAtMs + nextOffset : null,
   };
+}
+
+export function isPostLinkStage(lastStage: number): boolean {
+  return lastStage >= POST_LINK_STAGE_OFFSET;
+}
+
+export function postLinkFollowupText(url: string): string {
+  return `Vi que faltou só a senha pra ativar sua conta! 😊 O link é esse: ${url} — qualquer dúvida é só me chamar.`;
 }
 
 /** Primeiro nome utilizável, ou vazio (nome ausente / "Cliente"). */
@@ -190,7 +212,11 @@ export async function scheduleFollowup(
          anchor_at = EXCLUDED.anchor_at,
          next_at = EXCLUDED.next_at,
          touch_count = 0,
-         last_stage = 0,
+         last_stage = CASE
+           WHEN sales_followups.last_stage >= ${POST_LINK_STAGE_OFFSET}
+             THEN ${POST_LINK_STAGE_OFFSET}
+           ELSE 0
+         END,
          updated_at = now()
        WHERE sales_followups.opted_out = false`,
       [
@@ -212,6 +238,84 @@ export async function scheduleFollowup(
     Sentry.captureException(err, {
       tags: { service: 'sales-followups', operation: 'schedule', phoneNumberId },
     });
+  }
+}
+
+/** Marca a jornada como pós-link sem alterar anchor, contador ou próxima data. */
+export async function markFollowupPostLink(
+  phoneNumberId: string,
+  customerPhone: string
+): Promise<void> {
+  const key = conversationKey(phoneNumberId, customerPhone);
+  try {
+    await pool.query(
+      `UPDATE sales_followups
+          SET last_stage = $2 + touch_count, updated_at = now()
+        WHERE conversation_key = $1 AND opted_out = false`,
+      [key, POST_LINK_STAGE_OFFSET]
+    );
+  } catch (err) {
+    Sentry.captureException(err, {
+      tags: { service: 'sales-followups', operation: 'mark-post-link', phoneNumberId },
+    });
+  }
+}
+
+/**
+ * Recupera o prefill vigente sem criar/renovar token nem emitir evento. Nunca
+ * loga URL/telefone e nunca lança; 404 é o fallback esperado para o texto comum.
+ */
+export async function getCurrentPrefilledSignupLink(
+  customerPhone: string,
+  phoneNumberId: string
+): Promise<CurrentPrefilledSignupLinkResult> {
+  try {
+    const { data } = await axios.get<{ url?: string }>(
+      `${RECEPS_INTERNAL_API_URL}/api/v1/bot/signup-prefill`,
+      {
+        params: { customerPhone },
+        headers: { Authorization: `Bearer ${ERP_API_TOKEN}` },
+        timeout: REQUEST_TIMEOUT_MS,
+      }
+    );
+    if (data?.url) return { success: true, url: data.url };
+    Sentry.captureException(
+      new Error('sales-followups get-current-prefilled-signup failed (response without url)'),
+      {
+        tags: {
+          service: 'sales-followups',
+          operation: 'get-current-prefilled-signup',
+          phoneNumberId,
+        },
+      }
+    );
+    console.error(
+      '❌ [sales-followups] falha em get-current-prefilled-signup: response without url'
+    );
+    return { success: false, reason: 'unavailable' };
+  } catch (error) {
+    const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+    if (status === 404) return { success: false, reason: 'not_found' };
+
+    const detail = status
+      ? `HTTP ${status}`
+      : axios.isAxiosError(error)
+        ? error.code ?? 'axios_error'
+        : error instanceof Error
+          ? error.name
+          : 'unknown_error';
+    Sentry.captureException(
+      new Error(`sales-followups get-current-prefilled-signup failed (${detail})`),
+      {
+        tags: {
+          service: 'sales-followups',
+          operation: 'get-current-prefilled-signup',
+          phoneNumberId,
+        },
+      }
+    );
+    console.error(`❌ [sales-followups] falha em get-current-prefilled-signup: ${detail}`);
+    return { success: false, reason: 'unavailable' };
   }
 }
 
@@ -281,6 +385,10 @@ export interface FollowupTickDeps {
   loadDue: (nowMs: number) => Promise<FollowupRow[]>;
   getConfig: (phoneNumberId: string) => Promise<TenantBotConfig | null>;
   isPaused: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
+  getPrefilledLink: (
+    customerPhone: string,
+    phoneNumberId: string
+  ) => Promise<CurrentPrefilledSignupLinkResult>;
   send: (to: string, text: string, config: TenantBotConfig) => Promise<void>;
   record: (conversationKey: string, role: 'assistant', content: string) => Promise<void>;
   emitEvent: typeof emitSalesEvent;
@@ -295,6 +403,7 @@ const defaultTickDeps: FollowupTickDeps = {
   loadDue: loadDueRows,
   getConfig: getTenantConfig,
   isPaused: isConversationPaused,
+  getPrefilledLink: getCurrentPrefilledSignupLink,
   send: (to, text, config) => sendFreeformMessage(to, text, config),
   record: (key, role, content) => addMessage(key, role, content),
   emitEvent: emitSalesEvent,
@@ -324,7 +433,16 @@ export async function runFollowupTick(
         continue; // handoff/echo em andamento — Renata cala
       }
 
-      const text = followupStageText(row.touchCount, row.customerName);
+      let text = followupStageText(row.touchCount, row.customerName);
+      if (isPostLinkStage(row.lastStage)) {
+        const currentLink = await deps.getPrefilledLink(
+          row.customerPhone,
+          row.phoneNumberId
+        );
+        if (currentLink.success) {
+          text = postLinkFollowupText(currentLink.url);
+        }
+      }
       await deps.send(row.customerPhone, text, config);
       void deps
         .emitEvent(row.phoneNumberId, row.customerPhone, 'followup_enviado', {

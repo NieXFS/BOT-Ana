@@ -1,7 +1,8 @@
 /**
  * Smoke DETERMINÍSTICO da régua de follow-up da Renata (Workstream B §B5). Testa
  * o RULER puro (agenda / zera no inbound / opt-out / limite 3 / janela 72h) e o
- * `runFollowupTick` com deps injetadas (pula pausada e não-sales, envia a devida).
+ * `runFollowupTick` com deps injetadas (pula pausada/não-sales; pós-link reenvia
+ * o prefill vigente e 404 cai no texto genérico).
  * Sem rede / DB real.
  *
  * Rodar: npx tsx scripts/smoke-sales-followups.ts
@@ -72,8 +73,11 @@ async function main() {
     isTouchDue,
     advanceAfterTouch,
     followupStageText,
+    isPostLinkStage,
+    postLinkFollowupText,
     runFollowupTick,
     FOLLOWUP_OFFSETS_MS,
+    POST_LINK_STAGE_OFFSET,
   } = mod;
 
   const now = 1_000_000_000_000;
@@ -92,6 +96,20 @@ async function main() {
   check('reset agenda +4h a partir do novo inbound', reset !== null && reset.nextAtMs === later + FOLLOWUP_OFFSETS_MS[0]);
   const resetOpted = rescheduleFollowupState({ windowExpiresAtMs: now + 72 * HOUR, optedOut: true }, later);
   check('opt-out NÃO reabre a régua', resetOpted === null);
+  const resetPostLink = rescheduleFollowupState(
+    {
+      windowExpiresAtMs: now + 72 * HOUR,
+      optedOut: false,
+      lastStage: POST_LINK_STAGE_OFFSET + 2,
+    },
+    later
+  );
+  check(
+    'inbound zera contador/horário, mas preserva a jornada pós-link',
+    resetPostLink !== null &&
+      resetPostLink.touchCount === 0 &&
+      resetPostLink.lastStage === POST_LINK_STAGE_OFFSET
+  );
 
   console.log('▶ isTouchDue');
   check('devido: nextAt<=now, na janela', isTouchDue(row({ nextAtMs: now - 1 }), now) === true);
@@ -108,6 +126,14 @@ async function main() {
   check('após toque 1 → count 2, next = anchor+48h', a1.touchCount === 2 && a1.nextAtMs === now + FOLLOWUP_OFFSETS_MS[2]);
   const a2 = advanceAfterTouch(row({ touchCount: 2 }));
   check('após toque 2 (último) → count 3, next null', a2.touchCount === 3 && a2.nextAtMs === null);
+  const postLinkAdvance = advanceAfterTouch(
+    row({ touchCount: 0, lastStage: POST_LINK_STAGE_OFFSET })
+  );
+  check(
+    'avanço preserva marcador pós-link',
+    isPostLinkStage(postLinkAdvance.lastStage) &&
+      postLinkAdvance.lastStage === POST_LINK_STAGE_OFFSET + 1
+  );
 
   console.log('▶ textos dos toques (manual §7)');
   check('toque 0 com nome → "Oi, Maria!"', followupStageText(0, 'Maria Silva').includes('Oi, Maria!'));
@@ -115,20 +141,47 @@ async function main() {
   check('toque 0 nome "Cliente" tratado como sem nome', followupStageText(0, 'Cliente').startsWith('Oi!'));
   check('toque 1 → prova/trial grátis', followupStageText(1, null).includes('testar a Receps grátis'));
   check('toque 2 → demonstração com o Victor', followupStageText(2, null).includes('demonstração'));
+  check(
+    'texto pós-link usa exatamente a URL vigente',
+    postLinkFollowupText('https://receps.com.br/cadastro?pf=TOKEN').includes(
+      'O link é esse: https://receps.com.br/cadastro?pf=TOKEN'
+    )
+  );
 
-  console.log('▶ runFollowupTick (pula pausada e não-sales; envia a devida)');
+  console.log('▶ runFollowupTick (stage-aware + invariantes)');
   const dueRow = row({ conversationKey: 'PN1:a', phoneNumberId: 'PN1', customerPhone: 'a', nextAtMs: now - 1, touchCount: 0 });
   const pausedRow = row({ conversationKey: 'PN1:b', phoneNumberId: 'PN1', customerPhone: 'b', nextAtMs: now - 1 });
   const nonSalesRow = row({ conversationKey: 'PN2:c', phoneNumberId: 'PN2', customerPhone: 'c', nextAtMs: now - 1 });
+  const postLinkRow = row({
+    conversationKey: 'PN1:d',
+    phoneNumberId: 'PN1',
+    customerPhone: 'd',
+    nextAtMs: now - 1,
+    lastStage: POST_LINK_STAGE_OFFSET,
+  });
+  const expiredPrefillRow = row({
+    conversationKey: 'PN1:e',
+    phoneNumberId: 'PN1',
+    customerPhone: 'e',
+    nextAtMs: now - 1,
+    lastStage: POST_LINK_STAGE_OFFSET,
+  });
 
   const sent: Array<{ to: string; text: string }> = [];
   const emitted: Array<{ type: string; stage: number | undefined }> = [];
   const persisted: string[] = [];
+  const prefillLookups: string[] = [];
   const deps: FollowupTickDeps = {
     now: () => now,
-    loadDue: async () => [dueRow, pausedRow, nonSalesRow],
+    loadDue: async () => [dueRow, pausedRow, nonSalesRow, postLinkRow, expiredPrefillRow],
     getConfig: async (pn) => (pn === 'PN1' ? salesConfig(pn) : { ...salesConfig(pn), botRole: 'receptionist' }),
     isPaused: async (_pn, phone) => phone === 'b',
+    getPrefilledLink: async (phone) => {
+      prefillLookups.push(phone);
+      return phone === 'd'
+        ? { success: true, url: 'https://receps.com.br/cadastro?pf=TOKEN_VIGENTE' }
+        : { success: false, reason: 'not_found' };
+    },
     send: async (to, text) => {
       sent.push({ to, text });
     },
@@ -145,16 +198,33 @@ async function main() {
   };
 
   const count = await runFollowupTick(deps);
-  check('enviou exatamente 1 toque (só a devida)', count === 1 && sent.length === 1);
+  check('enviou os 3 toques elegíveis', count === 3 && sent.length === 3);
   check('enviou pra conversa devida (a)', sent[0]?.to === 'a');
   check('texto = toque 0 com nome', sent[0]?.text.includes('Oi, Maria!'));
   check('pausada (b) NÃO recebeu', !sent.some((s) => s.to === 'b'));
   check('não-sales (c) NÃO recebeu', !sent.some((s) => s.to === 'c'));
   check(
-    'emitiu followup_enviado com stage 0',
-    emitted.length === 1 && emitted[0]?.type === 'followup_enviado' && emitted[0]?.stage === 0
+    'pós-link com GET 200 reenvia o mesmo prefill',
+    sent.find((s) => s.to === 'd')?.text ===
+      'Vi que faltou só a senha pra ativar sua conta! 😊 O link é esse: https://receps.com.br/cadastro?pf=TOKEN_VIGENTE — qualquer dúvida é só me chamar.'
   );
-  check('persistiu avanço só da devida', persisted.length === 1 && persisted[0] === 'PN1:a');
+  check(
+    'pós-link com GET 404 cai no texto genérico atual',
+    sent.find((s) => s.to === 'e')?.text.includes('Oi, Maria!') === true
+  );
+  check(
+    'GET só roda nos estágios pós-link elegíveis',
+    prefillLookups.join(',') === 'd,e'
+  );
+  check(
+    'emitiu followup_enviado com stage 0 nos 3 envios',
+    emitted.length === 3 &&
+      emitted.every((event) => event.type === 'followup_enviado' && event.stage === 0)
+  );
+  check(
+    'persistiu avanço só das elegíveis',
+    persisted.join(',') === 'PN1:a,PN1:d,PN1:e'
+  );
 
   if (failures > 0) {
     console.error(`\n❌ ${failures} check(s) falharam.`);

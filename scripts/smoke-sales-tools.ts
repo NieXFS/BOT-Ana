@@ -137,7 +137,7 @@ async function main() {
   const withClid = buildSignupLink('pro', undefined, phone, salesConfig, 'ABC123CLID');
   check('ctwaClid > wa:hash', withClid.success === true && withClid.url.includes('cid=ABC123CLID') && !withClid.url.includes('wa%3A'));
 
-  console.log('▶ createPrefilledSignupLink — v1.1 (contrato HTTP)');
+  console.log('▶ createPrefilledSignupLink — v1.2 (contrato HTTP)');
   captured.length = 0;
   const prefill = await createPrefilledSignupLink(
     phone,
@@ -148,10 +148,13 @@ async function main() {
       clinicName: 'Clínica Bella',
       plan: 'pro',
       interval: 'annual',
+      niche: 'estetica_facial_corporal',
+      professionalsCount: 3,
     },
     salesConfig
   );
   check('prefill: success', prefill.success === true);
+  check('prefill: sucesso do endpoint marcado como prefilled', prefill.success === true && prefill.prefilled === true);
   check(
     'prefill: devolve a URL do servidor (só o token opaco)',
     prefill.success === true && prefill.url.includes('?pf=') && !prefill.url.includes('utm_')
@@ -169,8 +172,28 @@ async function main() {
   check('prefill: nome e clínica repassados', prefillReq?.body.name === 'Maria' && prefillReq?.body.clinicName === 'Clínica Bella');
   check('prefill: plano/intervalo normalizados', prefillReq?.body.plan === 'pro' && prefillReq?.body.interval === 'annual');
   check(
+    'prefill: niche/professionalsCount repassados',
+    prefillReq?.body.niche === 'estetica_facial_corporal' &&
+      prefillReq?.body.professionalsCount === 3
+  );
+  check(
     'prefill: NÃO manda ctwaClid (o Receps tira do SalesLead)',
     prefillReq !== undefined && !('ctwaClid' in prefillReq.body)
+  );
+  await createPrefilledSignupLink(
+    phone,
+    'PNID',
+    { email: 'sem-qualificacao@clinica.com.br', plan: 'essencial' },
+    salesConfig
+  );
+  const prefillWithoutQualification = captured.filter(
+    (c) => c.path === '/signup-prefill'
+  )[1];
+  check(
+    'prefill: omite niche/professionalsCount quando ausentes',
+    prefillWithoutQualification !== undefined &&
+      !('niche' in prefillWithoutQualification.body) &&
+      !('professionalsCount' in prefillWithoutQualification.body)
   );
 
   console.log('▶ createPrefilledSignupLink — guardas de plano (sem round-trip)');
@@ -205,10 +228,21 @@ async function main() {
     { email: 'x@y.com', plan: 'quebra' },
     { ...salesConfig, plans: [...salesConfig.plans, { ...salesConfig.plans[2], slug: 'quebra' as never }] }
   );
-  check('prefill: 500 do servidor não lança', prefillBoom.success === false);
   check(
-    'prefill: mensagem manda a Renata usar o link normal',
-    prefillBoom.success === false && /link normal/i.test(prefillBoom.message)
+    'prefill: 500 do servidor não lança e devolve link comum utilizável',
+    prefillBoom.success === true &&
+      prefillBoom.prefilled === false &&
+      prefillBoom.url.includes('plan=quebra') &&
+      prefillBoom.url.includes('utm_source=whatsapp')
+  );
+  check(
+    'prefill: fallback explícito pro modelo não prometer preenchimento/só senha',
+    prefillBoom.success === true &&
+      prefillBoom.prefilled === false &&
+      prefillBoom.fallbackReason === 'prefill_indisponivel' &&
+      /link comum/i.test(prefillBoom.warning) &&
+      /não diga/i.test(prefillBoom.warning) &&
+      /senha/i.test(prefillBoom.warning)
   );
 
   console.log('▶ regressão: sendSignupLink (fallback) intacto');

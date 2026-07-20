@@ -131,11 +131,28 @@ async function main() {
     SALES_TOOLS.filter((t) => (t as { cache_control?: unknown }).cache_control != null).length === 1
   );
   check(
-    'sendPrefilledSignup exige e-mail e plano',
+    'sendPrefilledSignup required = só e-mail e plano',
     (() => {
       const tool = SALES_TOOLS.find((t) => t.name === 'sendPrefilledSignup');
       const required = (tool?.input_schema as { required?: string[] })?.required ?? [];
-      return required.includes('email') && required.includes('plan');
+      return required.join(',') === 'email,plan';
+    })()
+  );
+  check(
+    'sendPrefilledSignup expõe niche enum + professionalsCount integer opcionais',
+    (() => {
+      const tool = SALES_TOOLS.find((t) => t.name === 'sendPrefilledSignup');
+      const properties = (
+        tool?.input_schema as {
+          properties?: Record<string, { type?: string; enum?: string[] }>;
+        }
+      )?.properties;
+      return (
+        properties?.professionalsCount?.type === 'integer' &&
+        properties?.niche?.type === 'string' &&
+        properties?.niche?.enum?.join(',') ===
+          'estetica_facial_corporal,sobrancelhas_cilios,podologia,depilacao,outro'
+      );
     })()
   );
   check(
@@ -143,6 +160,14 @@ async function main() {
     /confirme o e-mail/i.test(
       SALES_TOOLS.find((t) => t.name === 'sendPrefilledSignup')?.description ?? ''
     )
+  );
+  check(
+    'sendPrefilledSignup instrui reenvio do mesmo link e agenda pronta',
+    (() => {
+      const description =
+        SALES_TOOLS.find((t) => t.name === 'sendPrefilledSignup')?.description ?? '';
+      return /mesmo link/i.test(description) && /agenda pronta/i.test(description);
+    })()
   );
   check(
     'sendSignupLink continua no toolset (fallback de quem não dá e-mail)',

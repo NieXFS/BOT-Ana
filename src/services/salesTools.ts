@@ -111,11 +111,41 @@ export type PrefilledSignupInput = {
   clinicName?: string;
   plan: string;
   interval?: string;
+  niche?: string;
+  professionalsCount?: number;
 };
 
+export const PREFILL_NICHES = [
+  'estetica_facial_corporal',
+  'sobrancelhas_cilios',
+  'podologia',
+  'depilacao',
+  'outro',
+] as const;
+
+export type PrefilledSignupLinkResult =
+  | {
+      success: true;
+      url: string;
+      prefilled: true;
+      plan: string;
+      interval: 'monthly' | 'annual';
+    }
+  | {
+      success: true;
+      url: string;
+      prefilled: false;
+      plan: string;
+      interval: 'monthly' | 'annual';
+      fallbackReason: 'prefill_indisponivel';
+      warning: string;
+    }
+  | { success: false; message: string; waitlistHref?: string };
+
 /**
- * Link mágico de cadastro pré-preenchido (v1.1): a Renata já coletou e-mail,
- * nome, clínica e plano — o link leva tudo isso e o lead só cria a senha.
+ * Link mágico de cadastro pré-preenchido (v1.2): a Renata já coletou e-mail,
+ * nome, clínica, plano e, quando disponíveis, nicho/número de profissionais —
+ * o link leva tudo isso e o lead só cria a senha.
  *
  * Valida o plano ANTES da chamada com a MESMA função do `sendSignupLink`
  * (`buildSignupLink`): plano inexistente/em fase de testes volta a mesma
@@ -126,14 +156,16 @@ export type PrefilledSignupInput = {
  * a atribuição capturada do referral (C1). O evento `link_enviado` também é
  * emitido lá — a Ana não emite no caminho do prefill (seria contagem dupla).
  *
- * Nunca lança: erro vira { success:false } e a Renata cai no sendSignupLink.
+ * Nunca lança: se o prefill estiver indisponível, a própria tool devolve o link
+ * comum já validado, marcado como `prefilled:false`, e instrui a Renata a não
+ * prometer dados pré-preenchidos. Plano inválido/beta mantém a recusa original.
  */
 export async function createPrefilledSignupLink(
   phone: string,
   phoneNumberId: string,
   input: PrefilledSignupInput,
   config: SalesConfig
-): Promise<SignupLinkResult> {
+): Promise<PrefilledSignupLinkResult> {
   const validation = buildSignupLink(input.plan, input.interval, phone, config);
   if (!validation.success) {
     return validation;
@@ -149,6 +181,10 @@ export async function createPrefilledSignupLink(
         clinicName: input.clinicName,
         plan: validation.plan,
         interval: validation.interval,
+        ...(input.niche !== undefined ? { niche: input.niche } : {}),
+        ...(input.professionalsCount !== undefined
+          ? { professionalsCount: input.professionalsCount }
+          : {}),
       },
       {
         headers: {
@@ -159,18 +195,34 @@ export async function createPrefilledSignupLink(
       }
     );
 
-    if (!data?.url) {
-      return { success: false, message: 'Não consegui gerar o link agora.' };
-    }
+    if (!data?.url) return buildPrefillFallback(validation);
 
-    return { success: true, url: data.url, plan: validation.plan, interval: validation.interval };
+    return {
+      success: true,
+      url: data.url,
+      prefilled: true,
+      plan: validation.plan,
+      interval: validation.interval,
+    };
   } catch (error) {
     capture(error, 'create-prefilled-signup', phoneNumberId);
-    return {
-      success: false,
-      message: 'Não consegui gerar o link com os dados agora. Mande o link normal de cadastro.',
-    };
+    return buildPrefillFallback(validation);
   }
+}
+
+function buildPrefillFallback(
+  validation: Extract<SignupLinkResult, { success: true }>
+): Extract<PrefilledSignupLinkResult, { success: true; prefilled: false }> {
+  return {
+    success: true,
+    url: validation.url,
+    prefilled: false,
+    plan: validation.plan,
+    interval: validation.interval,
+    fallbackReason: 'prefill_indisponivel',
+    warning:
+      'ESTE É O LINK COMUM (não pré-preenchido). NÃO diga que já vem com os dados nem que só falta a senha — peça pra ela preencher e-mail e dados no cadastro normalmente.',
+  };
 }
 
 export type QualifiedLeadPayload = {

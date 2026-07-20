@@ -14,11 +14,12 @@ import {
 import {
   buildSignupLink,
   createPrefilledSignupLink,
+  PREFILL_NICHES,
   registerQualifiedLead,
   handoffToHuman,
   type QualifiedLeadPayload,
 } from './salesTools';
-import { scheduleFollowup } from './salesFollowups';
+import { markFollowupPostLink, scheduleFollowup } from './salesFollowups';
 import { emitSalesEvent } from './salesEvents';
 
 /**
@@ -153,7 +154,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'sendPrefilledSignup',
     description:
-      'Gera o link de cadastro JÁ PREENCHIDO com os dados do lead (e-mail, nome, clínica, plano) — ela só precisa criar a senha. PREFIRA esta tool ao sendSignupLink sempre que você souber o e-mail. Antes de chamar, CONFIRME o e-mail repetindo de volta pra ela ("só confirma pra mim: maria@gmail.com, certo?"). Se ela não quiser dar o e-mail, use o sendSignupLink e não insista. Retorna a URL pra você enviar.',
+      'Gera ou reenvia o MESMO link vigente de cadastro JÁ PREENCHIDO com os dados do lead (e-mail, nome, clínica, plano e, quando descobertos, nicho e número de profissionais); informar o nicho faz o cadastro já chegar com uma agenda pronta. Ela só precisa criar a senha. PREFIRA esta tool ao sendSignupLink sempre que você souber o e-mail, inclusive se ela pedir "manda o link de novo" ou disser que perdeu o link. Antes de chamar, CONFIRME o e-mail repetindo de volta pra ela ("só confirma pra mim: maria@gmail.com, certo?"). Se ela não quiser dar o e-mail, use o sendSignupLink e não insista. Retorna a URL pra você enviar.',
     input_schema: {
       type: 'object',
       properties: {
@@ -172,6 +173,15 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
           type: 'string',
           enum: ['monthly', 'annual'],
           description: 'Cobrança mensal (padrão) ou anual. Omita para mensal.',
+        },
+        niche: {
+          type: 'string',
+          enum: [...PREFILL_NICHES],
+          description: 'Nicho da clínica que você descobriu na qualificação.',
+        },
+        professionalsCount: {
+          type: 'integer',
+          description: 'Quantos profissionais atendem, se souber.',
         },
       },
       required: ['email', 'plan'],
@@ -294,6 +304,7 @@ async function executeSalesFunction(
           salesConfig
         );
         if (result.success) {
+          await markFollowupPostLink(config.phoneNumberId, phone);
           void emitSalesEvent(config.phoneNumberId, phone, 'link_enviado', {
             plan: result.plan,
             interval: result.interval,
@@ -319,9 +330,21 @@ async function executeSalesFunction(
             clinicName: typeof input.clinicName === 'string' ? input.clinicName : undefined,
             plan: String(input.plan ?? ''),
             interval: typeof input.interval === 'string' ? input.interval : undefined,
+            niche:
+              typeof input.niche === 'string' &&
+              (PREFILL_NICHES as readonly string[]).includes(input.niche)
+                ? input.niche
+                : undefined,
+            professionalsCount:
+              typeof input.professionalsCount === 'number'
+                ? input.professionalsCount
+                : undefined,
           },
           salesConfig
         );
+        if (result.success) {
+          await markFollowupPostLink(config.phoneNumberId, phone);
+        }
         return JSON.stringify(result);
       }
       case 'registerQualifiedLead': {
