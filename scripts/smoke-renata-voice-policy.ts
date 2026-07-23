@@ -244,9 +244,24 @@ async function main(): Promise<void> {
   check('kill-switch OFF bloqueia sales', !isRenataVoiceEnabled(sales));
   process.env.RENATA_VOICE_ENABLED = 'true';
 
+  delete process.env.RENATA_TTS_STYLE;
   const cfg = getVoiceEnvConfig();
+  check('style default = 0.10', cfg.style === 0.10);
+  process.env.RENATA_TTS_STYLE = '0.27';
+  check('style aceita sobrescrita por env', getVoiceEnvConfig().style === 0.27);
+  delete process.env.RENATA_TTS_STYLE;
+
   const changed = { ...cfg, voiceId: `${cfg.voiceId}-outra` };
   check('fingerprint muda com a voz', voiceFingerprint(cfg) !== voiceFingerprint(changed));
+  const changedStyle = { ...cfg, style: cfg.style + 0.01 };
+  check(
+    'fingerprint muda quando só o style muda',
+    voiceFingerprint(cfg) !== voiceFingerprint(changedStyle)
+  );
+  check(
+    'fingerprint é estável para a mesma config',
+    voiceFingerprint(cfg) === voiceFingerprint({ ...cfg })
+  );
 
   if (failures) process.exit(1);
   console.log('\n✅ smoke-renata-voice-policy OK');

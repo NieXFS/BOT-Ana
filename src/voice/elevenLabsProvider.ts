@@ -24,6 +24,7 @@ export class ElevenLabsProvider implements TtsProvider {
           // speed dentro de voice_settings, ajustar conforme a documentação
           // vigente — não remover silenciosamente deste contrato.
           speed: this.config.speed,
+          style: this.config.style,
         },
       },
       {
