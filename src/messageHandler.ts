@@ -13,6 +13,8 @@ import {
 } from './whatsappCloudService';
 import { conversationTracker } from './conversationTracker';
 import { Sentry } from './observability/sentry';
+import { isRenataVoiceEnabled } from './voice/voiceConfig';
+import { deliverSalesReply } from './voice/voiceDelivery';
 
 interface MessageBuffer {
   texts: string[];
@@ -71,6 +73,12 @@ export interface FlushDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
+  /** Caminho que ignora voz para fallbacks de sistema. */
+  sendReplyPlain?: (
+    from: string,
+    text: string,
+    config: TenantBotConfig
+  ) => Promise<void>;
 }
 
 /**
@@ -82,15 +90,68 @@ export function typingSimEnabled(config: TenantBotConfig): boolean {
   return config.botRole !== 'sales';
 }
 
+export interface ConfiguredReplyDeps {
+  voiceEnabled: (config: TenantBotConfig) => boolean;
+  deliverVoice: (
+    from: string,
+    text: string,
+    config: TenantBotConfig
+  ) => Promise<void>;
+  waitTyping: (text: string) => Promise<void>;
+  sendText: (
+    from: string,
+    text: string,
+    config: TenantBotConfig
+  ) => Promise<void>;
+}
+
+const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
+  voiceEnabled: isRenataVoiceEnabled,
+  deliverVoice: deliverSalesReply,
+  waitTyping: typingDelay,
+  sendText: sendFreeformMessage,
+};
+
+/** Seam do ponto de entrega: permite provar o caminho byte-idêntico da recepção. */
+export async function sendConfiguredReply(
+  from: string,
+  text: string,
+  config: TenantBotConfig,
+  deps: ConfiguredReplyDeps = defaultConfiguredReplyDeps
+): Promise<void> {
+  if (deps.voiceEnabled(config)) {
+    await deps.deliverVoice(from, text, config);
+    return;
+  }
+  if (typingSimEnabled(config)) {
+    await deps.waitTyping(text);
+  }
+  await deps.sendText(from, text, config);
+}
+
 const defaultFlushDeps: FlushDeps = {
   getReply,
-  sendReply: async (from, text, config) => {
+  sendReply: sendConfiguredReply,
+  sendReplyPlain: async (from, text, config) => {
     if (typingSimEnabled(config)) {
       await typingDelay(text);
     }
     await sendFreeformMessage(from, text, config);
   },
 };
+
+export function redactPhone(phone: string): string {
+  const prefix = phone.trim().slice(0, 4);
+  return prefix ? `${prefix}***` : '***';
+}
+
+function safeSalesContext(config: TenantBotConfig, from: string): string {
+  return `phoneNumberId=${config.phoneNumberId} lead=${redactPhone(from)}`;
+}
+
+function errorKind(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
 
 /**
  * M24: após uma falha no flush, avisa o cliente UMA vez (dentro da janela de
@@ -106,15 +167,33 @@ async function emitFlushFallback(
   const now = Date.now();
   const suppressedUntil = flushRecoveryUntil.get(bufferKey) ?? 0;
   if (now < suppressedUntil) {
-    console.log(`🟡 [flush] ${bufferKey} em janela de recovery — fallback suprimido`);
+    if (config.botRole === 'sales') {
+      console.log(
+        `🟡 [flush] ${safeSalesContext(config, from)} em recovery — fallback suprimido`
+      );
+    } else {
+      console.log(`🟡 [flush] ${bufferKey} em janela de recovery — fallback suprimido`);
+    }
     return;
   }
   flushRecoveryUntil.set(bufferKey, now + FLUSH_RECOVERY_WINDOW_MS);
   try {
-    await deps.sendReply(from, FLUSH_FALLBACK_MESSAGE, config);
-    console.log(`🆘 [flush] fallback de erro enviado para ${bufferKey}`);
+    await (deps.sendReplyPlain ?? deps.sendReply)(
+      from,
+      FLUSH_FALLBACK_MESSAGE,
+      config
+    );
+    if (config.botRole === 'sales') {
+      console.log(`🆘 [flush] fallback de erro enviado | ${safeSalesContext(config, from)}`);
+    } else {
+      console.log(`🆘 [flush] fallback de erro enviado para ${bufferKey}`);
+    }
   } catch (sendErr) {
-    Sentry.captureException(sendErr, {
+    const capturedError =
+      config.botRole === 'sales'
+        ? new Error('message_handler flush fallback send failed')
+        : sendErr;
+    Sentry.captureException(capturedError, {
       tags: {
         service: 'message_handler',
         operation: 'flush_fallback_send',
@@ -122,7 +201,13 @@ async function emitFlushFallback(
         tenantSlug: config.tenantSlug,
       },
     });
-    console.error(`❌ [flush] falha ao enviar fallback para ${bufferKey}:`, sendErr);
+    if (config.botRole === 'sales') {
+      console.error(
+        `❌ [flush] falha ao enviar fallback | ${safeSalesContext(config, from)} | error=${errorKind(sendErr)}`
+      );
+    } else {
+      console.error(`❌ [flush] falha ao enviar fallback para ${bufferKey}:`, sendErr);
+    }
   }
 }
 
@@ -170,17 +255,33 @@ export async function flushBuffer(
   buffer.texts = [];
   const { name, config, from } = buffer;
 
-  console.log(`🧠 Enviando para ${config.botName} (${bufferKey}): "${consolidatedText}"`);
+  if (config.botRole === 'sales') {
+    console.log(
+      `🧠 Enviando para ${config.botName} | ${safeSalesContext(config, from)} | messages=${messageCount}`
+    );
+  } else {
+    console.log(`🧠 Enviando para ${config.botName} (${bufferKey}): "${consolidatedText}"`);
+  }
 
   let flushFailed = false;
   try {
     const reply = await deps.getReply(from, consolidatedText, name, config);
 
     await deps.sendReply(from, reply, config);
-    console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
+    if (config.botRole === 'sales') {
+      console.log(
+        `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply.length}`
+      );
+    } else {
+      console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
+    }
   } catch (err) {
     flushFailed = true;
-    Sentry.captureException(err, {
+    const capturedError =
+      config.botRole === 'sales'
+        ? new Error('message_handler sales flush failed')
+        : err;
+    Sentry.captureException(capturedError, {
       tags: {
         service: 'message_handler',
         operation: 'flush_buffer',
@@ -189,7 +290,13 @@ export async function flushBuffer(
         messageCount,
       },
     });
-    console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+    if (config.botRole === 'sales') {
+      console.error(
+        `❌ Erro ao processar mensagens de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+      );
+    } else {
+      console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+    }
     // M24: antes o cliente ficava em silêncio total quando o flush falhava.
     // Avisa que houve um problema e pede pra repetir (uma vez por janela).
     await emitFlushFallback(bufferKey, from, config, deps);
@@ -208,25 +315,47 @@ export async function flushBuffer(
   }
 
   if (currentBuffer.pendingTexts.length > 0) {
-    console.log(
-      `🔄 ${currentBuffer.pendingTexts.length} mensagem(s) pendente(s) pra ${bufferKey}, abrindo novo debounce`
-    );
+    if (config.botRole === 'sales') {
+      console.log(
+        `🔄 ${currentBuffer.pendingTexts.length} mensagem(s) pendente(s) | ${safeSalesContext(config, from)}`
+      );
+    } else {
+      console.log(
+        `🔄 ${currentBuffer.pendingTexts.length} mensagem(s) pendente(s) pra ${bufferKey}, abrindo novo debounce`
+      );
+    }
     currentBuffer.texts = currentBuffer.pendingTexts;
     currentBuffer.pendingTexts = [];
     currentBuffer.isProcessing = false;
     currentBuffer.firstMessageAt = Date.now();
 
     currentBuffer.timer = setTimeout(() => {
-      flushBuffer(bufferKey).catch((err) =>
-        console.error(`❌ Erro ao processar mensagens pendentes de ${bufferKey}:`, err)
-      );
+      flushBuffer(bufferKey).catch((err) => {
+        if (config.botRole === 'sales') {
+          console.error(
+            `❌ Erro ao processar mensagens pendentes | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+          );
+        } else {
+          console.error(`❌ Erro ao processar mensagens pendentes de ${bufferKey}:`, err);
+        }
+      });
     }, DEBOUNCE_TIME_MS);
 
     currentBuffer.maxWaitTimer = setTimeout(() => {
-      console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
-      flushBuffer(bufferKey).catch((err) =>
-        console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err)
-      );
+      if (config.botRole === 'sales') {
+        console.log(`⏰ Max wait atingido | ${safeSalesContext(config, from)}`);
+      } else {
+        console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
+      }
+      flushBuffer(bufferKey).catch((err) => {
+        if (config.botRole === 'sales') {
+          console.error(
+            `❌ Erro no max-wait flush | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+          );
+        } else {
+          console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err);
+        }
+      });
     }, MAX_WAIT_TIME_MS);
   } else {
     messageBuffers.delete(bufferKey);
@@ -305,7 +434,11 @@ export async function handleIncomingMessage(
 
   if (message.type === 'button') {
     text = message.button?.text ?? '';
-    console.log(`🔘 Botão clicado por ${conversationKey}: "${text}"`);
+    if (config.botRole === 'sales') {
+      console.log(`🔘 Botão clicado | ${safeSalesContext(config, from)}`);
+    } else {
+      console.log(`🔘 Botão clicado por ${conversationKey}: "${text}"`);
+    }
   } else if (message.type === 'text') {
     text = message.text?.body ?? '';
   } else if (message.type === 'audio') {
@@ -314,12 +447,35 @@ export async function handleIncomingMessage(
     try {
       const buffer = await downloadMedia(message.audio.id, config);
       text = await transcreverAudioBuffer(buffer, config.openaiApiKey);
-      console.log(`🎙️ Áudio transcrito de ${conversationKey}: "${text}"`);
+      if (config.botRole === 'sales') {
+        console.log(
+          `🎙️ Áudio transcrito | ${safeSalesContext(config, from)} | chars=${text.length}`
+        );
+      } else {
+        console.log(`🎙️ Áudio transcrito de ${conversationKey}: "${text}"`);
+      }
     } catch (err) {
-      Sentry.captureException(err, {
-        tags: { service: 'message_handler', operation: 'audio_transcription' },
-      });
-      console.error(`❌ Falha ao transcrever áudio de ${conversationKey}:`, err);
+      if (config.botRole === 'sales') {
+        Sentry.captureException(
+          new Error('message_handler sales audio transcription failed'),
+          {
+            tags: {
+              service: 'message_handler',
+              operation: 'audio_transcription',
+              phoneNumberId: config.phoneNumberId,
+              tenantSlug: config.tenantSlug,
+            },
+          }
+        );
+        console.error(
+          `❌ Falha ao transcrever áudio | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+        );
+      } else {
+        Sentry.captureException(err, {
+          tags: { service: 'message_handler', operation: 'audio_transcription' },
+        });
+        console.error(`❌ Falha ao transcrever áudio de ${conversationKey}:`, err);
+      }
       await sendFreeformMessage(
         from,
         'Desculpe, não consegui ouvir o áudio. Pode me mandar por escrito?',
@@ -361,7 +517,13 @@ export async function handleIncomingMessage(
   }
 
   conversationTracker.markActive(conversationKey);
-  console.log(`💬 Mensagem de ${conversationKey} (${name}): "${text}"`);
+  if (config.botRole === 'sales') {
+    console.log(
+      `💬 Mensagem de vendas recebida | ${safeSalesContext(config, from)} | chars=${text.length}`
+    );
+  } else {
+    console.log(`💬 Mensagem de ${conversationKey} (${name}): "${text}"`);
+  }
 
   const bufferKey = buildBufferKey(config, from);
 
@@ -373,7 +535,13 @@ export async function handleIncomingMessage(
       await typingDelay(outsideHoursMessage);
       await sendFreeformMessage(from, outsideHoursMessage, config);
     } else {
-      console.log(`🟡 [fora-de-horário] aviso suprimido (throttle) para ${bufferKey}`);
+      if (config.botRole === 'sales') {
+        console.log(
+          `🟡 [fora-de-horário] aviso suprimido | ${safeSalesContext(config, from)}`
+        );
+      } else {
+        console.log(`🟡 [fora-de-horário] aviso suprimido (throttle) para ${bufferKey}`);
+      }
     }
     return;
   }
@@ -385,16 +553,28 @@ export async function handleIncomingMessage(
       existing.pendingTexts.push(text);
       existing.name = name;
       existing.config = config;
-      console.log(`📥 Mensagem adicionada à fila pendente de ${bufferKey} (Ana processando)`);
+      if (config.botRole === 'sales') {
+        console.log(
+          `📥 Mensagem adicionada à fila pendente | ${safeSalesContext(config, from)}`
+        );
+      } else {
+        console.log(`📥 Mensagem adicionada à fila pendente de ${bufferKey} (Ana processando)`);
+      }
     } else {
       if (existing.timer) clearTimeout(existing.timer);
       existing.texts.push(text);
       existing.name = name;
       existing.config = config;
       existing.timer = setTimeout(() => {
-        flushBuffer(bufferKey).catch((err) =>
-          console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err)
-        );
+        flushBuffer(bufferKey).catch((err) => {
+          if (config.botRole === 'sales') {
+            console.error(
+              `❌ Erro ao processar mensagens de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+            );
+          } else {
+            console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+          }
+        });
       }, DEBOUNCE_TIME_MS);
     }
   } else {
@@ -412,16 +592,32 @@ export async function handleIncomingMessage(
     };
 
     newBuffer.timer = setTimeout(() => {
-      flushBuffer(bufferKey).catch((err) =>
-        console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err)
-      );
+      flushBuffer(bufferKey).catch((err) => {
+        if (config.botRole === 'sales') {
+          console.error(
+            `❌ Erro ao processar mensagens de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+          );
+        } else {
+          console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+        }
+      });
     }, DEBOUNCE_TIME_MS);
 
     newBuffer.maxWaitTimer = setTimeout(() => {
-      console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
-      flushBuffer(bufferKey).catch((err) =>
-        console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err)
-      );
+      if (config.botRole === 'sales') {
+        console.log(`⏰ Max wait atingido | ${safeSalesContext(config, from)}`);
+      } else {
+        console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
+      }
+      flushBuffer(bufferKey).catch((err) => {
+        if (config.botRole === 'sales') {
+          console.error(
+            `❌ Erro no max-wait flush | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+          );
+        } else {
+          console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err);
+        }
+      });
     }, MAX_WAIT_TIME_MS);
 
     messageBuffers.set(bufferKey, newBuffer);

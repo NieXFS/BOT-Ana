@@ -7,6 +7,8 @@ import { isConversationPaused } from './pauseService';
 import { markFollowupOptedOut } from './salesFollowups';
 import { sendFreeformMessage } from '../whatsappCloudService';
 import { Sentry } from '../observability/sentry';
+import { isRenataVoiceEnabled } from '../voice/voiceConfig';
+import { deliverSalesReply } from '../voice/voiceDelivery';
 
 /**
  * Gatilho pós-cadastro da Renata (v1.1, D4). O Receps avisa (POST assinado em
@@ -117,7 +119,10 @@ const defaultDeps: SalesNotifyDeps = {
   endFollowups: markFollowupOptedOut,
   isPaused: isConversationPaused,
   lastInboundAt: getLastInboundAtMs,
-  send: (to, text, config) => sendFreeformMessage(to, text, config),
+  send: (to, text, config) =>
+    isRenataVoiceEnabled(config)
+      ? deliverSalesReply(to, text, config)
+      : sendFreeformMessage(to, text, config),
   record: (key, role, content) => addMessage(key, role, content),
 };
 

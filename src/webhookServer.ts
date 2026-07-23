@@ -8,6 +8,7 @@ import {
   handleIncomingMessage,
   CloudMessage,
   CloudContact,
+  redactPhone,
 } from './messageHandler';
 import {
   botSignatureMiddleware,
@@ -33,6 +34,11 @@ import {
 import { decideConversationActivity } from './services/conversationActivity';
 import { ERP_API_TOKEN } from './erpApiToken';
 import { isEchoChange, handleSmbMessageEchoes } from './echoHandler';
+import { ensureTtsCacheTable } from './voice/ttsCache';
+import { ensureTtsUsageTable } from './voice/costMeter';
+import { ensureChannelPrefsTable } from './voice/channelPref';
+import { checkFfmpegAvailable } from './voice/audioEncoder';
+import { getVoiceEnvConfig } from './voice/voiceConfig';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -110,8 +116,17 @@ async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
       });
 
       return handleIncomingMessage(message, contact, config).catch((err) => {
-        Sentry.captureException(err);
-        console.error(`❌ Erro ao processar mensagem de ${message.from}:`, err);
+        if (config.botRole === 'sales') {
+          Sentry.captureException(
+            new Error('webhook_server sales message processing failed')
+          );
+          console.error(
+            `❌ Erro ao processar mensagem de vendas | phoneNumberId=${phoneNumberId} | lead=${redactPhone(message.from)} | error=${err instanceof Error ? err.name : typeof err}`
+          );
+        } else {
+          Sentry.captureException(err);
+          console.error(`❌ Erro ao processar mensagem de ${message.from}:`, err);
+        }
       });
     });
   }
@@ -408,6 +423,31 @@ async function boot(): Promise<void> {
   // de 60s (só toca conversas de VENDA — o receptionist não escreve na tabela).
   await ensureSalesFollowupsTable();
   startFollowupPoller();
+
+  // Voz da Renata: tabelas raw pg + checagem do ffmpeg antes de aceitar
+  // tráfego. A flag continua OFF por default; sem chave/ffmpeg o gate mantém
+  // texto, sem degradar a recepção nem deixar a Renata em silêncio.
+  await ensureTtsCacheTable();
+  await ensureTtsUsageTable();
+  await ensureChannelPrefsTable();
+  const ffmpegReady = await checkFfmpegAvailable();
+  const voiceConfig = getVoiceEnvConfig();
+
+  if (!ffmpegReady && process.env.NODE_ENV === 'production') {
+    Sentry.captureMessage('renata_voice: ffmpeg missing', {
+      level: 'warning',
+      tags: { service: 'renata_voice', reason: 'ffmpeg_missing' },
+    });
+  }
+
+  const voiceState = !voiceConfig.enabled
+    ? 'disabled (flag_off)'
+    : !voiceConfig.apiKey
+      ? 'disabled (api_key_missing)'
+      : !ffmpegReady
+        ? 'disabled (ffmpeg_missing)'
+        : 'enabled (ready)';
+  console.log(`🔊 Renata voice: ${voiceState}`);
 
   app.listen(PORT, () => {
     console.log(`🚀 Ana — Atendente Virtual rodando na porta ${PORT}`);

@@ -25,7 +25,13 @@
     "smoke:sales-tools": "npx tsx scripts/smoke-sales-tools.ts",
     "smoke:sales-followups": "npx tsx scripts/smoke-sales-followups.ts",
     "smoke:sales-notify": "npx tsx scripts/smoke-sales-notify.ts",
-    "smoke:admin-reset": "npx tsx scripts/smoke-admin-reset.ts"
+    "smoke:admin-reset": "npx tsx scripts/smoke-admin-reset.ts",
+    "smoke:renata-number-words": "npx tsx scripts/smoke-renata-number-words.ts",
+    "smoke:renata-voice-policy": "npx tsx scripts/smoke-renata-voice-policy.ts",
+    "smoke:renata-voice-delivery": "npx tsx scripts/smoke-renata-voice-delivery.ts",
+    "smoke:renata-voice-whatsapp": "npx tsx scripts/smoke-renata-voice-whatsapp.ts",
+    "smoke:renata-voice-storage": "npx tsx scripts/smoke-renata-voice-storage.ts",
+    "smoke:renata-sales-openers": "npx tsx scripts/smoke-renata-sales-openers.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",

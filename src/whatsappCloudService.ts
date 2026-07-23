@@ -1,7 +1,7 @@
-import axios from 'axios';
+import axios, { type AxiosRequestConfig } from 'axios';
 import type { TenantBotConfig } from './configProvider';
 
-type WhatsAppTenantConfig = Pick<
+export type WhatsAppTenantConfig = Pick<
   TenantBotConfig,
   'phoneNumberId' | 'waAccessToken' | 'waApiVersion'
 >;
@@ -60,4 +60,73 @@ export async function downloadMedia(
   });
 
   return Buffer.from(mediaResponse.data);
+}
+
+// --- Upload + envio de nota de voz (Renata) ---------------------------------
+
+export type WhatsAppHttpPost = (
+  url: string,
+  data: unknown,
+  config?: AxiosRequestConfig
+) => Promise<{ data: unknown }>;
+
+const defaultHttpPost: WhatsAppHttpPost = (url, data, config) =>
+  axios.post(url, data, config);
+
+export function buildAudioMessagePayload(to: string, mediaId: string) {
+  return {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'audio',
+    audio: { id: mediaId, voice: true },
+  } as const;
+}
+
+/**
+ * Faz upload de OGG/Opus usando FormData/Blob globais do Node 20. O axios
+ * reconhece FormData WHATWG e injeta o boundary correto; por isso não setamos
+ * Content-Type manualmente.
+ */
+export async function uploadMedia(
+  oggBuffer: Buffer,
+  waConfig: WhatsAppTenantConfig,
+  post: WhatsAppHttpPost = defaultHttpPost
+): Promise<string> {
+  const form = new FormData();
+  form.append('messaging_product', 'whatsapp');
+  form.append(
+    'file',
+    new Blob([new Uint8Array(oggBuffer)], { type: 'audio/ogg' }),
+    'renata.ogg'
+  );
+
+  const response = await post(
+    `https://graph.facebook.com/${waConfig.waApiVersion}/${waConfig.phoneNumberId}/media`,
+    form,
+    {
+      headers: {
+        Authorization: `Bearer ${waConfig.waAccessToken}`,
+      },
+      timeout: 20_000,
+    }
+  );
+
+  const mediaId = (response.data as { id?: unknown } | undefined)?.id;
+  if (typeof mediaId !== 'string' || !mediaId) {
+    throw new Error('WhatsApp media upload returned no id');
+  }
+  return mediaId;
+}
+
+/** Envia o media ID como PTT (`voice:true`), não como anexo de áudio comum. */
+export async function sendAudioMessage(
+  to: string,
+  mediaId: string,
+  waConfig: WhatsAppTenantConfig,
+  post: WhatsAppHttpPost = defaultHttpPost
+): Promise<void> {
+  await post(buildApiUrl(waConfig), buildAudioMessagePayload(to, mediaId), {
+    headers: headers(waConfig),
+    timeout: 20_000,
+  });
 }

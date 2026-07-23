@@ -72,3 +72,16 @@ Dois endpoints GET internos que expõem o `ana_conversation_history` para o pain
 - **Leitores** (`src/services/contextManager.ts`, exportados): `listConversations`/`getHistoryWithTimestamps` (com query INJETÁVEL p/ o smoke) + puros `parseConversationKey`/`escapeLikePattern`/`truncatePreview`/`clampConversationsLimit`/`clampConversationsOffset`. **Smoke**: `smoke:conversations-endpoint` (puros + shape com pool mockado). NUNCA logam PII.
 
 > Contraparte no Receps: `src/services/ana-conversations-admin.service.ts` consome via `ANA_INTERNAL_API_URL` (padrão do `fetchAnaActivity`) + UI em `/painel-receps/clientes/[tenantId]/conversas`. Ver AGENTS.md do Receps + `docs/features/plataforma.md`.
+
+### FEATURE — Voz da Renata (sales-only, áudio-primeiro) (2026-07-23)
+A Renata (`botRole === "sales"`) pode responder em nota de voz PTT pelo pipeline batch em `src/voice/`. O gate ÚNICO é `isRenataVoiceEnabled(config)`: exige sales + `RENATA_VOICE_ENABLED=true` + chave ElevenLabs + ffmpeg disponível. A flag é **OFF por default**; gate falso mantém o envio de texto anterior. A recepcionista nunca entra no pipeline.
+
+- **TTS plugável:** `ttsProvider.ts` (`elevenlabs`; `selfhosted` é stub). Voz Carla `x8FWrDHAK5xiFTJLpnHq`, modelo obrigatório `eleven_multilingual_v2`, stability 0.30, similarity 0.75, speed 1.12, sem `language_code`. O MP3 inteiro é sintetizado e `audioEncoder.ts` converte por stdin/stdout para OGG/Opus 24 kbit/s, 24 kHz, mono, sem `/tmp`.
+- **Política determinística:** `channelPolicy.ts` aplica áudio por padrão. Vira texto com opt-out persistido, e-mail, lista de horários, mensagem > `RENATA_VOICE_MAX_CHARS`, só-link ou fallback de sistema. Fala+link vira voz primeiro e texto contendo só o link depois. `channelPref.ts` detecta "manda texto"/"manda áudio" e persiste a preferência reversível por `conversationKey`.
+- **Nunca silêncio:** `voiceDelivery.ts` captura falha de cache/TTS/ffmpeg/upload/send sem anexar o erro cru (Axios pode conter PII) e tenta `sendFreeformMessage` com o texto ORIGINAL, pré-prosódia. Fallback de flush/transcrição força texto e não passa pelo pipeline.
+- **Cache/custo raw pg:** `tts_cache` usa SHA-256 do texto pós-prosódia + fingerprint da voz; media ID fresco (<25d) evita TTS e upload, media velho reusa `ogg_bytes` e só reenvia o upload. `tts_daily_usage` soma chars apenas em MISS, hits/misses e alerta Sentry uma vez/dia em 80% do orçamento. `renata_channel_prefs` guarda opt-out. As três tabelas são criadas no `boot()`.
+- **Aberturas CTWA:** `salesOpeners.ts` casa os 2 textos reais dos anúncios no primeiro inbound, escolhe um script por hash estável do telefone, grava histórico/emite `primeira_resposta` e não chama Anthropic. Os scripts canônicos vivem em `OPENER_SCRIPTS`.
+- **Saídas cobertas:** resposta reativa (`messageHandler`), régua (`salesFollowups`) e aviso de trial (`salesNotify`) usam o mesmo orquestrador/cache quando o gate está ligado. Logs de sales não imprimem telefone inteiro, nome nem conteúdo.
+- **Smokes (não usam rede/DB/ffmpeg):** `smoke:renata-voice-policy`, `smoke:renata-voice-delivery`, `smoke:renata-voice-whatsapp`, `smoke:renata-voice-storage`, `smoke:renata-sales-openers`.
+
+Deploy exige `ffmpeg -version` funcional na VPS. Se faltar, instalar antes de ligar a flag; o boot reporta `ffmpeg_missing` no Sentry em produção e mantém voz desabilitada.

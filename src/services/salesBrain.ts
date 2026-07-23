@@ -21,6 +21,11 @@ import {
 } from './salesTools';
 import { markFollowupPostLink, scheduleFollowup } from './salesFollowups';
 import { emitSalesEvent } from './salesEvents';
+import { detectChannelRequest, setChannelPref } from '../voice/channelPref';
+import {
+  matchAdOpening,
+  pickOpenerScript,
+} from './salesOpeners';
 
 /**
  * Brain de VENDAS da Renata (Workstream B). Provider Anthropic (claude-sonnet-5),
@@ -415,17 +420,63 @@ function extractText(content: Anthropic.ContentBlock[]): string {
     .trim();
 }
 
+export interface SalesReplyDeps {
+  addMessage: typeof addMessage;
+  scheduleFollowup: typeof scheduleFollowup;
+  setChannelPreference: typeof setChannelPref;
+  getHistory: typeof getHistory;
+  emitEvent: typeof emitSalesEvent;
+}
+
+const defaultSalesReplyDeps: SalesReplyDeps = {
+  addMessage,
+  scheduleFollowup,
+  setChannelPreference: setChannelPref,
+  getHistory,
+  emitEvent: emitSalesEvent,
+};
+
 export async function getSalesReply(
   phone: string,
   userMessage: string,
   userName: string,
-  config: TenantBotConfig
+  config: TenantBotConfig,
+  deps: SalesReplyDeps = defaultSalesReplyDeps
 ): Promise<string> {
   const conversationKey = buildConversationKey(config.phoneNumberId, phone);
 
-  await addMessage(conversationKey, 'user', userMessage);
+  await deps.addMessage(conversationKey, 'user', userMessage);
   // Régua de follow-up ZERA a cada inbound (best-effort, não bloqueia a resposta).
-  await scheduleFollowup(config.phoneNumberId, phone, userName).catch(() => undefined);
+  await deps
+    .scheduleFollowup(config.phoneNumberId, phone, userName)
+    .catch(() => undefined);
+
+  // Pedido explícito de canal vale já para ESTA resposta e é reversível.
+  const channelRequest = detectChannelRequest(userMessage);
+  if (channelRequest) {
+    await deps
+      .setChannelPreference(conversationKey, channelRequest === 'text')
+      .catch(() => undefined);
+  }
+
+  const history = await deps.getHistory(conversationKey);
+  const isFirstResponse = !history.some((message) => message.role === 'assistant');
+
+  // Aberturas reais dos anúncios: 1º inbound casado recebe script canônico sem
+  // Anthropic. O texto original segue no histórico e no mesmo evento do caminho
+  // normal; o messageHandler decide voz/texto depois.
+  if (
+    history.filter((message) => message.role === 'user').length === 1 &&
+    isFirstResponse &&
+    matchAdOpening(userMessage)
+  ) {
+    const script = pickOpenerScript(phone);
+    await deps.addMessage(conversationKey, 'assistant', script);
+    void deps
+      .emitEvent(config.phoneNumberId, phone, 'primeira_resposta')
+      .catch(() => undefined);
+    return script;
+  }
 
   // Preço SEMPRE da sales-config. Indisponível → bloco seguro (nunca inventa).
   let salesConfig: SalesConfig | null = null;
@@ -437,8 +488,6 @@ export async function getSalesReply(
     console.warn('⚠️ sales-config indisponível — Renata segue sem preço:', err);
   }
 
-  const history = await getHistory(conversationKey);
-  const isFirstResponse = !history.some((message) => message.role === 'assistant');
   const messages: Anthropic.MessageParam[] = history.map((m) => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
     content: m.content,
@@ -468,11 +517,11 @@ export async function getSalesReply(
 
       if (toolUses.length === 0) {
         const reply = extractText(response.content) || getFallbackMessage(config);
-        await addMessage(conversationKey, 'assistant', reply);
+        await deps.addMessage(conversationKey, 'assistant', reply);
         if (isFirstResponse) {
-          void emitSalesEvent(config.phoneNumberId, phone, 'primeira_resposta').catch(
-            () => undefined
-          );
+          void deps
+            .emitEvent(config.phoneNumberId, phone, 'primeira_resposta')
+            .catch(() => undefined);
         }
         return reply;
       }
@@ -521,11 +570,11 @@ export async function getSalesReply(
   }
 
   const fallbackReply = getFallbackMessage(config);
-  await addMessage(conversationKey, 'assistant', fallbackReply);
+  await deps.addMessage(conversationKey, 'assistant', fallbackReply);
   if (isFirstResponse) {
-    void emitSalesEvent(config.phoneNumberId, phone, 'primeira_resposta').catch(
-      () => undefined
-    );
+    void deps
+      .emitEvent(config.phoneNumberId, phone, 'primeira_resposta')
+      .catch(() => undefined);
   }
   return fallbackReply;
 }

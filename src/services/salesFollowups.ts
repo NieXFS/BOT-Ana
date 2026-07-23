@@ -8,6 +8,8 @@ import { sendFreeformMessage } from '../whatsappCloudService';
 import { Sentry } from '../observability/sentry';
 import { emitSalesEvent } from './salesEvents';
 import { ERP_API_TOKEN } from '../erpApiToken';
+import { isRenataVoiceEnabled } from '../voice/voiceConfig';
+import { deliverSalesReply } from '../voice/voiceDelivery';
 
 /**
  * Régua de FOLLOW-UP da Renata (Workstream B, §B5). Dentro da janela CTWA de 72h,
@@ -404,7 +406,10 @@ const defaultTickDeps: FollowupTickDeps = {
   getConfig: getTenantConfig,
   isPaused: isConversationPaused,
   getPrefilledLink: getCurrentPrefilledSignupLink,
-  send: (to, text, config) => sendFreeformMessage(to, text, config),
+  send: (to, text, config) =>
+    isRenataVoiceEnabled(config)
+      ? deliverSalesReply(to, text, config)
+      : sendFreeformMessage(to, text, config),
   record: (key, role, content) => addMessage(key, role, content),
   emitEvent: emitSalesEvent,
   persist: persistAdvance,
