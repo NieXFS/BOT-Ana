@@ -25,7 +25,11 @@ import {
 } from './services/salesFollowups';
 import { handleSalesNotify } from './services/salesNotify';
 import { resetAdminConversation } from './services/adminReset';
-import { getLastMessageMeta } from './services/contextManager';
+import {
+  getLastMessageMeta,
+  listConversations,
+  getHistoryWithTimestamps,
+} from './services/contextManager';
 import { decideConversationActivity } from './services/conversationActivity';
 import { ERP_API_TOKEN } from './erpApiToken';
 import { isEchoChange, handleSmbMessageEchoes } from './echoHandler';
@@ -290,6 +294,100 @@ app.get('/internal/conversation-activity', (req: Request, res: Response) => {
         },
       });
       console.error('❌ Erro ao consultar conversation-activity:', err);
+      res.status(500).json({ error: 'internal error' });
+    });
+});
+
+/** Parseia um query param inteiro; ausente/vazio/inválido → undefined (o
+ * clamp em contextManager aplica os defaults). */
+function parseQueryInt(value: unknown): number | undefined {
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+/**
+ * GET /internal/conversations?phoneNumberId=&limit=&offset=
+ *
+ * Lista as conversas da Ana de um tenant (por phoneNumberId), para o histórico
+ * de conversas no painel interno do Receps (/painel-receps, SUPER_ADMIN). Auth:
+ * Bearer ERP_API_TOKEN (segredo compartilhado Ana↔Receps = AI_BOT_API_KEY do
+ * Receps). READ-ONLY sobre a janela rolante de MAX_MESSAGES — não mexe no trim.
+ * NUNCA loga/ecoa o token nem o telefone/conteúdo do cliente (PII).
+ */
+app.get('/internal/conversations', (req: Request, res: Response) => {
+  if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+    res.sendStatus(401);
+    return;
+  }
+
+  const phoneNumberId =
+    typeof req.query.phoneNumberId === 'string' ? req.query.phoneNumberId.trim() : '';
+
+  if (!phoneNumberId) {
+    res.status(400).json({ error: 'phoneNumberId é obrigatório.' });
+    return;
+  }
+
+  listConversations(
+    phoneNumberId,
+    parseQueryInt(req.query.limit),
+    parseQueryInt(req.query.offset)
+  )
+    .then((result) => {
+      res.json(result);
+    })
+    .catch((err) => {
+      Sentry.captureException(err, {
+        tags: {
+          service: 'webhook_server',
+          operation: 'list_conversations',
+          phoneNumberId,
+        },
+      });
+      console.error('❌ Erro ao listar conversas:', err);
+      res.status(500).json({ error: 'internal error' });
+    });
+});
+
+/**
+ * GET /internal/conversation-messages?phoneNumberId=&customerPhone=
+ *
+ * Thread completa de UMA conversa (janela de MAX_MESSAGES, ordem ASC) para o
+ * painel interno do Receps. Mesma auth do /internal/conversations. Mensagens
+ * `assistant` com prefixo "[atendente] " (echo do humano) VÃO no payload como
+ * estão — quem interpreta o marcador é a UI do Receps. Conversa inexistente →
+ * { messages: [] } (200). NUNCA loga PII.
+ */
+app.get('/internal/conversation-messages', (req: Request, res: Response) => {
+  if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+    res.sendStatus(401);
+    return;
+  }
+
+  const phoneNumberId =
+    typeof req.query.phoneNumberId === 'string' ? req.query.phoneNumberId.trim() : '';
+  const customerPhone =
+    typeof req.query.customerPhone === 'string' ? req.query.customerPhone.trim() : '';
+
+  if (!phoneNumberId || !customerPhone) {
+    res.status(400).json({ error: 'phoneNumberId e customerPhone são obrigatórios.' });
+    return;
+  }
+
+  getHistoryWithTimestamps(phoneNumberId, customerPhone)
+    .then((messages) => {
+      res.json({ messages });
+    })
+    .catch((err) => {
+      Sentry.captureException(err, {
+        tags: {
+          service: 'webhook_server',
+          operation: 'conversation_messages',
+          phoneNumberId,
+        },
+      });
+      console.error('❌ Erro ao consultar conversation-messages:', err);
       res.status(500).json({ error: 'internal error' });
     });
 });

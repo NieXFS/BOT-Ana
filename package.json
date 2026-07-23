@@ -20,6 +20,7 @@
     "smoke:echo-handler": "npx tsx scripts/smoke-echo-handler.ts",
     "smoke:listen-while-paused": "npx tsx scripts/smoke-listen-while-paused.ts",
     "smoke:conversation-activity": "npx tsx scripts/smoke-conversation-activity.ts",
+    "smoke:conversations-endpoint": "npx tsx scripts/smoke-conversations-endpoint.ts",
     "smoke:sales-registry": "npx tsx scripts/smoke-sales-brain-registry.ts",
     "smoke:sales-tools": "npx tsx scripts/smoke-sales-tools.ts",
     "smoke:sales-followups": "npx tsx scripts/smoke-sales-followups.ts",
