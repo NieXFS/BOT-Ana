@@ -31,7 +31,9 @@
     "smoke:renata-voice-delivery": "npx tsx scripts/smoke-renata-voice-delivery.ts",
     "smoke:renata-voice-whatsapp": "npx tsx scripts/smoke-renata-voice-whatsapp.ts",
     "smoke:renata-voice-storage": "npx tsx scripts/smoke-renata-voice-storage.ts",
-    "smoke:renata-sales-openers": "npx tsx scripts/smoke-renata-sales-openers.ts"
+    "smoke:renata-sales-openers": "npx tsx scripts/smoke-renata-sales-openers.ts",
+    "smoke:renata-partner-mention": "npx tsx scripts/smoke-renata-partner-mention.ts",
+    "smoke:renata-demo-video": "npx tsx scripts/smoke-renata-demo-video.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",

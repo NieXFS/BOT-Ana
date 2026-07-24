@@ -39,6 +39,7 @@ import { ensureTtsUsageTable } from './voice/costMeter';
 import { ensureChannelPrefsTable } from './voice/channelPref';
 import { checkFfmpegAvailable } from './voice/audioEncoder';
 import { getVoiceEnvConfig } from './voice/voiceConfig';
+import { ensureMediaCacheTable } from './media/mediaCache';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -430,6 +431,7 @@ async function boot(): Promise<void> {
   await ensureTtsCacheTable();
   await ensureTtsUsageTable();
   await ensureChannelPrefsTable();
+  await ensureMediaCacheTable();
   const ffmpegReady = await checkFfmpegAvailable();
   const voiceConfig = getVoiceEnvConfig();
 

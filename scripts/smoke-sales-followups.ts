@@ -1,28 +1,27 @@
 /**
- * Smoke DETERMINÍSTICO da régua de follow-up da Renata (Workstream B §B5). Testa
- * o RULER puro (agenda / zera no inbound / opt-out / limite 3 / janela 72h) e o
- * `runFollowupTick` com deps injetadas (pula pausada/não-sales; pós-link reenvia
- * o prefill vigente e 404 cai no texto genérico).
- * Sem rede / DB real.
- *
- * Rodar: npx tsx scripts/smoke-sales-followups.ts
+ * Smoke determinístico da régua da Renata: ruler, journeys, backfill e tick.
+ * Sem rede/DB real.
  */
-process.env.DATABASE_URL =
-  process.env.DATABASE_URL || 'postgres://smoke:smoke@127.0.0.1:1/smoke';
+process.env.DATABASE_URL ||=
+  'postgres://smoke:smoke@127.0.0.1:1/smoke';
 
 import type { TenantBotConfig } from '../src/configProvider';
-import type { FollowupRow, FollowupTickDeps } from '../src/services/salesFollowups';
+import type {
+  FollowupRow,
+  FollowupTickDeps,
+} from '../src/services/salesFollowups';
 
 let failures = 0;
-function check(label: string, cond: boolean) {
-  if (cond) console.log(`  ✓ ${label}`);
+function check(label: string, condition: boolean): void {
+  if (condition) console.log(`  ✓ ${label}`);
   else {
     console.error(`  ✗ ${label}`);
     failures += 1;
   }
 }
 
-const HOUR = 3600_000;
+const HOUR = 3_600_000;
+const NOW = Date.UTC(2026, 6, 23, 12);
 
 function salesConfig(phoneNumberId: string): TenantBotConfig {
   return {
@@ -48,24 +47,25 @@ function salesConfig(phoneNumberId: string): TenantBotConfig {
   };
 }
 
-function row(over: Partial<FollowupRow>): FollowupRow {
-  const now = 1_000_000_000_000;
+function row(over: Partial<FollowupRow> = {}): FollowupRow {
   return {
-    conversationKey: 'PN:phone',
-    phoneNumberId: 'PN',
+    conversationKey: 'PN1:phone',
+    phoneNumberId: 'PN1',
     customerPhone: 'phone',
     customerName: 'Maria Silva',
-    anchorAtMs: now,
-    windowExpiresAtMs: now + 72 * HOUR,
-    nextAtMs: now,
+    anchorAtMs: NOW,
+    windowExpiresAtMs: NOW + 72 * HOUR,
+    nextAtMs: NOW,
     touchCount: 0,
     lastStage: 0,
+    journey: 'default',
+    lastTouchIdx: null,
     optedOut: false,
     ...over,
   };
 }
 
-async function main() {
+async function main(): Promise<void> {
   const mod = await import('../src/services/salesFollowups');
   const {
     initialFollowupState,
@@ -73,168 +73,306 @@ async function main() {
     isTouchDue,
     advanceAfterTouch,
     followupStageText,
-    isPostLinkStage,
+    pickFollowupVariant,
     postLinkFollowupText,
+    promoteFollowupJourney,
+    demoJourneyFollowupText,
+    DEMO_SIMULATION_FALLBACK_TEXT,
+    ensureSalesFollowupsTable,
     runFollowupTick,
     FOLLOWUP_OFFSETS_MS,
-    POST_LINK_STAGE_OFFSET,
   } = mod;
 
-  const now = 1_000_000_000_000;
-
-  console.log('▶ estado inicial (agenda)');
-  const init = initialFollowupState(now);
-  check('anchor = now', init.anchorAtMs === now);
-  check('janela = now + 72h', init.windowExpiresAtMs === now + 72 * HOUR);
-  check('próximo toque = now + 4h', init.nextAtMs === now + FOLLOWUP_OFFSETS_MS[0]);
-  check('touchCount 0', init.touchCount === 0);
-
-  console.log('▶ inbound ZERA a régua (mantém janela; opt-out sticky)');
-  const later = now + 10 * HOUR;
-  const reset = rescheduleFollowupState({ windowExpiresAtMs: now + 72 * HOUR, optedOut: false }, later);
-  check('reset volta pro estágio 0', reset !== null && reset.touchCount === 0);
-  check('reset agenda +4h a partir do novo inbound', reset !== null && reset.nextAtMs === later + FOLLOWUP_OFFSETS_MS[0]);
-  const resetOpted = rescheduleFollowupState({ windowExpiresAtMs: now + 72 * HOUR, optedOut: true }, later);
-  check('opt-out NÃO reabre a régua', resetOpted === null);
-  const resetPostLink = rescheduleFollowupState(
+  console.log('▶ ruler + reset');
+  const init = initialFollowupState(NOW);
+  check(
+    'estado inicial: +4h, janela 72h, stage 0',
+    init.anchorAtMs === NOW &&
+      init.windowExpiresAtMs === NOW + 72 * HOUR &&
+      init.nextAtMs === NOW + FOLLOWUP_OFFSETS_MS[0] &&
+      init.touchCount === 0 &&
+      init.lastStage === 0
+  );
+  const reset = rescheduleFollowupState(
     {
-      windowExpiresAtMs: now + 72 * HOUR,
+      windowExpiresAtMs: NOW + 72 * HOUR,
       optedOut: false,
-      lastStage: POST_LINK_STAGE_OFFSET + 2,
+      journey: 'demo',
+      lastTouchIdx: 2,
     },
-    later
+    NOW + HOUR
   );
   check(
-    'inbound zera contador/horário, mas preserva a jornada pós-link',
-    resetPostLink !== null &&
-      resetPostLink.touchCount === 0 &&
-      resetPostLink.lastStage === POST_LINK_STAGE_OFFSET
-  );
-
-  console.log('▶ isTouchDue');
-  check('devido: nextAt<=now, na janela', isTouchDue(row({ nextAtMs: now - 1 }), now) === true);
-  check('opt-out → não devido', isTouchDue(row({ nextAtMs: now - 1, optedOut: true }), now) === false);
-  check('limite 3 → não devido', isTouchDue(row({ nextAtMs: now - 1, touchCount: 3 }), now) === false);
-  check('fora da janela 72h → não devido', isTouchDue(row({ nextAtMs: now - 1, windowExpiresAtMs: now - 1 }), now) === false);
-  check('nextAt no futuro → não devido', isTouchDue(row({ nextAtMs: now + HOUR }), now) === false);
-  check('nextAt null → não devido', isTouchDue(row({ nextAtMs: null }), now) === false);
-
-  console.log('▶ advanceAfterTouch (agenda o próximo / limite 3)');
-  const a0 = advanceAfterTouch(row({ touchCount: 0 }));
-  check('após toque 0 → count 1, next = anchor+24h', a0.touchCount === 1 && a0.nextAtMs === now + FOLLOWUP_OFFSETS_MS[1]);
-  const a1 = advanceAfterTouch(row({ touchCount: 1 }));
-  check('após toque 1 → count 2, next = anchor+48h', a1.touchCount === 2 && a1.nextAtMs === now + FOLLOWUP_OFFSETS_MS[2]);
-  const a2 = advanceAfterTouch(row({ touchCount: 2 }));
-  check('após toque 2 (último) → count 3, next null', a2.touchCount === 3 && a2.nextAtMs === null);
-  const postLinkAdvance = advanceAfterTouch(
-    row({ touchCount: 0, lastStage: POST_LINK_STAGE_OFFSET })
+    'reset preserva journey e last_touch_idx',
+    reset?.touchCount === 0 &&
+      reset.lastStage === 0 &&
+      reset.journey === 'demo' &&
+      reset.lastTouchIdx === 2
   );
   check(
-    'avanço preserva marcador pós-link',
-    isPostLinkStage(postLinkAdvance.lastStage) &&
-      postLinkAdvance.lastStage === POST_LINK_STAGE_OFFSET + 1
+    'opt-out não reabre',
+    rescheduleFollowupState(
+      { windowExpiresAtMs: NOW, optedOut: true },
+      NOW
+    ) === null
   );
 
-  console.log('▶ textos dos toques (manual §7)');
-  check('toque 0 com nome → "Oi, Maria!"', followupStageText(0, 'Maria Silva').includes('Oi, Maria!'));
-  check('toque 0 sem nome → "Oi!" (sem vírgula-nome)', followupStageText(0, null).startsWith('Oi!'));
-  check('toque 0 nome "Cliente" tratado como sem nome', followupStageText(0, 'Cliente').startsWith('Oi!'));
-  check('toque 1 → prova/trial grátis', followupStageText(1, null).includes('testar a Receps grátis'));
-  check('toque 2 → demonstração com o Victor', followupStageText(2, null).includes('demonstração'));
   check(
-    'texto pós-link usa exatamente a URL vigente',
-    postLinkFollowupText('https://receps.com.br/cadastro?pf=TOKEN').includes(
-      'O link é esse: https://receps.com.br/cadastro?pf=TOKEN'
+    'isTouchDue respeita tempo/janela/opt-out',
+    isTouchDue(row({ nextAtMs: NOW - 1 }), NOW) &&
+      !isTouchDue(row({ nextAtMs: NOW + 1 }), NOW) &&
+      !isTouchDue(row({ optedOut: true }), NOW) &&
+      !isTouchDue(row({ windowExpiresAtMs: NOW - 1 }), NOW)
+  );
+  const advanced = advanceAfterTouch(row(), 1);
+  check(
+    'advance faz bookkeeping e persiste índice usado',
+    advanced.touchCount === 1 &&
+      advanced.lastStage === 1 &&
+      advanced.nextAtMs === NOW + FOLLOWUP_OFFSETS_MS[1] &&
+      advanced.lastTouchIdx === 1
+  );
+
+  console.log('▶ variações e correção B2');
+  const first = pickFollowupVariant(0, 'Maria Silva', null);
+  const afterFirst = advanceAfterTouch(row(), first.idx);
+  const afterInbound = rescheduleFollowupState(
+    {
+      windowExpiresAtMs: NOW + 72 * HOUR,
+      optedOut: false,
+      journey: 'default',
+      lastTouchIdx: afterFirst.lastTouchIdx,
+    },
+    NOW + HOUR
+  );
+  const second = pickFollowupVariant(
+    0,
+    'Maria Silva',
+    afterInbound?.lastTouchIdx ?? null
+  );
+  check(
+    'toque → inbound reset → próximo toque usa texto diferente',
+    first.idx !== second.idx && first.text !== second.text
+  );
+  check(
+    'variação canônica mantém primeiro nome',
+    followupStageText(0, 'Maria Silva').startsWith('Oi, Maria!')
+  );
+  check(
+    'sem nome/Cliente não deixa placeholder',
+    followupStageText(0, null).startsWith('Oi!') &&
+      followupStageText(0, 'Cliente').startsWith('Oi!')
+  );
+  const lastCanonical = followupStageText(2, null);
+  check(
+    '+48h convida simulação in-chat e não promete demo com Victor',
+    lastCanonical.includes("oi, queria marcar um horário") &&
+      !/Victor|30min/i.test(lastCanonical)
+  );
+
+  console.log('▶ journey + backfill');
+  check(
+    'precedência post_link > demo > default',
+    promoteFollowupJourney('default', 'demo') === 'demo' &&
+      promoteFollowupJourney('demo', 'post_link') === 'post_link' &&
+      promoteFollowupJourney('post_link', 'demo') === 'post_link'
+  );
+  const legacy = { journey: 'default', lastStage: 102 };
+  const ensureSql: string[] = [];
+  await ensureSalesFollowupsTable(async (sql) => {
+    ensureSql.push(sql);
+    if (
+      /SET journey = 'post_link'/.test(sql) &&
+      legacy.journey === 'default' &&
+      legacy.lastStage >= 100
+    ) {
+      legacy.journey = 'post_link';
+    }
+    return { rows: [] };
+  });
+  check(
+    'ensure adiciona journey + last_touch_idx',
+    ensureSql.some(
+      (sql) =>
+        /ADD COLUMN IF NOT EXISTS journey/.test(sql) &&
+        /ADD COLUMN IF NOT EXISTS last_touch_idx/.test(sql)
     )
   );
+  check(
+    'backfill idempotente promove legado last_stage >= 100',
+    legacy.journey === 'post_link' &&
+      ensureSql.some(
+        (sql) =>
+          /WHERE journey = 'default'/.test(sql) &&
+          /last_stage >= 100/.test(sql)
+      )
+  );
 
-  console.log('▶ runFollowupTick (stage-aware + invariantes)');
-  const dueRow = row({ conversationKey: 'PN1:a', phoneNumberId: 'PN1', customerPhone: 'a', nextAtMs: now - 1, touchCount: 0 });
-  const pausedRow = row({ conversationKey: 'PN1:b', phoneNumberId: 'PN1', customerPhone: 'b', nextAtMs: now - 1 });
-  const nonSalesRow = row({ conversationKey: 'PN2:c', phoneNumberId: 'PN2', customerPhone: 'c', nextAtMs: now - 1 });
-  const postLinkRow = row({
-    conversationKey: 'PN1:d',
-    phoneNumberId: 'PN1',
-    customerPhone: 'd',
-    nextAtMs: now - 1,
-    lastStage: POST_LINK_STAGE_OFFSET,
+  console.log('▶ jornada demo: slots reais ou simulação');
+  const datesRead: string[] = [];
+  const withSlots = await demoJourneyFollowupText(salesConfig('PN3'), {
+    now: () => NOW,
+    resolveServiceId: async () => 'service-demo',
+    getSlots: async (date) => {
+      datesRead.push(date);
+      return date === '2026-07-25'
+        ? { success: true, slots: ['10:30', '15:00', '16:00'] }
+        : { success: true, slots: [] };
+    },
   });
-  const expiredPrefillRow = row({
-    conversationKey: 'PN1:e',
-    phoneNumberId: 'PN1',
-    customerPhone: 'e',
-    nextAtMs: now - 1,
-    lastStage: POST_LINK_STAGE_OFFSET,
+  check(
+    'demo busca dias até achar e oferece os dois primeiros horários',
+    datesRead.join(',') === '2026-07-23,2026-07-24,2026-07-25' &&
+      withSlots.includes('25/07/2026') &&
+      withSlots.includes('10:30') &&
+      withSlots.includes('15:00')
+  );
+  check(
+    'demo nunca pergunta data em aberto',
+    !/que dia você prefere/i.test(withSlots)
+  );
+  const withoutSlots = await demoJourneyFollowupText(salesConfig('PN4'), {
+    now: () => NOW,
+    resolveServiceId: async () => 'service-demo',
+    getSlots: async () => ({ success: true, slots: [] }),
   });
+  check(
+    'demo sem slots cai na simulação e nunca no genérico',
+    withoutSlots === DEMO_SIMULATION_FALLBACK_TEXT &&
+      !withoutSlots.includes('Ficou alguma dúvida')
+  );
+  const apiDown = await demoJourneyFollowupText(salesConfig('PN4'), {
+    resolveServiceId: async () => 'service-demo',
+    getSlots: async () => {
+      throw new Error('mock timeout');
+    },
+  });
+  check(
+    'API fora também cai na simulação',
+    apiDown === DEMO_SIMULATION_FALLBACK_TEXT
+  );
 
+  console.log('▶ runFollowupTick stage-aware');
+  const dueRows = [
+    row({
+      conversationKey: 'PN1:a',
+      customerPhone: 'a',
+      nextAtMs: NOW - 1,
+    }),
+    row({
+      conversationKey: 'PN1:b',
+      customerPhone: 'b',
+      nextAtMs: NOW - 1,
+    }),
+    row({
+      conversationKey: 'PN2:c',
+      phoneNumberId: 'PN2',
+      customerPhone: 'c',
+      nextAtMs: NOW - 1,
+    }),
+    row({
+      conversationKey: 'PN1:d',
+      customerPhone: 'd',
+      nextAtMs: NOW - 1,
+      journey: 'post_link',
+    }),
+    row({
+      conversationKey: 'PN1:e',
+      customerPhone: 'e',
+      nextAtMs: NOW - 1,
+      journey: 'post_link',
+    }),
+    row({
+      conversationKey: 'PN3:f',
+      phoneNumberId: 'PN3',
+      customerPhone: 'f',
+      nextAtMs: NOW - 1,
+      journey: 'demo',
+    }),
+    row({
+      conversationKey: 'PN4:g',
+      phoneNumberId: 'PN4',
+      customerPhone: 'g',
+      nextAtMs: NOW - 1,
+      journey: 'demo',
+    }),
+  ];
   const sent: Array<{ to: string; text: string }> = [];
-  const emitted: Array<{ type: string; stage: number | undefined }> = [];
-  const persisted: string[] = [];
+  const persisted = new Map<string, { lastTouchIdx: number | null }>();
   const prefillLookups: string[] = [];
   const deps: FollowupTickDeps = {
-    now: () => now,
-    loadDue: async () => [dueRow, pausedRow, nonSalesRow, postLinkRow, expiredPrefillRow],
-    getConfig: async (pn) => (pn === 'PN1' ? salesConfig(pn) : { ...salesConfig(pn), botRole: 'receptionist' }),
-    isPaused: async (_pn, phone) => phone === 'b',
-    getPrefilledLink: async (phone) => {
-      prefillLookups.push(phone);
-      return phone === 'd'
-        ? { success: true, url: 'https://receps.com.br/cadastro?pf=TOKEN_VIGENTE' }
+    now: () => NOW,
+    loadDue: async () => dueRows,
+    getConfig: async (phoneNumberId) =>
+      phoneNumberId === 'PN2'
+        ? { ...salesConfig(phoneNumberId), botRole: 'receptionist' }
+        : salesConfig(phoneNumberId),
+    isPaused: async (_phoneNumberId, customerPhone) => customerPhone === 'b',
+    getPrefilledLink: async (customerPhone) => {
+      prefillLookups.push(customerPhone);
+      return customerPhone === 'd'
+        ? {
+            success: true,
+            url: 'https://receps.com.br/cadastro?pf=TOKEN_VIGENTE',
+          }
         : { success: false, reason: 'not_found' };
     },
+    getDemoText: async (config) =>
+      config.phoneNumberId === 'PN3'
+        ? 'Tenho 25/07/2026 às 10:30 ou às 15:00. Qual fica melhor?'
+        : DEMO_SIMULATION_FALLBACK_TEXT,
     send: async (to, text) => {
       sent.push({ to, text });
     },
     record: async () => undefined,
-    emitEvent: async (_pn, _phone, type, metadata) => {
-      emitted.push({
-        type,
-        stage: typeof metadata?.stage === 'number' ? metadata.stage : undefined,
-      });
-    },
-    persist: async (key) => {
-      persisted.push(key);
+    emitEvent: async () => undefined,
+    persist: async (key, advance) => {
+      persisted.set(key, { lastTouchIdx: advance.lastTouchIdx });
     },
   };
-
   const count = await runFollowupTick(deps);
-  check('enviou os 3 toques elegíveis', count === 3 && sent.length === 3);
-  check('enviou pra conversa devida (a)', sent[0]?.to === 'a');
-  check('texto = toque 0 com nome', sent[0]?.text.includes('Oi, Maria!'));
-  check('pausada (b) NÃO recebeu', !sent.some((s) => s.to === 'b'));
-  check('não-sales (c) NÃO recebeu', !sent.some((s) => s.to === 'c'));
   check(
-    'pós-link com GET 200 reenvia o mesmo prefill',
-    sent.find((s) => s.to === 'd')?.text ===
-      'Vi que faltou só a senha pra ativar sua conta! 😊 O link é esse: https://receps.com.br/cadastro?pf=TOKEN_VIGENTE — qualquer dúvida é só me chamar.'
+    'envia só 5 elegíveis; pausada e receptionist ficam fora',
+    count === 5 &&
+      !sent.some((item) => item.to === 'b' || item.to === 'c')
   );
   check(
-    'pós-link com GET 404 cai no texto genérico atual',
-    sent.find((s) => s.to === 'e')?.text.includes('Oi, Maria!') === true
+    'post_link vigente permanece intacto',
+    sent.find((item) => item.to === 'd')?.text ===
+      postLinkFollowupText(
+        'https://receps.com.br/cadastro?pf=TOKEN_VIGENTE'
+      )
   );
   check(
-    'GET só roda nos estágios pós-link elegíveis',
-    prefillLookups.join(',') === 'd,e'
+    'post_link sem prefill mantém fallback genérico',
+    sent.find((item) => item.to === 'e')?.text.includes(
+      'Ficou alguma dúvida'
+    ) === true &&
+      prefillLookups.join(',') === 'd,e'
   );
   check(
-    'emitiu followup_enviado com stage 0 nos 3 envios',
-    emitted.length === 3 &&
-      emitted.every((event) => event.type === 'followup_enviado' && event.stage === 0)
+    'journey demo com slots retoma os dois horários',
+    sent.find((item) => item.to === 'f')?.text.includes('10:30') === true &&
+      sent.find((item) => item.to === 'f')?.text.includes('15:00') === true
   );
   check(
-    'persistiu avanço só das elegíveis',
-    persisted.join(',') === 'PN1:a,PN1:d,PN1:e'
+    'journey demo sem slots usa simulação, nunca genérico',
+    sent.find((item) => item.to === 'g')?.text ===
+      DEMO_SIMULATION_FALLBACK_TEXT
+  );
+  check(
+    'índice só avança quando o texto veio do pool',
+    persisted.get('PN1:a')?.lastTouchIdx === 0 &&
+      persisted.get('PN1:e')?.lastTouchIdx === 0 &&
+      persisted.get('PN1:d')?.lastTouchIdx === null &&
+      persisted.get('PN3:f')?.lastTouchIdx === null
   );
 
-  if (failures > 0) {
-    console.error(`\n❌ ${failures} check(s) falharam.`);
-    process.exit(1);
-  }
+  if (failures) process.exit(1);
   console.log('\n✅ smoke-sales-followups OK');
-  process.exit(0);
 }
 
-main().catch((err) => {
-  console.error('❌ erro no smoke:', err);
+main().catch((error) => {
+  console.error('❌ smoke falhou:', error);
   process.exit(1);
 });

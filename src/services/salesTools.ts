@@ -232,9 +232,12 @@ export type QualifiedLeadPayload = {
   whatsappVolume?: string;
   currentSystem?: string;
   mainPain?: string;
+  interest?: 'sistema' | 'ia' | 'ambos';
   recommendedPlan?: string;
   score?: number;
   status?: string;
+  /** Origem determinística da 1ª mensagem; nunca vem do modelo. */
+  partnerSlug?: string;
 };
 
 // Status que encerram a régua de follow-up (convertido / perdido / opt-out).
@@ -251,10 +254,16 @@ export async function registerQualifiedLead(
   payload: QualifiedLeadPayload
 ): Promise<{ success: boolean; message?: string }> {
   const status = payload.status ?? 'qualificado';
+  const { interest, ...payloadWithoutInterest } = payload;
   try {
     await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
-      { ...payload, status, customerPhone: phone },
+      {
+        ...payloadWithoutInterest,
+        ...(interest !== undefined ? { interest } : {}),
+        status,
+        customerPhone: phone,
+      },
       {
         headers: {
           Authorization: `Bearer ${ERP_API_TOKEN}`,

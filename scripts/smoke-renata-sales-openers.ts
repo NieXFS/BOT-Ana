@@ -63,6 +63,22 @@ async function main(): Promise<void> {
       pickOpenerScript('5511000000002') as (typeof OPENER_SCRIPTS)[number]
     )
   );
+  check(
+    'script 1 termina na pergunta das 3 trilhas',
+    OPENER_SCRIPTS[0].endsWith(
+      'organizar a clínica toda, com agenda, financeiro e comissão, ter a Ana respondendo seu WhatsApp, ou as duas coisas?'
+    )
+  );
+  check(
+    'script 2 termina na pergunta das 3 trilhas',
+    OPENER_SCRIPTS[1].endsWith(
+      'organizar a clínica toda, com agenda, financeiro e comissão, ter a Ana respondendo seu WhatsApp no seu lugar, ou as duas coisas juntas?'
+    )
+  );
+  check(
+    'scripts preservam pausas de prosódia',
+    OPENER_SCRIPTS.every((script) => script.includes('\n\n'))
+  );
 
   const history: Message[] = [];
   const events: string[] = [];

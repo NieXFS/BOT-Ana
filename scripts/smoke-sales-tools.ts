@@ -256,9 +256,11 @@ async function main() {
   );
 
   console.log('▶ registerQualifiedLead (contrato HTTP)');
+  captured.length = 0;
   const reg = await registerQualifiedLead(phone, 'PNID', {
     name: 'Maria',
     professionalsCount: 2,
+    interest: 'ia',
     status: 'qualificado',
   });
   check('register: success', reg.success === true);
@@ -266,6 +268,19 @@ async function main() {
   check('register: POST /sales-lead com status qualificado', !!regReq);
   check('register: customerPhone injetado', regReq?.body.customerPhone === phone);
   check('register: name repassado', regReq?.body.name === 'Maria');
+  check('register: interest viaja quando presente', regReq?.body.interest === 'ia');
+  await registerQualifiedLead(phone, 'PNID', {
+    name: 'Sem trilha',
+    status: 'qualificado',
+  });
+  const regWithoutInterest = captured.find(
+    (c) => c.path === '/sales-lead' && c.body.name === 'Sem trilha'
+  );
+  check(
+    'register: interest some quando ausente',
+    regWithoutInterest !== undefined &&
+      !('interest' in regWithoutInterest.body)
+  );
 
   console.log('▶ handoffToHuman (contrato HTTP)');
   captured.length = 0;

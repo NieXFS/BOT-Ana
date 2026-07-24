@@ -82,6 +82,22 @@ export function buildAudioMessagePayload(to: string, mediaId: string) {
   } as const;
 }
 
+export function buildVideoMessagePayload(
+  to: string,
+  mediaId: string,
+  caption?: string
+) {
+  return {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'video',
+    video: {
+      id: mediaId,
+      ...(caption ? { caption } : {}),
+    },
+  } as const;
+}
+
 /**
  * Faz upload de OGG/Opus usando FormData/Blob globais do Node 20. O axios
  * reconhece FormData WHATWG e injeta o boundary correto; por isso não setamos
@@ -118,6 +134,38 @@ export async function uploadMedia(
   return mediaId;
 }
 
+/** Upload do MP4 commitado da demonstração; 10 MB pedem timeout maior. */
+export async function uploadVideoMedia(
+  videoBuffer: Buffer,
+  waConfig: WhatsAppTenantConfig,
+  post: WhatsAppHttpPost = defaultHttpPost
+): Promise<string> {
+  const form = new FormData();
+  form.append('messaging_product', 'whatsapp');
+  form.append(
+    'file',
+    new Blob([new Uint8Array(videoBuffer)], { type: 'video/mp4' }),
+    'receps-demo.mp4'
+  );
+
+  const response = await post(
+    `https://graph.facebook.com/${waConfig.waApiVersion}/${waConfig.phoneNumberId}/media`,
+    form,
+    {
+      headers: {
+        Authorization: `Bearer ${waConfig.waAccessToken}`,
+      },
+      timeout: 60_000,
+    }
+  );
+
+  const mediaId = (response.data as { id?: unknown } | undefined)?.id;
+  if (typeof mediaId !== 'string' || !mediaId) {
+    throw new Error('WhatsApp video upload returned no id');
+  }
+  return mediaId;
+}
+
 /** Envia o media ID como PTT (`voice:true`), não como anexo de áudio comum. */
 export async function sendAudioMessage(
   to: string,
@@ -129,4 +177,22 @@ export async function sendAudioMessage(
     headers: headers(waConfig),
     timeout: 20_000,
   });
+}
+
+/** Envia um vídeo já hospedado pela Graph API. */
+export async function sendVideoMessage(
+  to: string,
+  mediaId: string,
+  waConfig: WhatsAppTenantConfig,
+  post: WhatsAppHttpPost = defaultHttpPost,
+  caption?: string
+): Promise<void> {
+  await post(
+    buildApiUrl(waConfig),
+    buildVideoMessagePayload(to, mediaId, caption),
+    {
+      headers: headers(waConfig),
+      timeout: 20_000,
+    }
+  );
 }

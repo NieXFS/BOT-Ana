@@ -84,6 +84,32 @@ export async function captureReferral(
   }
 }
 
+/**
+ * Carimba cedo a origem de parceira no SalesLead, sem `status` e sem evento.
+ * O Receps revalida regex + allowlist e aplica first-write-wins. Nunca lança.
+ */
+export async function capturePartnerAttribution(
+  phoneNumberId: string,
+  customerPhone: string,
+  partnerSlug: string
+): Promise<void> {
+  try {
+    await axios.post(
+      `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
+      { customerPhone, partnerSlug },
+      {
+        headers: {
+          Authorization: `Bearer ${ERP_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: REQUEST_TIMEOUT_MS,
+      }
+    );
+  } catch (error) {
+    capture(error, 'capture-partner-attribution', phoneNumberId);
+  }
+}
+
 /** Emite um marco do funil de vendas. Nunca lança. */
 export async function emitSalesEvent(
   phoneNumberId: string,

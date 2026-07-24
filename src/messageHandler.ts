@@ -15,6 +15,7 @@ import { conversationTracker } from './conversationTracker';
 import { Sentry } from './observability/sentry';
 import { isRenataVoiceEnabled } from './voice/voiceConfig';
 import { deliverSalesReply } from './voice/voiceDelivery';
+import { rememberConversationAdHeadline } from './services/salesAdState';
 
 interface MessageBuffer {
   texts: string[];
@@ -503,6 +504,14 @@ export async function handleIncomingMessage(
     void captureReferral(config.phoneNumberId, from, message.referral).catch(
       () => undefined
     );
+    // A Meta só anexa referral na primeira janela CTWA. O estado é volátil,
+    // first-write-wins e sales-only; a headline nunca entra em logs.
+    if (message.referral.headline) {
+      rememberConversationAdHeadline(
+        buildConversationKey(config.phoneNumberId, from),
+        message.referral.headline
+      );
+    }
   }
 
   // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada

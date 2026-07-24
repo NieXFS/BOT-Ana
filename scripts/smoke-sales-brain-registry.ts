@@ -100,15 +100,30 @@ const salesConfig: SalesConfig = {
 async function main() {
   const { resolveBrainRole } = await import('../src/services/brainService');
   const { typingSimEnabled } = await import('../src/messageHandler');
-  const { SALES_TOOLS, buildSalesSystem, buildStableSalesPrompt } = await import(
+  const {
+    SALES_TOOLS,
+    buildSalesSystem,
+    buildStableSalesPrompt,
+  } = await import(
     '../src/services/salesBrain'
   );
+  const {
+    rememberConversationAdHeadline,
+    getConversationAdHeadline,
+    clearConversationAdHeadlines,
+  } = await import('../src/services/salesAdState');
   const { renderPlansBlock } = await import('../src/salesConfigProvider');
 
   console.log('▶ brain registry (botRole)');
   check('sales → sales', resolveBrainRole(makeConfig('sales')) === 'sales');
   check('receptionist → receptionist', resolveBrainRole(makeConfig('receptionist')) === 'receptionist');
   check('botRole vazio → receptionist (fallback)', resolveBrainRole(makeConfig('')) === 'receptionist');
+  check(
+    'recepcionista permanece no caminho byte-idêntico para qualquer role não-sales',
+    ['receptionist', '', 'legacy'].every(
+      (role) => resolveBrainRole(makeConfig(role)) === 'receptionist'
+    )
+  );
 
   console.log('▶ typingDelay OFF em sales');
   check('sales → typing OFF', typingSimEnabled(makeConfig('sales')) === false);
@@ -118,9 +133,9 @@ async function main() {
   const lastTool = SALES_TOOLS[SALES_TOOLS.length - 1];
   check('última tool tem cache_control', (lastTool as { cache_control?: unknown }).cache_control != null);
   check(
-    'toolset = 6 tools esperadas (v1.1: + sendPrefilledSignup)',
+    'toolset inclui sendDemoVideo antes do handoff',
     SALES_TOOLS.map((t) => t.name).join(',') ===
-      'getAvailableSlots,scheduleDemo,sendSignupLink,sendPrefilledSignup,registerQualifiedLead,handoffToHuman'
+      'getAvailableSlots,scheduleDemo,sendSignupLink,sendPrefilledSignup,registerQualifiedLead,sendDemoVideo,handoffToHuman'
   );
   // O cache_control mora na ÚLTIMA tool (cacheia todas as definições). Tool nova
   // entra ANTES do handoffToHuman de propósito — se alguém a pendurar no fim sem
@@ -173,10 +188,70 @@ async function main() {
     'sendSignupLink continua no toolset (fallback de quem não dá e-mail)',
     SALES_TOOLS.some((t) => t.name === 'sendSignupLink')
   );
+  check(
+    'sendDemoVideo não exige parâmetros',
+    (() => {
+      const tool = SALES_TOOLS.find((item) => item.name === 'sendDemoVideo');
+      const required =
+        (tool?.input_schema as { required?: string[] })?.required ?? [];
+      return required.length === 0;
+    })()
+  );
+  check(
+    'registerQualifiedLead expõe interest com enum das 3 trilhas',
+    (() => {
+      const tool = SALES_TOOLS.find(
+        (item) => item.name === 'registerQualifiedLead'
+      );
+      const interest = (
+        tool?.input_schema as {
+          properties?: Record<string, { enum?: string[] }>;
+        }
+      )?.properties?.interest;
+      return interest?.enum?.join(',') === 'sistema,ia,ambos';
+    })()
+  );
+  check(
+    'handoff não usa sinal de compra como gatilho',
+    (() => {
+      const description =
+        SALES_TOOLS.find((item) => item.name === 'handoffToHuman')
+          ?.description ?? '';
+      return /sinal de compra NÃO é handoff/i.test(description);
+    })()
+  );
   const system = buildSalesSystem(makeConfig('sales', 'M {{PLANOS}} F'), renderPlansBlock(salesConfig));
   check('system[0] (estável) tem cache_control', (system[0] as { cache_control?: unknown }).cache_control != null);
   check('system[1] (volátil) SEM cache_control', (system[1] as { cache_control?: unknown }).cache_control == null);
   check('system[1] é o contexto temporal', system[1].text.includes('CONTEXTO TEMPORAL'));
+  const headline = 'A Ana responde suas clientes no WhatsApp';
+  const withHeadline = buildSalesSystem(
+    makeConfig('sales', 'M {{PLANOS}} F'),
+    renderPlansBlock(salesConfig),
+    { adHeadline: headline }
+  );
+  check(
+    'headline entra somente no bloco volátil',
+    !withHeadline[0].text.includes(headline) &&
+      withHeadline[1].text.includes(headline) &&
+      withHeadline[1].text.includes('CONFIRMAR a trilha provável')
+  );
+  check(
+    'sem headline o bloco específico fica ausente',
+    !system[1].text.includes('HEADLINE DO ANÚNCIO')
+  );
+  rememberConversationAdHeadline('PN:lead', `${headline}${'x'.repeat(250)}`);
+  rememberConversationAdHeadline('PN:lead', 'segunda headline');
+  check(
+    'estado de headline é first-write-wins e truncado em 200 chars',
+    getConversationAdHeadline('PN:lead')?.startsWith(headline) === true &&
+      getConversationAdHeadline('PN:lead')?.length === 200
+  );
+  clearConversationAdHeadlines(['PN:lead']);
+  check(
+    'reset administrativo limpa headline volátil',
+    getConversationAdHeadline('PN:lead') === null
+  );
 
   console.log('▶ injeção do {{PLANOS}}');
   const plansBlock = renderPlansBlock(salesConfig);

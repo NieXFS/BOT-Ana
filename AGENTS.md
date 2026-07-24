@@ -2,13 +2,17 @@
 
 Bot de atendimento via WhatsApp Cloud API que conversa com o cliente (OpenAI, function calling) e agenda no ERP **Receps** via HTTP (`/api/v1/agenda/*`). Prod: VPS `root@46.62.134.25` em `~/Ana`, processo pm2 **ana-bot** (porta **3001**). O Receps roda na MESMA VPS em `localhost:3000`. Auth Ana→Receps: `Authorization: Bearer <ERP_API_TOKEN>` (= `AI_BOT_API_KEY` do Receps; ver `src/erpApiToken.ts`).
 
-## Deploy (SEM git)
-Sincroniza por rsync e builda na VPS:
+## Deploy (POR GIT — a seção "rsync" antiga está morta)
+O repo é `NieXFS/BOT-Ana`, checkout de `origin/main` em `/root/Ana`. **⚠️ NUNCA editar `/root/Ana` direto na VPS** — em 2026-07-15 um hot-patch de 438 linhas travou o `git pull`.
 ```
-rsync -avz --exclude node_modules --exclude dist --exclude .env --exclude .git ~/dev/Ana/ root@46.62.134.25:~/Ana/
-ssh root@46.62.134.25 "cd ~/Ana && npm install --no-audit --no-fund && npm run build && pm2 restart ana-bot"
+ssh root@46.62.134.25 "cd ~/Ana && git pull && npm install --no-audit --no-fund && npm run build && pm2 restart ana-bot --update-env"
 ```
-`npm run build` é só `tsc` (saída em `dist/`, `start` roda `dist/webhookServer.js`).
+- `npm install` só é dispensável se o `package.json` NÃO mudou (armadilha do `xlsx`/`@anthropic-ai/sdk`).
+- `npm run build` é só `tsc` (saída em `dist/`, `start` roda `dist/webhookServer.js`). **Confira o exit REAL e o `dist/` emitido** antes do restart.
+- **O `pm2 restart` não é opcional**: em 2026-07-20 um deploy fez pull+build sem restart e o processo rodou 1,5 dia com código velho enquanto o prompt (banco, hot-reload) já prometia features novas — a "assimetria fatal". Confira que o processo subiu DEPOIS do build.
+
+## Assets binários
+`assets/renata-demo.mp4` (10,7MB) é o vídeo da escada de demonstração da Renata, **commitado de propósito**: o `video/` do repo Receps é gitignored, então o `git pull` é o único caminho que leva o arquivo pra VPS. O `boot()` não lê o asset; ele só é carregado no 1º `sendDemoVideo` (e aí fica ~11MB memoizado no processo). Env opcional `RENATA_DEMO_VIDEO_PATH` sobrepõe o caminho.
 
 ## Smokes (determinísticos, sem rede/OpenAI/DB)
 Rodados com `npx tsx`. Padrão pós-ESM: setar `process.env.DATABASE_URL`/`OPENAI_API_KEY` dummy ANTES de carregar o módulo (o `contextManager` LANÇA no load sem `DATABASE_URL`; o `Pool` do pg é lazy, não conecta), usar `import type` pros tipos e `await import()` dinâmico pro módulo real. Lista em `package.json` (`smoke:*`).

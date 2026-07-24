@@ -5,7 +5,7 @@ import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
 import { callAnthropicWithRetry } from '../utils/anthropicRetry';
 import { isCaptured } from '../observability/captured';
 import { addMessage, buildConversationKey, getHistory } from './contextManager';
-import { getServices, getAvailableSlots, bookAppointment } from './calendarService';
+import { getAvailableSlots, bookAppointment } from './calendarService';
 import {
   getSalesConfig,
   renderPlansBlock,
@@ -19,13 +19,28 @@ import {
   handoffToHuman,
   type QualifiedLeadPayload,
 } from './salesTools';
-import { markFollowupPostLink, scheduleFollowup } from './salesFollowups';
-import { emitSalesEvent } from './salesEvents';
+import {
+  markFollowupDemoStage,
+  markFollowupPostLink,
+  scheduleFollowup,
+} from './salesFollowups';
+import {
+  capturePartnerAttribution,
+  emitSalesEvent,
+} from './salesEvents';
 import { detectChannelRequest, setChannelPref } from '../voice/channelPref';
 import {
   matchAdOpening,
+  matchPartnerMention,
   pickOpenerScript,
 } from './salesOpeners';
+import {
+  getConversationPartnerSlug,
+  rememberConversationPartnerSlug,
+} from './salesPartnerState';
+import { resolveDemoServiceId } from './demoScheduling';
+import { sendDemoVideo } from '../media/demoVideo';
+import { getConversationAdHeadline } from './salesAdState';
 
 /**
  * Brain de VENDAS da Renata (Workstream B). Provider Anthropic (claude-sonnet-5),
@@ -84,8 +99,17 @@ export function buildStableSalesPrompt(
 ${manual}`;
 }
 
-/** Bloco VOLÁTIL (contexto temporal) — fica FORA do cache (muda a cada chamada). */
-export function buildVolatileSalesPrompt(config: TenantBotConfig): string {
+export interface VolatileSalesContext {
+  partnerSlug?: string | null;
+  isFirstResponse?: boolean;
+  adHeadline?: string | null;
+}
+
+/** Bloco VOLÁTIL (tempo + origem do lead) — fica FORA do prompt cacheado. */
+export function buildVolatileSalesPrompt(
+  config: TenantBotConfig,
+  context: VolatileSalesContext = {}
+): string {
   const now = new Date();
   const today = now.toLocaleDateString('pt-BR', {
     timeZone: config.timezone,
@@ -102,14 +126,33 @@ export function buildVolatileSalesPrompt(config: TenantBotConfig): string {
   const currentYear = Number(
     new Intl.DateTimeFormat('en-US', { timeZone: config.timezone, year: 'numeric' }).format(now)
   );
-  return `CONTEXTO TEMPORAL (para agendar demonstrações): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Datas relativas (amanhã, semana que vem) são a partir de HOJE. Se citarem só dia/mês, assuma ${currentYear}.`;
+  const temporal = `CONTEXTO TEMPORAL (para agendar demonstrações): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Datas relativas (amanhã, semana que vem) são a partir de HOJE. Se citarem só dia/mês, assuma ${currentYear}.`;
+
+  const volatileBlocks = [temporal];
+
+  if (context.partnerSlug) {
+    const partnerInstruction = context.isFirstResponse
+      ? `Esta é a PRIMEIRA resposta. Comece reconhecendo somente a indicação (por exemplo: "Que bom que a @${context.partnerSlug} te indicou!"), sem afirmar que a parceira usa, testou ou aprovou o produto e sem inventar intimidade. Em seguida, continue o fluxo normal de qualificação.`
+      : 'A indicação já faz parte do contexto; não repita a saudação de origem em toda resposta.';
+
+    volatileBlocks.push(`ORIGEM DE PARCEIRA (detectada deterministicamente na primeira mensagem): @${context.partnerSlug}.
+${partnerInstruction}
+Não invente benefício, prazo de trial, lucro ou resultado a partir desta origem. Este contexto NÃO substitui nem altera a regra e a ordem da disclosure B2a do manual.`);
+  }
+
+  if (context.adHeadline) {
+    volatileBlocks.push(`HEADLINE DO ANÚNCIO (contexto volátil, não é uma afirmação do lead): ${context.adHeadline.slice(0, 200)}
+Use somente como pista para CONFIRMAR a trilha provável (sistema, IA ou ambos), em vez de perguntar no escuro. Não afirme que a pessoa quer algo que ela não disse. Não invente oferta, prazo, trial, funcionalidade ou resultado a partir da headline. Este contexto NÃO altera a regra nem a ordem da disclosure B2a do manual.`);
+  }
+
+  return volatileBlocks.join('\n\n');
 }
 
 export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'getAvailableSlots',
     description:
-      'Consulta os horários livres para a DEMONSTRAÇÃO com o Victor numa data. Use antes de oferecer horários — nunca invente. Ofereça só os horários retornados.',
+      'Consulta horários livres para uma demonstração ao vivo com o Victor. Esta é a ÚLTIMA etapa da escada: use SOMENTE quando a clínica tem 3+ profissionais, o interesse é no plano Pro, ou a pessoa pediu explicitamente falar com humano. Consulte antes de oferecer e apresente DOIS horários concretos; nunca pergunte data em aberto nem invente horário.',
     input_schema: {
       type: 'object',
       properties: {
@@ -125,7 +168,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'scheduleDemo',
     description:
-      'Agenda a demonstração de 30min com o Victor no horário escolhido. Só chame APÓS o lead confirmar data e horário. O telefone e o nome são preenchidos automaticamente.',
+      'Agenda a demonstração ao vivo de 30min com o Victor. Use SOMENTE quando a clínica tem 3+ profissionais, o interesse é no plano Pro, ou a pessoa pediu explicitamente falar com humano, e só APÓS ela escolher um dos horários reais oferecidos por getAvailableSlots. Nunca peça data em aberto. Telefone e nome são preenchidos automaticamente.',
     input_schema: {
       type: 'object',
       properties: {
@@ -214,6 +257,12 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
           description: 'Como organiza hoje (papel, planilha, outro sistema — qual).',
         },
         mainPain: { type: 'string', description: 'A dor principal que fez o lead clicar.' },
+        interest: {
+          type: 'string',
+          enum: ['sistema', 'ia', 'ambos'],
+          description:
+            'Trilha escolhida pela lead na abertura: sistema, atendente IA ou ambos.',
+        },
         recommendedPlan: {
           type: 'string',
           description: 'Slug do plano recomendado ("essencial" ou "pro").',
@@ -229,9 +278,19 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'sendDemoVideo',
+    description:
+      'Envia o vídeo curto de demonstração quando a lead prefere SÓ ASSISTIR, em vez de fazer a simulação in-chat da escada de demonstração. Depois do envio, pergunte o que ela achou.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+  {
     name: 'handoffToHuman',
     description:
-      'Transfere a conversa pro Victor (humano). Use em: pedido de falar com pessoa, negociação de preço/desconto, migração técnica de dados, reclamação, imprensa/parceria, ou sinal claro de fechamento ("posso assinar agora?"). Avise o lead que o Victor responde por aqui já já.',
+      'Transfere a conversa pro Victor (humano). Use em: pedido explícito de falar com pessoa, negociação de preço/desconto/condição, migração técnica de dados, reclamação ou imprensa/parceria/revenda. Sinal de compra NÃO é handoff: mande o link na hora. Avise o lead que o Victor responde por aqui já já.',
     input_schema: {
       type: 'object',
       properties: {
@@ -244,27 +303,19 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   },
 ];
 
-/** Resolve o serviceId da DEMONSTRAÇÃO no tenant receps-vendas (1 serviço). */
-async function resolveDemoServiceId(config: TenantBotConfig): Promise<string | null> {
-  const result = await getServices(config);
-  if (!result.success || !result.services || result.services.length === 0) {
-    return null;
-  }
-  const demo = result.services.find((s) => /demonstra/i.test(s.name));
-  return (demo ?? result.services[0]).id;
-}
-
 async function executeSalesFunction(
   name: string,
   input: Record<string, unknown>,
   phone: string,
   userName: string,
   config: TenantBotConfig,
-  salesConfig: SalesConfig | null
+  salesConfig: SalesConfig | null,
+  partnerSlug: string | null
 ): Promise<string> {
   try {
     switch (name) {
       case 'getAvailableSlots': {
+        await markFollowupDemoStage(config.phoneNumberId, phone);
         const serviceId = await resolveDemoServiceId(config);
         if (!serviceId) {
           return JSON.stringify({
@@ -276,6 +327,7 @@ async function executeSalesFunction(
         return JSON.stringify(result);
       }
       case 'scheduleDemo': {
+        await markFollowupDemoStage(config.phoneNumberId, phone);
         const serviceId = await resolveDemoServiceId(config);
         if (!serviceId) {
           return JSON.stringify({
@@ -362,19 +414,43 @@ async function executeSalesFunction(
             typeof input.whatsappVolume === 'string' ? input.whatsappVolume : undefined,
           currentSystem: typeof input.currentSystem === 'string' ? input.currentSystem : undefined,
           mainPain: typeof input.mainPain === 'string' ? input.mainPain : undefined,
+          interest:
+            input.interest === 'sistema' ||
+            input.interest === 'ia' ||
+            input.interest === 'ambos'
+              ? input.interest
+              : undefined,
           recommendedPlan:
             typeof input.recommendedPlan === 'string' ? input.recommendedPlan : undefined,
           score: typeof input.score === 'number' ? input.score : undefined,
           status: typeof input.status === 'string' ? input.status : 'qualificado',
+          partnerSlug: partnerSlug ?? undefined,
         };
         const result = await registerQualifiedLead(phone, config.phoneNumberId, payload);
         return JSON.stringify(result);
+      }
+      case 'sendDemoVideo': {
+        const result = await sendDemoVideo(phone, config);
+        return JSON.stringify(
+          result.success
+            ? {
+                success: true,
+                message:
+                  'O vídeo já foi enviado. Agora pergunte o que ela achou, sem descrever o vídeo em detalhe.',
+              }
+            : {
+                success: false,
+                message:
+                  'Não consegui enviar o vídeo. Ofereça a simulação in-chat da Ana e siga a conversa sem prometer que o vídeo será enviado.',
+              }
+        );
       }
       case 'handoffToHuman': {
         const result = await handoffToHuman(
           phone,
           config.phoneNumberId,
-          typeof input.reason === 'string' ? input.reason : 'pedido do lead'
+          typeof input.reason === 'string' ? input.reason : 'pedido do lead',
+          { partnerSlug: partnerSlug ?? undefined }
         );
         return JSON.stringify(result);
       }
@@ -397,7 +473,8 @@ async function executeSalesFunction(
  */
 export function buildSalesSystem(
   config: TenantBotConfig,
-  plansBlock: string
+  plansBlock: string,
+  context: VolatileSalesContext = {}
 ): Anthropic.TextBlockParam[] {
   return [
     {
@@ -405,7 +482,7 @@ export function buildSalesSystem(
       text: buildStableSalesPrompt(config, plansBlock),
       cache_control: { type: 'ephemeral' },
     },
-    { type: 'text', text: buildVolatileSalesPrompt(config) },
+    { type: 'text', text: buildVolatileSalesPrompt(config, context) },
   ];
 }
 
@@ -446,6 +523,28 @@ export async function getSalesReply(
   const conversationKey = buildConversationKey(config.phoneNumberId, phone);
 
   await deps.addMessage(conversationKey, 'user', userMessage);
+  const history = await deps.getHistory(conversationKey);
+  const userMessages = history.filter((message) => message.role === 'user');
+  const isFirstResponse = !history.some((message) => message.role === 'assistant');
+  const isFirstInboundWindow = userMessages.length === 1 && isFirstResponse;
+
+  // Mesma janela determinística do matchAdOpening: só a primeira mensagem
+  // consolidada da conversa pode criar a atribuição. O carimbo inicial não leva
+  // `status` nem evento; falha de rede jamais interrompe a resposta.
+  if (isFirstInboundWindow) {
+    const detectedPartnerSlug = matchPartnerMention(userMessage);
+    if (detectedPartnerSlug) {
+      rememberConversationPartnerSlug(conversationKey, detectedPartnerSlug);
+      void capturePartnerAttribution(
+        config.phoneNumberId,
+        phone,
+        detectedPartnerSlug
+      ).catch(() => undefined);
+    }
+  }
+  const partnerSlug = getConversationPartnerSlug(conversationKey);
+  const adHeadline = getConversationAdHeadline(conversationKey);
+
   // Régua de follow-up ZERA a cada inbound (best-effort, não bloqueia a resposta).
   await deps
     .scheduleFollowup(config.phoneNumberId, phone, userName)
@@ -459,15 +558,11 @@ export async function getSalesReply(
       .catch(() => undefined);
   }
 
-  const history = await deps.getHistory(conversationKey);
-  const isFirstResponse = !history.some((message) => message.role === 'assistant');
-
   // Aberturas reais dos anúncios: 1º inbound casado recebe script canônico sem
   // Anthropic. O texto original segue no histórico e no mesmo evento do caminho
   // normal; o messageHandler decide voz/texto depois.
   if (
-    history.filter((message) => message.role === 'user').length === 1 &&
-    isFirstResponse &&
+    isFirstInboundWindow &&
     matchAdOpening(userMessage)
   ) {
     const script = pickOpenerScript(phone);
@@ -493,7 +588,11 @@ export async function getSalesReply(
     content: m.content,
   }));
 
-  const system = buildSalesSystem(config, plansBlock);
+  const system = buildSalesSystem(config, plansBlock, {
+    partnerSlug,
+    isFirstResponse,
+    adHeadline,
+  });
 
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -542,7 +641,8 @@ export async function getSalesReply(
           phone,
           userName,
           config,
-          salesConfig
+          salesConfig,
+          partnerSlug
         );
         toolResults.push({
           type: 'tool_result',
