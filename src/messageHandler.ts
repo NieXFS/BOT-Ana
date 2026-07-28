@@ -80,6 +80,12 @@ export interface FlushDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
+  isPaused?: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
+  recordPausedInbound?: (
+    conversationKey: string,
+    text: string,
+    config: TenantBotConfig
+  ) => Promise<void>;
 }
 
 /**
@@ -139,6 +145,8 @@ const defaultFlushDeps: FlushDeps = {
     }
     await sendFreeformMessage(from, text, config);
   },
+  isPaused: isConversationPaused,
+  recordPausedInbound: recordInboundWhilePaused,
 };
 
 export function redactPhone(phone: string): string {
@@ -238,6 +246,39 @@ function buildOutsideHoursMessage(config: TenantBotConfig): string {
   return `Nosso atendimento funciona das ${config.botActiveStart} às ${config.botActiveEnd}. Envie sua mensagem e responderemos assim que possível!`;
 }
 
+async function suppressFlushIfPaused(params: {
+  bufferKey: string;
+  buffer: MessageBuffer;
+  alreadyProcessedTexts: string[];
+  deps: FlushDeps;
+}): Promise<boolean> {
+  const { bufferKey, buffer, alreadyProcessedTexts, deps } = params;
+  const isPaused = deps.isPaused ?? isConversationPaused;
+  if (!(await isPaused(buffer.config.phoneNumberId, buffer.from))) {
+    return false;
+  }
+
+  // Textos ainda não entregues ao brain precisam entrar no histórico pra Renata
+  // retomar com o contexto correto depois da pausa. Os já processados pelo brain
+  // não são gravados de novo.
+  const recordPausedInbound = deps.recordPausedInbound ?? recordInboundWhilePaused;
+  const unprocessedTexts = [...alreadyProcessedTexts, ...buffer.pendingTexts];
+  buffer.pendingTexts = [];
+  for (const text of unprocessedTexts) {
+    if (text.trim()) {
+      await recordPausedInbound(
+        buildConversationKey(buffer.config.phoneNumberId, buffer.from),
+        text,
+        buffer.config
+      );
+    }
+  }
+
+  messageBuffers.delete(bufferKey);
+  console.log('⏸️ [pausado] resposta pendente suprimida após intervenção humana.');
+  return true;
+}
+
 export async function flushBuffer(
   bufferKey: string,
   deps: FlushDeps = defaultFlushDeps
@@ -251,10 +292,24 @@ export async function flushBuffer(
   buffer.maxWaitTimer = null;
 
   buffer.isProcessing = true;
-  const consolidatedText = buffer.texts.join(' ');
+  const bufferedTexts = [...buffer.texts];
+  const consolidatedText = bufferedTexts.join(' ');
   const messageCount = buffer.texts.length;
   buffer.texts = [];
   const { name, config, from } = buffer;
+
+  // A conversa pode ter sido pausada DEPOIS que o inbound entrou no debounce.
+  // Revalidar aqui impede gerar resposta para um buffer aberto antes do echo.
+  if (
+    await suppressFlushIfPaused({
+      bufferKey,
+      buffer,
+      alreadyProcessedTexts: bufferedTexts,
+      deps,
+    })
+  ) {
+    return;
+  }
 
   if (config.botRole === 'sales') {
     console.log(
@@ -267,6 +322,19 @@ export async function flushBuffer(
   let flushFailed = false;
   try {
     const reply = await deps.getReply(from, consolidatedText, name, config);
+
+    // Segunda barreira: se o humano assumiu enquanto o LLM estava em voo, a
+    // resposta gerada é descartada e nunca chega ao WhatsApp.
+    if (
+      await suppressFlushIfPaused({
+        bufferKey,
+        buffer,
+        alreadyProcessedTexts: [],
+        deps,
+      })
+    ) {
+      return;
+    }
 
     await deps.sendReply(from, reply, config);
     if (config.botRole === 'sales') {
@@ -297,6 +365,16 @@ export async function flushBuffer(
       );
     } else {
       console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+    }
+    if (
+      await suppressFlushIfPaused({
+        bufferKey,
+        buffer,
+        alreadyProcessedTexts: [],
+        deps,
+      })
+    ) {
+      return;
     }
     // M24: antes o cliente ficava em silêncio total quando o flush falhava.
     // Avisa que houve um problema e pede pra repetir (uma vez por janela).

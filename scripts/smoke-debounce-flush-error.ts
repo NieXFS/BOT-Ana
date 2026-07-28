@@ -6,6 +6,8 @@
  *   - re-flush imediato na mesma conversa é noop (janela de recovery);
  *   - conversa DIFERENTE não é suprimida (janela é por conversa);
  *   - sucesso continua respondendo normalmente.
+ *   - pausa antes do flush impede até chamar o brain;
+ *   - pausa enquanto o brain está em voo impede a entrega da resposta.
  *
  * Sem WhatsApp/OpenAI reais — deps injetadas. A captura no Sentry roda na MESMA
  * cláusula catch, imediatamente antes do fallback: se o fallback foi enviado, o
@@ -29,9 +31,11 @@ const FALLBACK = 'Tive um probleminha aqui. Pode repetir sua última mensagem?';
 const config: TenantBotConfig = {
   tenantSlug: 'smoke-tenant',
   botName: 'Ana',
+  botRole: 'receptionist',
   systemPrompt: '',
   greetingMessage: null,
   fallbackMessage: null,
+  aiProvider: 'openai',
   aiModel: 'gpt-4o-mini',
   aiTemperature: 0.4,
   aiMaxTokens: 500,
@@ -68,6 +72,8 @@ async function main() {
     sendReply: async (from, text) => {
       sent.push({ from, text });
     },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
   };
 
   const from = '5511999990000';
@@ -105,12 +111,88 @@ async function main() {
     sendReply: async (f, t) => {
       sent.push({ from: f, text: t });
     },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
   };
   const key4 = __seedFlushBufferForTest(config, from, ['oi']);
   await flushBuffer(key4, okDeps);
 
   expect('4) sucesso responde ao cliente', sent.length === 1 && Boolean(sent[0]?.text.includes('15h')));
   expect('4) buffer limpo após sucesso', !__hasBufferForTest(key4));
+
+  // --- Caso 5: echo antes do flush → brain nem roda --------------------------
+  __resetFlushStateForTest();
+  sent.length = 0;
+  let brainCalls = 0;
+  const pausedTexts: string[] = [];
+  const pausedBeforeDeps: FlushDeps = {
+    getReply: async () => {
+      brainCalls += 1;
+      return 'não deveria ser gerada';
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => true,
+    recordPausedInbound: async (_key, text) => {
+      pausedTexts.push(text);
+    },
+  };
+  const key5 = __seedFlushBufferForTest(config, from, ['pode manter', '15:30']);
+  await flushBuffer(key5, pausedBeforeDeps);
+
+  expect('5) pausa pré-flush não chama o brain', brainCalls === 0);
+  expect('5) pausa pré-flush não envia resposta', sent.length === 0);
+  expect('5) textos do buffer são preservados no histórico', pausedTexts.join('|') === 'pode manter|15:30');
+  expect('5) buffer pausado é limpo', !__hasBufferForTest(key5));
+
+  // --- Caso 6: echo chega com o brain em voo → resposta é descartada --------
+  __resetFlushStateForTest();
+  sent.length = 0;
+  let pauseChecks = 0;
+  const pausedDuringDeps: FlushDeps = {
+    getReply: async () => {
+      brainCalls += 1;
+      return 'resposta gerada antes do echo';
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => {
+      pauseChecks += 1;
+      return pauseChecks >= 2;
+    },
+    recordPausedInbound: async () => {},
+  };
+  const key6 = __seedFlushBufferForTest(config, from, ['pode manter 15:30']);
+  await flushBuffer(key6, pausedDuringDeps);
+
+  expect('6) brain chegou a gerar a resposta', brainCalls === 1);
+  expect('6) pausa pós-brain bloqueia a entrega', sent.length === 0);
+  expect('6) buffer é limpo após suprimir resposta', !__hasBufferForTest(key6));
+
+  // --- Caso 7: erro + pausa não manda nem fallback ---------------------------
+  __resetFlushStateForTest();
+  sent.length = 0;
+  pauseChecks = 0;
+  const failedWhilePausedDeps: FlushDeps = {
+    getReply: async () => {
+      throw new Error('provider caiu durante takeover');
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => {
+      pauseChecks += 1;
+      return pauseChecks >= 2;
+    },
+    recordPausedInbound: async () => {},
+  };
+  const key7 = __seedFlushBufferForTest(config, from, ['ok']);
+  await flushBuffer(key7, failedWhilePausedDeps);
+
+  expect('7) pausa após erro bloqueia fallback', sent.length === 0);
+  expect('7) buffer é limpo sem rearmar', !__hasBufferForTest(key7));
 
   const failed = checks.filter((c) => !c.ok);
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passaram.`);
