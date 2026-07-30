@@ -421,7 +421,7 @@ async function boot(): Promise<void> {
     });
 
   // Workstream B (Renata): régua de follow-up. Garante a tabela e liga o poller
-  // de 60s (só toca conversas de VENDA — o receptionist não escreve na tabela).
+  // de 30min por default (só VENDA — o receptionist não escreve na tabela).
   await ensureSalesFollowupsTable();
   startFollowupPoller();
 

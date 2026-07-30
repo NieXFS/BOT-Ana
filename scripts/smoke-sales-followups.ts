@@ -81,7 +81,219 @@ async function main(): Promise<void> {
     ensureSalesFollowupsTable,
     runFollowupTick,
     FOLLOWUP_OFFSETS_MS,
+    DEFAULT_FOLLOWUP_POLL_MS,
+    MIN_FOLLOWUP_POLL_MS,
+    MAX_FOLLOWUP_BACKOFF_MS,
+    resolveFollowupPollIntervalMs,
+    createFollowupPollerState,
+    runFollowupPollerCycle,
+    startFollowupPoller,
+    __stopFollowupPollerForTest,
   } = mod;
+
+  console.log('▶ configuração do poller');
+  const originalPollEnv = process.env.SALES_FOLLOWUP_POLL_MS;
+  const originalConsoleWarn = console.warn;
+  const pollWarnings: string[] = [];
+  console.warn = (...args: unknown[]) => {
+    pollWarnings.push(args.map(String).join(' '));
+  };
+  try {
+    delete process.env.SALES_FOLLOWUP_POLL_MS;
+    check(
+      'sem argumento e sem env usa 30min',
+      startFollowupPoller() === DEFAULT_FOLLOWUP_POLL_MS
+    );
+    __stopFollowupPollerForTest();
+
+    process.env.SALES_FOLLOWUP_POLL_MS = '3600000';
+    check(
+      'env válido sobrescreve o default',
+      startFollowupPoller() === 3_600_000
+    );
+    __stopFollowupPollerForTest();
+
+    process.env.SALES_FOLLOWUP_POLL_MS = '60000';
+    const warningCountBeforeClamp = pollWarnings.length;
+    check(
+      'env abaixo do piso é elevado a 10min e avisa',
+      startFollowupPoller() === MIN_FOLLOWUP_POLL_MS &&
+        pollWarnings.length === warningCountBeforeClamp + 1 &&
+        pollWarnings.at(-1)?.includes(String(MIN_FOLLOWUP_POLL_MS)) === true
+    );
+    __stopFollowupPollerForTest();
+
+    const breadcrumbReasons: string[] = [];
+    check(
+      'clamp também deixa breadcrumb warning no Sentry',
+      resolveFollowupPollIntervalMs(undefined, {
+        warn: () => undefined,
+        addBreadcrumb: (breadcrumb) => {
+          breadcrumbReasons.push(String(breadcrumb.data.reason));
+        },
+      }) === MIN_FOLLOWUP_POLL_MS &&
+        breadcrumbReasons.join(',') === 'below_minimum'
+    );
+
+    for (const invalid of ['abc', '0', '-1']) {
+      process.env.SALES_FOLLOWUP_POLL_MS = invalid;
+      const warningsBeforeInvalid = pollWarnings.length;
+      check(
+        `env inválido (${invalid}) cai no default e avisa`,
+        startFollowupPoller() === DEFAULT_FOLLOWUP_POLL_MS &&
+          pollWarnings.length === warningsBeforeInvalid + 1
+      );
+      __stopFollowupPollerForTest();
+    }
+
+    process.env.SALES_FOLLOWUP_POLL_MS = '60000';
+    const warningsBeforeExplicit = pollWarnings.length;
+    check(
+      'startFollowupPoller(50) honra o seam sem clamp',
+      startFollowupPoller(50) === 50 &&
+        pollWarnings.length === warningsBeforeExplicit
+    );
+    __stopFollowupPollerForTest();
+  } finally {
+    console.warn = originalConsoleWarn;
+    if (originalPollEnv === undefined) {
+      delete process.env.SALES_FOLLOWUP_POLL_MS;
+    } else {
+      process.env.SALES_FOLLOWUP_POLL_MS = originalPollEnv;
+    }
+    __stopFollowupPollerForTest();
+  }
+
+  console.log('▶ backoff, dedup e recuperação do poller');
+  const backoffState = createFollowupPollerState();
+  let backoffNow = 0;
+  let failingTickCalls = 0;
+  const backoffs: number[] = [];
+  const failingCycleDeps = {
+    state: backoffState,
+    intervalMs: 50,
+    now: () => backoffNow,
+    tick: async () => {
+      failingTickCalls += 1;
+      throw new Error('db unavailable');
+    },
+    captureException: () => undefined,
+    captureMessage: () => undefined,
+    logError: () => undefined,
+  };
+
+  const firstFailureAt = backoffNow;
+  check(
+    'primeira falha agenda backoff a partir do intervalo efetivo',
+    (await runFollowupPollerCycle(failingCycleDeps)) === 'failed'
+  );
+  backoffs.push(backoffState.skipUntilMs - firstFailureAt);
+  backoffNow = backoffState.skipUntilMs - 1;
+  check(
+    'gate retorna sem chamar tick dentro do backoff',
+    (await runFollowupPollerCycle(failingCycleDeps)) === 'skipped' &&
+      failingTickCalls === 1
+  );
+
+  for (let failure = 2; failure <= 25; failure += 1) {
+    backoffNow = backoffState.skipUntilMs;
+    const failureAt = backoffNow;
+    await runFollowupPollerCycle(failingCycleDeps);
+    backoffs.push(backoffState.skipUntilMs - failureAt);
+  }
+  check(
+    'backoff cresce exponencialmente e satura em 2h',
+    backoffs[0] === 50 &&
+      backoffs[1] === 100 &&
+      backoffs[2] === 200 &&
+      backoffs.at(-1) === MAX_FOLLOWUP_BACKOFF_MS &&
+      Math.max(...backoffs) === MAX_FOLLOWUP_BACKOFF_MS
+  );
+
+  const outageState = createFollowupPollerState();
+  let outageNow = 0;
+  let outageCaptures = 0;
+  let outageTickCalls = 0;
+  for (
+    let simulatedAt = 0;
+    simulatedAt < 24 * HOUR;
+    simulatedAt += DEFAULT_FOLLOWUP_POLL_MS
+  ) {
+    outageNow = simulatedAt;
+    await runFollowupPollerCycle({
+      state: outageState,
+      intervalMs: DEFAULT_FOLLOWUP_POLL_MS,
+      now: () => outageNow,
+      tick: async () => {
+        outageTickCalls += 1;
+        throw new Error('db unavailable');
+      },
+      captureException: () => {
+        outageCaptures += 1;
+      },
+      captureMessage: () => undefined,
+      logError: () => undefined,
+    });
+  }
+  check(
+    'queda simulada de 24h gera 13 capturas (≤15), com ciclos sem query',
+    outageCaptures === 13 &&
+      outageCaptures <= 15 &&
+      outageTickCalls < 48
+  );
+
+  const recoveryState = createFollowupPollerState();
+  let recoveryNow = NOW;
+  let recoveryShouldFail = true;
+  const recoveryMessages: Array<{
+    message: string;
+    level: string | undefined;
+    failures: number | undefined;
+    unavailableForMs: number | undefined;
+  }> = [];
+  const recoveryDeps = {
+    state: recoveryState,
+    intervalMs: DEFAULT_FOLLOWUP_POLL_MS,
+    now: () => recoveryNow,
+    tick: async () => {
+      if (recoveryShouldFail) throw new Error('db unavailable');
+    },
+    captureException: () => undefined,
+    captureMessage: (
+      message: string,
+      context: {
+        level?: 'info';
+        extra: Record<string, number>;
+      }
+    ) => {
+      recoveryMessages.push({
+        message,
+        level: context.level,
+        failures: context.extra.consecutiveFailures,
+        unavailableForMs: context.extra.unavailableForMs,
+      });
+    },
+    logError: () => undefined,
+  };
+  await runFollowupPollerCycle(recoveryDeps);
+  recoveryNow = recoveryState.skipUntilMs;
+  recoveryShouldFail = false;
+  check(
+    'sucesso após falha emite recuperação info e zera o estado',
+    (await runFollowupPollerCycle(recoveryDeps)) === 'succeeded' &&
+      recoveryMessages.length === 1 &&
+      recoveryMessages[0].level === 'info' &&
+      recoveryMessages[0].failures === 1 &&
+      recoveryMessages[0].unavailableForMs === DEFAULT_FOLLOWUP_POLL_MS &&
+      recoveryState.consecutiveFailures === 0 &&
+      recoveryState.skipUntilMs === 0
+  );
+  await runFollowupPollerCycle(recoveryDeps);
+  check(
+    'recuperação é sinalizada uma única vez',
+    recoveryMessages.length === 1 &&
+      recoveryMessages[0].message.includes('1 falha')
+  );
 
   console.log('▶ ruler + reset');
   const init = initialFollowupState(NOW);

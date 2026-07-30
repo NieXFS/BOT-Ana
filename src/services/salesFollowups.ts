@@ -21,12 +21,16 @@ import { resolveDemoServiceId } from './demoScheduling';
  *
  * Tabela `sales_followups` no Postgres da Ana (padrão processedMessages, raw pg).
  * A lógica da régua é PURA (funções abaixo) pra smoke determinístico; o poller é
- * a casca impura (60s, no boot do webhookServer).
+ * a casca impura (30min por default, no boot do webhookServer).
  */
 
 const HOUR_MS = 60 * 60 * 1000;
 const WINDOW_MS = 72 * HOUR_MS;
 const REQUEST_TIMEOUT_MS = 10_000;
+export const DEFAULT_FOLLOWUP_POLL_MS = 30 * 60 * 1000;
+export const MIN_FOLLOWUP_POLL_MS = 10 * 60 * 1000;
+export const MAX_FOLLOWUP_BACKOFF_MS = 2 * HOUR_MS;
+const SENTRY_FAILURE_CAPTURE_INTERVAL_MS = HOUR_MS;
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 /** Offsets do anchor (último inbound) até cada toque. Stage k dispara em anchor+OFFSETS[k]. */
@@ -707,19 +711,217 @@ export async function runFollowupTick(
 
 let pollerHandle: NodeJS.Timeout | null = null;
 
-/** Liga o poller de 60s (no boot). Idempotente. */
-export function startFollowupPoller(intervalMs = 60_000): void {
-  if (pollerHandle) return;
-  pollerHandle = setInterval(() => {
-    runFollowupTick().catch((err) => {
-      Sentry.captureException(err, {
+export interface FollowupPollIntervalObservability {
+  warn: (message: string) => void;
+  addBreadcrumb: (breadcrumb: {
+    category: string;
+    level: 'warning';
+    message: string;
+    data: Record<string, number | string>;
+  }) => void;
+}
+
+const defaultPollIntervalObservability: FollowupPollIntervalObservability = {
+  warn: (message) => console.warn(message),
+  addBreadcrumb: (breadcrumb) => Sentry.addBreadcrumb(breadcrumb),
+};
+
+function warnPollInterval(
+  message: string,
+  reason: 'invalid' | 'below_minimum',
+  effectiveIntervalMs: number,
+  observability: FollowupPollIntervalObservability
+): void {
+  observability.warn(message);
+  observability.addBreadcrumb({
+    category: 'sales-followups.poller-config',
+    level: 'warning',
+    message,
+    data: { reason, effectiveIntervalMs },
+  });
+}
+
+/**
+ * O Neon só suspende depois de 5min ocioso, e cada query reinicia esse relógio:
+ * 5min mantém o compute sempre acordado; 10min é o piso com margem e 30min deixa
+ * aproximadamente 4h/dia de cauda acordada. Não reduza por "precisão": a régua
+ * trabalha em offsets de horas (4h/24h/48h).
+ *
+ * Um argumento explícito é seam de teste e, por contrato, não sofre clamp.
+ */
+export function resolveFollowupPollIntervalMs(
+  intervalMs?: number,
+  observability: FollowupPollIntervalObservability = defaultPollIntervalObservability
+): number {
+  if (intervalMs !== undefined) return intervalMs;
+
+  const raw = process.env.SALES_FOLLOWUP_POLL_MS;
+  if (raw === undefined) return DEFAULT_FOLLOWUP_POLL_MS;
+
+  const configured = Number(raw);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    warnPollInterval(
+      `⚠️ SALES_FOLLOWUP_POLL_MS inválido; usando o default de ${DEFAULT_FOLLOWUP_POLL_MS}ms.`,
+      'invalid',
+      DEFAULT_FOLLOWUP_POLL_MS,
+      observability
+    );
+    return DEFAULT_FOLLOWUP_POLL_MS;
+  }
+
+  if (configured < MIN_FOLLOWUP_POLL_MS) {
+    warnPollInterval(
+      `⚠️ SALES_FOLLOWUP_POLL_MS=${configured}ms está abaixo do piso; elevado para ${MIN_FOLLOWUP_POLL_MS}ms.`,
+      'below_minimum',
+      MIN_FOLLOWUP_POLL_MS,
+      observability
+    );
+    return MIN_FOLLOWUP_POLL_MS;
+  }
+
+  return configured;
+}
+
+export interface FollowupPollerState {
+  consecutiveFailures: number;
+  skipUntilMs: number;
+  failureStartedAtMs: number | null;
+  lastExceptionCapturedAtMs: number | null;
+}
+
+export function createFollowupPollerState(): FollowupPollerState {
+  return {
+    consecutiveFailures: 0,
+    skipUntilMs: 0,
+    failureStartedAtMs: null,
+    lastExceptionCapturedAtMs: null,
+  };
+}
+
+interface PollerCaptureContext {
+  level?: 'info';
+  tags: {
+    service: 'sales-followups';
+    operation: 'poller' | 'poller-recovered';
+  };
+  extra: Record<string, number>;
+}
+
+export interface FollowupPollerCycleDeps {
+  state: FollowupPollerState;
+  intervalMs: number;
+  now: () => number;
+  tick: () => Promise<unknown>;
+  captureException: (error: unknown, context: PollerCaptureContext) => void;
+  captureMessage: (message: string, context: PollerCaptureContext) => void;
+  logError?: (message: string, error: unknown) => void;
+}
+
+export type FollowupPollerCycleResult = 'skipped' | 'failed' | 'succeeded';
+
+function resetFollowupPollerState(state: FollowupPollerState): void {
+  state.consecutiveFailures = 0;
+  state.skipUntilMs = 0;
+  state.failureStartedAtMs = null;
+  state.lastExceptionCapturedAtMs = null;
+}
+
+/**
+ * Um ciclo isolado e dirigível por relógio falso. O gate vem antes do tick:
+ * durante o backoff este caminho não toca no banco nem em qualquer outra I/O.
+ */
+export async function runFollowupPollerCycle(
+  deps: FollowupPollerCycleDeps
+): Promise<FollowupPollerCycleResult> {
+  const nowMs = deps.now();
+  const state = deps.state;
+
+  if (nowMs < state.skipUntilMs) return 'skipped';
+
+  try {
+    await deps.tick();
+  } catch (error) {
+    const failedAtMs = deps.now();
+    state.consecutiveFailures += 1;
+    state.failureStartedAtMs ??= failedAtMs;
+
+    const exponent = Math.min(state.consecutiveFailures - 1, 52);
+    const backoffMs = Math.min(
+      deps.intervalMs * 2 ** exponent,
+      MAX_FOLLOWUP_BACKOFF_MS
+    );
+    state.skipUntilMs = failedAtMs + backoffMs;
+
+    const shouldCapture =
+      state.consecutiveFailures === 1 ||
+      state.lastExceptionCapturedAtMs === null ||
+      failedAtMs - state.lastExceptionCapturedAtMs >=
+        SENTRY_FAILURE_CAPTURE_INTERVAL_MS;
+    if (shouldCapture) {
+      state.lastExceptionCapturedAtMs = failedAtMs;
+      deps.captureException(error, {
         tags: { service: 'sales-followups', operation: 'poller' },
+        extra: {
+          consecutiveFailures: state.consecutiveFailures,
+          backoffMs,
+        },
       });
-      console.error('❌ Erro no poller de follow-up:', err);
+    }
+
+    if (deps.logError) {
+      deps.logError('❌ Erro no poller de follow-up:', error);
+    } else {
+      console.error('❌ Erro no poller de follow-up:', error);
+    }
+    return 'failed';
+  }
+
+  if (state.consecutiveFailures > 0) {
+    const recoveredAtMs = deps.now();
+    const failures = state.consecutiveFailures;
+    const unavailableForMs = Math.max(
+      0,
+      recoveredAtMs - (state.failureStartedAtMs ?? recoveredAtMs)
+    );
+    resetFollowupPollerState(state);
+    deps.captureMessage(
+      `Poller de follow-up recuperado após ${failures} falha(s) consecutiva(s).`,
+      {
+        level: 'info',
+        tags: { service: 'sales-followups', operation: 'poller-recovered' },
+        extra: { consecutiveFailures: failures, unavailableForMs },
+      }
+    );
+  }
+
+  return 'succeeded';
+}
+
+let pollerState = createFollowupPollerState();
+let pollerIntervalMs: number | null = null;
+
+/** Liga o poller (30min por default). Idempotente; retorna o intervalo efetivo. */
+export function startFollowupPoller(intervalMs?: number): number {
+  if (pollerHandle) return pollerIntervalMs as number;
+
+  const effectiveIntervalMs = resolveFollowupPollIntervalMs(intervalMs);
+  pollerState = createFollowupPollerState();
+  pollerIntervalMs = effectiveIntervalMs;
+  pollerHandle = setInterval(() => {
+    void runFollowupPollerCycle({
+      state: pollerState,
+      intervalMs: effectiveIntervalMs,
+      now: () => Date.now(),
+      tick: () => runFollowupTick(),
+      captureException: (error, context) =>
+        Sentry.captureException(error, context),
+      captureMessage: (message, context) =>
+        Sentry.captureMessage(message, context),
     });
-  }, intervalMs);
+  }, effectiveIntervalMs);
   // Não segura o processo vivo só por causa do poller.
   if (typeof pollerHandle.unref === 'function') pollerHandle.unref();
+  return effectiveIntervalMs;
 }
 
 /** Seam de teste. */
@@ -728,4 +930,6 @@ export function __stopFollowupPollerForTest(): void {
     clearInterval(pollerHandle);
     pollerHandle = null;
   }
+  pollerIntervalMs = null;
+  resetFollowupPollerState(pollerState);
 }
