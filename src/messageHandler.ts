@@ -85,6 +85,12 @@ export interface FlushDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
+  isPaused?: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
+  recordPausedInbound?: (
+    conversationKey: string,
+    text: string,
+    config: TenantBotConfig
+  ) => Promise<void>;
 }
 
 /**
@@ -144,6 +150,8 @@ const defaultFlushDeps: FlushDeps = {
     }
     await sendFreeformMessage(from, text, config);
   },
+  isPaused: isConversationPaused,
+  recordPausedInbound: recordInboundWhilePaused,
 };
 
 export function redactPhone(phone: string): string {
@@ -243,6 +251,39 @@ function buildOutsideHoursMessage(config: TenantBotConfig): string {
   return `Nosso atendimento funciona das ${config.botActiveStart} às ${config.botActiveEnd}. Envie sua mensagem e responderemos assim que possível!`;
 }
 
+async function suppressFlushIfPaused(params: {
+  bufferKey: string;
+  buffer: MessageBuffer;
+  alreadyProcessedTexts: string[];
+  deps: FlushDeps;
+}): Promise<boolean> {
+  const { bufferKey, buffer, alreadyProcessedTexts, deps } = params;
+  const isPaused = deps.isPaused ?? isConversationPaused;
+  if (!(await isPaused(buffer.config.phoneNumberId, buffer.from))) {
+    return false;
+  }
+
+  // Textos ainda não entregues ao brain precisam entrar no histórico pra Renata
+  // retomar com o contexto correto depois da pausa. Os já processados pelo brain
+  // não são gravados de novo.
+  const recordPausedInbound = deps.recordPausedInbound ?? recordInboundWhilePaused;
+  const unprocessedTexts = [...alreadyProcessedTexts, ...buffer.pendingTexts];
+  buffer.pendingTexts = [];
+  for (const text of unprocessedTexts) {
+    if (text.trim()) {
+      await recordPausedInbound(
+        buildConversationKey(buffer.config.phoneNumberId, buffer.from),
+        text,
+        buffer.config
+      );
+    }
+  }
+
+  messageBuffers.delete(bufferKey);
+  console.log('⏸️ [pausado] resposta pendente suprimida após intervenção humana.');
+  return true;
+}
+
 export async function flushBuffer(
   bufferKey: string,
   deps: FlushDeps = defaultFlushDeps
@@ -256,10 +297,24 @@ export async function flushBuffer(
   buffer.maxWaitTimer = null;
 
   buffer.isProcessing = true;
-  const consolidatedText = buffer.texts.join(' ');
+  const bufferedTexts = [...buffer.texts];
+  const consolidatedText = bufferedTexts.join(' ');
   const messageCount = buffer.texts.length;
   buffer.texts = [];
   const { name, config, from } = buffer;
+
+  // A conversa pode ter sido pausada DEPOIS que o inbound entrou no debounce.
+  // Revalidar aqui impede gerar resposta para um buffer aberto antes do echo.
+  if (
+    await suppressFlushIfPaused({
+      bufferKey,
+      buffer,
+      alreadyProcessedTexts: bufferedTexts,
+      deps,
+    })
+  ) {
+    return;
+  }
 
   if (config.botRole === 'sales') {
     console.log(
@@ -288,6 +343,20 @@ export async function flushBuffer(
       console.error(
         `❌ Erro no brain de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
       );
+
+      // Pausa/takeover não é falha recuperável: a intervenção humana vence e
+      // suprime tanto a resposta quanto o evento/timer de recovery.
+      if (
+        await suppressFlushIfPaused({
+          bufferKey,
+          buffer,
+          alreadyProcessedTexts: [],
+          deps,
+        })
+      ) {
+        return;
+      }
+
       // Todo erro no caminho do brain sales agenda recovery. Edge residual:
       // se o próprio addMessage do inbound falhou, o histórico não contém a
       // mensagem e a guarda da reexecução cancela silenciosamente; a
@@ -302,6 +371,19 @@ export async function flushBuffer(
     }
 
     if (!flushFailed) {
+      // Segunda barreira: se o humano assumiu enquanto o brain estava em voo, a
+      // resposta gerada é descartada e nunca chega ao WhatsApp.
+      if (
+        await suppressFlushIfPaused({
+          bufferKey,
+          buffer,
+          alreadyProcessedTexts: [],
+          deps,
+        })
+      ) {
+        return;
+      }
+
       try {
         await deps.sendReply(from, reply!, config);
         notifySalesReplyDelivered(bufferKey, 'novo_inbound');
@@ -322,6 +404,20 @@ export async function flushBuffer(
         console.error(
           `❌ Erro ao enviar resposta de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
         );
+
+        // Um takeover ocorrido durante a tentativa de envio não deve abrir um
+        // recovery nem emitir falha_resposta.
+        if (
+          await suppressFlushIfPaused({
+            bufferKey,
+            buffer,
+            alreadyProcessedTexts: [],
+            deps,
+          })
+        ) {
+          return;
+        }
+
         scheduleSalesRecovery({
           conversationKey: bufferKey,
           phone: from,
@@ -334,6 +430,19 @@ export async function flushBuffer(
   } else {
     try {
       const reply = await deps.getReply(from, consolidatedText, name, config);
+
+      // A mesma barreira pós-brain vale para a recepcionista.
+      if (
+        await suppressFlushIfPaused({
+          bufferKey,
+          buffer,
+          alreadyProcessedTexts: [],
+          deps,
+        })
+      ) {
+        return;
+      }
+
       await deps.sendReply(from, reply, config);
       console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
     } catch (err) {
@@ -348,6 +457,20 @@ export async function flushBuffer(
         },
       });
       console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+
+      // Se o humano assumiu enquanto o brain/envio falhou, não manda M24 por
+      // cima do atendimento e limpa o buffer sem rearmar.
+      if (
+        await suppressFlushIfPaused({
+          bufferKey,
+          buffer,
+          alreadyProcessedTexts: [],
+          deps,
+        })
+      ) {
+        return;
+      }
+
       // M24 da recepcionista permanece inalterado: avisa uma vez e pede reenvio.
       await emitFlushFallback(bufferKey, from, config, deps);
     }

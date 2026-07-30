@@ -6,6 +6,10 @@
  *   - re-flush imediato na mesma conversa é noop (janela de recovery);
  *   - conversa DIFERENTE não é suprimida (janela é por conversa);
  *   - sucesso continua respondendo normalmente.
+ *   - sales separa falha de brain da falha de envio e agenda recovery sem M24;
+ *   - pausa antes/depois do brain suprime resposta, fallback e recovery.
+ *   - pausa antes do flush impede até chamar o brain;
+ *   - pausa enquanto o brain está em voo impede a entrega da resposta.
  *
  * Sem WhatsApp/OpenAI reais — deps injetadas. A captura no Sentry roda na MESMA
  * cláusula catch, imediatamente antes do fallback: se o fallback foi enviado, o
@@ -62,6 +66,7 @@ async function main() {
     __resetFlushStateForTest,
   } = await import('../src/messageHandler');
   const salesRecovery = await import('../src/services/salesRecovery');
+  const { SalesBrainFailure } = await import('../src/services/salesBrain');
 
   const sent: { from: string; text: string }[] = [];
   const failingDeps: FlushDeps = {
@@ -71,6 +76,8 @@ async function main() {
     sendReply: async (from, text) => {
       sent.push({ from, text });
     },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
   };
 
   const from = '5511999990000';
@@ -108,6 +115,8 @@ async function main() {
     sendReply: async (f, t) => {
       sent.push({ from: f, text: t });
     },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
   };
   const key4 = __seedFlushBufferForTest(config, from, ['oi']);
   await flushBuffer(key4, okDeps);
@@ -115,7 +124,6 @@ async function main() {
   expect('4) sucesso responde ao cliente', sent.length === 1 && Boolean(sent[0]?.text.includes('15h')));
   expect('4) buffer limpo após sucesso', !__hasBufferForTest(key4));
 
-  // --- Caso 5: sales não usa M24; agenda recovery silencioso ----------------
   const salesConfig: TenantBotConfig = {
     ...config,
     botName: 'Renata',
@@ -123,20 +131,69 @@ async function main() {
     aiProvider: 'anthropic',
     aiModel: 'claude-sonnet-5',
   };
-  const fakeTimers: Array<{ cancelled: boolean }> = [];
-  salesRecovery.__setSalesRecoveryDepsForTest({
-    scheduler: {
-      setTimeout: () => {
-        const timer = { cancelled: false };
-        fakeTimers.push(timer);
-        return timer;
+  type RecoveryTimer = {
+    callback: () => void | Promise<void>;
+    cancelled: boolean;
+  };
+  const recoveryTimers: RecoveryTimer[] = [];
+  const recoveryEvents: string[] = [];
+  const recoveredReplyTexts: string[] = [];
+  const configureRecoveryHarness = () => {
+    recoveryTimers.length = 0;
+    recoveryEvents.length = 0;
+    recoveredReplyTexts.length = 0;
+    salesRecovery.__setSalesRecoveryDepsForTest({
+      scheduler: {
+        setTimeout: (callback) => {
+          const timer: RecoveryTimer = { callback, cancelled: false };
+          recoveryTimers.push(timer);
+          return timer;
+        },
+        clearTimeout: (timer) => {
+          (timer as RecoveryTimer).cancelled = true;
+        },
       },
-      clearTimeout: (timer) => {
-        (timer as { cancelled: boolean }).cancelled = true;
+      emitEvent: async (_phoneNumberId, _phone, event) => {
+        recoveryEvents.push(event);
       },
+      sendReply: async (_phone, replyText) => {
+        recoveredReplyTexts.push(replyText);
+      },
+    });
+  };
+
+  // --- Caso 5: SalesBrainFailure agenda recovery silencioso, sem M24 --------
+  __resetFlushStateForTest();
+  salesRecovery.__resetSalesRecoveryForTest();
+  configureRecoveryHarness();
+  sent.length = 0;
+  const salesBrainFailureDeps: FlushDeps = {
+    getReply: async () => {
+      throw new SalesBrainFailure(new Error('Anthropic 529 simulado'));
     },
-    emitEvent: async () => undefined,
-  });
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
+  };
+  const key5 = __seedFlushBufferForTest(salesConfig, from, ['quero conhecer']);
+  await flushBuffer(key5, salesBrainFailureDeps);
+
+  expect('5) SalesBrainFailure de sales não envia fallback M24', sent.length === 0);
+  expect(
+    '5) SalesBrainFailure agenda recovery de brain',
+    salesRecovery.__getSalesRecoveryStateForTest(key5)?.kind === 'brain'
+  );
+  expect(
+    '5) falha real de brain emite falha_resposta',
+    recoveryEvents.join('|') === 'falha_resposta'
+  );
+  expect('5) buffer sales é limpo após SalesBrainFailure', !__hasBufferForTest(key5));
+
+  // --- Caso 6: erro genérico de brain também agenda recovery ----------------
+  salesRecovery.__resetSalesRecoveryForTest();
+  configureRecoveryHarness();
   sent.length = 0;
   const genericSalesBrainFailureDeps: FlushDeps = {
     getReply: async () => {
@@ -145,38 +202,158 @@ async function main() {
     sendReply: async (f, t) => {
       sent.push({ from: f, text: t });
     },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
   };
-  const key5 = __seedFlushBufferForTest(salesConfig, from, ['quero conhecer']);
-  await flushBuffer(key5, genericSalesBrainFailureDeps);
-  expect('5) erro genérico de sales não envia fallback M24', sent.length === 0);
-  expect(
-    '5) erro genérico de sales agenda recovery de brain',
-    salesRecovery.__getSalesRecoveryStateForTest(key5)?.kind === 'brain'
-  );
-  expect('5) buffer sales é limpo após falha', !__hasBufferForTest(key5));
-  salesRecovery.__resetSalesRecoveryForTest();
+  const key6 = __seedFlushBufferForTest(salesConfig, from, ['quero conhecer']);
+  await flushBuffer(key6, genericSalesBrainFailureDeps);
 
-  // --- Caso 6: falha de envio guarda replyText, sem fallback ----------------
+  expect('6) erro genérico de sales não envia fallback M24', sent.length === 0);
+  expect(
+    '6) erro genérico de sales agenda recovery de brain',
+    salesRecovery.__getSalesRecoveryStateForTest(key6)?.kind === 'brain'
+  );
+  expect(
+    '6) erro genérico de brain emite falha_resposta',
+    recoveryEvents.join('|') === 'falha_resposta'
+  );
+  expect('6) buffer sales é limpo após erro genérico', !__hasBufferForTest(key6));
+
+  // --- Caso 7: falha de envio guarda replyText, sem fallback ----------------
+  salesRecovery.__resetSalesRecoveryForTest();
+  configureRecoveryHarness();
+  sent.length = 0;
   const salesSendFailureDeps: FlushDeps = {
     getReply: async () => 'Resposta natural já persistida',
     sendReply: async () => {
       throw new Error('WhatsApp indisponível');
     },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
   };
-  salesRecovery.__setSalesRecoveryDepsForTest({
-    scheduler: {
-      setTimeout: () => ({ cancelled: false }),
-      clearTimeout: () => undefined,
-    },
-    emitEvent: async () => undefined,
-  });
-  const key6 = __seedFlushBufferForTest(salesConfig, from, ['oi']);
-  await flushBuffer(key6, salesSendFailureDeps);
+  const key7 = __seedFlushBufferForTest(salesConfig, from, ['oi']);
+  await flushBuffer(key7, salesSendFailureDeps);
+
   expect(
-    '6) falha de envio agenda recovery kind send',
-    salesRecovery.__getSalesRecoveryStateForTest(key6)?.kind === 'send'
+    '7) falha de envio agenda recovery kind send',
+    salesRecovery.__getSalesRecoveryStateForTest(key7)?.kind === 'send'
   );
-  expect('6) buffer é limpo sem M24', !__hasBufferForTest(key6));
+  expect('7) falha de envio sales não dispara M24', sent.length === 0);
+  expect('7) buffer sales é limpo após falha de envio', !__hasBufferForTest(key7));
+  await recoveryTimers[0]?.callback();
+  expect(
+    '7) recovery de envio preserva o replyText original',
+    recoveredReplyTexts.join('|') === 'Resposta natural já persistida'
+  );
+
+  // --- Caso 8: echo antes do flush → brain nem roda --------------------------
+  __resetFlushStateForTest();
+  salesRecovery.__resetSalesRecoveryForTest();
+  sent.length = 0;
+  let brainCalls = 0;
+  const pausedTexts: string[] = [];
+  const pausedBeforeDeps: FlushDeps = {
+    getReply: async () => {
+      brainCalls += 1;
+      return 'não deveria ser gerada';
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => true,
+    recordPausedInbound: async (_key, text) => {
+      pausedTexts.push(text);
+    },
+  };
+  const key8 = __seedFlushBufferForTest(config, from, ['pode manter', '15:30']);
+  await flushBuffer(key8, pausedBeforeDeps);
+
+  expect('8) pausa pré-flush não chama o brain', brainCalls === 0);
+  expect('8) pausa pré-flush não envia resposta', sent.length === 0);
+  expect(
+    '8) textos não processados são preservados no histórico',
+    pausedTexts.join('|') === 'pode manter|15:30'
+  );
+  expect('8) buffer pausado é limpo', !__hasBufferForTest(key8));
+
+  // --- Caso 9: echo chega com o brain em voo → resposta é descartada --------
+  __resetFlushStateForTest();
+  sent.length = 0;
+  brainCalls = 0;
+  let pauseChecks = 0;
+  const pausedDuringDeps: FlushDeps = {
+    getReply: async () => {
+      brainCalls += 1;
+      return 'resposta gerada antes do echo';
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => {
+      pauseChecks += 1;
+      return pauseChecks >= 2;
+    },
+    recordPausedInbound: async () => {},
+  };
+  const key9 = __seedFlushBufferForTest(config, from, ['pode manter 15:30']);
+  await flushBuffer(key9, pausedDuringDeps);
+
+  expect('9) brain chegou a gerar a resposta', brainCalls === 1);
+  expect('9) pausa pós-brain bloqueia a entrega', sent.length === 0);
+  expect('9) buffer é limpo após suprimir resposta', !__hasBufferForTest(key9));
+
+  // --- Caso 10: erro + pausa não manda nem fallback --------------------------
+  __resetFlushStateForTest();
+  sent.length = 0;
+  pauseChecks = 0;
+  const failedWhilePausedDeps: FlushDeps = {
+    getReply: async () => {
+      throw new Error('provider caiu durante takeover');
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => {
+      pauseChecks += 1;
+      return pauseChecks >= 2;
+    },
+    recordPausedInbound: async () => {},
+  };
+  const key10 = __seedFlushBufferForTest(config, from, ['ok']);
+  await flushBuffer(key10, failedWhilePausedDeps);
+
+  expect('10) pausa após erro bloqueia fallback M24', sent.length === 0);
+  expect('10) buffer é limpo sem rearmar', !__hasBufferForTest(key10));
+
+  // --- Caso 11: em sales, pausa vence recovery e falha_resposta --------------
+  __resetFlushStateForTest();
+  salesRecovery.__resetSalesRecoveryForTest();
+  configureRecoveryHarness();
+  sent.length = 0;
+  pauseChecks = 0;
+  const salesFailedDuringTakeoverDeps: FlushDeps = {
+    getReply: async () => {
+      throw new SalesBrainFailure(new Error('Anthropic caiu durante takeover'));
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => {
+      pauseChecks += 1;
+      return pauseChecks >= 2;
+    },
+    recordPausedInbound: async () => {},
+  };
+  const key11 = __seedFlushBufferForTest(salesConfig, from, ['vou falar com o atendente']);
+  await flushBuffer(key11, salesFailedDuringTakeoverDeps);
+
+  expect('11) takeover sales não envia mensagem ao lead', sent.length === 0);
+  expect(
+    '11) takeover sales não agenda recovery',
+    salesRecovery.__getSalesRecoveryStateForTest(key11) === null
+  );
+  expect('11) takeover sales não emite falha_resposta', recoveryEvents.length === 0);
+  expect('11) buffer sales pausado é limpo', !__hasBufferForTest(key11));
   salesRecovery.__resetSalesRecoveryForTest();
 
   const failed = checks.filter((c) => !c.ok);

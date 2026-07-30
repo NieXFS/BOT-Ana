@@ -30,6 +30,11 @@ interface PauseCacheEntry {
 
 const pauseCache = new Map<string, PauseCacheEntry>();
 
+export interface EchoPauseDeps {
+  now: () => number;
+  persistPause: (phoneNumberId: string, customerPhone: string) => Promise<string | null>;
+}
+
 function cacheKey(phoneNumberId: string, customerPhone: string): string {
   // Mesma forma do conversationKey/bufferKey do resto da Ana.
   return `${phoneNumberId}:${customerPhone}`;
@@ -47,6 +52,45 @@ function entryIsPaused(entry: PauseCacheEntry, nowMs: number): boolean {
     (entry.conversationUntilMs !== null && entry.conversationUntilMs > nowMs) ||
     (entry.scheduleUntilMs !== null && entry.scheduleUntilMs > nowMs)
   );
+}
+
+async function persistPauseInReceps(
+  phoneNumberId: string,
+  customerPhone: string
+): Promise<string | null> {
+  const { data } = await axios.post<{ pausedUntil: string }>(
+    `${RECEPS_INTERNAL_API_URL}/api/v1/bot/pause-conversation`,
+    { phoneNumberId, customerPhone, source: 'echo' },
+    {
+      headers: {
+        Authorization: `Bearer ${ERP_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: REQUEST_TIMEOUT_MS,
+    }
+  );
+  return data?.pausedUntil ?? null;
+}
+
+const defaultEchoPauseDeps: EchoPauseDeps = {
+  now: Date.now,
+  persistPause: persistPauseInReceps,
+};
+
+function writeConversationPauseToCache(
+  phoneNumberId: string,
+  customerPhone: string,
+  conversationUntilMs: number,
+  nowMs: number
+): void {
+  const key = cacheKey(phoneNumberId, customerPhone);
+  const existing = pauseCache.get(key);
+  pauseCache.set(key, {
+    globalUntilMs: existing?.globalUntilMs ?? null,
+    conversationUntilMs,
+    scheduleUntilMs: existing?.scheduleUntilMs ?? null,
+    expiresAt: nowMs + PAUSE_STATE_TTL_MS,
+  });
 }
 
 // NUNCA logar PII: só phoneNumberId (id do salão, allowlistado no scrub). O número
@@ -99,36 +143,33 @@ async function fetchPauseState(
  */
 export async function pauseConversationByEcho(
   phoneNumberId: string,
-  customerPhone: string
+  customerPhone: string,
+  deps: EchoPauseDeps = defaultEchoPauseDeps
 ): Promise<void> {
-  let pausedUntilMs: number | null = null;
+  // O write-through precisa acontecer ANTES do primeiro await. A Meta pode entregar
+  // a resposta seguinte da cliente enquanto o POST ao Receps ainda está em voo;
+  // esperar a rede aqui abriria uma janela de até REQUEST_TIMEOUT_MS pra IA falar.
+  const startedAt = deps.now();
+  writeConversationPauseToCache(
+    phoneNumberId,
+    customerPhone,
+    startedAt + ECHO_LOCAL_FALLBACK_MS,
+    startedAt
+  );
 
   try {
-    const { data } = await axios.post<{ pausedUntil: string }>(
-      `${RECEPS_INTERNAL_API_URL}/api/v1/bot/pause-conversation`,
-      { phoneNumberId, customerPhone, source: 'echo' },
-      {
-        headers: {
-          Authorization: `Bearer ${ERP_API_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: REQUEST_TIMEOUT_MS,
-      }
-    );
-    pausedUntilMs = toMs(data?.pausedUntil);
+    const pausedUntilMs = toMs(await deps.persistPause(phoneNumberId, customerPhone));
+    if (pausedUntilMs !== null) {
+      writeConversationPauseToCache(
+        phoneNumberId,
+        customerPhone,
+        pausedUntilMs,
+        deps.now()
+      );
+    }
   } catch (error) {
     capture(error, phoneNumberId, 'pause-conversation');
   }
-
-  const now = Date.now();
-  const key = cacheKey(phoneNumberId, customerPhone);
-  const existing = pauseCache.get(key);
-  pauseCache.set(key, {
-    globalUntilMs: existing?.globalUntilMs ?? null,
-    conversationUntilMs: pausedUntilMs ?? now + ECHO_LOCAL_FALLBACK_MS,
-    scheduleUntilMs: existing?.scheduleUntilMs ?? null,
-    expiresAt: now + PAUSE_STATE_TTL_MS,
-  });
 }
 
 /**
