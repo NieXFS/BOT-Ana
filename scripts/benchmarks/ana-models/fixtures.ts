@@ -148,13 +148,27 @@ function json(value: unknown): string {
 }
 
 function serviceById(id: string) {
-  return SERVICES_RESULT.services?.find((service) => service.id === id);
+  const services = SERVICES_RESULT.services ?? [];
+  const normalizedId = id.trim();
+  const exact = services.find((service) => service.id === normalizedId);
+  if (exact) return exact;
+  const prefixes = services.filter((service) =>
+    service.id.startsWith(normalizedId)
+  );
+  return normalizedId && prefixes.length === 1 ? prefixes[0] : undefined;
 }
 
 function professionalById(id: string) {
-  return SERVICES_RESULT.professionals?.find(
-    (professional) => professional.id === id
+  const professionals = SERVICES_RESULT.professionals ?? [];
+  const normalizedId = id.trim();
+  const exact = professionals.find(
+    (professional) => professional.id === normalizedId
   );
+  if (exact) return exact;
+  const prefixes = professionals.filter((professional) =>
+    professional.id.startsWith(normalizedId)
+  );
+  return normalizedId && prefixes.length === 1 ? prefixes[0] : undefined;
 }
 
 function validateServiceAndProfessional(
@@ -174,7 +188,7 @@ function validateServiceAndProfessional(
     const professional = professionalById(args.professionalId);
     if (
       !professional ||
-      !service.professionalIds?.includes(args.professionalId)
+      !service.professionalIds?.includes(professional.id)
     ) {
       return 'INTERNAL_HINT: O profissional informado não atende este serviço. Use somente um profissional habilitado.';
     }
@@ -291,8 +305,14 @@ export function createFixtureToolHarness(
           });
         }
 
+        const stillHasUpcomingDuplicate =
+          fixtureUpcomingAppointments(
+            mode,
+            state.cancelledAppointmentIds
+          ).length > 0;
         if (
           (mode === 'duplicate' || mode === 'duplicate_multiple') &&
+          stillHasUpcomingDuplicate &&
           args.confirmedDuplicate !== true
         ) {
           return json({

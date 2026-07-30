@@ -5,6 +5,8 @@ import type { TenantBotConfig } from '../configProvider';
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 export const DEEPSEEK_V4_FLASH_MODEL = 'deepseek-v4-flash';
 export const RECEPTIONIST_AI_TIMEOUT_MS = 30_000;
+export const DEEPSEEK_PRODUCTION_APPROVAL_ENV =
+  'DEEPSEEK_PRODUCTION_APPROVED';
 const RECEPTIONIST_USER_ID_HMAC_SECRET_ENV =
   'RECEPTIONIST_USER_ID_HMAC_SECRET';
 
@@ -58,6 +60,19 @@ function requireModel(config: TenantBotConfig): string {
   return model;
 }
 
+function assertDeepSeekProductionApproved(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+
+  const approved =
+    process.env[DEEPSEEK_PRODUCTION_APPROVAL_ENV]?.trim().toLowerCase() ===
+    'true';
+  if (!approved) {
+    throw new Error(
+      `DeepSeek bloqueado em produção: ${DEEPSEEK_PRODUCTION_APPROVAL_ENV}=true só pode ser definido após aprovação de governança/LGPD e atualização dos subprocessadores.`
+    );
+  }
+}
+
 /**
  * Resolve provider, modelo e credencial sem fallback cruzado. Se um tenant foi
  * configurado como DeepSeek, uma falha de chave/modelo nunca pode cair
@@ -87,6 +102,8 @@ export function resolveReceptionistAiRuntime(
   }
 
   if (provider === 'deepseek') {
+    assertDeepSeekProductionApproved();
+
     if (model !== DEEPSEEK_V4_FLASH_MODEL) {
       throw new Error(
         `Configuração incompatível: provider deepseek exige o modelo ${DEEPSEEK_V4_FLASH_MODEL}.`
@@ -167,6 +184,11 @@ export function buildReceptionistCompletionRequest(
       tool_choice: 'auto',
     };
   }
+
+  // Defesa em profundidade: um runtime DeepSeek construído manualmente ou
+  // resolvido antes da inicialização completa do ambiente também não pode
+  // montar uma chamada produtiva sem o gate de governança.
+  assertDeepSeekProductionApproved();
 
   const thinkingMode = input.thinkingMode ?? 'disabled';
   if (thinkingMode === 'enabled' && process.env.NODE_ENV === 'production') {

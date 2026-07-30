@@ -5,6 +5,7 @@ import {
   buildSafeWriteConfirmation,
   hasFalseWriteClaim,
   inspectCustomerReply,
+  normalizeCustomerReplyStyle,
 } from '../src/services/customerReplyGuard';
 
 const services: ServicesResult = {
@@ -21,6 +22,14 @@ const services: ServicesResult = {
   ],
   professionals: [{ id: 'cmpro456technical', name: 'Júlia' }],
 };
+
+assert.equal(
+  normalizeCustomerReplyStyle(
+    '**Resumo:**\n1. **Serviço:** Limpeza\n2. **Horário:** 15h ✅😊'
+  ),
+  'Resumo:\nServiço: Limpeza\nHorário: 15h ✅',
+  'saída WhatsApp remove Markdown/list markers e limita emoji sem cortar conteúdo'
+);
 
 assert.deepEqual(
   inspectCustomerReply(
@@ -118,7 +127,13 @@ const stateDescriptions = [
   'Isso, seu agendamento está confirmado para quinta, dia 06/08/2026, às 14h.',
   'Você tem um horário marcado dia 6 às 14h.',
   'Sua Limpeza de Pele está agendada com a Júlia em 06/08 às 14:00.',
+  'Sua Limpeza de Pele com a Júlia está agendada para 06/08 às 14h.',
   'Seu agendamento é para quinta, dia 06/08, às 14h.',
+  'Seu agendamento ficou para quinta, 06/08, às 14h.',
+  'Seu agendamento é amanhã, quinta-feira, 06/08/2026, às 14h.',
+  'Você tem uma Limpeza de Pele com a Júlia agendada para 06/08 às 14h.',
+  'Vi aqui que você já tem uma Limpeza de Pele agendada para 06/08 às 14h com a Júlia.',
+  'Você já tem marcado um horário de Limpeza de Pele com a Júlia para 06/08 às 14h.',
 ];
 
 for (const reply of stateDescriptions) {
@@ -141,6 +156,14 @@ assert.equal(
   ),
   true,
   'leitura de 14h não licencia uma afirmação de 15h'
+);
+assert.equal(
+  hasFalseWriteClaim(
+    'Você já tem dois agendamentos futuros marcados.',
+    successfulUpcomingReadTrace
+  ),
+  true,
+  'uma leitura com só um agendamento não licencia contagem explícita de dois'
 );
 for (const incompatibleState of [
   'Seu Peeling está agendado para quinta às 14h.',

@@ -9,6 +9,10 @@ Postgres, Receps, WhatsApp, booking e cancelamento por fixtures em memória.
 - O runner sobrescreve `DATABASE_URL`, `ERP_BASE_URL` e
   `RECEPS_INTERNAL_API_URL` com destinos locais inválidos antes de importar o
   brain.
+- O entrypoint fixa `NODE_ENV=test`, mesmo que o `.env` local diga
+  `production`, porque o harness usa exclusivamente dados sintéticos e não pode
+  ser confundido com o serviço real pelo gate
+  `DEEPSEEK_PRODUCTION_APPROVED`.
 - O executor de tools precisa carregar `dryRun: true`; qualquer outro executor
   aborta.
 - `bookAppointment` e `cancelAppointment` apenas incrementam contadores em
@@ -27,6 +31,13 @@ Postgres, Receps, WhatsApp, booking e cancelamento por fixtures em memória.
 O DeepSeek usa o endpoint OpenAI-compatible oficial
 `https://api.deepseek.com`. Não há fallback cruzado: provider DeepSeek sem
 `DEEPSEEK_API_KEY`, ou com modelo incompatível, falha fechado.
+
+`DEEPSEEK_API_KEY` autoriza somente o acesso técnico. Em
+`NODE_ENV=production`, o runtime exige adicionalmente
+`DEEPSEEK_PRODUCTION_APPROVED=true`; sem a flag, tanto a resolução do provider
+quanto a montagem do request falham fechado. A flag não é necessária nos
+benchmarks locais com dados sintéticos e só pode ser ativada depois do gate de
+governança/LGPD e da atualização da lista pública de subprocessadores.
 
 ## Execução
 
@@ -121,6 +132,24 @@ O exit code é:
 - `0`: todos os hard checks passaram.
 - `1`: execução completa com ao menos uma falha de modelo.
 - `2`: erro de configuração/provider/harness.
+
+## Fechamento de 30/07/2026
+
+A rodada completa e a reauditoria calibrada estão em:
+
+- `benchmark-results/2026-07-30T20-39-41-783Z/report.md`
+- `benchmark-results/2026-07-30T20-39-41-783Z/reaudit-2026-07-30T21-11-31-382Z.md`
+
+As 20 repetições dos quatro casos probabilísticos e sua reauditoria estão em:
+
+- `benchmark-results/2026-07-30T20-50-03-265Z/report.md`
+- `benchmark-results/2026-07-30T20-50-03-265Z/reaudit-2026-07-30T21-11-32-426Z.md`
+
+Na reauditoria final, ID completo continua sendo medido como aderência soft,
+mas prefixo único que o runtime produtivo resolve não é falha funcional hard.
+Consulta de disponibilidade antes da preferência também é soft; deixar de
+consultar depois de “tanto faz” permanece hard. O relatório consolidado vive
+em `docs/RELATORIO-correcao-parecer-ana-2026-07-30.md`.
 
 ## Cenários P0
 

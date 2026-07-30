@@ -1,5 +1,20 @@
 # Ana — Segunda opinião sobre DeepSeek × GPT-4o mini, e as correções aplicadas
 
+## Atualização executável — 30/07/2026
+
+O bloqueio de governança deixou de ser apenas uma recomendação documental. O
+runtime agora exige `DEEPSEEK_PRODUCTION_APPROVED=true` além da
+`DEEPSEEK_API_KEY` quando `NODE_ENV=production`. A checagem ocorre na resolução
+do provider e novamente na montagem do request, de modo que uma chave presente
+ou um `BotConfig.aiProvider="deepseek"` não bastam para enviar conversas reais.
+
+O valor default permanece `false`. Em 30/07/2026, depois das correções e da
+repetição estatística, o operador aprovou o gate, autorizou a publicação da
+DeepSeek (incluindo o tratamento na China) na página de subprocessadores e
+limitou o canário aos tenants `centro-estetico-jackeline-hussar` e
+`studio-viti`. A flag não migra tenants por si só; a seleção continua no
+`BotConfig`.
+
 **Data:** 29/07/2026
 **Autor:** Opus 5 (Head/orquestrador) · execução de backend delegada ao Codex 5.6 Sol XHigh
 **Repositórios:** `/Users/niexfs/dev/Ana` (todas as alterações) · `/Users/niexfs/dev/Receps ERP` (nenhuma)

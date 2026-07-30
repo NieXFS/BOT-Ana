@@ -412,7 +412,10 @@ export function bookingConfirmationGate(input: {
   duplicateCancellationSucceeded?: boolean;
   currentUserMessageIndex?: number;
 }): BookingConfirmationDecision {
-  if (input.confirmedDuplicate) {
+  const isSameTurnRemarriageAfterCancellation =
+    input.duplicateCancellationSucceeded === true &&
+    isRemarriageDecision(input.currentUserMessage);
+  if (input.confirmedDuplicate || isSameTurnRemarriageAfterCancellation) {
     const previousAssistant = latestAssistantMessage(input.history);
     const duplicateWasPresented = historyContainsDuplicateChoice(input.history);
     const proposalWasPresented = historyContainsConfirmedProposal(

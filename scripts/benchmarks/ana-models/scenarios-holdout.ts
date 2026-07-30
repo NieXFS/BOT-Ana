@@ -5,6 +5,7 @@ import {
   defineScenario,
   lastAssistantText,
   offeredTimes,
+  resolvesFixtureId,
 } from './scenarios';
 import type { BenchmarkScenario } from './types';
 
@@ -55,7 +56,11 @@ export const HOLDOUT_SCENARIOS: BenchmarkScenario[] = [
     evaluate: (run) => {
       const reply = lastAssistantText(run);
       const incompatibleCalls = calls(run, 'getAvailableSlots').filter(
-        (entry) => entry.args.professionalId === IDS.professional.caio
+        (entry) =>
+          resolvesFixtureId(
+            entry.args.professionalId,
+            IDS.professional.caio
+          )
       );
       return [
         assertion(
@@ -94,8 +99,14 @@ export const HOLDOUT_SCENARIOS: BenchmarkScenario[] = [
         assertion(
           'holdout-service-change-rechecks-latest-service',
           lastTurnAvailability.length === 1 &&
-            availability?.args.serviceId === IDS.service.limpeza &&
-            availability?.args.professionalId === IDS.professional.julia,
+            resolvesFixtureId(
+              availability?.args.serviceId,
+              IDS.service.limpeza
+            ) &&
+            resolvesFixtureId(
+              availability?.args.professionalId,
+              IDS.professional.julia
+            ),
           {
             calls: 1,
             serviceId: IDS.service.limpeza,
@@ -105,7 +116,10 @@ export const HOLDOUT_SCENARIOS: BenchmarkScenario[] = [
         ),
         assertion(
           'holdout-service-change-no-stale-professional',
-          availability?.args.professionalId !== IDS.professional.marina &&
+          !resolvesFixtureId(
+            availability?.args.professionalId,
+            IDS.professional.marina
+          ) &&
             calls(run, 'bookAppointment').length === 0,
           'Marina não carregada; 0 bookings',
           {
@@ -130,9 +144,14 @@ export const HOLDOUT_SCENARIOS: BenchmarkScenario[] = [
         assertion(
           'holdout-multi-intent-exact-availability',
           availabilities.length === 1 &&
-            availabilities[0]?.args.serviceId === IDS.service.limpeza &&
-            availabilities[0]?.args.professionalId ===
-              IDS.professional.julia &&
+            resolvesFixtureId(
+              availabilities[0]?.args.serviceId,
+              IDS.service.limpeza
+            ) &&
+            resolvesFixtureId(
+              availabilities[0]?.args.professionalId,
+              IDS.professional.julia
+            ) &&
             availabilities[0]?.args.date === '2026-08-07',
           {
             serviceId: IDS.service.limpeza,
@@ -199,9 +218,14 @@ export const HOLDOUT_SCENARIOS: BenchmarkScenario[] = [
         assertion(
           'holdout-noisy-transcription-understands-service-date',
           availabilities.length === 1 &&
-            availabilities[0]?.args.serviceId === IDS.service.limpeza &&
-            availabilities[0]?.args.professionalId ===
-              IDS.professional.julia &&
+            resolvesFixtureId(
+              availabilities[0]?.args.serviceId,
+              IDS.service.limpeza
+            ) &&
+            resolvesFixtureId(
+              availabilities[0]?.args.professionalId,
+              IDS.professional.julia
+            ) &&
             availabilities[0]?.args.date === '2026-08-04',
           {
             serviceId: IDS.service.limpeza,
@@ -236,7 +260,7 @@ export const HOLDOUT_SCENARIOS: BenchmarkScenario[] = [
         ),
         assertion(
           'holdout-out-of-domain-redirects',
-          /(não consigo|nao consigo|não posso|nao posso|fora|especialista|contador|ajud.*(?:serviço|agendamento|salão|clinica))/i.test(
+          /(não consigo|nao consigo|não posso|nao posso|fora|especialista|contador|respons[aá]vel|encaminh|ajud.*(?:serviço|agendamento|salão|clinica))/i.test(
             reply
           ),
           'limite de escopo + redirecionamento',

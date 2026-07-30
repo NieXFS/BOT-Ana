@@ -42,6 +42,7 @@ import {
   buildSafeWriteConfirmation,
   inspectCustomerReply,
   needsAuthoritativeAppointmentRead,
+  normalizeCustomerReplyStyle,
 } from './customerReplyGuard';
 
 const rescheduleCancellationEvidence =
@@ -164,6 +165,8 @@ export function buildSystemPromptFromServices(
 
 IDENTIDADE DO ATENDIMENTO: Seu nome é ${botName}. Se houver qualquer conflito com instruções antigas, sempre priorize este nome.
 
+ESTILO DE WHATSAPP: use texto corrido, curto e natural; evite Markdown, bullets e listas numeradas. Quando precisar oferecer as quatro opções de duplicidade, coloque-as em uma única frase curta. Use no máximo 1 emoji. Concisão nunca autoriza pular uma ferramenta obrigatória nem omitir uma parte do pedido.
+
 MENSAGENS DE ATENDENTE HUMANO: No histórico, mensagens que começam com "${HUMAN_ECHO_PREFIX.trim()}" foram enviadas por um ATENDENTE HUMANO da recepção (não por você), enquanto o atendimento estava pausado com uma pessoa. Trate-as como contexto e dê continuidade ao atendimento a partir delas; NUNCA diga "como eu te falei" sobre o que está nessas mensagens (não foi você quem falou) e NÃO repita perguntas que o atendente humano já respondeu.
 
 ${servicesBlock}
@@ -174,6 +177,7 @@ REGRAS DE FLUXO DE ATENDIMENTO (prioridade máxima, leia primeiro):
 A. ESCOLHA DO SERVIÇO — NUNCA assuma qual serviço o cliente quer. Ao INICIAR um novo agendamento, se a mensagem ATUAL não nomear o serviço com clareza (ex.: "quero marcar", "quero marcar para o dia 31", "quero marcar amanhã", "quero remarcar") E houver mais de um item na lista "SERVIÇOS DISPONÍVEIS", você DEVE listar TODOS os serviços disponíveis de forma NEUTRA (texto natural) e perguntar qual ele deseja ANTES de consultar horários (getAvailableSlots) ou agendar. NÃO faça pergunta direcionada como "quer o mesmo serviço de antes?" nem cite só um serviço — apresente as opções e deixe o cliente escolher. NUNCA reaproveite o serviço de um agendamento JÁ CONCLUÍDO, de mensagens antigas ou do histórico desta conversa — cada NOVO pedido recomeça perguntando o serviço (o fato de o cliente ter marcado/citado Depilação antes NÃO significa que o próximo agendamento também é Depilação). Exceção: durante um agendamento EM ANDAMENTO, mantenha o serviço que o cliente já escolheu NESSE mesmo fluxo (não repergunte a cada mensagem). Só siga direto, sem perguntar, se existir exatamente UM serviço disponível.
 B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar success=false por causa do horário (campo reason = "blocked", "conflict" ou "outside_hours"), você DEVE chamar getAvailableSlots (mesma data, serviceId e profissional) ANTES de sugerir qualquer alternativa e oferecer SOMENTE os horários reais que ela retornar. NUNCA chute horários vizinhos (se pediram 15h, não invente 15h30 ou 16h). Se o retorno tiver um campo "hint", siga-o. ATENÇÃO: um retorno "INTERNAL_HINT:" sobre agendamento DUPLICADO NÃO é indisponibilidade de horário — nesse caso siga a regra 7 abaixo e NÃO chame getAvailableSlots.
 C. ESCOLHA DO PROFISSIONAL — Para o serviço que o cliente escolheu, considere SOMENTE os profissionais listados como "Profissionais habilitados" DAQUELE serviço. (a) 0 habilitados → informe gentilmente que o serviço está temporariamente sem profissional disponível e ofereça outro serviço; NÃO consulte horários nem agende. (b) Exatamente 1 habilitado → NÃO pergunte preferência; agende direto com ele e confirme o nome. (c) 2+ habilitados E o cliente não disse com quem → pergunte "Quer agendar com algum profissional específico ou tanto faz?". Se "tanto faz/qualquer um", chame bookAppointment SEM professionalId (auto-resolve). Se citar um nome, use o professionalId dele. SEMPRE confirme com quem ficou.
+D. PEDIDO COM MÚLTIPLAS PARTES — Responda a TODAS as partes explícitas do pedido. Ex.: se perguntar preço e também pedir um horário, informe o preço do catálogo e chame getAvailableSlots na mesma interação; não descarte uma parte para ser breve.
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).
@@ -184,8 +188,9 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. NÃO responda ao cliente, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente em nenhuma forma.
  7. DETECÇÃO DE AGENDAMENTO EXISTENTE — Quando bookAppointment retornar INTERNAL_HINT informando que o cliente já tem agendamento(s) futuro(s), NÃO crie o novo ainda. Pergunte ao cliente conforme as opções listadas no hint. Aguarde a resposta. Agir conforme:
     - "Manter os dois": chame bookAppointment de novo com confirmedDuplicate=true e os mesmos demais parâmetros.
-    - "Remarcar (cancelar e marcar este novo)": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos. PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior. Só após sucesso chame bookAppointment com confirmedDuplicate=true.
-    - "Só cancelar o anterior": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos e depois cancelAppointment com o ID técnico exato do agendamento anterior. NÃO chame bookAppointment.
+    - "Remarcar (cancelar e marcar este novo)": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos. PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior. Só após sucesso chame bookAppointment; confirmedDuplicate pode ser omitido porque o sistema deriva a autorização do cancelamento concluído.
+   - "Só cancelar o anterior": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos e depois cancelAppointment com o ID técnico exato do agendamento anterior. NÃO chame bookAppointment.
+   - Se o cliente escolher "só cancelar" ou pedir para escolher o novo horário depois e, em outro turno, retomar a remarcação: consulte a disponibilidade do novo horário, apresente um NOVO resumo completo e aguarde confirmação. Depois da confirmação, chame bookAppointment; NUNCA responda que confirmou sem executar a ferramenta. Como o agendamento anterior já foi cancelado, confirmedDuplicate pode ser omitido.
    - "Pensar depois": não chame ferramentas. Responda gentilmente e aguarde.
    - Se houver mais de um agendamento anterior e o cliente escolher remarcar/cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado ANTES de chamar cancelAppointment. Nunca invente appointmentId usando data/hora.
 8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment — encaminhe para a equipe conforme regras de comportamento.
@@ -345,7 +350,7 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
           confirmedDuplicate: {
             type: 'boolean',
             description:
-              'Marque como true APENAS quando o cliente confirmou explicitamente que quer manter agendamentos duplicados (no fluxo de detecção de conflito). NUNCA marque como true em outras situações.',
+              'Marque como true APENAS quando o cliente confirmou explicitamente que quer manter os dois agendamentos. Na remarcação, depois de cancelAppointment concluir com sucesso, omita este campo: o sistema deriva a autorização do cancelamento. NUNCA marque como true em outras situações.',
           },
         },
         required: ['date', 'time', 'serviceId'],
@@ -393,7 +398,6 @@ async function executeFunction(
     // no calendarService) pra não pegar o getAvailableSlots interno do Guardrail A.
     const isConfirmedRescheduleAfterCancellation =
       functionName === 'bookAppointment' &&
-      args.confirmedDuplicate === true &&
       rescheduleCancellationEvidence.peek(conversationKey) !== null;
     if (
       (functionName === 'getAvailableSlots' ||
@@ -438,6 +442,10 @@ async function executeFunction(
         return JSON.stringify(result);
       }
       case 'bookAppointment': {
+        const cancellationEvidence =
+          rescheduleCancellationEvidence.peek(conversationKey);
+        const shouldBypassDuplicateCheck =
+          args.confirmedDuplicate === true || cancellationEvidence !== null;
         const serviceId = String(args.serviceId ?? '');
         const professionalId =
           typeof args.professionalId === 'string'
@@ -461,8 +469,7 @@ async function executeFunction(
           currentUserMessageIndex: conversationHistory.length - 1,
           confirmedDuplicate: args.confirmedDuplicate === true,
           expectedBooking,
-          duplicateCancellationSucceeded:
-            rescheduleCancellationEvidence.peek(conversationKey) !== null,
+          duplicateCancellationSucceeded: cancellationEvidence !== null,
         });
         if (!confirmation.ok) {
           console.log(
@@ -474,7 +481,12 @@ async function executeFunction(
           });
         }
 
-        const consumedEvidence = confirmation.consumesCancellationEvidence
+        const hasCancellationEvidence = cancellationEvidence !== null;
+        // Qualquer booking bem-sucedido depois do cancelamento encerra a
+        // autorização cross-turn. Mesmo quando o modelo omite
+        // confirmedDuplicate (o anterior já não existe), não deixe a evidência
+        // sobrando para licenciar uma segunda escrita.
+        const consumedEvidence = hasCancellationEvidence
           ? rescheduleCancellationEvidence.consume(conversationKey)
           : null;
         if (
@@ -496,7 +508,7 @@ async function executeFunction(
           userName,
           config,
           professionalId,
-          args.confirmedDuplicate === true
+          shouldBypassDuplicateCheck
         );
         if (!result.success && consumedEvidence) {
           rescheduleCancellationEvidence.restore(consumedEvidence);
@@ -1001,10 +1013,11 @@ async function getReceptionistReply(
       const safeWriteConfirmation = buildSafeWriteConfirmation(
         modelResult.toolTrace
       );
-      const candidateReply =
+      const candidateReply = normalizeCustomerReplyStyle(
         modelResult.rawReply ||
-        safeWriteConfirmation ||
-        getFallbackMessage(config);
+          safeWriteConfirmation ||
+          getFallbackMessage(config)
+      );
       const forbiddenAppointmentIds = modelResult.toolTrace.flatMap((entry) => {
         const ids: string[] = [];
         if (

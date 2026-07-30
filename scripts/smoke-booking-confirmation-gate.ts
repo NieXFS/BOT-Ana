@@ -298,6 +298,18 @@ assert.deepEqual(
   }),
   { ok: true, consumesCancellationEvidence: true }
 );
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage:
+      'Quero remarcar: cancele o anterior e mantenha este novo.',
+    history: duplicateHistory,
+    confirmedDuplicate: false,
+    expectedBooking,
+    duplicateCancellationSucceeded: true,
+  }),
+  { ok: true, consumesCancellationEvidence: true },
+  'o cancelamento autoritativo deriva a remarcação no mesmo turno sem depender da flag do modelo'
+);
 
 const crossTurnHistory = [
   ...duplicateHistory,
@@ -357,6 +369,18 @@ assert.deepEqual(crossTurnWithinWindow, {
   ok: true,
   consumesCancellationEvidence: true,
 });
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage: 'sim',
+    history: crossTurnHistory,
+    currentUserMessageIndex: crossTurnHistory.length - 1,
+    confirmedDuplicate: false,
+    expectedBooking: crossTurnBooking,
+    duplicateCancellationSucceeded: true,
+  }),
+  { ok: true, consumesCancellationEvidence: false },
+  'após novo resumo, a confirmação cross-turn segue o gate normal mesmo sem flag do modelo'
+);
 
 const consumedEvidence = evidenceStore.consume(
   conversationKey,

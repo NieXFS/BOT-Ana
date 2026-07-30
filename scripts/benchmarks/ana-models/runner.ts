@@ -88,6 +88,11 @@ class BenchmarkHarnessError extends Error {
 // Hard block de rede interna: o import do brain carrega módulos que constroem
 // clientes lazy de Postgres/ERP. Mesmo que um refactor futuro tente usá-los por
 // engano, apontar para a porta descartada impede qualquer acesso real.
+// O `.env` da Ana pode carregar NODE_ENV=production mesmo no Mac. Este processo
+// é deliberadamente um ambiente sintético: fixar `test` impede que o gate de
+// dados reais do DeepSeek confunda o harness com o serviço produtivo. Isso não
+// relaxa a produção, porque a sobrescrita existe somente neste entrypoint.
+process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL =
   'postgresql://benchmark:benchmark@127.0.0.1:1/benchmark';
 process.env.ERP_API_TOKEN = 'benchmark-no-erp-access';
@@ -451,7 +456,6 @@ function evaluateRuntimeGuard(
   ) {
     const isConfirmedRescheduleAfterCancellation =
       input.functionName === 'bookAppointment' &&
-      input.args.confirmedDuplicate === true &&
       input.duplicateCancellationSucceeded;
     if (!isConfirmedRescheduleAfterCancellation) {
       const selection = deps.serviceSelectionGate(
@@ -1130,6 +1134,7 @@ async function runScenario(
     buildSafeWriteConfirmation,
     inspectCustomerReply,
     needsAuthoritativeAppointmentRead,
+    normalizeCustomerReplyStyle,
   } = await import('../../../src/services/customerReplyGuard');
   const {
     serviceSelectionGate,
@@ -1225,7 +1230,11 @@ async function runScenario(
           let result: string;
           const consumedCancellationEvidence =
             evaluation.runtimeGuard.wouldExecute &&
-            evaluation.consumesCancellationEvidence
+            functionName === 'bookAppointment' &&
+            rescheduleEvidenceStore.peek(
+              evidenceConversationKey,
+              turnNow
+            ) !== null
               ? rescheduleEvidenceStore.consume(
                   evidenceConversationKey,
                   turnNow
@@ -1362,8 +1371,11 @@ async function runScenario(
       const safeWriteConfirmation = buildSafeWriteConfirmation(
         protectedSuccessfulTrace
       );
-      const candidateReply =
-        loop.rawReply || safeWriteConfirmation || DEFAULT_FALLBACK_MESSAGE;
+      const candidateReply = normalizeCustomerReplyStyle(
+        loop.rawReply ||
+          safeWriteConfirmation ||
+          DEFAULT_FALLBACK_MESSAGE
+      );
       const forbiddenAppointmentIds =
         collectForbiddenAppointmentIds(loop.toolTrace);
       const customerReplyEvidenceTrace = [...loop.toolTrace];
@@ -1521,6 +1533,7 @@ async function reauditStoredResult(
       reply: string,
       trace: Array<{ name: string; result: string }>
     ) => boolean;
+    normalizeCustomerReplyStyle: (reply: string) => string;
   }
 ): Promise<ReauditedResult> {
   const stored = {
@@ -1605,7 +1618,11 @@ async function reauditStoredResult(
       recomputedTrace.push(recomputed);
       const consumedCancellationEvidence =
         evaluation.runtimeGuard.wouldExecute &&
-        evaluation.consumesCancellationEvidence
+        entry.name === 'bookAppointment' &&
+        rescheduleEvidenceStore.peek(
+          evidenceConversationKey,
+          turnNow
+        ) !== null
           ? rescheduleEvidenceStore.consume(
               evidenceConversationKey,
               turnNow
@@ -1678,12 +1695,14 @@ async function reauditStoredResult(
 
     const reply = replies.get(userTurn) ?? '';
     if (reply) {
+      const normalizedReply =
+        deps.normalizeCustomerReplyStyle(reply);
       const forbiddenAppointmentIds =
         collectForbiddenAppointmentIds(guardedTurnTrace);
       const customerReplyEvidenceTrace = [...guardedTurnTrace];
       if (
         deps.needsAuthoritativeAppointmentRead(
-          reply,
+          normalizedReply,
           customerReplyEvidenceTrace
         )
       ) {
@@ -1708,7 +1727,7 @@ async function reauditStoredResult(
         runtimeProtection.replyAuthoritativeReadChecks += 1;
       }
       const inspection = deps.inspectCustomerReply(
-        reply,
+        normalizedReply,
         SERVICES_RESULT,
         forbiddenAppointmentIds,
         customerReplyEvidenceTrace
@@ -1735,7 +1754,7 @@ async function reauditStoredResult(
           )
         );
       runtimeProtection.screenedRawFinalReply = inspection.safe
-        ? reply
+        ? normalizedReply
         : safeWriteConfirmation || DEFAULT_FALLBACK_MESSAGE;
     }
 
@@ -1860,6 +1879,8 @@ async function runReaudit(inputDir: string): Promise<void> {
       replyGuards.buildSafeWriteConfirmation,
     needsAuthoritativeAppointmentRead:
       replyGuards.needsAuthoritativeAppointmentRead,
+    normalizeCustomerReplyStyle:
+      replyGuards.normalizeCustomerReplyStyle,
   };
   const reaudited: ReauditedResult[] = [];
   for (const stored of storedResults) {

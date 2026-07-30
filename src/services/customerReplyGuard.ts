@@ -29,6 +29,8 @@ type AuthoritativeAppointment = {
 
 const COMPLETED_WRITE_CLAIM_RE =
   /\b(?:agendad[oa]s?|marcad[oa]s?|confirmad[oa]s?|cancelad[oa]s?|remarcad[oa]s?|reservad[oa]s?|criad[oa]s?|realizad[oa]s?|agendei|marquei|confirmei|cancelei|remarquei|reservei|realizei|acabei de (?:agendar|marcar|confirmar|cancelar|remarcar|reservar))\b/g;
+const EMOJI_CLUSTER_RE =
+  /\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier})?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier})?)*/gu;
 
 function normalizeClaimText(value: string): string {
   return value
@@ -36,6 +38,29 @@ function normalizeClaimText(value: string): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Normalização mecânica e conservadora para WhatsApp. Não resume nem corta
+ * conteúdo operacional: remove apenas sintaxe Markdown/list markers e limita
+ * a resposta a um emoji, mesmo quando o modelo ignora a instrução de estilo.
+ */
+export function normalizeCustomerReplyStyle(reply: string): string {
+  let emojiSeen = false;
+  return reply
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/__([^_\n]+)__/g, '$1')
+    .replace(/^\s*#{1,6}\s+/gm, '')
+    .replace(/^\s*(?:[-*•]|\d+[.)])\s+/gm, '')
+    .replace(EMOJI_CLUSTER_RE, (emoji) => {
+      if (emojiSeen) return '';
+      emojiSeen = true;
+      return emoji;
+    })
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
 
@@ -136,7 +161,8 @@ function isPresentAppointmentStateClaim(
   const beforeClaim = clause.slice(0, matchIndex);
   return (
     /\b(?:esta|ta|continua|permanece)\s*$/.test(beforeClaim) ||
-    /\b(?:voce\s+)?tem\s+(?:(?:um|o|esse|este|seu)\s+)?(?:agendamento|horario)\b[^.!?\n]{0,120}\s*$/.test(
+    /\bvoce\s+(?:ja\s+)?tem\s+(?!que\b)[^.!?\n]{0,140}\s*$/.test(beforeClaim) ||
+    /\b(?:voce\s+(?:ja\s+)?)?tem\s+(?:(?:um|o|esse|este|seu)\s+)?(?:agendamento|horario)\b[^.!?\n]{0,120}\s*$/.test(
       beforeClaim
     )
   );
@@ -323,13 +349,34 @@ function appointmentMatchesStateClause(
   ) {
     return false;
   }
-  const claimedService =
+  const rawClaimedService =
     clause.match(
       /\b(?:seu|sua)\s+(?!agendamento\b|horario\b|reserva\b)(.{2,80}?)\s+(?:esta|ta)\s+(?:agendad|marcad|confirmad|reservad)/
     )?.[1] ??
     clause.match(
       /\bagendamento\s+de\s+(.{2,80}?)\s+(?:esta|ta|foi|ficou)\s+(?:agendad|marcad|confirmad|reservad)/
     )?.[1];
+  let claimedService = rawClaimedService;
+  if (claimedService) {
+    // "Sua Limpeza de Pele com a Júlia está agendada" não torna
+    // "Limpeza de Pele com a Júlia" o nome do serviço. Remove somente o sufixo
+    // de um profissional autoritativamente conhecido; nomes de serviço que
+    // contenham "com" continuam intactos.
+    for (const item of allAppointments) {
+      if (!item.professionalName) continue;
+      const professional = normalizeClaimText(item.professionalName);
+      for (const suffix of [
+        ` com ${professional}`,
+        ` com a ${professional}`,
+        ` com o ${professional}`,
+      ]) {
+        if (claimedService.endsWith(suffix)) {
+          claimedService = claimedService.slice(0, -suffix.length).trim();
+          break;
+        }
+      }
+    }
+  }
   if (
     claimedService &&
     (!appointment.serviceName ||
@@ -365,6 +412,13 @@ function hasCompatibleAppointmentRead(
   clause: string,
   appointments: AuthoritativeAppointment[]
 ): boolean {
+  const explicitCount = clause.match(
+    /\b(?:tem|ha|existem?)\s+(dois|duas|2|tres|3)\s+agendamentos?\b/
+  )?.[1];
+  if (explicitCount) {
+    const expectedCount = /^(?:dois|duas|2)$/.test(explicitCount) ? 2 : 3;
+    if (appointments.length !== expectedCount) return false;
+  }
   return appointments.some((appointment) =>
     appointmentMatchesStateClause(clause, appointment, appointments)
   );
@@ -390,10 +444,10 @@ function inspectCompletedClaims(
 
     const isDirectStateReference =
       !clause.endsWith('?') &&
-      (/\b(?:(?:seu|o|esse|este)\s+)?(?:agendamento|horario)\s+(?:e|eh)\s+(?:para|no|na|dia|as)\b/.test(
+      (/\b(?:(?:seu|o|esse|este)\s+)?(?:agendamento|horario)\s+(?:e|eh|esta|ta|ficou)\s+(?:para|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b/.test(
         clause
       ) ||
-        /\bvoce\s+tem(?:\s+um)?\s+(?:agendamento|horario)\s+(?:para|no|na|dia|as)\b/.test(
+        /\bvoce\s+(?:ja\s+)?tem(?:\s+um)?\s+(?:agendamento|horario)\s+(?:para|no|na|dia|as)\b/.test(
           clause
         ));
     if (isDirectStateReference) {

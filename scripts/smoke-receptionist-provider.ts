@@ -10,6 +10,7 @@ import {
   buildReceptionistClientOptions,
   buildReceptionistCompletionRequest,
   DEEPSEEK_BASE_URL,
+  DEEPSEEK_PRODUCTION_APPROVAL_ENV,
   DEEPSEEK_V4_FLASH_MODEL,
   RECEPTIONIST_AI_TIMEOUT_MS,
   resolveReceptionistAiRuntime,
@@ -19,6 +20,7 @@ import { isRetryableAiError } from '../src/utils/openaiRetry';
 process.env.OPENAI_API_KEY = 'sk-openai-smoke';
 process.env.DEEPSEEK_API_KEY = 'sk-deepseek-smoke';
 process.env.NODE_ENV = 'test';
+delete process.env[DEEPSEEK_PRODUCTION_APPROVAL_ENV];
 process.env.RECEPTIONIST_USER_ID_HMAC_SECRET =
   'smoke-secret-with-at-least-32-characters';
 
@@ -143,9 +145,31 @@ assert.equal(
 
 process.env.NODE_ENV = 'production';
 delete process.env.RECEPTIONIST_USER_ID_HMAC_SECRET;
+delete process.env[DEEPSEEK_PRODUCTION_APPROVAL_ENV];
 assert.equal(
   buildOpaqueConversationUserId(deepseekConfig, '+5511999999999'),
   undefined
+);
+assert.throws(
+  () => resolveReceptionistAiRuntime(deepseekConfig),
+  new RegExp(DEEPSEEK_PRODUCTION_APPROVAL_ENV)
+);
+assert.throws(
+  () =>
+    buildReceptionistCompletionRequest(deepseekRuntime, {
+      messages,
+      tools,
+      temperature: 0.4,
+      maxTokens: 500,
+    }),
+  new RegExp(DEEPSEEK_PRODUCTION_APPROVAL_ENV),
+  'runtime construído antes do modo production também deve falhar fechado'
+);
+process.env[DEEPSEEK_PRODUCTION_APPROVAL_ENV] = 'true';
+assert.equal(
+  resolveReceptionistAiRuntime(deepseekConfig).provider,
+  'deepseek',
+  'aprovação explícita libera somente o provider já configurado'
 );
 assert.throws(
   () =>
@@ -159,6 +183,7 @@ assert.throws(
   /Thinking mode do DeepSeek está bloqueado em produção/
 );
 process.env.NODE_ENV = 'test';
+delete process.env[DEEPSEEK_PRODUCTION_APPROVAL_ENV];
 assert.throws(
   () => buildOpaqueConversationUserId(deepseekConfig, '+5511999999999'),
   /RECEPTIONIST_USER_ID_HMAC_SECRET/
