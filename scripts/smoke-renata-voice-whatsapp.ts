@@ -1,4 +1,7 @@
-/** Smoke determinístico do payload/upload WhatsApp, com POST injetado. */
+/**
+ * Smoke determinístico do payload/upload WhatsApp, com POST injetado.
+ * O contrato após qualquer provider/encoder continua sendo OGG + PTT voice:true.
+ */
 process.env.DATABASE_URL ||= 'postgres://smoke:smoke@127.0.0.1:1/smoke';
 
 import type {

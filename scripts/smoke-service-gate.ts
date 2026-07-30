@@ -44,6 +44,41 @@ expect('S2b: fluxo arrastado (6 msgs) ainda libera via teto=6', ok(corte.id, TWO
   'quero cortar o cabelo', 'qual o preço?', 'e demora muito?', 'tem amanhã?', 'pode ser', '15h',
 ]), true);
 
+// Confirmação não abre uma nova intenção e não pode apagar o serviço escolhido.
+expect('S2c: "sim, pode marcar" preserva o serviço da proposta', ok(corte.id, TWO, [
+  'quero marcar corte de cabelo amanhã', '15h', 'Sim, pode marcar.',
+]), true);
+expect('S2d: "perfeito, pode agendar" preserva o serviço da proposta', ok(depil.id, TWO, [
+  'quero marcar depilação a laser amanhã', '10h', 'Perfeito, pode agendar.',
+]), true);
+expect('S2e: pedido por outro atendimento abre intenção nova', ok(corte.id, TWO, [
+  'quero marcar corte de cabelo amanhã', 'Sim, quero marcar outro amanhã.',
+]), false);
+expect('S2f: "quero remarcar" preserva serviço em curso', ok(corte.id, TWO, [
+  'quero marcar corte de cabelo amanhã', '15h', 'Quero remarcar.',
+]), true);
+expect('S2g: "remarca" preserva serviço em curso', ok(depil.id, TWO, [
+  'quero marcar depilação a laser', '10h', 'Remarca pra mim.',
+]), true);
+expect('S2h: "mudar o horário" preserva serviço em curso', ok(corte.id, TWO, [
+  'quero corte de cabelo', 'Preciso mudar o horário.',
+]), true);
+expect('S2i: "trocar o horário" preserva serviço em curso', ok(depil.id, TWO, [
+  'quero depilação a laser', 'Quero trocar o horário.',
+]), true);
+expect('S2j: "outro atendimento" abre intenção nova', ok(corte.id, TWO, [
+  'quero corte de cabelo', 'Quero outro atendimento.',
+]), false);
+expect('S2k: "outro serviço" abre intenção nova', ok(depil.id, TWO, [
+  'quero depilação a laser', 'Quero outro serviço.',
+]), false);
+expect('S2l: "novo agendamento" abre intenção nova', ok(corte.id, TWO, [
+  'quero corte de cabelo', 'Quero um novo agendamento.',
+]), false);
+expect('S2m: "quero marcar também" abre intenção nova', ok(depil.id, TWO, [
+  'quero depilação a laser', 'Quero marcar também.',
+]), false);
+
 // S3 — serviço nomeado por inteiro na msg atual → LIBERA
 expect('S3: "quero marcar uma depilação a laser amanhã" → libera', ok(depil.id, TWO, [
   'quero marcar uma depilação a laser amanhã',
@@ -93,10 +128,25 @@ expectAsk('P1: "quero marcar amanhã" (hist. depil) → ask', ask(TWO, [
 expectAsk('P2: "quero cortar o cabelo" → não pergunta (serviço implícito)', ask(TWO, ['quero cortar o cabelo']), false);
 // P3: "quero marcar depilação a laser" (novo agendamento COM serviço) → NÃO pergunta
 expectAsk('P3: "quero marcar depilação a laser amanhã" → não pergunta', ask(TWO, ['quero marcar depilação a laser amanhã']), false);
+expectAsk('P3b: confirmação "sim, pode marcar" preserva serviço → não pergunta', ask(TWO, [
+  'quero marcar depilação a laser amanhã', '10h', 'Sim, pode marcar.',
+]), false);
 // P4: "quero agendar amanhã" (sem serviço) → PERGUNTA
 expectAsk('P4: "quero agendar amanhã" → ask', ask(TWO, ['quero agendar amanhã']), true);
 // P5: "quero remarcar" (fluxo de agendamento EXISTENTE) → NÃO pergunta serviço
 expectAsk('P5: "quero remarcar" → não pergunta (remarcação não é nova escolha)', ask(TWO, ['quero remarcar meu horário']), false);
+expectAsk('P5b: remarcação em curso preserva serviço → não pergunta', ask(TWO, [
+  'quero marcar corte de cabelo', 'Quero mudar o horário do agendamento.',
+]), false);
+expectAsk('P5c: "outro serviço" exige nova escolha → pergunta', ask(TWO, [
+  'quero marcar corte de cabelo', 'Quero outro serviço.',
+]), true);
+expectAsk('P5d: "novo agendamento" exige nova escolha → pergunta', ask(TWO, [
+  'quero marcar corte de cabelo', 'Quero um novo agendamento.',
+]), true);
+expectAsk('P5e: "quero marcar também" exige nova escolha → pergunta', ask(TWO, [
+  'quero marcar corte de cabelo', 'Quero marcar também.',
+]), true);
 // P6: "que horas vocês abrem?" (não é intenção de agendamento) → NÃO pergunta
 expectAsk('P6: "que horas vocês abrem?" → não pergunta', ask(TWO, ['que horas vocês abrem?']), false);
 // P7: tenant 1 serviço → nunca pergunta

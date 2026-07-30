@@ -5,7 +5,6 @@
 process.env.DATABASE_URL ||= 'postgres://smoke:smoke@127.0.0.1:1/smoke';
 
 import type { TenantBotConfig } from '../src/configProvider';
-import type { TtsProvider } from '../src/voice/ttsProvider';
 import type { TtsCacheRow } from '../src/voice/ttsCache';
 import type {
   VoiceDeliveryDeps,
@@ -46,12 +45,23 @@ const config: TenantBotConfig = {
 
 const voiceConfig: VoiceEnvConfig = {
   enabled: true,
+  provider: 'elevenlabs',
+  gemini: {
+    apiKey: 'gemini-key',
+    model: 'gemini-3.1-flash-tts-preview',
+    voice: 'Achernar',
+    temperature: 1.1,
+    stylePrompt: 'Fale com empatia',
+    styleMode: 'prefix',
+    dailyCharBudget: 100_000,
+  },
   apiKey: 'key',
   voiceId: 'voice',
   model: 'eleven_multilingual_v2',
   stability: 0.3,
   similarity: 0.75,
   speed: 1.12,
+  style: 0.1,
   dailyCharBudget: 200_000,
   maxChars: 600,
 };
@@ -95,18 +105,18 @@ function harness(
     events: [],
     warnings: [],
   };
-  const provider: TtsProvider = {
-    name: 'fake',
-    synthesize: async () => {
-      log.synth += 1;
-      return Buffer.from('mp3');
-    },
-  };
   const deps: VoiceDeliveryDeps = {
     getPreference: async () => false,
     voiceEnabled: () => true,
     getConfig: () => voiceConfig,
-    getProvider: () => provider,
+    synthesize: async () => {
+      log.synth += 1;
+      return {
+        audio: Buffer.from('mp3'),
+        format: 'mp3',
+        provider: 'elevenlabs',
+      };
+    },
     lookupCache: async () => null,
     saveCache: async () => {
       log.save += 1;
@@ -191,10 +201,9 @@ async function main(): Promise<void> {
     {
       label: 'tts',
       override: {
-        getProvider: () => ({
-          name: 'fake',
-          synthesize: async () => { throw new Error('tts'); },
-        }),
+        synthesize: async () => {
+          throw new Error('tts');
+        },
       },
       step: 'tts',
     },
@@ -241,10 +250,9 @@ async function main(): Promise<void> {
   }
   {
     const { deps, log } = harness({
-      getProvider: () => ({
-        name: 'fake',
-        synthesize: async () => { throw new Error('tts'); },
-      }),
+      synthesize: async () => {
+        throw new Error('tts');
+      },
     });
     await deliverSalesReply('lead', splitText, config, deps);
     check(

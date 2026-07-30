@@ -31,6 +31,12 @@ const INTENT_OPENER_RE =
 // Abridores de NOVO agendamento (disparam a pergunta proativa) — NÃO inclui
 // remarcar/reagendar (que são fluxo de agendamento EXISTENTE, não nova escolha).
 const NEW_BOOKING_RE = /\b(marcar|marca|agendar|agenda|agendamento|book)\b/;
+const CONFIRMATION_CONTINUATION_RE =
+  /^(?:sim\b|isso\b|confirmo\b|confirmado\b|perfeito\b|beleza\b|ok\b|certo\b|tudo certo\b)/;
+const RESCHEDULE_CONTINUATION_RE =
+  /\b(?:remarcar|remarca|reagendar|reagenda)\b|\b(?:mudar|trocar)\s+(?:o\s+)?horario\b/;
+const NEW_CHOICE_RE =
+  /\b(?:(?:outr[oa]s?|nov[oa]s?)\s+(?:atendimentos?|servicos?|agendamentos?)|(?:marcar|agendar)\s+tambem|(?:marcar|agendar)\b.{0,30}\boutr[oa]s?)\b/;
 
 const STOPWORDS = new Set([
   'de', 'da', 'do', 'das', 'dos', 'a', 'o', 'e', 'com', 'em', 'para', 'por',
@@ -44,6 +50,39 @@ function normalizeServiceText(value: string): string {
     .toLowerCase()
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * "Sim, pode marcar" confirma a proposta imediatamente anterior; não abre uma
+ * nova intenção e, portanto, não pode apagar da janela o serviço que o próprio
+ * cliente escolheu. Já "pode marcar amanhã?" sem uma confirmação explícita e
+ * pedidos por outro/novo atendimento continuam abrindo uma intenção nova.
+ */
+function isConfirmationContinuation(message: string): boolean {
+  const normalized = normalizeServiceText(message);
+  return (
+    CONFIRMATION_CONTINUATION_RE.test(normalized) &&
+    !NEW_CHOICE_RE.test(normalized)
+  );
+}
+
+/**
+ * Remarcar/mudar o horário continua o agendamento em curso e preserva o serviço
+ * já escolhido. Outro serviço/atendimento ou novo agendamento abre outro fluxo.
+ */
+function isRescheduleContinuation(message: string): boolean {
+  const normalized = normalizeServiceText(message);
+  return (
+    RESCHEDULE_CONTINUATION_RE.test(normalized) &&
+    !NEW_CHOICE_RE.test(normalized)
+  );
+}
+
+function isFlowContinuation(message: string): boolean {
+  return (
+    isConfirmationContinuation(message) ||
+    isRescheduleContinuation(message)
+  );
 }
 
 function escapeRegex(value: string): string {
@@ -83,7 +122,12 @@ function computeWindow(userMessages: string[]): { windowText: string; hasNewBook
   const lastIdx = messages.length - 1;
   let openerIdx = -1;
   for (let i = lastIdx; i >= Math.max(0, lastIdx - OPENER_SCAN_LIMIT); i--) {
-    if (INTENT_OPENER_RE.test(normalizeServiceText(messages[i]))) {
+    const normalized = normalizeServiceText(messages[i]);
+    if (
+      NEW_CHOICE_RE.test(normalized) ||
+      (INTENT_OPENER_RE.test(normalized) &&
+        !isFlowContinuation(normalized))
+    ) {
       openerIdx = i;
       break;
     }
@@ -93,7 +137,13 @@ function computeWindow(userMessages: string[]): { windowText: string; hasNewBook
   const windowStart = Math.max(0, openerIdx, lastIdx - (RECENT_USER_TURNS - 1));
   const windowMsgs = messages.slice(windowStart);
   const windowText = windowMsgs.map((m) => normalizeServiceText(m)).join(' \n ');
-  const hasNewBooking = windowMsgs.some((m) => NEW_BOOKING_RE.test(normalizeServiceText(m)));
+  const hasNewBooking = windowMsgs.some((message) => {
+    const normalized = normalizeServiceText(message);
+    return (
+      NEW_CHOICE_RE.test(normalized) ||
+      (NEW_BOOKING_RE.test(normalized) && !isFlowContinuation(normalized))
+    );
+  });
   return { windowText, hasNewBooking };
 }
 

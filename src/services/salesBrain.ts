@@ -2,7 +2,10 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Sentry } from '../observability/sentry';
 import type { TenantBotConfig } from '../configProvider';
 import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
-import { callAnthropicWithRetry } from '../utils/anthropicRetry';
+import {
+  callAnthropicWithRetry,
+  type AnthropicRetryPolicy,
+} from '../utils/anthropicRetry';
 import { isCaptured } from '../observability/captured';
 import { addMessage, buildConversationKey, getHistory } from './contextManager';
 import { getAvailableSlots, bookAppointment } from './calendarService';
@@ -513,65 +516,33 @@ const defaultSalesReplyDeps: SalesReplyDeps = {
   emitEvent: emitSalesEvent,
 };
 
-export async function getSalesReply(
+export interface SalesReplyOptions {
+  retryPolicy?: AnthropicRetryPolicy;
+}
+
+/** Falha terminal pública do miolo de vendas; nunca vira copy pro lead. */
+export class SalesBrainFailure extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super('Não foi possível gerar a resposta de vendas.');
+    this.name = 'SalesBrainFailure';
+    this.cause = cause;
+  }
+}
+
+async function runSalesReplyFromLoadedHistory(
   phone: string,
-  userMessage: string,
   userName: string,
   config: TenantBotConfig,
+  history: Awaited<ReturnType<typeof getHistory>>,
+  options: SalesReplyOptions,
   deps: SalesReplyDeps = defaultSalesReplyDeps
 ): Promise<string> {
   const conversationKey = buildConversationKey(config.phoneNumberId, phone);
-
-  await deps.addMessage(conversationKey, 'user', userMessage);
-  const history = await deps.getHistory(conversationKey);
-  const userMessages = history.filter((message) => message.role === 'user');
   const isFirstResponse = !history.some((message) => message.role === 'assistant');
-  const isFirstInboundWindow = userMessages.length === 1 && isFirstResponse;
-
-  // Mesma janela determinística do matchAdOpening: só a primeira mensagem
-  // consolidada da conversa pode criar a atribuição. O carimbo inicial não leva
-  // `status` nem evento; falha de rede jamais interrompe a resposta.
-  if (isFirstInboundWindow) {
-    const detectedPartnerSlug = matchPartnerMention(userMessage);
-    if (detectedPartnerSlug) {
-      rememberConversationPartnerSlug(conversationKey, detectedPartnerSlug);
-      void capturePartnerAttribution(
-        config.phoneNumberId,
-        phone,
-        detectedPartnerSlug
-      ).catch(() => undefined);
-    }
-  }
   const partnerSlug = getConversationPartnerSlug(conversationKey);
   const adHeadline = getConversationAdHeadline(conversationKey);
-
-  // Régua de follow-up ZERA a cada inbound (best-effort, não bloqueia a resposta).
-  await deps
-    .scheduleFollowup(config.phoneNumberId, phone, userName)
-    .catch(() => undefined);
-
-  // Pedido explícito de canal vale já para ESTA resposta e é reversível.
-  const channelRequest = detectChannelRequest(userMessage);
-  if (channelRequest) {
-    await deps
-      .setChannelPreference(conversationKey, channelRequest === 'text')
-      .catch(() => undefined);
-  }
-
-  // Aberturas reais dos anúncios: 1º inbound casado recebe script canônico sem
-  // Anthropic. O texto original segue no histórico e no mesmo evento do caminho
-  // normal; o messageHandler decide voz/texto depois.
-  if (
-    isFirstInboundWindow &&
-    matchAdOpening(userMessage)
-  ) {
-    const script = pickOpenerScript(phone);
-    await deps.addMessage(conversationKey, 'assistant', script);
-    void deps
-      .emitEvent(config.phoneNumberId, phone, 'primeira_resposta')
-      .catch(() => undefined);
-    return script;
-  }
 
   // Preço SEMPRE da sales-config. Indisponível → bloco seguro (nunca inventa).
   let salesConfig: SalesConfig | null = null;
@@ -607,7 +578,8 @@ export async function getSalesReply(
             tools: SALES_TOOLS,
             messages,
           }),
-        `sales tenant=${config.tenantSlug} round=${round + 1}/${MAX_TOOL_ROUNDS}`
+        `sales tenant=${config.tenantSlug} round=${round + 1}/${MAX_TOOL_ROUNDS}`,
+        options.retryPolicy ?? 'patient'
       );
 
       const toolUses = response.content.filter(
@@ -666,9 +638,16 @@ export async function getSalesReply(
         },
       });
     }
-    console.error('❌ Erro ao gerar resposta da Renata:', error);
+    console.error(
+      `❌ Erro ao gerar resposta da Renata | phoneNumberId=${
+        config.phoneNumberId
+      } | error=${error instanceof Error ? error.name : typeof error}`
+    );
+    throw new SalesBrainFailure(error);
   }
 
+  // O provider respondeu, mas esgotou MAX_TOOL_ROUNDS sem texto final. Este
+  // fallback de modelo vivo continua sendo uma resposta normal, como antes.
   const fallbackReply = getFallbackMessage(config);
   await deps.addMessage(conversationKey, 'assistant', fallbackReply);
   if (isFirstResponse) {
@@ -677,4 +656,93 @@ export async function getSalesReply(
       .catch(() => undefined);
   }
   return fallbackReply;
+}
+
+/**
+ * Reexecuta somente o miolo da Renata a partir do histórico já persistido.
+ * Não grava inbound nem repete follow-up, preferência de canal, atribuição ou
+ * opener. Usado pelo recovery automático e pelo reprocessamento administrativo.
+ */
+export async function getSalesReplyFromHistory(
+  phone: string,
+  userName: string,
+  config: TenantBotConfig,
+  options: SalesReplyOptions = {},
+  deps: SalesReplyDeps = defaultSalesReplyDeps
+): Promise<string> {
+  const conversationKey = buildConversationKey(config.phoneNumberId, phone);
+  const history = await deps.getHistory(conversationKey);
+  return runSalesReplyFromLoadedHistory(
+    phone,
+    userName,
+    config,
+    history,
+    options,
+    deps
+  );
+}
+
+export async function getSalesReply(
+  phone: string,
+  userMessage: string,
+  userName: string,
+  config: TenantBotConfig,
+  deps: SalesReplyDeps = defaultSalesReplyDeps
+): Promise<string> {
+  const conversationKey = buildConversationKey(config.phoneNumberId, phone);
+
+  await deps.addMessage(conversationKey, 'user', userMessage);
+  const history = await deps.getHistory(conversationKey);
+  const userMessages = history.filter((message) => message.role === 'user');
+  const isFirstResponse = !history.some((message) => message.role === 'assistant');
+  const isFirstInboundWindow = userMessages.length === 1 && isFirstResponse;
+
+  // Mesma janela determinística do matchAdOpening: só a primeira mensagem
+  // consolidada da conversa pode criar a atribuição. O carimbo inicial não leva
+  // `status` nem evento; falha de rede jamais interrompe a resposta.
+  if (isFirstInboundWindow) {
+    const detectedPartnerSlug = matchPartnerMention(userMessage);
+    if (detectedPartnerSlug) {
+      rememberConversationPartnerSlug(conversationKey, detectedPartnerSlug);
+      void capturePartnerAttribution(
+        config.phoneNumberId,
+        phone,
+        detectedPartnerSlug
+      ).catch(() => undefined);
+    }
+  }
+
+  // Régua de follow-up ZERA a cada inbound (best-effort, não bloqueia a resposta).
+  await deps
+    .scheduleFollowup(config.phoneNumberId, phone, userName)
+    .catch(() => undefined);
+
+  // Pedido explícito de canal vale já para ESTA resposta e é reversível.
+  const channelRequest = detectChannelRequest(userMessage);
+  if (channelRequest) {
+    await deps
+      .setChannelPreference(conversationKey, channelRequest === 'text')
+      .catch(() => undefined);
+  }
+
+  // Aberturas reais dos anúncios: 1º inbound casado recebe script canônico sem
+  // Anthropic. O texto original segue no histórico e no mesmo evento do caminho
+  // normal; o messageHandler decide voz/texto depois.
+  if (isFirstInboundWindow && matchAdOpening(userMessage)) {
+    const script = pickOpenerScript(phone);
+    await deps.addMessage(conversationKey, 'assistant', script);
+    void deps
+      .emitEvent(config.phoneNumberId, phone, 'primeira_resposta')
+      .catch(() => undefined);
+    return script;
+  }
+
+  return runSalesReplyFromLoadedHistory(
+    phone,
+    userName,
+    config,
+    history,
+    { retryPolicy: 'patient' },
+    deps
+  );
 }

@@ -60,22 +60,50 @@ async function main(): Promise<void> {
   );
 
   console.log('▶ custo + alarme 80% uma vez');
-  const state = { chars: 0, hits: 0, misses: 0, alerted: false };
+  const state = {
+    elevenlabs: {
+      chars: 0,
+      audioTokens: 0,
+      audioSeconds: 0,
+      hits: 0,
+      misses: 0,
+      alerted: false,
+    },
+    gemini: {
+      chars: 0,
+      audioTokens: 0,
+      audioSeconds: 0,
+      hits: 0,
+      misses: 0,
+      alerted: false,
+    },
+  };
   let warnings = 0;
   const meterDeps: CostMeterDeps = {
     query: async (text, params) => {
+      const provider = String(params?.[1] ?? 'elevenlabs') as keyof typeof state;
+      const providerState = state[provider];
       if (text.includes('INSERT INTO tts_daily_usage') && text.includes('hits')) {
-        state.hits += 1;
+        providerState.hits += 1;
         return { rows: [], rowCount: 1 };
       }
       if (text.includes('INSERT INTO tts_daily_usage') && text.includes('misses')) {
-        state.chars += Number(params?.[1] ?? 0);
-        state.misses += 1;
-        return { rows: [{ chars: state.chars, alerted: state.alerted }], rowCount: 1 };
+        providerState.chars += Number(params?.[2] ?? 0);
+        providerState.audioTokens += Number(params?.[3] ?? 0);
+        providerState.audioSeconds += Number(params?.[4] ?? 0);
+        providerState.misses += 1;
+        return {
+          rows: [{
+            chars: providerState.chars,
+            audio_seconds: providerState.audioSeconds,
+            alerted: providerState.alerted,
+          }],
+          rowCount: 1,
+        };
       }
       if (text.includes('SET alerted = true')) {
-        if (state.alerted) return { rows: [], rowCount: 0 };
-        state.alerted = true;
+        if (providerState.alerted) return { rows: [], rowCount: 0 };
+        providerState.alerted = true;
         return { rows: [{ day: params?.[0] }], rowCount: 1 };
       }
       return { rows: [], rowCount: 0 };
@@ -85,13 +113,24 @@ async function main(): Promise<void> {
     },
   };
   const day = '2026-07-23';
-  await cost.recordHit(day, meterDeps);
-  await cost.recordMiss(day, 40, 100, meterDeps);
-  await cost.recordMiss(day, 40, 100, meterDeps);
-  await cost.recordMiss(day, 10, 100, meterDeps);
-  check('hit não soma chars', state.hits === 1 && state.chars === 90);
-  check('misses contados', state.misses === 3);
-  check('alarme exatamente 1x/dia', warnings === 1 && state.alerted);
+  await cost.recordHit(day, 'elevenlabs', meterDeps);
+  await cost.recordMiss(day, 'elevenlabs', 40, 100, undefined, meterDeps);
+  await cost.recordMiss(day, 'elevenlabs', 40, 100, undefined, meterDeps);
+  await cost.recordMiss(day, 'elevenlabs', 10, 100, undefined, meterDeps);
+  check(
+    'hit não soma chars',
+    state.elevenlabs.hits === 1 && state.elevenlabs.chars === 90
+  );
+  check('misses contados', state.elevenlabs.misses === 3);
+  check(
+    'ElevenLabs mantém audio_tokens/audio_seconds em zero e régua por chars',
+    state.elevenlabs.audioTokens === 0 &&
+      state.elevenlabs.audioSeconds === 0
+  );
+  check(
+    'alarme exatamente 1x/dia',
+    warnings === 1 && state.elevenlabs.alerted
+  );
   check(
     'dayKey civil SP na borda UTC',
     cost.dayKey(new Date('2026-07-24T02:30:00.000Z')) === '2026-07-23'

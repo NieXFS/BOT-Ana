@@ -7,12 +7,13 @@ import {
   sendFreeformMessage,
   uploadMedia,
 } from '../whatsappCloudService';
-import { encodeToOpus } from './audioEncoder';
+import { encodeToOpus, type TtsEncoderInput } from './audioEncoder';
 import { decideDelivery } from './channelPolicy';
 import { getChannelPref } from './channelPref';
 import { dayKey, recordHit, recordMiss } from './costMeter';
 import { applyProsody } from './prosody';
-import { getTtsProvider, type TtsProvider } from './ttsProvider';
+import { synthesizeWithFallback } from './resilientTtsProvider';
+import type { TtsSynthesisResult, TtsUsage } from './ttsProvider';
 import {
   isMediaFresh,
   lookup,
@@ -23,8 +24,10 @@ import {
 import {
   getVoiceEnvConfig,
   isRenataVoiceEnabled,
+  providerDailyCharBudget,
   voiceFingerprint,
   type VoiceEnvConfig,
+  type VoiceTtsProviderName,
 } from './voiceConfig';
 
 export type VoiceDeliveryStep = 'tts' | 'ffmpeg' | 'upload' | 'send' | 'cache';
@@ -33,7 +36,7 @@ export interface VoiceDeliveryDeps {
   getPreference: (conversationKey: string) => Promise<boolean>;
   voiceEnabled: (config: TenantBotConfig) => boolean;
   getConfig: () => VoiceEnvConfig;
-  getProvider: () => TtsProvider;
+  synthesize: (text: string) => Promise<TtsSynthesisResult>;
   lookupCache: (textHash: string, fingerprint: string) => Promise<TtsCacheRow | null>;
   saveCache: (
     textHash: string,
@@ -46,7 +49,7 @@ export interface VoiceDeliveryDeps {
     fingerprint: string,
     mediaId: string
   ) => Promise<void>;
-  encode: (mp3: Buffer) => Promise<Buffer>;
+  encode: (audio: Buffer, input: TtsEncoderInput) => Promise<Buffer>;
   upload: (ogg: Buffer, config: TenantBotConfig) => Promise<string>;
   sendAudio: (
     to: string,
@@ -58,11 +61,16 @@ export interface VoiceDeliveryDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
-  recordCacheHit: (day: string) => Promise<void>;
+  recordCacheHit: (
+    day: string,
+    provider: VoiceTtsProviderName
+  ) => Promise<void>;
   recordCacheMiss: (
     day: string,
+    provider: VoiceTtsProviderName,
     chars: number,
-    dailyCharBudget: number
+    dailyCharBudget: number,
+    usage?: TtsUsage
   ) => Promise<void>;
   now: () => Date;
   captureWarning: (step: VoiceDeliveryStep) => void;
@@ -72,7 +80,7 @@ const defaultDeps: VoiceDeliveryDeps = {
   getPreference: getChannelPref,
   voiceEnabled: isRenataVoiceEnabled,
   getConfig: getVoiceEnvConfig,
-  getProvider: () => getTtsProvider(),
+  synthesize: (text) => synthesizeWithFallback(text, getVoiceEnvConfig()),
   lookupCache: lookup,
   saveCache: saveNew,
   refreshCachedMedia: refreshMediaId,
@@ -99,6 +107,11 @@ function resolveDeps(overrides?: Partial<VoiceDeliveryDeps>): VoiceDeliveryDeps 
 
 function hashText(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function resultProviderName(provider: string): VoiceTtsProviderName {
+  if (provider === 'gemini' || provider === 'elevenlabs') return provider;
+  throw new Error(`renata_voice returned unsupported provider ${provider}`);
 }
 
 async function bestEffortUsage(
@@ -145,18 +158,19 @@ async function speakAndSend(
   try {
     const prosodic = applyProsody(spokenText);
     const textHash = hashText(prosodic);
-    const fingerprint = voiceFingerprint(voiceConfig);
+    const primaryProvider = voiceConfig.provider;
+    const primaryFingerprint = voiceFingerprint(voiceConfig, primaryProvider);
     const usageDay = dayKey(deps.now());
 
     step = 'cache';
-    const cached = await deps.lookupCache(textHash, fingerprint);
+    const cached = await deps.lookupCache(textHash, primaryFingerprint);
     if (cached) {
       let mediaId = cached.mediaId;
       if (!isMediaFresh(cached, deps.now().getTime())) {
         step = 'upload';
         mediaId = await deps.upload(cached.oggBytes, config);
         step = 'cache';
-        await deps.refreshCachedMedia(textHash, fingerprint, mediaId);
+        await deps.refreshCachedMedia(textHash, primaryFingerprint, mediaId);
       }
 
       if (!mediaId) {
@@ -164,30 +178,48 @@ async function speakAndSend(
       }
       step = 'send';
       await deps.sendAudio(to, mediaId, config);
-      await bestEffortUsage(() => deps.recordCacheHit(usageDay), deps);
+      // A linha histórica do cache não guarda provider; como o lookup foi pelo
+      // fingerprint efetivo, o provider primário é autoritativo neste hit.
+      await bestEffortUsage(
+        () => deps.recordCacheHit(usageDay, primaryProvider),
+        deps
+      );
       return true;
     }
 
     step = 'tts';
-    const mp3 = await deps.getProvider().synthesize(prosodic);
-    // A ElevenLabs já cobrou os chars quando o MP3 chegou; conta mesmo se uma
-    // etapa posterior falhar.
+    const synthesis = await deps.synthesize(prosodic);
+    const effectiveProvider = resultProviderName(synthesis.provider);
+    const effectiveFingerprint = voiceFingerprint(
+      voiceConfig,
+      effectiveProvider
+    );
+    // Conta o texto prosódico sem o style prompt do Gemini. O input textual é
+    // ruído frente ao custo de áudio e a métrica segue comparável ao histórico.
+    // Conta assim que o provider respondeu, mesmo se uma etapa posterior falhar.
     await bestEffortUsage(
       () =>
         deps.recordCacheMiss(
           usageDay,
+          effectiveProvider,
           prosodic.length,
-          voiceConfig.dailyCharBudget
+          providerDailyCharBudget(voiceConfig, effectiveProvider),
+          synthesis.usage
         ),
       deps
     );
 
     step = 'ffmpeg';
-    const ogg = await deps.encode(mp3);
+    const ogg = await deps.encode(synthesis.audio, {
+      format: synthesis.format,
+      sampleRate: synthesis.sampleRate,
+    });
     step = 'upload';
     const mediaId = await deps.upload(ogg, config);
     step = 'cache';
-    await deps.saveCache(textHash, fingerprint, ogg, mediaId);
+    // Nunca grava fallback sob o fingerprint do primário: isso envenenaria o
+    // cache Gemini com uma voz ElevenLabs e pinaria uma indisponibilidade curta.
+    await deps.saveCache(textHash, effectiveFingerprint, ogg, mediaId);
     step = 'send';
     await deps.sendAudio(to, mediaId, config);
     return true;
@@ -199,8 +231,8 @@ async function speakAndSend(
 }
 
 /**
- * Orquestra a política áudio-primeiro da Renata. É batch: sintetiza o MP3
- * completo, converte em memória, faz upload e só então envia a nota de voz.
+ * Orquestra a política áudio-primeiro da Renata. É batch: sintetiza o áudio
+ * completo (MP3 ou PCM), converte em memória, faz upload e só então envia PTT.
  */
 export async function deliverSalesReply(
   to: string,
@@ -210,6 +242,10 @@ export async function deliverSalesReply(
 ): Promise<void> {
   const deps = resolveDeps(overrides);
   const voiceConfig = deps.getConfig();
+  if (!overrides?.synthesize) {
+    // Usa exatamente o mesmo snapshot de env do gate/fingerprint desta entrega.
+    deps.synthesize = (text) => synthesizeWithFallback(text, voiceConfig);
+  }
   const conversationKey = buildConversationKey(config.phoneNumberId, to);
 
   let prefersText = false;

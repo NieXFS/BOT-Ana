@@ -494,13 +494,9 @@ function findAppointmentByTechnicalId(
   const candidate = extractTechnicalAppointmentId(rawAppointmentId) ?? rawAppointmentId.trim();
   if (!candidate) return undefined;
 
-  const exactMatch = appointments.find((appointment) => appointment.id === candidate);
-  if (exactMatch) return exactMatch;
-
-  const prefixMatches = appointments.filter((appointment) =>
-    appointment.id.startsWith(candidate)
-  );
-  return prefixMatches.length === 1 ? prefixMatches[0] : undefined;
+  // Cancelamento é destrutivo: prefixo único não basta. Só um ID técnico
+  // COMPLETO que exista na lista autoritativa do cliente pode ser aceito.
+  return appointments.find((appointment) => appointment.id === candidate);
 }
 
 function findAppointmentByDateTimeReference(
@@ -527,6 +523,19 @@ function findAppointmentByDateTimeReference(
     return dateTimeMatches[0];
   }
 
+  const dateMatches = appointments.filter((appointment) => {
+    const { date } = formatDateTimeBR(appointment.startTime, timezone);
+    const shortDate = date.slice(0, 5);
+    return (
+      normalizedReference.includes(normalizeAppointmentReference(date)) ||
+      normalizedReference.includes(normalizeAppointmentReference(shortDate))
+    );
+  });
+
+  if (dateMatches.length === 1) {
+    return dateMatches[0];
+  }
+
   const timeMatches = appointments.filter((appointment) => {
     const { time } = formatDateTimeBR(appointment.startTime, timezone);
     return normalizedReference.includes(normalizeAppointmentReference(time));
@@ -535,25 +544,79 @@ function findAppointmentByDateTimeReference(
   return timeMatches.length === 1 ? timeMatches[0] : undefined;
 }
 
-function appointmentMatchesUserReference(
-  appointment: UpcomingAppointment,
-  rawReference: string | undefined,
-  timezone: string
-): boolean {
-  if (!rawReference?.trim()) return false;
+export type CancellationTargetResolution =
+  | {
+      ok: true;
+      appointmentId: string;
+      correctedFromRequestedId: boolean;
+    }
+  | {
+      ok: false;
+      reason: 'multiple_reference_required' | 'target_not_found';
+      message: string;
+    };
 
-  const normalizedReference = normalizeAppointmentReference(rawReference);
-  const { date, time } = formatDateTimeBR(appointment.startTime, timezone);
-  const shortDate = date.slice(0, 5);
-  const fullReference = normalizeAppointmentReference(`${date} ${time}`);
-  const shortReference = normalizeAppointmentReference(`${shortDate} ${time}`);
-  const timeReference = normalizeAppointmentReference(time);
-
-  return (
-    normalizedReference.includes(fullReference) ||
-    normalizedReference.includes(shortReference) ||
-    normalizedReference.includes(timeReference)
+/**
+ * Resolve o alvo destrutivo sem rede. É exportado para que smokes e o benchmark
+ * auditem exatamente a mesma decisão usada em produção, sem reimplementar uma
+ * versão mais permissiva do guardrail.
+ */
+export function resolveCancellationTarget(input: {
+  appointments: UpcomingAppointment[];
+  requestedAppointmentId: string;
+  currentUserMessage: string;
+  timezone: string;
+}): CancellationTargetResolution {
+  const requestedAppointmentId = input.requestedAppointmentId.trim();
+  const technicalMatch = findAppointmentByTechnicalId(
+    input.appointments,
+    requestedAppointmentId
   );
+  const currentReferenceMatch = findAppointmentByDateTimeReference(
+    input.appointments,
+    input.currentUserMessage,
+    input.timezone
+  );
+  const list = input.appointments
+    .slice(0, 5)
+    .map((appointment) =>
+      formatAppointmentForHint(appointment, input.timezone)
+    )
+    .join('\n- ');
+
+  if (technicalMatch) {
+    if (
+      input.appointments.length >= 2 &&
+      currentReferenceMatch?.id !== technicalMatch.id
+    ) {
+      return {
+        ok: false,
+        reason: 'multiple_reference_required',
+        message: `INTERNAL_HINT: há mais de um agendamento futuro e a mensagem ATUAL do cliente não identifica de forma inequívoca o mesmo agendamento do appointmentId recebido. Agendamentos futuros:\n- ${list}\n\nPergunte qual cancelar (peça data e/ou horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`,
+      };
+    }
+
+    return {
+      ok: true,
+      appointmentId: technicalMatch.id,
+      correctedFromRequestedId: technicalMatch.id !== requestedAppointmentId,
+    };
+  }
+
+  if (currentReferenceMatch) {
+    return {
+      ok: true,
+      appointmentId: currentReferenceMatch.id,
+      correctedFromRequestedId:
+        currentReferenceMatch.id !== requestedAppointmentId,
+    };
+  }
+
+  return {
+    ok: false,
+    reason: 'target_not_found',
+    message: `INTERNAL_HINT: não deu pra identificar com segurança qual agendamento cancelar — o appointmentId não corresponde exatamente a um agendamento futuro e a mensagem ATUAL do cliente não traz uma referência inequívoca de data/horário. Agendamentos futuros:\n- ${list}\n\nPergunte qual cancelar (peça data e/ou horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`,
+  };
 }
 
 export async function getServices(
@@ -739,11 +802,30 @@ export async function getCustomerUpcomingAppointments(
   }
 }
 
+interface CancelAppointmentPayload {
+  tenantSlug: string;
+  customerPhone: string;
+  appointmentId: string;
+}
+
+export interface CancelAppointmentDeps {
+  getUpcomingAppointments: typeof getCustomerUpcomingAppointments;
+  postCancel: (payload: CancelAppointmentPayload) => Promise<void>;
+}
+
+const defaultCancelAppointmentDeps: CancelAppointmentDeps = {
+  getUpcomingAppointments: getCustomerUpcomingAppointments,
+  postCancel: async (payload) => {
+    await erpApi.post('/api/v1/agenda/cancel', payload);
+  },
+};
+
 export async function cancelAppointment(
   appointmentId: string,
   phone: string,
   config: TenantBotConfig,
-  currentUserMessage?: string
+  currentUserMessage?: string,
+  deps: CancelAppointmentDeps = defaultCancelAppointmentDeps
 ): Promise<{ success: boolean; message: string }> {
   const requestedAppointmentId = appointmentId?.trim();
 
@@ -751,14 +833,14 @@ export async function cancelAppointment(
     return { success: false, message: 'Preciso do ID do agendamento para cancelar.' };
   }
 
-  let resolvedAppointmentId = requestedAppointmentId;
-  const upcoming = await getCustomerUpcomingAppointments(phone, config);
+  const upcoming = await deps.getUpcomingAppointments(phone, config);
 
   // GUARDRAIL: o cancelamento SÓ pode mirar um agendamento futuro REAL do cliente.
-  // Não dá pra confiar no id que o modelo passa (no log de prod ele mandou o
-  // serviceId no lugar do appointmentId → ERP 400). Resolvemos o id SEMPRE contra
-  // a lista de upcoming; se não bater, usamos contexto (único futuro / data citada)
-  // ou re-perguntamos — NUNCA mandamos um id não-verificado pro ERP.
+  // Não dá pra confiar no id que o modelo passa. O ID precisa bater EXATAMENTE
+  // com a lista autoritativa. Sem match técnico, só a referência inequívoca de
+  // data/horário na mensagem ATUAL do cliente pode resolver o alvo. Com 2+
+  // futuros, até um ID válido exige que a mensagem atual identifique o mesmo
+  // agendamento — o modelo nunca escolhe um dos vários sozinho.
   if (!upcoming.success) {
     return {
       success: false,
@@ -776,57 +858,27 @@ export async function cancelAppointment(
     };
   }
 
-  const technicalMatch = findAppointmentByTechnicalId(
-    upcomingAppointments,
-    requestedAppointmentId
-  );
-  if (technicalMatch) {
-    resolvedAppointmentId = technicalMatch.id;
-  } else if (upcomingAppointments.length === 1) {
-    // Id não bateu (ex.: serviceId no lugar do appointmentId), mas só há UM
-    // agendamento futuro → é esse que o cliente quer cancelar no fluxo de remarcação.
-    resolvedAppointmentId = upcomingAppointments[0].id;
-  } else {
-    const dateTimeMatch = findAppointmentByDateTimeReference(
-      upcomingAppointments,
-      requestedAppointmentId,
-      config.timezone
-    );
-    const userExplicitlyReferencedAppointment =
-      dateTimeMatch &&
-      appointmentMatchesUserReference(dateTimeMatch, currentUserMessage, config.timezone);
-
-    if (dateTimeMatch && userExplicitlyReferencedAppointment) {
-      resolvedAppointmentId = dateTimeMatch.id;
-    } else {
-      const list = upcomingAppointments
-        .slice(0, 5)
-        .map((appointment) => formatAppointmentForHint(appointment, config.timezone))
-        .join('\n- ');
-      return {
-        success: false,
-        message: `INTERNAL_HINT: não deu pra identificar com segurança qual agendamento cancelar — o id recebido não corresponde a nenhum agendamento futuro do cliente. Agendamentos futuros:\n- ${list}\n\nPergunte ao cliente qual cancelar (peça data e horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`,
-      };
-    }
+  const target = resolveCancellationTarget({
+    appointments: upcomingAppointments,
+    requestedAppointmentId,
+    currentUserMessage: currentUserMessage ?? '',
+    timezone: config.timezone,
+  });
+  if (!target.ok) {
+    return { success: false, message: target.message };
   }
 
-  if (resolvedAppointmentId !== requestedAppointmentId) {
-    const resolvedAppointment = upcomingAppointments.find(
-      (appointment) => appointment.id === resolvedAppointmentId
-    );
-    const resolvedLabel = resolvedAppointment
-      ? formatAppointmentForHint(resolvedAppointment, config.timezone)
-      : resolvedAppointmentId;
+  if (target.correctedFromRequestedId) {
     console.log(
-      `🔎 appointmentId "${requestedAppointmentId}" resolvido para ${resolvedLabel}`
+      `🔎 appointmentId corrigido por referência explícita do cliente | tenantSlug=${config.tenantSlug}`
     );
   }
 
   try {
-    await erpApi.post('/api/v1/agenda/cancel', {
+    await deps.postCancel({
       tenantSlug: config.tenantSlug,
       customerPhone: normalizeWhatsappPhone(phone),
-      appointmentId: resolvedAppointmentId,
+      appointmentId: target.appointmentId,
     });
 
     return {

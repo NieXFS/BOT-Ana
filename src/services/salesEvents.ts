@@ -25,7 +25,9 @@ export type SalesEventType =
   | 'primeira_resposta'
   | 'link_enviado'
   | 'followup_enviado'
-  | 'reabriu';
+  | 'reabriu'
+  | 'falha_resposta'
+  | 'recuperado_auto';
 
 export type SalesEventMetadata = Record<string, string | number | boolean | null>;
 

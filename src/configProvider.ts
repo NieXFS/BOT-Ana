@@ -8,13 +8,68 @@ import { ERP_API_TOKEN } from './erpApiToken';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 const CACHE_TTL_MS = 5 * 60 * 1000;
+const STALE_CONFIG_RETRY_TTL_MS = 30 * 1000;
+export const MAX_AUTHORITATIVELY_REJECTED_CONFIGS = 1_000;
 
 interface CachedConfig {
   data: TenantBotConfig;
   expiresAt: number;
+  source: 'erp' | 'legacy';
 }
 
 const configCache = new Map<string, CachedConfig>();
+
+export class BoundedLruSet<T> {
+  private readonly entries = new Map<T, true>();
+
+  constructor(readonly maxSize: number) {
+    if (!Number.isInteger(maxSize) || maxSize < 1) {
+      throw new Error('BoundedLruSet maxSize deve ser um inteiro positivo.');
+    }
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  add(value: T): this {
+    this.entries.delete(value);
+    this.entries.set(value, true);
+
+    if (this.entries.size > this.maxSize) {
+      const oldest = this.entries.keys().next();
+      if (!oldest.done) {
+        this.entries.delete(oldest.value);
+      }
+    }
+    return this;
+  }
+
+  has(value: T): boolean {
+    if (!this.entries.has(value)) return false;
+    // Leitura também renova a recência; o bloqueio continua com a mesma
+    // semântica, mas entradas rejeitadas que seguem ativas vencem a evicção.
+    this.entries.delete(value);
+    this.entries.set(value, true);
+    return true;
+  }
+
+  delete(value: T): boolean {
+    return this.entries.delete(value);
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+}
+
+// Um 4xx/3xx do endpoint é autoritativo: a configuração não pode ser
+// ressuscitada por cache stale nem pelo fallback legado numa falha posterior.
+// Uma resposta 2xx futura remove o bloqueio. O LRU só limita a memória do
+// processo; dentro do teto, a semântica autoritativa permanece idêntica.
+const authoritativelyRejectedConfigs = new BoundedLruSet<string>(
+  MAX_AUTHORITATIVELY_REJECTED_CONFIGS
+);
 
 export interface TenantBotConfig {
   tenantSlug: string;
@@ -25,8 +80,8 @@ export interface TenantBotConfig {
   systemPrompt: string;
   greetingMessage: string | null;
   fallbackMessage: string | null;
-  // Provider de IA: "openai" (default) | "anthropic" (Renata). Payload sem o
-  // campo (ERP antigo) → "openai".
+  // Provider de IA: "openai" (default) | "deepseek" (Ana) | "anthropic"
+  // (Renata). Payload sem o campo (ERP antigo) → "openai".
   aiProvider: string;
   aiModel: string;
   aiTemperature: number;
@@ -67,6 +122,12 @@ function getLegacyConfig(phoneNumberId: string): TenantBotConfig | null {
     return null;
   }
 
+  const aiProvider = (process.env.AI_PROVIDER ?? 'openai').trim().toLowerCase();
+  const aiModel =
+    aiProvider === 'deepseek'
+      ? process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash'
+      : process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
+
   return {
     tenantSlug: process.env.ERP_TENANT_SLUG ?? 'clinica-bella',
     botName: process.env.BOT_NAME ?? DEFAULT_BOT_NAME,
@@ -74,8 +135,8 @@ function getLegacyConfig(phoneNumberId: string): TenantBotConfig | null {
     systemPrompt: DEFAULT_BOT_SYSTEM_PROMPT,
     greetingMessage: process.env.GREETING_MESSAGE ?? DEFAULT_GREETING_MESSAGE,
     fallbackMessage: process.env.FALLBACK_MESSAGE ?? DEFAULT_FALLBACK_MESSAGE,
-    aiProvider: 'openai',
-    aiModel: process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
+    aiProvider,
+    aiModel,
     aiTemperature: parseNumber(process.env.OPENAI_TEMPERATURE, 0.4),
     aiMaxTokens: parseNumber(process.env.OPENAI_MAX_TOKENS, 500),
     openaiApiKey: null,
@@ -115,19 +176,65 @@ export async function getTenantConfig(
       const raw = (await response.json()) as Partial<TenantBotConfig>;
       // Fallbacks p/ tenants antigos cujo payload não traz os campos novos —
       // receptionist/openai = comportamento atual, 100% intocado.
+      const aiProvider = raw.aiProvider ?? 'openai';
       const data: TenantBotConfig = {
         ...(raw as TenantBotConfig),
         botRole: raw.botRole ?? 'receptionist',
-        aiProvider: raw.aiProvider ?? 'openai',
+        aiProvider,
+        aiModel:
+          raw.aiModel ??
+          (aiProvider === 'deepseek' ? 'deepseek-v4-flash' : 'gpt-4o-mini'),
       };
       configCache.set(cacheKey, {
         data,
         expiresAt: Date.now() + CACHE_TTL_MS,
+        source: 'erp',
       });
+      authoritativelyRejectedConfigs.delete(cacheKey);
       return data;
     }
+
+    const transientFailure =
+      response.status === 408 ||
+      response.status === 429 ||
+      response.status >= 500;
+    console.warn(
+      `⚠️ Config multi-tenant indisponível (HTTP ${response.status}).`
+    );
+
+    if (!transientFailure) {
+      configCache.delete(cacheKey);
+      authoritativelyRejectedConfigs.add(cacheKey);
+      return null;
+    }
+
+    if (cached?.source === 'erp') {
+      configCache.set(cacheKey, {
+        ...cached,
+        expiresAt: Date.now() + STALE_CONFIG_RETRY_TTL_MS,
+      });
+      return cached.data;
+    }
   } catch (error) {
-    console.warn('⚠️ Não foi possível buscar a config multi-tenant no ERP:', error);
+    console.warn(
+      `⚠️ Não foi possível buscar a config multi-tenant no ERP (${
+        error instanceof Error ? error.name : 'erro desconhecido'
+      }).`
+    );
+
+    if (cached?.source === 'erp') {
+      // Preserva exatamente provider/modelo já conhecidos. Nunca cai no
+      // legado/OpenAI durante uma indisponibilidade transitória do Receps.
+      configCache.set(cacheKey, {
+        ...cached,
+        expiresAt: Date.now() + STALE_CONFIG_RETRY_TTL_MS,
+      });
+      return cached.data;
+    }
+  }
+
+  if (authoritativelyRejectedConfigs.has(cacheKey)) {
+    return null;
   }
 
   const legacyConfig = getLegacyConfig(phoneNumberId);
@@ -136,8 +243,14 @@ export async function getTenantConfig(
     configCache.set(cacheKey, {
       data: legacyConfig,
       expiresAt: Date.now() + CACHE_TTL_MS,
+      source: 'legacy',
     });
   }
 
   return legacyConfig;
+}
+
+export function __resetTenantConfigCacheForTest(): void {
+  configCache.clear();
+  authoritativelyRejectedConfigs.clear();
 }

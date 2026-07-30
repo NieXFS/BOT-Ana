@@ -2,6 +2,7 @@ import { pool, buildConversationKey } from './contextManager';
 import { customerPhoneVariants } from './conversationActivity';
 import { clearConversationPartnerSlugs } from './salesPartnerState';
 import { clearConversationAdHeadlines } from './salesAdState';
+import { clearSalesRecoveryState } from './salesRecovery';
 
 export type AdminResetInput = {
   phoneNumberId: string;
@@ -106,5 +107,8 @@ export async function resetAdminConversation(
   const followups = await deps.deleteFollowups(keys);
   clearConversationPartnerSlugs(keys);
   clearConversationAdHeadlines(keys);
+  for (const key of keys) {
+    clearSalesRecoveryState(key);
+  }
   return { history, followups };
 }

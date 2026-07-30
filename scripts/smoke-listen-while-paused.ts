@@ -25,9 +25,11 @@ import type { PausedRecordDeps } from '../src/messageHandler';
 const config: TenantBotConfig = {
   tenantSlug: 'smoke-tenant',
   botName: 'Ana',
+  botRole: 'receptionist',
   systemPrompt: '',
   greetingMessage: null,
   fallbackMessage: null,
+  aiProvider: 'openai',
   aiModel: 'gpt-4o-mini',
   aiTemperature: 0.4,
   aiMaxTokens: 500,

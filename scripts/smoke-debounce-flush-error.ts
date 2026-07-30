@@ -29,9 +29,11 @@ const FALLBACK = 'Tive um probleminha aqui. Pode repetir sua última mensagem?';
 const config: TenantBotConfig = {
   tenantSlug: 'smoke-tenant',
   botName: 'Ana',
+  botRole: 'receptionist',
   systemPrompt: '',
   greetingMessage: null,
   fallbackMessage: null,
+  aiProvider: 'openai',
   aiModel: 'gpt-4o-mini',
   aiTemperature: 0.4,
   aiMaxTokens: 500,
@@ -59,6 +61,7 @@ async function main() {
     __hasBufferForTest,
     __resetFlushStateForTest,
   } = await import('../src/messageHandler');
+  const salesRecovery = await import('../src/services/salesRecovery');
 
   const sent: { from: string; text: string }[] = [];
   const failingDeps: FlushDeps = {
@@ -111,6 +114,70 @@ async function main() {
 
   expect('4) sucesso responde ao cliente', sent.length === 1 && Boolean(sent[0]?.text.includes('15h')));
   expect('4) buffer limpo após sucesso', !__hasBufferForTest(key4));
+
+  // --- Caso 5: sales não usa M24; agenda recovery silencioso ----------------
+  const salesConfig: TenantBotConfig = {
+    ...config,
+    botName: 'Renata',
+    botRole: 'sales',
+    aiProvider: 'anthropic',
+    aiModel: 'claude-sonnet-5',
+  };
+  const fakeTimers: Array<{ cancelled: boolean }> = [];
+  salesRecovery.__setSalesRecoveryDepsForTest({
+    scheduler: {
+      setTimeout: () => {
+        const timer = { cancelled: false };
+        fakeTimers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => {
+        (timer as { cancelled: boolean }).cancelled = true;
+      },
+    },
+    emitEvent: async () => undefined,
+  });
+  sent.length = 0;
+  const genericSalesBrainFailureDeps: FlushDeps = {
+    getReply: async () => {
+      throw new Error('falha genérica fora de SalesBrainFailure');
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+  };
+  const key5 = __seedFlushBufferForTest(salesConfig, from, ['quero conhecer']);
+  await flushBuffer(key5, genericSalesBrainFailureDeps);
+  expect('5) erro genérico de sales não envia fallback M24', sent.length === 0);
+  expect(
+    '5) erro genérico de sales agenda recovery de brain',
+    salesRecovery.__getSalesRecoveryStateForTest(key5)?.kind === 'brain'
+  );
+  expect('5) buffer sales é limpo após falha', !__hasBufferForTest(key5));
+  salesRecovery.__resetSalesRecoveryForTest();
+
+  // --- Caso 6: falha de envio guarda replyText, sem fallback ----------------
+  const salesSendFailureDeps: FlushDeps = {
+    getReply: async () => 'Resposta natural já persistida',
+    sendReply: async () => {
+      throw new Error('WhatsApp indisponível');
+    },
+  };
+  salesRecovery.__setSalesRecoveryDepsForTest({
+    scheduler: {
+      setTimeout: () => ({ cancelled: false }),
+      clearTimeout: () => undefined,
+    },
+    emitEvent: async () => undefined,
+  });
+  const key6 = __seedFlushBufferForTest(salesConfig, from, ['oi']);
+  await flushBuffer(key6, salesSendFailureDeps);
+  expect(
+    '6) falha de envio agenda recovery kind send',
+    salesRecovery.__getSalesRecoveryStateForTest(key6)?.kind === 'send'
+  );
+  expect('6) buffer é limpo sem M24', !__hasBufferForTest(key6));
+  salesRecovery.__resetSalesRecoveryForTest();
 
   const failed = checks.filter((c) => !c.ok);
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passaram.`);

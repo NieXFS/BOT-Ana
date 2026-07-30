@@ -16,6 +16,11 @@ import { Sentry } from './observability/sentry';
 import { isRenataVoiceEnabled } from './voice/voiceConfig';
 import { deliverSalesReply } from './voice/voiceDelivery';
 import { rememberConversationAdHeadline } from './services/salesAdState';
+import {
+  cancelSalesRecovery,
+  notifySalesReplyDelivered,
+  scheduleSalesRecovery,
+} from './services/salesRecovery';
 
 interface MessageBuffer {
   texts: string[];
@@ -265,51 +270,95 @@ export async function flushBuffer(
   }
 
   let flushFailed = false;
-  try {
-    const reply = await deps.getReply(from, consolidatedText, name, config);
-
-    await deps.sendReply(from, reply, config);
-    if (config.botRole === 'sales') {
-      console.log(
-        `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply.length}`
-      );
-    } else {
-      console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
-    }
-  } catch (err) {
-    flushFailed = true;
-    const capturedError =
-      config.botRole === 'sales'
-        ? new Error('message_handler sales flush failed')
-        : err;
-    Sentry.captureException(capturedError, {
-      tags: {
-        service: 'message_handler',
-        operation: 'flush_buffer',
-        phoneNumberId: config.phoneNumberId,
-        tenantSlug: config.tenantSlug,
-        messageCount,
-      },
-    });
-    if (config.botRole === 'sales') {
+  if (config.botRole === 'sales') {
+    let reply: string;
+    try {
+      reply = await deps.getReply(from, consolidatedText, name, config);
+    } catch (err) {
+      flushFailed = true;
+      Sentry.captureException(new Error('message_handler sales brain failed'), {
+        tags: {
+          service: 'message_handler',
+          operation: 'flush_buffer_brain',
+          phoneNumberId: config.phoneNumberId,
+          tenantSlug: config.tenantSlug,
+          messageCount,
+        },
+      });
       console.error(
-        `❌ Erro ao processar mensagens de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+        `❌ Erro no brain de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
       );
-    } else {
-      console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+      // Todo erro no caminho do brain sales agenda recovery. Edge residual:
+      // se o próprio addMessage do inbound falhou, o histórico não contém a
+      // mensagem e a guarda da reexecução cancela silenciosamente; a
+      // visibilidade permanece no Sentry + evento falha_resposta do painel.
+      scheduleSalesRecovery({
+        conversationKey: bufferKey,
+        phone: from,
+        userName: name,
+        config,
+        failure: { kind: 'brain' },
+      });
     }
-    // M24: antes o cliente ficava em silêncio total quando o flush falhava.
-    // Avisa que houve um problema e pede pra repetir (uma vez por janela).
-    await emitFlushFallback(bufferKey, from, config, deps);
+
+    if (!flushFailed) {
+      try {
+        await deps.sendReply(from, reply!, config);
+        notifySalesReplyDelivered(bufferKey, 'novo_inbound');
+        console.log(
+          `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply!.length}`
+        );
+      } catch (err) {
+        flushFailed = true;
+        Sentry.captureException(new Error('message_handler sales send failed'), {
+          tags: {
+            service: 'message_handler',
+            operation: 'flush_buffer_send',
+            phoneNumberId: config.phoneNumberId,
+            tenantSlug: config.tenantSlug,
+            messageCount,
+          },
+        });
+        console.error(
+          `❌ Erro ao enviar resposta de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+        );
+        scheduleSalesRecovery({
+          conversationKey: bufferKey,
+          phone: from,
+          userName: name,
+          config,
+          failure: { kind: 'send', replyText: reply! },
+        });
+      }
+    }
+  } else {
+    try {
+      const reply = await deps.getReply(from, consolidatedText, name, config);
+      await deps.sendReply(from, reply, config);
+      console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
+    } catch (err) {
+      flushFailed = true;
+      Sentry.captureException(err, {
+        tags: {
+          service: 'message_handler',
+          operation: 'flush_buffer',
+          phoneNumberId: config.phoneNumberId,
+          tenantSlug: config.tenantSlug,
+          messageCount,
+        },
+      });
+      console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+      // M24 da recepcionista permanece inalterado: avisa uma vez e pede reenvio.
+      await emitFlushFallback(bufferKey, from, config, deps);
+    }
   }
 
   const currentBuffer = messageBuffers.get(bufferKey);
   if (!currentBuffer) return;
 
-  // M24: flush falhou → limpa o buffer INTEIRO (inclui pendingTexts) e NÃO
-  // re-arma. Um debounce condenado só re-falharia, e o cliente já foi convidado
-  // a reenviar; o que ele mandar de novo abre um buffer limpo. A janela de
-  // recovery impede spam de fallback se ele insistir.
+  // Falha no flush → limpa o buffer INTEIRO (inclui pendingTexts) e NÃO re-arma.
+  // No receptionist, M24 já convidou o cliente a reenviar; em sales, o recovery
+  // volátil assumiu a resposta silenciosamente.
   if (flushFailed) {
     messageBuffers.delete(bufferKey);
     return;
@@ -553,6 +602,10 @@ export async function handleIncomingMessage(
       }
     }
     return;
+  }
+
+  if (config.botRole === 'sales') {
+    cancelSalesRecovery(conversationKey);
   }
 
   const existing = messageBuffers.get(bufferKey);

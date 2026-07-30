@@ -5,6 +5,7 @@
 process.env.DATABASE_URL ||= 'postgres://smoke:smoke@127.0.0.1:1/smoke';
 process.env.OPENAI_API_KEY ||= 'sk-smoke';
 process.env.RENATA_VOICE_ENABLED = 'true';
+process.env.RENATA_TTS_PROVIDER = 'elevenlabs';
 process.env.RENATA_ELEVENLABS_API_KEY = 'tts-smoke';
 
 import type { TenantBotConfig } from '../src/configProvider';
@@ -177,16 +178,15 @@ async function main(): Promise<void> {
   const opener0 = applyProsody(OPENER_SCRIPTS[0]);
   const opener1 = applyProsody(OPENER_SCRIPTS[1]);
   check(
-    'abertura 1 preserva parágrafos sem grudar "chamou Deixa"',
-    !opener0.includes('chamou Deixa') &&
-      opener0.includes('chamou\n\nDeixa') &&
-      opener0.includes('clínica.\n\nMe conta')
+    'abertura 1 preserva parágrafos sem grudar "chamou A Receps"',
+    !opener0.includes('chamou A Receps') &&
+      opener0.includes('chamou\n\nA Receps') &&
+      opener0.includes('você.\n\nMe conta')
   );
   check(
-    'abertura 2 preserva parágrafos sem grudar "interesse A Receps"',
-    !opener1.includes('interesse A Receps') &&
-      opener1.includes('interesse\n\nA Receps') &&
-      opener1.includes('você.\n\nPra eu')
+    'abertura 2 preserva parágrafos sem grudar "interesse Pra eu"',
+    !opener1.includes('interesse Pra eu') &&
+      opener1.includes('interesse\n\nPra eu')
   );
 
   const spokenNumbers = applyProsody(
@@ -252,15 +252,21 @@ async function main(): Promise<void> {
   delete process.env.RENATA_TTS_STYLE;
 
   const changed = { ...cfg, voiceId: `${cfg.voiceId}-outra` };
-  check('fingerprint muda com a voz', voiceFingerprint(cfg) !== voiceFingerprint(changed));
+  check(
+    'fingerprint muda com a voz',
+    voiceFingerprint(cfg, 'elevenlabs') !==
+      voiceFingerprint(changed, 'elevenlabs')
+  );
   const changedStyle = { ...cfg, style: cfg.style + 0.01 };
   check(
     'fingerprint muda quando só o style muda',
-    voiceFingerprint(cfg) !== voiceFingerprint(changedStyle)
+    voiceFingerprint(cfg, 'elevenlabs') !==
+      voiceFingerprint(changedStyle, 'elevenlabs')
   );
   check(
     'fingerprint é estável para a mesma config',
-    voiceFingerprint(cfg) === voiceFingerprint({ ...cfg })
+    voiceFingerprint(cfg, 'elevenlabs') ===
+      voiceFingerprint({ ...cfg }, 'elevenlabs')
   );
 
   if (failures) process.exit(1);

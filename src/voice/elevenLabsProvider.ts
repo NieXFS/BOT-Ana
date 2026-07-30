@@ -1,17 +1,18 @@
 import axios from 'axios';
 import type { VoiceEnvConfig } from './voiceConfig';
 import { getVoiceEnvConfig } from './voiceConfig';
-import type { TtsProvider } from './ttsProvider';
+import type { TtsProvider, TtsProviderOutput } from './ttsProvider';
 
 const ELEVENLABS_BASE_URL = 'https://api.elevenlabs.io/v1/text-to-speech';
 const REQUEST_TIMEOUT_MS = 20_000;
 
 export class ElevenLabsProvider implements TtsProvider {
   readonly name = 'elevenlabs';
+  readonly outputFormat = 'mp3' as const;
 
   constructor(private readonly config: VoiceEnvConfig = getVoiceEnvConfig()) {}
 
-  async synthesize(text: string): Promise<Buffer> {
+  async synthesize(text: string): Promise<TtsProviderOutput> {
     const { data } = await axios.post<ArrayBuffer>(
       `${ELEVENLABS_BASE_URL}/${encodeURIComponent(this.config.voiceId)}`,
       {
@@ -38,6 +39,6 @@ export class ElevenLabsProvider implements TtsProvider {
       }
     );
 
-    return Buffer.from(data);
+    return { audio: Buffer.from(data) };
   }
 }

@@ -1,10 +1,17 @@
 import { spawn } from 'child_process';
+import type { TtsAudioFormat } from './ttsProvider';
 
 const ENCODE_TIMEOUT_MS = 15_000;
 const FFMPEG_CHECK_TIMEOUT_MS = 5_000;
 
 let ffmpegState = false;
 let ffmpegCheckPromise: Promise<boolean> | null = null;
+let encodeSpawn: typeof spawn = spawn;
+
+export interface TtsEncoderInput {
+  format: TtsAudioFormat;
+  sampleRate?: number;
+}
 
 /** Resultado síncrono da checagem feita no boot. */
 export function ffmpegAvailable(): boolean {
@@ -44,35 +51,56 @@ export function checkFfmpegAvailable(): Promise<boolean> {
   return ffmpegCheckPromise;
 }
 
-/** Converte MP3 para OGG/Opus inteiramente por stdin/stdout. */
-export async function encodeToOpus(mp3Buffer: Buffer): Promise<Buffer> {
+export function buildFfmpegEncodeArgs(
+  input: TtsEncoderInput = { format: 'mp3' }
+): string[] {
+  const inputArgs =
+    input.format === 'pcm_s16le'
+      ? [
+          '-f',
+          's16le',
+          '-ar',
+          String(input.sampleRate ?? 24_000),
+          '-ac',
+          '1',
+        ]
+      : [];
+  return [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    ...inputArgs,
+    '-i',
+    'pipe:0',
+    '-c:a',
+    'libopus',
+    '-b:a',
+    '24k',
+    '-ar',
+    '24000',
+    '-ac',
+    '1',
+    '-application',
+    'voip',
+    '-vbr',
+    'on',
+    '-f',
+    'ogg',
+    'pipe:1',
+  ];
+}
+
+/** Converte MP3 ou PCM s16le para OGG/Opus inteiramente por stdin/stdout. */
+export async function encodeToOpus(
+  audio: Buffer,
+  input: TtsEncoderInput = { format: 'mp3' }
+): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     let settled = false;
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
 
-    const child = spawn('ffmpeg', [
-      '-hide_banner',
-      '-loglevel',
-      'error',
-      '-i',
-      'pipe:0',
-      '-c:a',
-      'libopus',
-      '-b:a',
-      '24k',
-      '-ar',
-      '24000',
-      '-ac',
-      '1',
-      '-application',
-      'voip',
-      '-vbr',
-      'on',
-      '-f',
-      'ogg',
-      'pipe:1',
-    ]);
+    const child = encodeSpawn('ffmpeg', buildFfmpegEncodeArgs(input));
 
     const finish = (error?: Error) => {
       if (settled) return;
@@ -119,7 +147,7 @@ export async function encodeToOpus(mp3Buffer: Buffer): Promise<Buffer> {
     child.stdin.once('error', () => {
       // O evento close fornece o código/diagnóstico definitivo.
     });
-    child.stdin.end(mp3Buffer);
+    child.stdin.end(audio);
   });
 }
 
@@ -127,4 +155,11 @@ export async function encodeToOpus(mp3Buffer: Buffer): Promise<Buffer> {
 export function __setFfmpegAvailableForTest(available: boolean): void {
   ffmpegState = available;
   ffmpegCheckPromise = Promise.resolve(available);
+}
+
+/** Seam exclusivo para capturar args do ffmpeg em smoke offline. */
+export function __setAudioEncoderSpawnForTest(
+  spawnImpl: typeof spawn = spawn
+): void {
+  encodeSpawn = spawnImpl;
 }

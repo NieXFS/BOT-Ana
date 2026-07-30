@@ -27,6 +27,10 @@ import {
 import { handleSalesNotify } from './services/salesNotify';
 import { resetAdminConversation } from './services/adminReset';
 import {
+  isValidAdminReprocessInput,
+  reprocessSalesResponse,
+} from './services/adminReprocess';
+import {
   getLastMessageMeta,
   listConversations,
   getHistoryWithTimestamps,
@@ -38,7 +42,10 @@ import { ensureTtsCacheTable } from './voice/ttsCache';
 import { ensureTtsUsageTable } from './voice/costMeter';
 import { ensureChannelPrefsTable } from './voice/channelPref';
 import { checkFfmpegAvailable } from './voice/audioEncoder';
-import { getVoiceEnvConfig } from './voice/voiceConfig';
+import {
+  getVoiceEnvConfig,
+  providerApiKey,
+} from './voice/voiceConfig';
 import { ensureMediaCacheTable } from './media/mediaCache';
 
 interface CloudWebhookMetadata {
@@ -261,6 +268,51 @@ app.post(
   }
 );
 
+app.post(
+  '/admin/reprocess-response',
+  botSignatureMiddleware,
+  async (req: Request, res: Response) => {
+    if (!isValidAdminReprocessInput(req.body)) {
+      res.status(400).json({
+        error: 'phoneNumberId e customerPhone são obrigatórios.',
+      });
+      return;
+    }
+
+    const phoneNumberId = req.body.phoneNumberId.trim();
+    const customerPhone = req.body.customerPhone.trim();
+
+    try {
+      const result = await reprocessSalesResponse({
+        phoneNumberId,
+        customerPhone,
+      });
+      console.info(
+        `[admin-reprocess] concluído | phoneNumberId=${phoneNumberId} | replied=${result.replied}`
+      );
+      res.status(200).json(result);
+    } catch (err) {
+      Sentry.captureException(
+        new Error('webhook_server admin reprocess failed'),
+        {
+          tags: {
+            service: 'webhook_server',
+            operation: 'admin_reprocess_response',
+            phoneNumberId,
+            error_kind: err instanceof Error ? err.name : typeof err,
+          },
+        }
+      );
+      console.error(
+        `[admin-reprocess] falha | phoneNumberId=${phoneNumberId} | error=${
+          err instanceof Error ? err.name : typeof err
+        }`
+      );
+      res.status(500).json({ error: 'internal error' });
+    }
+  }
+);
+
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });
 });
@@ -421,7 +473,7 @@ async function boot(): Promise<void> {
     });
 
   // Workstream B (Renata): régua de follow-up. Garante a tabela e liga o poller
-  // de 60s (só toca conversas de VENDA — o receptionist não escreve na tabela).
+  // de 30min por default (só VENDA — o receptionist não escreve na tabela).
   await ensureSalesFollowupsTable();
   startFollowupPoller();
 
@@ -444,11 +496,11 @@ async function boot(): Promise<void> {
 
   const voiceState = !voiceConfig.enabled
     ? 'disabled (flag_off)'
-    : !voiceConfig.apiKey
-      ? 'disabled (api_key_missing)'
+    : !providerApiKey(voiceConfig, voiceConfig.provider)
+      ? `disabled (api_key_missing provider=${voiceConfig.provider})`
       : !ffmpegReady
         ? 'disabled (ffmpeg_missing)'
-        : 'enabled (ready)';
+        : `enabled (ready provider=${voiceConfig.provider})`;
   console.log(`🔊 Renata voice: ${voiceState}`);
 
   app.listen(PORT, () => {

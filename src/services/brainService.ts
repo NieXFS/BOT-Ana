@@ -1,8 +1,8 @@
-import OpenAI from 'openai';
+import type OpenAI from 'openai';
 import * as Sentry from '@sentry/node';
 import type { TenantBotConfig } from '../configProvider';
 import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
-import { callOpenAIWithRetry } from '../utils/openaiRetry';
+import { callAiWithRetry } from '../utils/openaiRetry';
 import { isCaptured } from '../observability/captured';
 import {
   addMessage,
@@ -14,6 +14,7 @@ import {
 import {
   getServices,
   getAvailableSlots,
+  getCustomerUpcomingAppointments,
   bookAppointment,
   cancelAppointment,
 } from './calendarService';
@@ -24,32 +25,34 @@ import {
   buildServiceQuestion,
 } from './service-gate';
 import { getSalesReply } from './salesBrain';
+import {
+  createReceptionistChatCompletion,
+  resolveReceptionistAiRuntime,
+  type DeepSeekThinkingMode,
+  type ReceptionistAiRuntime,
+} from './receptionistLlmProvider';
+import {
+  bookingConfirmationGate,
+  cancellationIntentGate,
+  RescheduleCancellationEvidenceStore,
+  type BookingProposal,
+} from './bookingConfirmationGate';
+import {
+  buildSafeRecoveryReply,
+  buildSafeWriteConfirmation,
+  inspectCustomerReply,
+  needsAuthoritativeAppointmentRead,
+} from './customerReplyGuard';
 
-const clientCache = new Map<string, OpenAI>();
+const rescheduleCancellationEvidence =
+  new RescheduleCancellationEvidenceStore();
 
-function getOpenAIClient(config: TenantBotConfig): OpenAI {
-  const apiKey = config.openaiApiKey?.trim() || process.env.OPENAI_API_KEY;
-
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY não configurada para o tenant nem no ambiente global.');
-  }
-
-  const cached = clientCache.get(apiKey);
-  if (cached) {
-    return cached;
-  }
-
-  const client = new OpenAI({ apiKey });
-  clientCache.set(apiKey, client);
-  return client;
-}
-
-function getCurrentYear(timezone: string): number {
+function getCurrentYear(timezone: string, now: Date): number {
   return Number(
     new Intl.DateTimeFormat('en-US', {
       timeZone: timezone,
       year: 'numeric',
-    }).format(new Date())
+    }).format(now)
   );
 }
 
@@ -136,8 +139,11 @@ ${professionals
 ${lines.join('\n')}`;
 }
 
-export async function buildSystemPrompt(config: TenantBotConfig): Promise<string> {
-  const now = new Date();
+export function buildSystemPromptFromServices(
+  config: TenantBotConfig,
+  servicesResult: ServicesResult,
+  now: Date
+): string {
   const today = now.toLocaleDateString('pt-BR', {
     timeZone: config.timezone,
     weekday: 'long',
@@ -150,9 +156,8 @@ export async function buildSystemPrompt(config: TenantBotConfig): Promise<string
     hour: '2-digit',
     minute: '2-digit',
   });
-  const currentYear = getCurrentYear(config.timezone);
+  const currentYear = getCurrentYear(config.timezone, now);
   const botName = config.botName.trim() || 'Ana';
-  const servicesResult = await getServices(config);
   const servicesBlock = buildServicesBlock(servicesResult);
 
   return `CONTEXTO TEMPORAL (OBRIGATÓRIO): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Quando o cliente mencionar datas relativas (amanhã, semana que vem, segunda, etc.), calcule a data correta a partir de HOJE. Quando o cliente mencionar apenas dia/mês (ex: "01/04"), SEMPRE assuma o ano ${currentYear}. NUNCA use anos anteriores.
@@ -177,13 +182,18 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 4. Se a ferramenta retornar erro de "Serviço não encontrado", chame getServices uma vez pra atualizar e use o ID exato retornado.
 5. FONTE DA VERDADE — Os horários retornados por getAvailableSlots são a única fonte da verdade sobre disponibilidade. Se o cliente pedir um horário que ESTÁ na lista (incluindo variações como "15h" = "15:00", "15h30" = "15:30", "às 8 da manhã" = "08:00"), prossiga DIRETO para a confirmação do agendamento. NUNCA, EM HIPÓTESE ALGUMA, invente que está ocupado se o horário aparece na lista retornada pela ferramenta. Só diga que está indisponível se a ferramenta retornar erro 409 explicitamente.
 6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. NÃO responda ao cliente, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente em nenhuma forma.
-7. DETECÇÃO DE AGENDAMENTO EXISTENTE — Quando bookAppointment retornar INTERNAL_HINT informando que o cliente já tem agendamento(s) futuro(s), NÃO crie o novo ainda. Pergunte ao cliente conforme as opções listadas no hint. Aguarde a resposta. Agir conforme:
-   - "Manter os dois": chame bookAppointment de novo com confirmedDuplicate=true e os mesmos demais parâmetros.
-   - "Remarcar (cancelar e marcar este novo)": PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior (o valor dentro de [id: ...]). Após sucesso, chame bookAppointment com confirmedDuplicate=true.
-   - "Só cancelar o anterior": chame cancelAppointment com o ID técnico exato do agendamento anterior (o valor dentro de [id: ...]). NÃO chame bookAppointment.
+ 7. DETECÇÃO DE AGENDAMENTO EXISTENTE — Quando bookAppointment retornar INTERNAL_HINT informando que o cliente já tem agendamento(s) futuro(s), NÃO crie o novo ainda. Pergunte ao cliente conforme as opções listadas no hint. Aguarde a resposta. Agir conforme:
+    - "Manter os dois": chame bookAppointment de novo com confirmedDuplicate=true e os mesmos demais parâmetros.
+    - "Remarcar (cancelar e marcar este novo)": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos. PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior. Só após sucesso chame bookAppointment com confirmedDuplicate=true.
+    - "Só cancelar o anterior": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos e depois cancelAppointment com o ID técnico exato do agendamento anterior. NÃO chame bookAppointment.
    - "Pensar depois": não chame ferramentas. Responda gentilmente e aguarde.
    - Se houver mais de um agendamento anterior e o cliente escolher remarcar/cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado ANTES de chamar cancelAppointment. Nunca invente appointmentId usando data/hora.
-8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment — encaminhe para a equipe conforme regras de comportamento.`;
+8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment — encaminhe para a equipe conforme regras de comportamento.
+9. CONFIRMAÇÃO INEQUÍVOCA — Só chame bookAppointment depois de apresentar o resumo completo e receber uma confirmação CLARA no turno seguinte ("sim", "confirmo", "pode marcar", "tudo certo"). Frases hesitantes como "acho que pode", "talvez", "pode ser", "se der" ou equivalentes NÃO confirmam: pergunte novamente de forma objetiva e aguarde. O código também bloqueará chamadas sem confirmação inequívoca.`;
+}
+
+export async function buildSystemPrompt(config: TenantBotConfig): Promise<string> {
+  return buildSystemPromptFromServices(config, await getServices(config), new Date());
 }
 
 function sanitizeTemperature(value: number): number {
@@ -251,15 +261,7 @@ export function maybePrependGreeting(
   return `${greeting}\n\n${reply}`;
 }
 
-function parseFunctionArgs(rawArgs: string): Record<string, unknown> {
-  try {
-    return JSON.parse(rawArgs || '{}') as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}
-
-const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
@@ -299,6 +301,19 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
         },
         required: ['date', 'serviceId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'getUpcomingAppointments',
+      description:
+        'Reconsulta os agendamentos futuros e seus IDs técnicos. Use somente depois que bookAppointment detectar agendamento existente, no turno em que o cliente escolher manter, remarcar ou cancelar. Os IDs são internos e nunca podem aparecer na resposta ao cliente.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
       },
     },
   },
@@ -365,7 +380,10 @@ async function executeFunction(
   userName: string,
   config: TenantBotConfig,
   currentUserMessage: string,
-  userMessages: string[]
+  userMessages: string[],
+  conversationHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+  servicesResult: ServicesResult,
+  conversationKey: string
 ): Promise<string> {
   try {
     // GUARDRAIL B (gate determinístico de serviço): antes de consultar horários
@@ -373,8 +391,15 @@ async function executeFunction(
     // ancorado numa escolha EXPLÍCITA recente do cliente — não no histórico. Se
     // não estiver, bloqueia e manda a Ana perguntar qual serviço. Roda AQUI (não
     // no calendarService) pra não pegar o getAvailableSlots interno do Guardrail A.
-    if (functionName === 'getAvailableSlots' || functionName === 'bookAppointment') {
-      const servicesResult = await getServices(config);
+    const isConfirmedRescheduleAfterCancellation =
+      functionName === 'bookAppointment' &&
+      args.confirmedDuplicate === true &&
+      rescheduleCancellationEvidence.peek(conversationKey) !== null;
+    if (
+      (functionName === 'getAvailableSlots' ||
+        functionName === 'bookAppointment') &&
+      !isConfirmedRescheduleAfterCancellation
+    ) {
       if (
         servicesResult.success &&
         servicesResult.services &&
@@ -387,7 +412,7 @@ async function executeFunction(
         );
         if (!gate.ok) {
           console.log(
-            `🚧 ${config.botName} gate de serviço bloqueou ${functionName} (serviço não escolhido pelo cliente) para ${phone}`
+            `🚧 ${config.botName} gate de serviço bloqueou ${functionName} (serviço não escolhido pelo cliente) | phoneNumberId=${config.phoneNumberId}`
           );
           return JSON.stringify({ success: false, message: gate.hintMessage });
         }
@@ -408,26 +433,103 @@ async function executeFunction(
         );
         return JSON.stringify(result);
       }
+      case 'getUpcomingAppointments': {
+        const result = await getCustomerUpcomingAppointments(phone, config);
+        return JSON.stringify(result);
+      }
       case 'bookAppointment': {
+        const serviceId = String(args.serviceId ?? '');
+        const professionalId =
+          typeof args.professionalId === 'string'
+            ? args.professionalId
+            : undefined;
+        const expectedBooking: BookingProposal = {
+          date: String(args.date ?? ''),
+          time: String(args.time ?? ''),
+          serviceName: servicesResult.services?.find(
+            (service) => service.id === serviceId
+          )?.name,
+          professionalName: professionalId
+            ? servicesResult.professionals?.find(
+                (professional) => professional.id === professionalId
+              )?.name
+            : undefined,
+        };
+        const confirmation = bookingConfirmationGate({
+          currentUserMessage,
+          history: conversationHistory,
+          currentUserMessageIndex: conversationHistory.length - 1,
+          confirmedDuplicate: args.confirmedDuplicate === true,
+          expectedBooking,
+          duplicateCancellationSucceeded:
+            rescheduleCancellationEvidence.peek(conversationKey) !== null,
+        });
+        if (!confirmation.ok) {
+          console.log(
+            `🛑 ${config.botName} bloqueou book sem confirmação inequívoca | phoneNumberId=${config.phoneNumberId}`
+          );
+          return JSON.stringify({
+            success: false,
+            message: confirmation.hintMessage,
+          });
+        }
+
+        const consumedEvidence = confirmation.consumesCancellationEvidence
+          ? rescheduleCancellationEvidence.consume(conversationKey)
+          : null;
+        if (
+          confirmation.consumesCancellationEvidence &&
+          !consumedEvidence
+        ) {
+          return JSON.stringify({
+            success: false,
+            message:
+              'INTERNAL_HINT: a evidência autoritativa do cancelamento expirou ou já foi consumida. Não agende como duplicidade; consulte os agendamentos atuais e reinicie o fluxo de remarcação.',
+          });
+        }
+
         const result = await bookAppointment(
           String(args.date ?? ''),
           String(args.time ?? ''),
-          String(args.serviceId ?? ''),
+          serviceId,
           phone,
           userName,
           config,
-          typeof args.professionalId === 'string' ? args.professionalId : undefined,
+          professionalId,
           args.confirmedDuplicate === true
         );
+        if (!result.success && consumedEvidence) {
+          rescheduleCancellationEvidence.restore(consumedEvidence);
+        }
         return JSON.stringify(result);
       }
       case 'cancelAppointment': {
+        const cancellation = cancellationIntentGate({
+          currentUserMessage,
+          history: conversationHistory,
+        });
+        if (!cancellation.ok) {
+          console.log(
+            `🛑 ${config.botName} bloqueou cancelamento fora do fluxo de duplicidade | phoneNumberId=${config.phoneNumberId}`
+          );
+          return JSON.stringify({
+            success: false,
+            message: cancellation.hintMessage,
+          });
+        }
+
         const result = await cancelAppointment(
           String(args.appointmentId ?? ''),
           phone,
           config,
           currentUserMessage
         );
+        if (result.success) {
+          rescheduleCancellationEvidence.record(
+            conversationKey,
+            String(args.appointmentId ?? '')
+          );
+        }
         return JSON.stringify(result);
       }
       default:
@@ -440,6 +542,351 @@ async function executeFunction(
       message: 'Tive um probleminha ao verificar a agenda, pode tentar de novo em um instante?',
     });
   }
+}
+
+export interface ReceptionistToolTraceEntry {
+  round: number;
+  name: string;
+  args: Record<string, unknown>;
+  argumentsValidJson: boolean;
+  result: string;
+}
+
+export interface ReceptionistRequestUsage {
+  round: number;
+  durationMs: number;
+  finishReason: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedPromptTokens: number | null;
+  cacheMissPromptTokens: number | null;
+  reasoningTokens: number | null;
+}
+
+export interface ReceptionistModelLoopResult {
+  rawReply: string | null;
+  exhausted: boolean;
+  provider: 'openai' | 'deepseek';
+  model: string;
+  providerReportedModels: string[];
+  rounds: number;
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+  toolTrace: ReceptionistToolTraceEntry[];
+  usage: ReceptionistRequestUsage[];
+}
+
+export type ReceptionistToolExecutor = (
+  functionName: string,
+  args: Record<string, unknown>
+) => Promise<string>;
+
+export interface RunReceptionistModelLoopInput {
+  config: TenantBotConfig;
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+  executeTool: ReceptionistToolExecutor;
+  userId?: string;
+  thinkingMode?: DeepSeekThinkingMode;
+  maxToolRounds?: number;
+}
+
+type ExtendedCompletionUsage = NonNullable<
+  OpenAI.Chat.Completions.ChatCompletion['usage']
+> & {
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+  };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+  };
+};
+
+function parseFunctionArgsWithStatus(rawArgs: string): {
+  args: Record<string, unknown>;
+  valid: boolean;
+} {
+  try {
+    const parsed = JSON.parse(rawArgs || '{}') as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { args: {}, valid: false };
+    }
+    return { args: parsed as Record<string, unknown>, valid: true };
+  } catch {
+    return { args: {}, valid: false };
+  }
+}
+
+function validateToolArguments(
+  functionName: string,
+  args: Record<string, unknown>
+): string | null {
+  const schemas: Record<
+    string,
+    {
+      required: string[];
+      optional: Record<string, 'string' | 'boolean'>;
+    }
+  > = {
+    getServices: { required: [], optional: {} },
+    getUpcomingAppointments: { required: [], optional: {} },
+    getAvailableSlots: {
+      required: ['date', 'serviceId'],
+      optional: { date: 'string', serviceId: 'string', professionalId: 'string' },
+    },
+    bookAppointment: {
+      required: ['date', 'time', 'serviceId'],
+      optional: {
+        date: 'string',
+        time: 'string',
+        serviceId: 'string',
+        professionalId: 'string',
+        confirmedDuplicate: 'boolean',
+      },
+    },
+    cancelAppointment: {
+      required: ['appointmentId'],
+      optional: { appointmentId: 'string' },
+    },
+  };
+  const schema = schemas[functionName];
+  if (!schema) return `ferramenta desconhecida: ${functionName}`;
+
+  for (const key of schema.required) {
+    if (typeof args[key] !== 'string' || !(args[key] as string).trim()) {
+      return `campo obrigatório inválido ou ausente: ${key}`;
+    }
+  }
+  for (const [key, value] of Object.entries(args)) {
+    const expectedType = schema.optional[key];
+    if (!expectedType) return `campo não permitido: ${key}`;
+    if (typeof value !== expectedType) {
+      return `tipo inválido em ${key}: esperado ${expectedType}`;
+    }
+  }
+  return null;
+}
+
+class AiCompletionResponseError extends Error {
+  status?: number;
+  code: string;
+
+  constructor(message: string, code: string, status?: number) {
+    super(message);
+    this.name = 'AiCompletionResponseError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function validateCompletionResponse(
+  response: OpenAI.Chat.Completions.ChatCompletion
+): OpenAI.Chat.Completions.ChatCompletion {
+  const choice = response.choices[0];
+  if (!choice) {
+    throw new AiCompletionResponseError(
+      'Provider de IA retornou uma resposta sem choices.',
+      'AI_EMPTY_CHOICES',
+      503
+    );
+  }
+
+  // DeepSeek acrescenta "insufficient_system_resource", ainda ausente na union
+  // do SDK OpenAI-compatible usada pelo projeto.
+  const finishReason = choice.finish_reason as string | null;
+  if (finishReason === 'stop' || finishReason === 'tool_calls') {
+    return response;
+  }
+  if (finishReason === 'insufficient_system_resource') {
+    throw new AiCompletionResponseError(
+      'Provider de IA reportou recursos insuficientes.',
+      'AI_INSUFFICIENT_SYSTEM_RESOURCE',
+      503
+    );
+  }
+  if (finishReason === 'length') {
+    throw new AiCompletionResponseError(
+      'Resposta do provider foi truncada pelo limite de tokens.',
+      'AI_RESPONSE_TRUNCATED'
+    );
+  }
+  if (finishReason === 'content_filter') {
+    throw new AiCompletionResponseError(
+      'Resposta do provider foi bloqueada pelo filtro de conteúdo.',
+      'AI_CONTENT_FILTERED'
+    );
+  }
+
+  throw new AiCompletionResponseError(
+    `Provider de IA retornou finish_reason inesperado: ${
+      finishReason ?? 'null'
+    }.`,
+    'AI_UNEXPECTED_FINISH_REASON'
+  );
+}
+
+function normalizeAssistantMessageForReplay(
+  message: OpenAI.Chat.Completions.ChatCompletionMessage,
+  runtime: ReceptionistAiRuntime,
+  thinkingMode: DeepSeekThinkingMode
+): OpenAI.Chat.Completions.ChatCompletionMessageParam {
+  if (
+    runtime.provider !== 'deepseek' ||
+    thinkingMode !== 'enabled' ||
+    !message.tool_calls?.length ||
+    message.content !== null
+  ) {
+    return message;
+  }
+
+  // Em thinking mode o DeepSeek exige o assistant message completo (incluindo
+  // reasoning_content) no próximo request e content não-nulo quando há tools.
+  // O spread preserva o campo provider-specific sem registrá-lo em telemetria.
+  return {
+    ...(message as unknown as Record<string, unknown>),
+    content: '',
+  } as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam;
+}
+
+function normalizeUsage(
+  round: number,
+  durationMs: number,
+  finishReason: string | null,
+  usage: OpenAI.Chat.Completions.ChatCompletion['usage']
+): ReceptionistRequestUsage {
+  const extended = usage as ExtendedCompletionUsage | undefined;
+  return {
+    round,
+    durationMs,
+    finishReason,
+    promptTokens: extended?.prompt_tokens ?? 0,
+    completionTokens: extended?.completion_tokens ?? 0,
+    totalTokens: extended?.total_tokens ?? 0,
+    cachedPromptTokens:
+      extended?.prompt_cache_hit_tokens ??
+      extended?.prompt_tokens_details?.cached_tokens ??
+      null,
+    cacheMissPromptTokens: extended?.prompt_cache_miss_tokens ?? null,
+    reasoningTokens:
+      extended?.completion_tokens_details?.reasoning_tokens ?? null,
+  };
+}
+
+/**
+ * Loop compartilhado pela produção e pelo benchmark. Não grava histórico, não
+ * acessa o ERP e não envia WhatsApp por conta própria: todo efeito passa pelo
+ * executeTool injetado. Isso permite chamar os LLMs reais contra fixtures 100%
+ * em memória sem risco de book/cancel real.
+ */
+export async function runReceptionistModelLoop(
+  input: RunReceptionistModelLoopInput
+): Promise<ReceptionistModelLoopResult> {
+  const runtime = resolveReceptionistAiRuntime(input.config);
+  const thinkingMode = input.thinkingMode ?? 'disabled';
+  const maxToolRounds = input.maxToolRounds ?? 8;
+  const messages = [...input.messages];
+  const toolTrace: ReceptionistToolTraceEntry[] = [];
+  const usage: ReceptionistRequestUsage[] = [];
+  const providerReportedModels: string[] = [];
+
+  for (let index = 0; index < maxToolRounds; index += 1) {
+    const round = index + 1;
+    const startedAt = Date.now();
+    const response = await callAiWithRetry(
+      async () =>
+        validateCompletionResponse(
+          await createReceptionistChatCompletion(runtime, {
+          messages,
+          tools: RECEPTIONIST_TOOLS,
+          temperature: sanitizeTemperature(input.config.aiTemperature),
+          maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
+          userId: input.userId,
+          thinkingMode,
+          })
+        ),
+      `receptionist tenant=${input.config.tenantSlug} round=${round}/${maxToolRounds}`,
+      runtime.provider
+    );
+    const durationMs = Date.now() - startedAt;
+    if (response.model) {
+      providerReportedModels.push(response.model);
+    }
+    const choice = response.choices[0]!;
+
+    usage.push(
+      normalizeUsage(round, durationMs, choice.finish_reason ?? null, response.usage)
+    );
+
+    const assistantMessage = choice.message;
+    messages.push(
+      normalizeAssistantMessageForReplay(
+        assistantMessage,
+        runtime,
+        thinkingMode
+      )
+    );
+
+    if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+      const rawReply =
+        typeof assistantMessage.content === 'string'
+          ? assistantMessage.content.trim()
+          : '';
+      return {
+        rawReply,
+        exhausted: false,
+        provider: runtime.provider,
+        model: runtime.model,
+        providerReportedModels,
+        rounds: round,
+        messages,
+        toolTrace,
+        usage,
+      };
+    }
+
+    for (const toolCall of assistantMessage.tool_calls) {
+      const functionName = toolCall.function.name;
+      const parsed = parseFunctionArgsWithStatus(
+        toolCall.function.arguments || '{}'
+      );
+      const schemaIssue = parsed.valid
+        ? validateToolArguments(functionName, parsed.args)
+        : 'argumentos não são um objeto JSON válido';
+      const result = schemaIssue
+        ? JSON.stringify({
+            success: false,
+            message: `INTERNAL_HINT: argumentos inválidos para ${functionName}: ${schemaIssue}. Corrija e refaça a chamada sem responder ao cliente.`,
+          })
+        : await input.executeTool(functionName, parsed.args);
+
+      toolTrace.push({
+        round,
+        name: functionName,
+        args: parsed.args,
+        argumentsValidJson: parsed.valid,
+        result,
+      });
+
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: result,
+      });
+    }
+  }
+
+  return {
+    rawReply: null,
+    exhausted: true,
+    provider: runtime.provider,
+    model: runtime.model,
+    providerReportedModels,
+    rounds: maxToolRounds,
+    messages,
+    toolTrace,
+    usage,
+  };
 }
 
 /**
@@ -500,61 +947,34 @@ async function getReceptionistReply(
       isFirstContact,
       config
     );
-    console.log(`🚦 ${config.botName} desambiguou o serviço proativamente para ${phone}`);
+    console.log(
+      `🚦 ${config.botName} desambiguou o serviço proativamente | phoneNumberId=${config.phoneNumberId}`
+    );
     await addMessage(conversationKey, 'assistant', question);
     return question;
   }
 
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: 'system', content: await buildSystemPrompt(config) },
+    {
+      role: 'system',
+      content: buildSystemPromptFromServices(config, servicesForGate, new Date()),
+    },
     ...history,
   ];
 
-  const maxToolRounds = 8;
+  // Sobrevive a erro/exhaustion depois de uma tool. Sem isso, um agendamento
+  // já gravado poderia terminar com a mensagem genérica de falha e induzir uma
+  // tentativa duplicada do cliente.
+  const completedWriteTrace: Array<{ name: string; result: string }> = [];
 
   try {
-    for (let round = 0; round < maxToolRounds; round++) {
-      const response = await callOpenAIWithRetry(
-        () =>
-          getOpenAIClient(config).chat.completions.create({
-            model: config.aiModel,
-            messages,
-            tools: TOOLS,
-            tool_choice: 'auto',
-            temperature: sanitizeTemperature(config.aiTemperature),
-            max_tokens: sanitizeMaxTokens(config.aiMaxTokens),
-          }),
-        `chat-completion tenant=${config.tenantSlug} round=${round + 1}/${maxToolRounds}`
-      );
-
-      const choice = response.choices[0];
-      const assistantMessage = choice.message;
-
-      messages.push(assistantMessage);
-
-      if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
-        const rawReply =
-          typeof assistantMessage.content === 'string'
-            ? assistantMessage.content.trim()
-            : '';
-        const finalReply = maybePrependGreeting(
-          rawReply || getFallbackMessage(config),
-          isFirstContact,
-          config
-        );
-
-        await addMessage(conversationKey, 'assistant', finalReply);
-        return finalReply;
-      }
-
-      for (const toolCall of assistantMessage.tool_calls) {
-        const functionName = toolCall.function.name;
-        const args = parseFunctionArgs(toolCall.function.arguments || '{}');
-
+    const modelResult = await runReceptionistModelLoop({
+      config,
+      messages,
+      executeTool: async (functionName, args) => {
         console.log(
-          `🔧 ${config.botName} chamou função: ${functionName}(${JSON.stringify(args)}) para ${phone}`
+          `🔧 ${config.botName} chamou ${functionName} | phoneNumberId=${config.phoneNumberId}`
         );
-
         const result = await executeFunction(
           functionName,
           args,
@@ -562,21 +982,116 @@ async function getReceptionistReply(
           userName,
           config,
           userMessage,
-          userMessages
+          userMessages,
+          history,
+          servicesForGate,
+          conversationKey
         );
+        if (
+          functionName === 'bookAppointment' ||
+          functionName === 'cancelAppointment'
+        ) {
+          completedWriteTrace.push({ name: functionName, result });
+        }
+        return result;
+      },
+    });
 
-        console.log(`📋 Resultado de ${functionName}: ${result}`);
-
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: result,
+    if (!modelResult.exhausted) {
+      const safeWriteConfirmation = buildSafeWriteConfirmation(
+        modelResult.toolTrace
+      );
+      const candidateReply =
+        modelResult.rawReply ||
+        safeWriteConfirmation ||
+        getFallbackMessage(config);
+      const forbiddenAppointmentIds = modelResult.toolTrace.flatMap((entry) => {
+        const ids: string[] = [];
+        if (
+          entry.name === 'cancelAppointment' &&
+          typeof entry.args.appointmentId === 'string'
+        ) {
+          ids.push(entry.args.appointmentId);
+        }
+        for (const match of entry.result.matchAll(/\[id:\s*([^\]\s]+)\]/g)) {
+          if (match[1]) ids.push(match[1]);
+        }
+        if (entry.name === 'getUpcomingAppointments') {
+          try {
+            const parsed = JSON.parse(entry.result) as {
+              appointments?: Array<{ id?: unknown }>;
+            };
+            for (const appointment of parsed.appointments ?? []) {
+              if (typeof appointment.id === 'string') {
+                ids.push(appointment.id);
+              }
+            }
+          } catch {
+            // Resultado inválido já será tratado pelo fluxo/fallback do modelo;
+            // o guard ainda cobre INTERNAL_HINT e IDs conhecidos.
+          }
+        }
+        return ids;
+      });
+      let customerReplyEvidenceTrace = modelResult.toolTrace;
+      if (
+        needsAuthoritativeAppointmentRead(
+          candidateReply,
+          customerReplyEvidenceTrace
+        )
+      ) {
+        const authoritativeRead =
+          await getCustomerUpcomingAppointments(phone, config);
+        customerReplyEvidenceTrace = [
+          ...customerReplyEvidenceTrace,
+          {
+            round: modelResult.rounds + 1,
+            name: 'getUpcomingAppointments',
+            args: {},
+            argumentsValidJson: true,
+            result: JSON.stringify(authoritativeRead),
+          },
+        ];
+      }
+      const inspection = inspectCustomerReply(
+        candidateReply,
+        servicesForGate,
+        forbiddenAppointmentIds,
+        customerReplyEvidenceTrace
+      );
+      if (!inspection.safe) {
+        Sentry.captureMessage('Resposta da Ana bloqueada por conteúdo interno', {
+          level: 'warning',
+          tags: {
+            service: 'brain',
+            operation: 'customer_reply_guard',
+            ai_provider: modelResult.provider,
+            leak_reasons: inspection.reasons.join(','),
+          },
+          contexts: {
+            customer_reply_guard: {
+              tenant_slug: config.tenantSlug,
+              phone_number_id: config.phoneNumberId,
+              model: modelResult.model,
+              reasons: inspection.reasons,
+            },
+          },
         });
       }
+      const finalReply = maybePrependGreeting(
+        inspection.safe
+          ? candidateReply
+          : safeWriteConfirmation || getFallbackMessage(config),
+        isFirstContact,
+        config
+      );
+
+      await addMessage(conversationKey, 'assistant', finalReply);
+      return finalReply;
     }
   } catch (error) {
-    // Erros do OpenAI já foram capturados no funil (openaiRetry); aqui pegamos
-    // o resto (ex.: falha de persistência de contexto) sem duplicar.
+    // Erros do provider já foram capturados no funil provider-aware; aqui
+    // pegamos o resto (ex.: falha de persistência) sem duplicar.
     if (!isCaptured(error)) {
       Sentry.captureException(error, {
         tags: { service: 'brain', operation: 'get_reply' },
@@ -593,7 +1108,7 @@ async function getReceptionistReply(
   }
 
   const fallbackReply = maybePrependGreeting(
-    getFallbackMessage(config),
+    buildSafeRecoveryReply(completedWriteTrace, getFallbackMessage(config)),
     isFirstContact,
     config
   );
