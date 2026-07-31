@@ -184,14 +184,14 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'sendSignupLink',
     description:
-      'Gera o link de cadastro do trial grátis (sem cartão) de um plano. Retorna a URL para você enviar ao lead. NÃO gere link do plano em fase de testes (ele volta com a lista de espera).',
+      'Gera o link de cadastro do trial grátis (sem cartão) de um plano. Retorna a URL para você enviar ao lead. NÃO gere link de plano temporariamente pausado (ele volta com a lista de interesse).',
     input_schema: {
       type: 'object',
       properties: {
         plan: {
           type: 'string',
           description:
-            'Slug do plano ("essencial" ou "pro"; "atendente-ia" está em testes). Use o slug exato do bloco PLANOS.',
+            'Slug do plano ("essencial" ou "pro"; "atendente-ia" está em atualização e não é vendável agora). Use o slug exato do bloco PLANOS.',
         },
         interval: {
           type: 'string',
@@ -218,7 +218,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
         plan: {
           type: 'string',
           description:
-            'Slug do plano ("essencial" ou "pro"; "atendente-ia" está em testes). Use o slug exato do bloco PLANOS.',
+            'Slug do plano ("essencial" ou "pro"; "atendente-ia" está em atualização e não é vendável agora). Use o slug exato do bloco PLANOS.',
         },
         interval: {
           type: 'string',

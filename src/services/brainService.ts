@@ -24,7 +24,22 @@ import {
   shouldAskServiceUpfront,
   buildServiceQuestion,
 } from './service-gate';
-import { getSalesReply } from './salesBrain';
+import {
+  getSalesReply,
+  getSalesReplyFromHistory,
+  type SalesReplyOptions,
+} from './salesBrain';
+import {
+  getOnboardingReply,
+  getOnboardingReplyFromHistory,
+} from './onboardingBrain';
+import {
+  claimOnboardingSession,
+  getOnboardingSessionResult,
+  matchOnboardingClaimCode,
+  matchOnboardingIntentWithoutCode,
+} from './onboardingSession';
+import { isConversationPaused } from './pauseService';
 import {
   createReceptionistChatCompletion,
   resolveReceptionistAiRuntime,
@@ -910,6 +925,101 @@ export function resolveBrainRole(config: TenantBotConfig): 'sales' | 'receptioni
   return config.botRole === 'sales' ? 'sales' : 'receptionist';
 }
 
+export type ConversationBrainRole =
+  | 'receptionist'
+  | 'paused'
+  | 'claim'
+  | 'onboarding'
+  | 'sales';
+
+export type RecoverableSalesConversationRole =
+  | 'sales'
+  | 'onboarding';
+
+const lastResolvedSalesRoleByConversation =
+  new Map<string, RecoverableSalesConversationRole>();
+
+function rememberResolvedSalesRole(
+  phone: string,
+  config: TenantBotConfig,
+  role: RecoverableSalesConversationRole
+): void {
+  lastResolvedSalesRoleByConversation.set(
+    buildConversationKey(config.phoneNumberId, phone),
+    role
+  );
+}
+
+export function getLastResolvedSalesConversationRole(
+  conversationKey: string
+): RecoverableSalesConversationRole {
+  return (
+    lastResolvedSalesRoleByConversation.get(conversationKey) ??
+    'sales'
+  );
+}
+
+export function clearResolvedSalesConversationRoles(
+  conversationKeys: string[]
+): void {
+  for (const conversationKey of conversationKeys) {
+    lastResolvedSalesRoleByConversation.delete(conversationKey);
+  }
+}
+
+/**
+ * Precedência fechada da ponte por conversa. O registry base continua sendo
+ * `resolveBrainRole`; este helper só refina o ramo sales.
+ */
+export function resolveConversationBrainRole(input: {
+  baseRole: 'sales' | 'receptionist';
+  paused: boolean;
+  claimMatched: boolean;
+  claimSucceeded: boolean;
+  hasOpenOnboardingSession: boolean;
+}): ConversationBrainRole {
+  if (input.baseRole === 'receptionist') return 'receptionist';
+  if (input.paused) return 'paused';
+  if (input.claimMatched) {
+    return input.claimSucceeded ? 'onboarding' : 'claim';
+  }
+  if (input.hasOpenOnboardingSession) return 'onboarding';
+  return 'sales';
+}
+
+export function resolveHistoryRecoveryRole(input: {
+  sessionKind: 'open' | 'none' | 'blocked' | 'unavailable';
+  expectedConversationRole?: RecoverableSalesConversationRole;
+}): 'onboarding' | 'sales' | 'blocked' {
+  if (input.sessionKind === 'open') return 'onboarding';
+  if (input.expectedConversationRole === 'onboarding') {
+    return 'blocked';
+  }
+  return input.sessionKind === 'none' ? 'sales' : 'blocked';
+}
+
+export class ConversationPausedBeforeDispatch extends Error {
+  constructor() {
+    super('Conversa pausada antes do dispatch do brain.');
+    this.name = 'ConversationPausedBeforeDispatch';
+  }
+}
+
+async function recordDirectSalesReply(
+  phone: string,
+  storedUserMessage: string,
+  reply: string,
+  config: TenantBotConfig
+): Promise<string> {
+  const conversationKey = buildConversationKey(
+    config.phoneNumberId,
+    phone
+  );
+  await addMessage(conversationKey, 'user', storedUserMessage);
+  await addMessage(conversationKey, 'assistant', reply);
+  return reply;
+}
+
 /**
  * Despacha por `botRole`. "sales" → Renata (brain de vendas, provider Anthropic).
  * Qualquer outro valor → recepcionista. Tenants antigos (config sem botRole) já
@@ -921,10 +1031,121 @@ export async function getReply(
   userName: string,
   config: TenantBotConfig
 ): Promise<string> {
-  if (resolveBrainRole(config) === 'sales') {
+  const baseRole = resolveBrainRole(config);
+  if (baseRole === 'sales') {
+    // A checagem duplicada fecha a corrida entre o pre-flush e o claim: uma
+    // pausa que entrou nesse intervalo impede inclusive reivindicar o código.
+    if (await isConversationPaused(config.phoneNumberId, phone)) {
+      throw new ConversationPausedBeforeDispatch();
+    }
+
+    const claimCode = matchOnboardingClaimCode(userMessage);
+    if (claimCode) {
+      const claim = await claimOnboardingSession(phone, claimCode);
+      const storedMessage = claim.success
+        ? '[código de onboarding confirmado]'
+        : '[código de onboarding informado]';
+      if (!claim.success) {
+        return recordDirectSalesReply(
+          phone,
+          storedMessage,
+          claim.message,
+          config
+        );
+      }
+      rememberResolvedSalesRole(phone, config, 'onboarding');
+      return getOnboardingReply(
+        phone,
+        storedMessage,
+        userName,
+        config,
+        claim.state
+      );
+    }
+
+    const onboarding = await getOnboardingSessionResult(phone);
+    if (onboarding.kind === 'open') {
+      rememberResolvedSalesRole(phone, config, 'onboarding');
+      return getOnboardingReply(
+        phone,
+        userMessage,
+        userName,
+        config
+      );
+    }
+    if (
+      onboarding.kind === 'blocked' ||
+      onboarding.kind === 'unavailable'
+    ) {
+      return recordDirectSalesReply(
+        phone,
+        userMessage,
+        onboarding.message,
+        config
+      );
+    }
+    if (matchOnboardingIntentWithoutCode(userMessage)) {
+      return recordDirectSalesReply(
+        phone,
+        userMessage,
+        'Me manda o código que aparece na tela de boas-vindas da Receps. Ele começa com ONB e é o que vincula esta conversa à clínica certa.',
+        config
+      );
+    }
+
+    // Sem sessão: chama exatamente o entry point de vendas já existente.
+    rememberResolvedSalesRole(phone, config, 'sales');
     return getSalesReply(phone, userMessage, userName, config);
   }
   return getReceptionistReply(phone, userMessage, userName, config);
+}
+
+/**
+ * Entry point da recuperação/reexecução: resolve novamente o papel pela sessão
+ * atual, sem regravar inbound. Nunca cai de onboarding para vendas.
+ */
+export async function getSalesConversationReplyFromHistory(
+  phone: string,
+  userName: string,
+  config: TenantBotConfig,
+  options: SalesReplyOptions & {
+    expectedConversationRole?: RecoverableSalesConversationRole;
+  } = {}
+): Promise<string> {
+  if (await isConversationPaused(config.phoneNumberId, phone)) {
+    throw new ConversationPausedBeforeDispatch();
+  }
+  const onboarding = await getOnboardingSessionResult(phone);
+  const recoveryRole = resolveHistoryRecoveryRole({
+    sessionKind: onboarding.kind,
+    expectedConversationRole: options.expectedConversationRole,
+  });
+  if (recoveryRole === 'onboarding' && onboarding.kind === 'open') {
+    return getOnboardingReplyFromHistory(
+      phone,
+      userName,
+      config,
+      options
+    );
+  }
+  if (recoveryRole === 'blocked') {
+    const reason =
+      onboarding.kind === 'open'
+        ? 'unexpected_open_state'
+        : onboarding.reason;
+    throw new Error(
+      `A recuperação perdeu a resolução segura do papel (${reason}); fail-closed sem voltar a vendas.`
+    );
+  }
+  if (recoveryRole === 'sales' && onboarding.kind === 'none') {
+    return getSalesReplyFromHistory(
+      phone,
+      userName,
+      config,
+      options
+    );
+  }
+  throw new Error('Estado impossível na resolução do recovery.');
 }
 
 async function getReceptionistReply(

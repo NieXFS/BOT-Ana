@@ -10,6 +10,10 @@ import type {
   FollowupRow,
   FollowupTickDeps,
 } from '../src/services/salesFollowups';
+import type {
+  OnboardingDerivedStage,
+  OnboardingState,
+} from '../src/services/onboardingSession';
 
 let failures = 0;
 function check(label: string, condition: boolean): void {
@@ -65,16 +69,60 @@ function row(over: Partial<FollowupRow> = {}): FollowupRow {
   };
 }
 
+function onboardingState(
+  derivedStage: OnboardingDerivedStage
+): OnboardingState {
+  return {
+    session: {
+      id: 'session',
+      stage: 'welcome',
+      expiresAt: new Date(NOW + 24 * HOUR).toISOString(),
+      status: 'OPEN',
+      derivedStage,
+    },
+    tenant: {
+      name: 'Clínica',
+      segment: null,
+      planSlug: 'essencial',
+      maxProfessionals: 2,
+      professionalsActive: 1,
+      setupCompletedAt:
+        derivedStage === 'done'
+          ? new Date(NOW).toISOString()
+          : null,
+    },
+    catalog: {
+      servicesCount: 1,
+      seedServicesCount: 0,
+      services: [],
+    },
+    schedule: {
+      openingTime: '09:00',
+      closingTime: '19:00',
+      slotIntervalMinutes: 30,
+      scheduleLocked: false,
+    },
+    whatsapp: {
+      connected:
+        derivedStage === 'test' || derivedStage === 'done',
+      coexistence: false,
+      connectedAt: null,
+    },
+  };
+}
+
 async function main(): Promise<void> {
   const mod = await import('../src/services/salesFollowups');
   const {
     initialFollowupState,
+    onboardingFollowupState,
     rescheduleFollowupState,
     isTouchDue,
     advanceAfterTouch,
     followupStageText,
     pickFollowupVariant,
     postLinkFollowupText,
+    onboardingFollowupText,
     promoteFollowupJourney,
     demoJourneyFollowupText,
     DEMO_SIMULATION_FALLBACK_TEXT,
@@ -88,6 +136,8 @@ async function main(): Promise<void> {
     resolveFollowupPollOffsetMin,
     msUntilAlignedTick,
     DEFAULT_FOLLOWUP_POLL_OFFSET_MIN,
+    ONBOARDING_FOLLOWUP_OFFSET_MS,
+    ONBOARDING_SERVICE_WINDOW_MS,
     createFollowupPollerState,
     runFollowupPollerCycle,
     startFollowupPoller,
@@ -398,6 +448,31 @@ async function main(): Promise<void> {
       advanced.nextAtMs === NOW + FOLLOWUP_OFFSETS_MS[1] &&
       advanced.lastTouchIdx === 1
   );
+  const onboardingInit = onboardingFollowupState(NOW);
+  check(
+    'onboarding agenda um único toque +20h dentro da janela +24h',
+    onboardingInit.nextAtMs ===
+      NOW + ONBOARDING_FOLLOWUP_OFFSET_MS &&
+      onboardingInit.windowExpiresAtMs ===
+        NOW + ONBOARDING_SERVICE_WINDOW_MS &&
+      onboardingInit.journey === 'onboarding'
+  );
+  const onboardingAdvanced = advanceAfterTouch(
+    row({ journey: 'onboarding' })
+  );
+  check(
+    'onboarding encerra depois do primeiro toque',
+    onboardingAdvanced.touchCount === 1 &&
+      onboardingAdvanced.nextAtMs === null &&
+      !isTouchDue(
+        row({
+          journey: 'onboarding',
+          touchCount: 1,
+          nextAtMs: NOW - 1,
+        }),
+        NOW
+      )
+  );
 
   console.log('▶ variações e correção B2');
   const first = pickFollowupVariant(0, 'Maria Silva', null);
@@ -438,9 +513,12 @@ async function main(): Promise<void> {
 
   console.log('▶ journey + backfill');
   check(
-    'precedência post_link > demo > default',
+    'precedência post_link > onboarding > demo > default',
     promoteFollowupJourney('default', 'demo') === 'demo' &&
-      promoteFollowupJourney('demo', 'post_link') === 'post_link' &&
+      promoteFollowupJourney('demo', 'onboarding') ===
+        'onboarding' &&
+      promoteFollowupJourney('onboarding', 'post_link') ===
+        'post_link' &&
       promoteFollowupJourney('post_link', 'demo') === 'post_link'
   );
   const legacy = { journey: 'default', lastStage: 102 };
@@ -516,6 +594,23 @@ async function main(): Promise<void> {
   check(
     'API fora também cai na simulação',
     apiDown === DEMO_SIMULATION_FALLBACK_TEXT
+  );
+
+  console.log('▶ jornada onboarding: copy derivada do estado');
+  check(
+    'whatsapp usa a copy canônica stage-aware',
+    onboardingFollowupText(onboardingState('whatsapp')) ===
+      'Faltou só conectar o WhatsApp — 5 minutinhos e sua clínica atende sozinha.'
+  );
+  check(
+    'services retoma serviços, nunca venda',
+    onboardingFollowupText(onboardingState('services'))?.includes(
+      'serviços da clínica'
+    ) === true
+  );
+  check(
+    'done não produz toque',
+    onboardingFollowupText(onboardingState('done')) === null
   );
 
   console.log('▶ runFollowupTick stage-aware');
@@ -632,6 +727,178 @@ async function main(): Promise<void> {
       persisted.get('PN1:e')?.lastTouchIdx === 0 &&
       persisted.get('PN1:d')?.lastTouchIdx === null &&
       persisted.get('PN3:f')?.lastTouchIdx === null
+  );
+
+  console.log('▶ tick onboarding: término e anti-venda');
+  const onboardingRows = [
+    row({
+      conversationKey: 'PN1:onb-wa',
+      customerPhone: 'onb-wa',
+      journey: 'onboarding',
+      windowExpiresAtMs: NOW + 24 * HOUR,
+    }),
+    row({
+      conversationKey: 'PN1:onb-services',
+      customerPhone: 'onb-services',
+      // Prova defesa em profundidade: sessão aberta vence uma journey que
+      // tenha ficado default por falha de marcação.
+      journey: 'default',
+    }),
+    row({
+      conversationKey: 'PN1:onb-closed',
+      customerPhone: 'onb-closed',
+      journey: 'onboarding',
+    }),
+    row({
+      conversationKey: 'PN1:onb-paused',
+      customerPhone: 'onb-paused',
+      journey: 'onboarding',
+    }),
+    row({
+      conversationKey: 'PN1:onb-down',
+      customerPhone: 'onb-down',
+      journey: 'onboarding',
+    }),
+    row({
+      conversationKey: 'PN1:onb-done',
+      customerPhone: 'onb-done',
+      journey: 'onboarding',
+    }),
+    row({
+      conversationKey: 'PN1:onb-expired',
+      customerPhone: 'onb-expired',
+      journey: 'onboarding',
+    }),
+    row({
+      conversationKey: 'PN1:onb-post',
+      customerPhone: 'onb-post',
+      journey: 'post_link',
+    }),
+  ];
+  const onboardingSent: Array<{ to: string; text: string }> = [];
+  const onboardingEnded: string[] = [];
+  const onboardingAdvances = new Map<
+    string,
+    { nextAtMs: number | null; touchCount: number }
+  >();
+  const onboardingCount = await runFollowupTick({
+    now: () => NOW,
+    loadDue: async () => onboardingRows,
+    getConfig: async (phoneNumberId) => salesConfig(phoneNumberId),
+    isPaused: async (_phoneNumberId, customerPhone) =>
+      customerPhone === 'onb-paused',
+    getPrefilledLink: async (customerPhone) =>
+      customerPhone === 'onb-post'
+        ? {
+            success: true,
+            url: 'https://receps.com.br/cadastro?pf=ONBOARDING',
+          }
+        : {
+            success: false,
+            reason: 'not_found',
+          },
+    getDemoText: async () => 'não deve usar demo',
+    getOnboardingSession: async (customerPhone) => {
+      if (customerPhone === 'onb-closed') {
+        return {
+          kind: 'none',
+          reason: 'session_closed',
+          message: 'fechada',
+        };
+      }
+      if (customerPhone === 'onb-expired') {
+        return {
+          kind: 'none',
+          reason: 'no_session',
+          message: 'expirada',
+        };
+      }
+      if (customerPhone === 'onb-down') {
+        return {
+          kind: 'unavailable',
+          reason: 'network',
+          message: 'indisponível',
+        };
+      }
+      const stage: OnboardingDerivedStage =
+        customerPhone === 'onb-wa'
+          ? 'whatsapp'
+          : customerPhone === 'onb-done'
+            ? 'done'
+            : 'services';
+      return {
+        kind: 'open',
+        state: onboardingState(stage),
+      };
+    },
+    endJourney: async (_phoneNumberId, customerPhone) => {
+      onboardingEnded.push(customerPhone);
+    },
+    send: async (to, text) => {
+      onboardingSent.push({ to, text });
+    },
+    record: async () => undefined,
+    emitEvent: async () => undefined,
+    persist: async (key, advance) => {
+      onboardingAdvances.set(key, {
+        nextAtMs: advance.nextAtMs,
+        touchCount: advance.touchCount,
+      });
+    },
+  });
+  check(
+    'envia os dois toques de onboarding e preserva post_link prioritário',
+    onboardingCount === 3 &&
+      onboardingSent.map((item) => item.to).join(',') ===
+        'onb-wa,onb-services,onb-post' &&
+      onboardingSent.find((item) => item.to === 'onb-post')
+        ?.text ===
+        postLinkFollowupText(
+          'https://receps.com.br/cadastro?pf=ONBOARDING'
+        )
+  );
+  check(
+    'sessão aberta nunca recebe copy de venda',
+    onboardingSent.every(
+      (item) =>
+        !/Ficou alguma dúvida|testar a Receps grátis|vou deixar você em paz/i.test(
+          item.text
+        )
+    )
+  );
+  check(
+    'derivedStage escolhe whatsapp e services',
+    onboardingSent.find((item) => item.to === 'onb-wa')?.text ===
+      'Faltou só conectar o WhatsApp — 5 minutinhos e sua clínica atende sozinha.' &&
+      onboardingSent
+        .find((item) => item.to === 'onb-services')
+        ?.text.includes('serviços da clínica') === true
+  );
+  check(
+    'sessão fechada/setup concluído/pausa encerram a jornada',
+    [
+      'onb-closed',
+      'onb-done',
+      'onb-expired',
+      'onb-paused',
+    ].every((phone) =>
+      onboardingEnded.includes(phone)
+    )
+  );
+  check(
+    'estado indisponível faz skip silencioso, sem copy genérica',
+    !onboardingSent.some((item) => item.to === 'onb-down') &&
+      !onboardingEnded.includes('onb-down')
+  );
+  check(
+    'toque único persiste next_at nulo',
+    ['PN1:onb-wa', 'PN1:onb-services'].every((key) => {
+      const advance = onboardingAdvances.get(key);
+      return (
+        advance?.touchCount === 1 && advance.nextAtMs === null
+      );
+    }) &&
+      onboardingAdvances.get('PN1:onb-post')?.nextAtMs !== null
   );
 
   if (failures) process.exit(1);

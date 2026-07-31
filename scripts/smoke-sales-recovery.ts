@@ -10,6 +10,7 @@ import type {
   SalesEventMetadata,
   SalesEventType,
 } from '../src/services/salesEvents';
+import fs from 'node:fs';
 
 interface FakeJob {
   id: number;
@@ -92,6 +93,78 @@ function check(label: string, condition: boolean): void {
 
 async function main(): Promise<void> {
   const recovery = await import('../src/services/salesRecovery');
+  const brainRegistry = await import('../src/services/brainService');
+
+  console.log('▶ entry point ciente do papel');
+  const recoverySource = fs.readFileSync(
+    new URL('../src/services/salesRecovery.ts', import.meta.url),
+    'utf8'
+  );
+  check(
+    'default regenerator importa o dispatcher por conversa',
+    recoverySource.includes(
+      'getSalesConversationReplyFromHistory'
+    ) &&
+      !recoverySource.includes(
+        "import type { getSalesReplyFromHistory } from './salesBrain'"
+      )
+  );
+  check(
+    'papel onboarding esperado nunca cai em sales se a sessão fechou',
+    brainRegistry.resolveHistoryRecoveryRole({
+      sessionKind: 'none',
+      expectedConversationRole: 'onboarding',
+    }) === 'blocked'
+  );
+  check(
+    'recovery de venda sem sessão continua sales',
+    brainRegistry.resolveHistoryRecoveryRole({
+      sessionKind: 'none',
+      expectedConversationRole: 'sales',
+    }) === 'sales'
+  );
+
+  {
+    const scheduler = new FakeScheduler();
+    const sent: string[] = [];
+    let recoveredRole = '';
+    let expectedRole = '';
+    recovery.__setSalesRecoveryDepsForTest({
+      scheduler: scheduler.api,
+      isPaused: async () => false,
+      getHistory: async () => [
+        { role: 'user', content: 'vamos continuar a configuração' },
+      ],
+      regenerate: async (_phone, _name, _config, options) => {
+        expectedRole =
+          options.expectedConversationRole ?? '';
+        recoveredRole = brainRegistry.resolveConversationBrainRole({
+          baseRole: 'sales',
+          paused: false,
+          claimMatched: false,
+          claimSucceeded: false,
+          hasOpenOnboardingSession: true,
+        });
+        return `resposta-${recoveredRole}`;
+      },
+      sendReply: async (_phone, text) => {
+        sent.push(text);
+      },
+      emitEvent: async () => undefined,
+    });
+    recovery.scheduleSalesRecovery({
+      ...baseInput,
+      conversationRole: 'onboarding',
+    });
+    await scheduler.runNext();
+    check(
+      'turno com sessão é recuperado como onboarding, não sales',
+      recoveredRole === 'onboarding' &&
+        expectedRole === 'onboarding' &&
+        sent.join(',') === 'resposta-onboarding'
+    );
+    recovery.__resetSalesRecoveryForTest();
+  }
 
   // Sucesso da reexecução -----------------------------------------------------
   {
@@ -106,6 +179,7 @@ async function main(): Promise<void> {
     recovery.__setSalesRecoveryDepsForTest({
       scheduler: scheduler.api,
       clock: { now: () => 1_000 },
+      isPaused: async () => false,
       getHistory: async () => [{ role: 'user', content: 'quero conhecer' }],
       regenerate: async () => {
         brainCalls += 1;
@@ -164,6 +238,7 @@ async function main(): Promise<void> {
     const handoffs: string[] = [];
     recovery.__setSalesRecoveryDepsForTest({
       scheduler: scheduler.api,
+      isPaused: async () => false,
       getHistory: async () => [{ role: 'user', content: 'oi' }],
       regenerate: async () => {
         throw new Error('Anthropic indisponível');
@@ -231,6 +306,7 @@ async function main(): Promise<void> {
     const scheduler = new FakeScheduler();
     recovery.__setSalesRecoveryDepsForTest({
       scheduler: scheduler.api,
+      isPaused: async () => false,
       emitEvent: async () => undefined,
     });
     recovery.scheduleSalesRecovery(baseInput);
@@ -243,6 +319,39 @@ async function main(): Promise<void> {
     recovery.__resetSalesRecoveryForTest();
   }
 
+  // Pausa/takeover cancela antes de brain ou envio ---------------------------
+  {
+    const scheduler = new FakeScheduler();
+    let brainCalls = 0;
+    let sends = 0;
+    recovery.__setSalesRecoveryDepsForTest({
+      scheduler: scheduler.api,
+      isPaused: async () => true,
+      getHistory: async () => [
+        { role: 'user', content: 'não deve processar' },
+      ],
+      regenerate: async () => {
+        brainCalls += 1;
+        return 'não deveria';
+      },
+      sendReply: async () => {
+        sends += 1;
+      },
+      emitEvent: async () => undefined,
+    });
+    recovery.scheduleSalesRecovery(baseInput);
+    await scheduler.runNext();
+    check(
+      'pausa cancela recovery sem brain/envio/timer',
+      brainCalls === 0 &&
+        sends === 0 &&
+        scheduler.activeJobs().length === 0 &&
+        recovery.__getSalesRecoveryStateForTest(conversationKey) ===
+          null
+    );
+    recovery.__resetSalesRecoveryForTest();
+  }
+
   // Guarda de corrida: assistant já respondeu --------------------------------
   {
     const scheduler = new FakeScheduler();
@@ -250,6 +359,7 @@ async function main(): Promise<void> {
     let brainCalls = 0;
     recovery.__setSalesRecoveryDepsForTest({
       scheduler: scheduler.api,
+      isPaused: async () => false,
       getHistory: async () => [
         { role: 'user', content: 'oi' },
         { role: 'assistant', content: 'já respondido' },
@@ -283,6 +393,7 @@ async function main(): Promise<void> {
     let brainCalls = 0;
     recovery.__setSalesRecoveryDepsForTest({
       scheduler: scheduler.api,
+      isPaused: async () => false,
       regenerate: async () => {
         brainCalls += 1;
         return 'não deveria';
@@ -317,6 +428,7 @@ async function main(): Promise<void> {
     let sends = 0;
     recovery.__setSalesRecoveryDepsForTest({
       scheduler: scheduler.api,
+      isPaused: async () => false,
       getHistory: async () => [{ role: 'user', content: 'oi' }],
       regenerate: async () => {
         brainCalls += 1;

@@ -1,7 +1,7 @@
 /**
  * Smoke dos CONTRATOS das ferramentas de venda da Renata (Workstream B).
- * - buildSignupLink: URL builder puro (utm + cid + plano + interval; beta →
- *   lista de espera; plano inválido → recusa; ctwaClid > wa:hash).
+ * - buildSignupLink: URL builder puro (utm + cid + plano + interval; plano pausado →
+ *   lista de interesse; plano inválido → recusa; ctwaClid > wa:hash).
  * - registerQualifiedLead / handoffToHuman: contrato HTTP contra um MOCK do
  *   Receps (express local) — sem tocar no Receps real nem no DB (a régua de
  *   follow-up é best-effort e falha em silêncio no smoke).
@@ -41,7 +41,7 @@ const salesConfig: SalesConfig = {
       trialDays: 7,
       maxProfessionals: 1,
       features: [],
-      waitlist: { reason: 'em testes', href: 'https://wa.me/5516991113783' },
+      waitlist: { reason: 'em atualização', href: 'https://wa.me/5516991113783' },
     },
     {
       slug: 'essencial',
@@ -70,7 +70,7 @@ const salesConfig: SalesConfig = {
       features: [],
     },
   ],
-  anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'beta' },
+  anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'plano em atualização' },
 };
 
 type Captured = { path: string; body: Record<string, unknown> };
@@ -128,8 +128,8 @@ async function main() {
   check('pro anual: plan=pro', proAnnual.success === true && proAnnual.url.includes('plan=pro'));
 
   const beta = buildSignupLink('atendente-ia', undefined, phone, salesConfig);
-  check('beta: recusa (não vende)', beta.success === false);
-  check('beta: devolve waitlistHref', beta.success === false && beta.waitlistHref === 'https://wa.me/5516991113783');
+  check('plano pausado: recusa (não vende)', beta.success === false);
+  check('plano pausado: devolve waitlistHref', beta.success === false && beta.waitlistHref === 'https://wa.me/5516991113783');
 
   const invalid = buildSignupLink('inexistente', undefined, phone, salesConfig);
   check('plano inválido: recusa listando válidos', invalid.success === false && invalid.message.includes('essencial'));
@@ -204,9 +204,9 @@ async function main() {
     { email: 'x@y.com', plan: 'atendente-ia' },
     salesConfig
   );
-  check('prefill beta: recusa', prefillBeta.success === false);
+  check('prefill do plano pausado: recusa', prefillBeta.success === false);
   check(
-    'prefill beta: MESMA lista de espera do sendSignupLink',
+    'prefill do plano pausado: MESMA lista de interesse do sendSignupLink',
     prefillBeta.success === false && prefillBeta.waitlistHref === 'https://wa.me/5516991113783'
   );
   const prefillInvalid = await createPrefilledSignupLink(

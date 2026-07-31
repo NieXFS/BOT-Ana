@@ -3,8 +3,10 @@ import { Sentry } from '../observability/sentry';
 import type { sendFreeformMessage } from '../whatsappCloudService';
 import type { getHistory } from './contextManager';
 import type { emitSalesEvent } from './salesEvents';
-import type { getSalesReplyFromHistory } from './salesBrain';
+import type { getSalesConversationReplyFromHistory } from './brainService';
+import type { RecoverableSalesConversationRole } from './brainService';
 import type { handoffToHuman } from './salesTools';
+import type { isConversationPaused } from './pauseService';
 
 export const LAST_RESORT_MESSAGE =
   'Oi! Desculpa a demora — já te respondo direitinho aqui 😊';
@@ -23,6 +25,7 @@ export interface ScheduleSalesRecoveryInput {
   userName: string;
   config: TenantBotConfig;
   failure: RecoveryFailure;
+  conversationRole?: RecoverableSalesConversationRole;
 }
 
 type TimerHandle = unknown;
@@ -37,7 +40,8 @@ export interface SalesRecoveryDeps {
   };
   clock: { now: () => number };
   getHistory: typeof getHistory;
-  regenerate: typeof getSalesReplyFromHistory;
+  regenerate: typeof getSalesConversationReplyFromHistory;
+  isPaused: typeof isConversationPaused;
   sendReply: (
     phone: string,
     replyText: string,
@@ -71,12 +75,18 @@ const defaultDeps: SalesRecoveryDeps = {
     return loadHistory(...args);
   },
   regenerate: async (
-    ...args: Parameters<typeof getSalesReplyFromHistory>
+    ...args: Parameters<typeof getSalesConversationReplyFromHistory>
   ) => {
-    const { getSalesReplyFromHistory: regenerate } = await import(
-      './salesBrain'
+    const { getSalesConversationReplyFromHistory: regenerate } = await import(
+      './brainService'
     );
     return regenerate(...args);
+  },
+  isPaused: async (...args: Parameters<typeof isConversationPaused>) => {
+    const { isConversationPaused: check } = await import(
+      './pauseService'
+    );
+    return check(...args);
   },
   // Import dinâmico evita o ciclo messageHandler -> salesRecovery ->
   // messageHandler durante o carregamento dos módulos.
@@ -216,6 +226,16 @@ async function runRecoveryAttempt(conversationKey: string): Promise<void> {
   state.attempt += 1;
 
   try {
+    if (
+      await deps.isPaused(
+        state.config.phoneNumberId,
+        state.phone
+      )
+    ) {
+      cancelSalesRecovery(conversationKey);
+      return;
+    }
+
     if (state.failure.kind === 'brain') {
       let history: Awaited<ReturnType<typeof getHistory>>;
       try {
@@ -236,10 +256,14 @@ async function runRecoveryAttempt(conversationKey: string): Promise<void> {
       try {
         replyText = await deps.regenerate(
           state.phone,
-          state.userName,
-          state.config,
-          { retryPolicy: 'patient' }
-        );
+        state.userName,
+        state.config,
+        {
+          retryPolicy: 'patient',
+          expectedConversationRole:
+            state.conversationRole ?? 'sales',
+        }
+      );
       } catch (error) {
         captureRecoveryError('brain', state, error);
         await scheduleNextOrExhaust(state);
@@ -248,6 +272,16 @@ async function runRecoveryAttempt(conversationKey: string): Promise<void> {
 
       if (recoveryByConversation.get(conversationKey) !== state) return;
       state.failure = { kind: 'send', replyText };
+    }
+
+    if (
+      await deps.isPaused(
+        state.config.phoneNumberId,
+        state.phone
+      )
+    ) {
+      cancelSalesRecovery(conversationKey);
+      return;
     }
 
     try {

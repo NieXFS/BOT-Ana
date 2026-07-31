@@ -2,6 +2,13 @@
 
 Bot de atendimento via WhatsApp Cloud API que conversa com o cliente (OpenAI, function calling) e agenda no ERP **Receps** via HTTP (`/api/v1/agenda/*`). Prod: VPS `root@46.62.134.25` em `~/Ana`, processo pm2 **ana-bot** (porta **3001**). O Receps roda na MESMA VPS em `localhost:3000`. Auth Ana→Receps: `Authorization: Bearer <ERP_API_TOKEN>` (= `AI_BOT_API_KEY` do Receps; ver `src/erpApiToken.ts`).
 
+## Conexão de novos tenants — Embedded Signup público (resolvido 2026-07-30)
+
+- Cada cliente conecta o próprio WhatsApp Business no Receps pelo Embedded Signup/Coexistence; a Ana apenas consome o `BotConfig` resultante. Não existe etapa normal de ativação manual, convite como tester ou acesso do Victor ao Business do cliente.
+- Meta App `1248305527427779`; configuração v4 ativa em produção `1728530234932540` (`Receps Embedded Signup v4`). Permissões usadas: `whatsapp_business_management` + `whatsapp_business_messaging`; `business_management` não é necessária.
+- A falha que bloqueava contas sem função no app era `public_profile` em “Pronto para teste”. Aumentar o acesso para “Pronto para publicar” resolveu sem novo App Review; o fluxo real foi confirmado com conta comum e tenant de testes.
+- O Receps mantém `META_EMBEDDED_SIGNUP_ENABLED` somente como kill-switch operacional. Não reintroduzir na documentação nem no produto o fluxo histórico anterior à liberação pública.
+
 ## Deploy (POR GIT — a seção "rsync" antiga está morta)
 O repo é `NieXFS/BOT-Ana`, checkout de `origin/main` em `/root/Ana`. **⚠️ NUNCA editar `/root/Ana` direto na VPS** — em 2026-07-15 um hot-patch de 438 linhas travou o `git pull`.
 ```

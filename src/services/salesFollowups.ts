@@ -12,6 +12,10 @@ import { isRenataVoiceEnabled } from '../voice/voiceConfig';
 import { deliverSalesReply } from '../voice/voiceDelivery';
 import { getAvailableSlots } from './calendarService';
 import { resolveDemoServiceId } from './demoScheduling';
+import {
+  getOnboardingSessionResult,
+  type OnboardingState,
+} from './onboardingSession';
 
 /**
  * Régua de FOLLOW-UP da Renata (Workstream B, §B5). Dentro da janela CTWA de 72h,
@@ -39,9 +43,15 @@ const RECEPS_INTERNAL_API_URL =
 /** Offsets do anchor (último inbound) até cada toque. Stage k dispara em anchor+OFFSETS[k]. */
 export const FOLLOWUP_OFFSETS_MS = [4 * HOUR_MS, 24 * HOUR_MS, 48 * HOUR_MS];
 export const MAX_TOUCHES = FOLLOWUP_OFFSETS_MS.length;
+export const ONBOARDING_FOLLOWUP_OFFSET_MS = 20 * HOUR_MS;
+export const ONBOARDING_SERVICE_WINDOW_MS = 24 * HOUR_MS;
 /** Somente para migrar o marcador legado `last_stage = 100 + touch_count`. */
 export const LEGACY_POST_LINK_STAGE_OFFSET = 100;
-export type FollowupJourney = 'default' | 'post_link' | 'demo';
+export type FollowupJourney =
+  | 'default'
+  | 'post_link'
+  | 'onboarding'
+  | 'demo';
 
 export type CurrentPrefilledSignupLinkResult =
   | { success: true; url: string }
@@ -81,6 +91,25 @@ export function initialFollowupState(nowMs: number): {
   };
 }
 
+export function onboardingFollowupState(nowMs: number): {
+  anchorAtMs: number;
+  windowExpiresAtMs: number;
+  nextAtMs: number;
+  touchCount: number;
+  lastStage: number;
+  journey: 'onboarding';
+} {
+  return {
+    anchorAtMs: nowMs,
+    windowExpiresAtMs:
+      nowMs + ONBOARDING_SERVICE_WINDOW_MS,
+    nextAtMs: nowMs + ONBOARDING_FOLLOWUP_OFFSET_MS,
+    touchCount: 0,
+    lastStage: 0,
+    journey: 'onboarding',
+  };
+}
+
 /**
  * Régua ZERA num novo inbound: anchor/next voltam pro toque 0, touch_count=0.
  * A janela de 72h (do 1º inbound), a jornada e o índice da última variação são
@@ -117,9 +146,11 @@ export function rescheduleFollowupState(
 
 /** Um toque está DEVIDO agora? (dentro da janela, com toque pendente, não opt-out). */
 export function isTouchDue(row: FollowupRow, nowMs: number): boolean {
+  const maxTouches =
+    row.journey === 'onboarding' ? 1 : MAX_TOUCHES;
   return (
     !row.optedOut &&
-    row.touchCount < MAX_TOUCHES &&
+    row.touchCount < maxTouches &&
     row.nextAtMs !== null &&
     row.nextAtMs <= nowMs &&
     row.windowExpiresAtMs > nowMs
@@ -152,6 +183,14 @@ export function advanceAfterTouch(
   lastTouchIdx: number | null;
 } {
   const nextCount = row.touchCount + 1;
+  if (row.journey === 'onboarding') {
+    return {
+      touchCount: nextCount,
+      lastStage: nextCount,
+      nextAtMs: null,
+      lastTouchIdx,
+    };
+  }
   const nextOffset = FOLLOWUP_OFFSETS_MS[nextCount];
   return {
     touchCount: nextCount,
@@ -164,7 +203,8 @@ export function advanceAfterTouch(
 const JOURNEY_PRIORITY: Record<FollowupJourney, number> = {
   default: 0,
   demo: 1,
-  post_link: 2,
+  onboarding: 2,
+  post_link: 3,
 };
 
 export function promoteFollowupJourney(
@@ -178,6 +218,28 @@ export function promoteFollowupJourney(
 
 export function postLinkFollowupText(url: string): string {
   return `Vi que faltou só a senha pra ativar sua conta! 😊 O link é esse: ${url} — qualquer dúvida é só me chamar.`;
+}
+
+/** Copy de um único toque, sempre derivada do `derivedStage` autoritativo. */
+export function onboardingFollowupText(
+  state: OnboardingState
+): string | null {
+  switch (state.session.derivedStage) {
+    case 'services':
+      return 'Vamos retomar sua configuração? Faltou deixar os serviços da clínica com preço e duração reais. Me manda o próximo serviço e eu organizo com você.';
+    case 'schedule':
+      return 'Faltou só ajustar os horários da clínica — abertura, fechamento, dias de folga e almoço. Quer terminar isso comigo agora?';
+    case 'team':
+      return 'Vamos retomar sua configuração? Falta conferir quem atende na clínica para a agenda ficar certinha.';
+    case 'clinic':
+      return 'Faltou completar os dados básicos da clínica. Se quiser, terminamos por aqui em poucos minutos.';
+    case 'whatsapp':
+      return 'Faltou só conectar o WhatsApp — 5 minutinhos e sua clínica atende sozinha.';
+    case 'test':
+      return 'Seu WhatsApp já está conectado. Falta só fazer o primeiro teste ao vivo: mande uma mensagem para o número da clínica como se fosse uma cliente.';
+    case 'done':
+      return null;
+  }
 }
 
 /** Primeiro nome utilizável, ou vazio (nome ausente / "Cliente"). */
@@ -387,7 +449,16 @@ export async function scheduleFollowup(
        ON CONFLICT (conversation_key) DO UPDATE SET
          customer_name = COALESCE(EXCLUDED.customer_name, sales_followups.customer_name),
          anchor_at = EXCLUDED.anchor_at,
-         next_at = EXCLUDED.next_at,
+         window_expires_at = CASE
+           WHEN sales_followups.journey = 'onboarding'
+             THEN to_timestamp(($5 + ${ONBOARDING_SERVICE_WINDOW_MS})/1000.0)
+           ELSE sales_followups.window_expires_at
+         END,
+         next_at = CASE
+           WHEN sales_followups.journey = 'onboarding'
+             THEN to_timestamp(($5 + ${ONBOARDING_FOLLOWUP_OFFSET_MS})/1000.0)
+           ELSE EXCLUDED.next_at
+         END,
          touch_count = 0,
          last_stage = 0,
          -- journey e last_touch_idx são deliberadamente preservados: a resposta
@@ -416,6 +487,93 @@ export async function scheduleFollowup(
     Sentry.captureException(err, {
       tags: { service: 'sales-followups', operation: 'schedule', phoneNumberId },
     });
+  }
+}
+
+/**
+ * Ativa/zera a jornada de onboarding a partir do ÚLTIMO inbound: um único toque
+ * em +20h, com expiração estrita em +24h. A transição trial→onboarding troca o
+ * ciclo de vida de `default`/`demo`; `post_link` continua acima dela na
+ * precedência canônica e preserva seu relógio.
+ */
+export async function scheduleOnboardingFollowup(
+  phoneNumberId: string,
+  customerPhone: string,
+  customerName: string | null,
+  anchorAtMs = Date.now()
+): Promise<void> {
+  const key = conversationKey(phoneNumberId, customerPhone);
+  const state = onboardingFollowupState(anchorAtMs);
+  try {
+    await pool.query(
+      `INSERT INTO sales_followups
+         (conversation_key, phone_number_id, customer_phone, customer_name,
+          anchor_at, window_expires_at, next_at, touch_count, last_stage,
+          journey, last_touch_idx, opted_out, updated_at)
+       VALUES (
+         $1, $2, $3, $4,
+         to_timestamp($5/1000.0),
+         to_timestamp(($5 + $6)/1000.0),
+         to_timestamp(($5 + $7)/1000.0),
+         0, 0, 'onboarding', NULL, false, now()
+       )
+       ON CONFLICT (conversation_key) DO UPDATE SET
+         customer_name = COALESCE(EXCLUDED.customer_name, sales_followups.customer_name),
+         anchor_at = CASE
+           WHEN sales_followups.journey = 'post_link'
+             THEN sales_followups.anchor_at
+           ELSE EXCLUDED.anchor_at
+         END,
+         window_expires_at = CASE
+           WHEN sales_followups.journey = 'post_link'
+             THEN sales_followups.window_expires_at
+           ELSE EXCLUDED.window_expires_at
+         END,
+         next_at = CASE
+           WHEN sales_followups.journey = 'post_link'
+             THEN sales_followups.next_at
+           ELSE EXCLUDED.next_at
+         END,
+         touch_count = CASE
+           WHEN sales_followups.journey = 'post_link'
+             THEN sales_followups.touch_count
+           ELSE 0
+         END,
+         last_stage = CASE
+           WHEN sales_followups.journey = 'post_link'
+             THEN sales_followups.last_stage
+           ELSE 0
+         END,
+         journey = CASE
+           WHEN sales_followups.journey = 'post_link'
+             THEN 'post_link'
+           ELSE 'onboarding'
+         END,
+         updated_at = now()
+       WHERE sales_followups.opted_out = false`,
+      [
+        key,
+        phoneNumberId,
+        customerPhone,
+        customerName,
+        state.anchorAtMs,
+        ONBOARDING_SERVICE_WINDOW_MS,
+        ONBOARDING_FOLLOWUP_OFFSET_MS,
+      ]
+    );
+  } catch (error) {
+    Sentry.captureException(
+      new Error('sales-followups schedule onboarding failed'),
+      {
+        tags: {
+          service: 'sales-followups',
+          operation: 'schedule-onboarding',
+          phoneNumberId,
+          error_kind:
+            error instanceof Error ? error.name : typeof error,
+        },
+      }
+    );
   }
 }
 
@@ -567,7 +725,9 @@ async function loadDueRows(nowMs: number): Promise<FollowupRow[]> {
     touchCount: r.touch_count,
     lastStage: r.last_stage,
     journey:
-      r.journey === 'post_link' || r.journey === 'demo'
+      r.journey === 'post_link' ||
+      r.journey === 'onboarding' ||
+      r.journey === 'demo'
         ? r.journey
         : 'default',
     lastTouchIdx:
@@ -614,6 +774,11 @@ export interface FollowupTickDeps {
     phoneNumberId: string
   ) => Promise<CurrentPrefilledSignupLinkResult>;
   getDemoText: (config: TenantBotConfig) => Promise<string>;
+  getOnboardingSession?: typeof getOnboardingSessionResult;
+  endJourney?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<void>;
   send: (to: string, text: string, config: TenantBotConfig) => Promise<void>;
   record: (conversationKey: string, role: 'assistant', content: string) => Promise<void>;
   emitEvent: typeof emitSalesEvent;
@@ -630,6 +795,8 @@ const defaultTickDeps: FollowupTickDeps = {
   isPaused: isConversationPaused,
   getPrefilledLink: getCurrentPrefilledSignupLink,
   getDemoText: demoJourneyFollowupText,
+  getOnboardingSession: getOnboardingSessionResult,
+  endJourney: markFollowupOptedOut,
   send: (to, text, config) =>
     isRenataVoiceEnabled(config)
       ? deliverSalesReply(to, text, config)
@@ -659,8 +826,43 @@ export async function runFollowupTick(
       }
 
       if (await deps.isPaused(row.phoneNumberId, row.customerPhone)) {
+        if (row.journey === 'onboarding') {
+          await deps
+            .endJourney?.(row.phoneNumberId, row.customerPhone)
+            .catch(() => undefined);
+        }
         continue; // handoff/echo em andamento — Renata cala
       }
+
+      const onboarding = deps.getOnboardingSession
+        ? await deps.getOnboardingSession(row.customerPhone)
+        : {
+            kind: 'none' as const,
+            reason: 'no_session' as const,
+            message: 'Sem sessão de onboarding no seam injetado.',
+          };
+      if (
+        onboarding.kind === 'unavailable' ||
+        onboarding.kind === 'blocked'
+      ) {
+        // Sem resolução autoritativa do papel, falha fechado: não arrisca um
+        // toque de venda numa conversa que pode já estar em onboarding.
+        continue;
+      }
+      if (
+        onboarding.kind === 'none' &&
+        (onboarding.reason === 'session_closed' ||
+          row.journey === 'onboarding')
+      ) {
+        await deps
+          .endJourney?.(row.phoneNumberId, row.customerPhone)
+          .catch(() => undefined);
+        continue;
+      }
+      const effectiveJourney: FollowupJourney =
+        onboarding.kind === 'open'
+          ? promoteFollowupJourney(row.journey, 'onboarding')
+          : row.journey;
 
       const variant = pickFollowupVariant(
         row.touchCount,
@@ -670,7 +872,7 @@ export async function runFollowupTick(
       let text = variant.text;
       let nextVariantIdx: number | null = variant.idx;
 
-      if (row.journey === 'post_link') {
+      if (effectiveJourney === 'post_link') {
         const currentLink = await deps.getPrefilledLink(
           row.customerPhone,
           row.phoneNumberId
@@ -679,7 +881,30 @@ export async function runFollowupTick(
           text = postLinkFollowupText(currentLink.url);
           nextVariantIdx = row.lastTouchIdx;
         }
-      } else if (row.journey === 'demo') {
+      } else if (effectiveJourney === 'onboarding') {
+        if (onboarding.kind !== 'open') {
+          // Linha marcada onboarding sem estado disponível/aberto: nunca cai
+          // na copy genérica de vendas.
+          continue;
+        }
+        if (onboarding.state.tenant.setupCompletedAt) {
+          await deps
+            .endJourney?.(row.phoneNumberId, row.customerPhone)
+            .catch(() => undefined);
+          continue;
+        }
+        const onboardingText = onboardingFollowupText(
+          onboarding.state
+        );
+        if (!onboardingText) {
+          await deps
+            .endJourney?.(row.phoneNumberId, row.customerPhone)
+            .catch(() => undefined);
+          continue;
+        }
+        text = onboardingText;
+        nextVariantIdx = row.lastTouchIdx;
+      } else if (effectiveJourney === 'demo') {
         text = await deps.getDemoText(config);
         nextVariantIdx = row.lastTouchIdx;
       }
@@ -687,6 +912,7 @@ export async function runFollowupTick(
       void deps
         .emitEvent(row.phoneNumberId, row.customerPhone, 'followup_enviado', {
           stage: row.touchCount,
+          journey: effectiveJourney,
         })
         .catch(() => undefined);
       await deps
@@ -695,7 +921,10 @@ export async function runFollowupTick(
 
       await deps.persist(
         row.conversationKey,
-        advanceAfterTouch(row, nextVariantIdx)
+        advanceAfterTouch(
+          { ...row, journey: effectiveJourney },
+          nextVariantIdx
+        )
       );
       sent += 1;
     } catch (err) {

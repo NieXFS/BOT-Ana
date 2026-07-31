@@ -57,8 +57,8 @@ export type SignupLinkResult =
 
 /**
  * Monta o link de cadastro do plano (URL builder PURO). Valida contra a
- * salesConfig: plano inexistente → recusa listando os válidos; plano em fase de
- * testes (beta) → recusa e devolve o link da lista de espera. `cid` usa o
+ * salesConfig: plano inexistente → recusa listando os válidos; plano
+ * temporariamente pausado → recusa e devolve o link da lista de interesse. `cid` usa o
  * ctwaClid quando existir (C1), senão `wa:<hash-telefone>`.
  */
 export function buildSignupLink(
@@ -83,7 +83,7 @@ export function buildSignupLink(
     const href = plan.waitlist?.href ?? config.anaBeta.waitlistHref;
     return {
       success: false,
-      message: `O plano ${plan.name} está em fase de testes e não é vendido agora. Ofereça a lista de espera.`,
+      message: `O plano ${plan.name} está sendo atualizado e não é vendido agora. Ofereça a lista de interesse e o Essencial como opção com a Ana disponível.`,
       waitlistHref: href,
     };
   }
@@ -148,8 +148,8 @@ export type PrefilledSignupLinkResult =
  * o link leva tudo isso e o lead só cria a senha.
  *
  * Valida o plano ANTES da chamada com a MESMA função do `sendSignupLink`
- * (`buildSignupLink`): plano inexistente/em fase de testes volta a mesma
- * mensagem e a lista de espera, sem gastar round-trip. O servidor revalida de
+ * (`buildSignupLink`): plano inexistente/temporariamente pausado volta a mesma
+ * mensagem e a lista de interesse, sem gastar round-trip. O servidor revalida de
  * qualquer jeito (422) — esta checagem é UX, não segurança.
  *
  * O `ctwaClid` NÃO vai daqui: o Receps tira o snapshot do SalesLead, que já tem
@@ -158,7 +158,7 @@ export type PrefilledSignupLinkResult =
  *
  * Nunca lança: se o prefill estiver indisponível, a própria tool devolve o link
  * comum já validado, marcado como `prefilled:false`, e instrui a Renata a não
- * prometer dados pré-preenchidos. Plano inválido/beta mantém a recusa original.
+ * prometer dados pré-preenchidos. Plano inválido/pausado mantém a recusa original.
  */
 export async function createPrefilledSignupLink(
   phone: string,

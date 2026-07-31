@@ -1,5 +1,8 @@
 import type { TenantBotConfig } from './configProvider';
-import { getReply } from './services/brainService';
+import {
+  getLastResolvedSalesConversationRole,
+  getReply,
+} from './services/brainService';
 import { addMessage, buildConversationKey } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
@@ -21,6 +24,11 @@ import {
   notifySalesReplyDelivered,
   scheduleSalesRecovery,
 } from './services/salesRecovery';
+import {
+  cancelOnboardingPolling,
+  noteOnboardingInbound,
+} from './services/onboardingPolling';
+import { clearPendingOnboardingProposal } from './services/onboardingConfirmationGate';
 
 interface MessageBuffer {
   texts: string[];
@@ -262,6 +270,8 @@ async function suppressFlushIfPaused(params: {
   if (!(await isPaused(buffer.config.phoneNumberId, buffer.from))) {
     return false;
   }
+  cancelOnboardingPolling(bufferKey);
+  clearPendingOnboardingProposal(bufferKey);
 
   // Textos ainda não entregues ao brain precisam entrar no histórico pra Renata
   // retomar com o contexto correto depois da pausa. Os já processados pelo brain
@@ -367,6 +377,8 @@ export async function flushBuffer(
         userName: name,
         config,
         failure: { kind: 'brain' },
+        conversationRole:
+          getLastResolvedSalesConversationRole(bufferKey),
       });
     }
 
@@ -392,6 +404,10 @@ export async function flushBuffer(
         );
       } catch (err) {
         flushFailed = true;
+        // A proposta só pode autorizar B3 depois de ter sido entregue. Se o
+        // envio falhou, descarta o Map; a recuperação pode reenviar o texto,
+        // mas uma futura escrita exigirá nova proposta/confirmação.
+        clearPendingOnboardingProposal(bufferKey);
         Sentry.captureException(new Error('message_handler sales send failed'), {
           tags: {
             service: 'message_handler',
@@ -424,6 +440,8 @@ export async function flushBuffer(
           userName: name,
           config,
           failure: { kind: 'send', replyText: reply! },
+          conversationRole:
+            getLastResolvedSalesConversationRole(bufferKey),
         });
       }
     }
@@ -692,6 +710,9 @@ export async function handleIncomingMessage(
   // pausada, a Ana NÃO responde mas REGISTRA o inbound no histórico (o echo do
   // humano é gravado pelo echoHandler) — assim ela tem contexto ao retomar.
   if (await isConversationPaused(config.phoneNumberId, from)) {
+    if (config.botRole === 'sales') {
+      cancelOnboardingPolling(conversationKey);
+    }
     await recordInboundWhilePaused(conversationKey, text, config);
     console.log('⏸️ [pausado] Ana não responde; inbound registrado no histórico.');
     return;
@@ -699,6 +720,9 @@ export async function handleIncomingMessage(
 
   conversationTracker.markActive(conversationKey);
   if (config.botRole === 'sales') {
+    // Novo inbound cancela a rodada de polling vigente. Só a frase
+    // determinística de conclusão habilita a segunda (e última) rodada.
+    noteOnboardingInbound(conversationKey, text);
     console.log(
       `💬 Mensagem de vendas recebida | ${safeSalesContext(config, from)} | chars=${text.length}`
     );

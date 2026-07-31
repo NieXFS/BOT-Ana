@@ -1,8 +1,13 @@
-import { pool, buildConversationKey } from './contextManager';
+import {
+  pool,
+  buildConversationKey,
+  parseConversationKey,
+} from './contextManager';
 import { customerPhoneVariants } from './conversationActivity';
 import { clearConversationPartnerSlugs } from './salesPartnerState';
 import { clearConversationAdHeadlines } from './salesAdState';
 import { clearSalesRecoveryState } from './salesRecovery';
+import { clearPendingOnboardingProposals } from './onboardingConfirmationGate';
 
 export type AdminResetInput = {
   phoneNumberId: string;
@@ -17,6 +22,9 @@ export interface AdminResetDeps {
   countFollowups: (keys: string[]) => Promise<number>;
   deleteHistory: (keys: string[]) => Promise<number>;
   deleteFollowups: (keys: string[]) => Promise<number>;
+  clearOnboardingPollingStates?: (keys: string[]) => Promise<void>;
+  clearResolvedSalesConversationRoles?: (keys: string[]) => Promise<void>;
+  invalidateOnboardingSession?: (customerPhone: string) => Promise<void>;
 }
 
 /**
@@ -85,6 +93,24 @@ const defaultDeps: AdminResetDeps = {
   countFollowups,
   deleteHistory,
   deleteFollowups,
+  clearOnboardingPollingStates: async (keys) => {
+    const { clearOnboardingPollingStates } = await import(
+      './onboardingPolling'
+    );
+    clearOnboardingPollingStates(keys);
+  },
+  clearResolvedSalesConversationRoles: async (keys) => {
+    const { clearResolvedSalesConversationRoles } = await import(
+      './brainService'
+    );
+    clearResolvedSalesConversationRoles(keys);
+  },
+  invalidateOnboardingSession: async (customerPhone) => {
+    const { invalidateOnboardingSession } = await import(
+      './onboardingSession'
+    );
+    invalidateOnboardingSession(customerPhone);
+  },
 };
 
 /** `processed_messages` deliberadamente não faz parte deste reset. */
@@ -107,8 +133,14 @@ export async function resetAdminConversation(
   const followups = await deps.deleteFollowups(keys);
   clearConversationPartnerSlugs(keys);
   clearConversationAdHeadlines(keys);
+  clearPendingOnboardingProposals(keys);
+  await deps.clearOnboardingPollingStates?.(keys);
+  await deps.clearResolvedSalesConversationRoles?.(keys);
   for (const key of keys) {
     clearSalesRecoveryState(key);
+    await deps.invalidateOnboardingSession?.(
+      parseConversationKey(key).customerPhone
+    );
   }
   return { history, followups };
 }

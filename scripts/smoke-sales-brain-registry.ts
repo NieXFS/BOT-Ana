@@ -65,7 +65,7 @@ const salesConfig: SalesConfig = {
       trialDays: 7,
       maxProfessionals: 1,
       features: ['Ana 24h no WhatsApp'],
-      waitlist: { reason: 'em testes', href: 'https://wa.me/5516991113783' },
+      waitlist: { reason: 'em atualização', href: 'https://wa.me/5516991113783' },
     },
     {
       slug: 'essencial',
@@ -94,7 +94,7 @@ const salesConfig: SalesConfig = {
       features: ['Ana ilimitada', 'Prontuário'],
     },
   ],
-  anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'beta' },
+  anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'plano em atualização' },
 };
 
 async function main() {
@@ -267,10 +267,10 @@ async function main() {
   check('pro mensal presente', plansBlock.includes('R$ 299,99'));
   check('equivalente mensal anual presente', plansBlock.includes('R$ 133,32'));
   check('header "NUNCA cite preço de memória"', plansBlock.includes('NUNCA cite preço de memória'));
-  check('beta NÃO é vendido (sem preço do beta no bloco)', !plansBlock.includes('R$ 99,99'));
+  check('plano pausado NÃO é vendido (sem preço no bloco)', !plansBlock.includes('R$ 99,99'));
   check(
-    'beta → lista de espera com link',
-    plansBlock.includes('lista de espera') && plansBlock.includes('wa.me/5516991113783')
+    'plano pausado → lista de interesse com link',
+    plansBlock.includes('lista de interesse') && plansBlock.includes('wa.me/5516991113783')
   );
   const allowed = new Set<string>();
   for (const p of salesConfig.plans) {

@@ -201,7 +201,7 @@ app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
  *
  * Responde 200 na hora e processa fora do request: o Receps dispara isso no meio
  * da criação do trial e não pode ficar esperando o WhatsApp. Body:
- * `{ customerPhone, event: "trial_started" }`.
+ * `{ customerPhone, event: "trial_started", onboarding?: boolean }`.
  */
 app.post('/sales-notify', botSignatureMiddleware, (req: Request, res: Response) => {
   res.sendStatus(200);
@@ -209,13 +209,19 @@ app.post('/sales-notify', botSignatureMiddleware, (req: Request, res: Response) 
   const customerPhone =
     typeof req.body?.customerPhone === 'string' ? req.body.customerPhone.trim() : '';
   const event = typeof req.body?.event === 'string' ? req.body.event.trim() : '';
+  const onboarding = req.body?.onboarding === true;
 
   if (!customerPhone || !event) {
     console.warn('⚠️ [sales-notify] payload sem customerPhone/event — ignorado.');
     return;
   }
 
-  handleSalesNotify(event, customerPhone).catch((err) => {
+  handleSalesNotify(
+    event,
+    customerPhone,
+    undefined,
+    onboarding
+  ).catch((err) => {
     Sentry.captureException(err, {
       tags: { service: 'webhook_server', operation: 'sales_notify' },
     });

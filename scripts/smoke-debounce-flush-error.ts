@@ -67,6 +67,9 @@ async function main() {
   } = await import('../src/messageHandler');
   const salesRecovery = await import('../src/services/salesRecovery');
   const { SalesBrainFailure } = await import('../src/services/salesBrain');
+  const onboardingGate = await import(
+    '../src/services/onboardingConfirmationGate'
+  );
 
   const sent: { from: string; text: string }[] = [];
   const failingDeps: FlushDeps = {
@@ -232,6 +235,11 @@ async function main() {
     recordPausedInbound: async () => {},
   };
   const key7 = __seedFlushBufferForTest(salesConfig, from, ['oi']);
+  onboardingGate.rememberPendingOnboardingProposal(
+    key7,
+    'completeOnboarding',
+    {}
+  );
   await flushBuffer(key7, salesSendFailureDeps);
 
   expect(
@@ -239,6 +247,10 @@ async function main() {
     salesRecovery.__getSalesRecoveryStateForTest(key7)?.kind === 'send'
   );
   expect('7) falha de envio sales não dispara M24', sent.length === 0);
+  expect(
+    '7) proposta B3 não entregue é descartada',
+    onboardingGate.getPendingOnboardingProposal(key7) === null
+  );
   expect('7) buffer sales é limpo após falha de envio', !__hasBufferForTest(key7));
   await recoveryTimers[0]?.callback();
   expect(

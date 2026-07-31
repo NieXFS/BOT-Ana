@@ -4,7 +4,7 @@
  * Exercita o PROMPT + TOOLS + PLANOS reais (buildStableSalesPrompt / SALES_TOOLS /
  * renderPlansBlock) com histórico EM MEMÓRIA e tools de efeito colateral STUBADAS
  * (não toca DB nem Receps). Valida o CÉREBRO: sem alucinar preço/feature, plano
- * beta nunca vendido, escalonamento correto, disclosure ("você é um robô?" →
+ * plano pausado nunca vendido, escalonamento correto, disclosure ("você é um robô?" →
  * confirma IA sem despistar), tom do manual.
  *
  * Requer ANTHROPIC_API_KEY. Roda o manual REAL (marketing/Renata-Manual-Vendas.md).
@@ -29,11 +29,11 @@ const salesConfig: SalesConfig = {
   annualFreeMonths: 2,
   signupBaseUrl: 'https://receps.com.br/cadastro',
   plans: [
-    { slug: 'atendente-ia', name: 'Somente Atendente IA', sellable: false, priceMonthly: 99.99, priceMonthlyFormatted: 'R$ 99,99', priceAnnualTotalFormatted: 'R$ 999,90', priceAnnualMonthlyFormatted: 'R$ 83,32', annualFreeMonths: 2, trialDays: 7, maxProfessionals: 1, features: ['Ana 24h no WhatsApp'], waitlist: { reason: 'em testes', href: 'https://wa.me/5516991113783' } },
+    { slug: 'atendente-ia', name: 'Somente Atendente IA', sellable: false, priceMonthly: 99.99, priceMonthlyFormatted: 'R$ 99,99', priceAnnualTotalFormatted: 'R$ 999,90', priceAnnualMonthlyFormatted: 'R$ 83,32', annualFreeMonths: 2, trialDays: 7, maxProfessionals: 1, features: ['Ana 24h no WhatsApp'], waitlist: { reason: 'em atualização', href: 'https://wa.me/5516991113783' } },
     { slug: 'essencial', name: 'Essencial', sellable: true, priceMonthly: 159.99, priceMonthlyFormatted: 'R$ 159,99', priceAnnualTotalFormatted: 'R$ 1.599,90', priceAnnualMonthlyFormatted: 'R$ 133,32', annualFreeMonths: 2, trialDays: 7, maxProfessionals: 3, features: ['Agenda completa', 'Financeiro (caixa, comissões)', 'Clientes, serviços e pacotes'] },
     { slug: 'pro', name: 'Pro', sellable: true, priceMonthly: 299.99, priceMonthlyFormatted: 'R$ 299,99', priceAnnualTotalFormatted: 'R$ 2.999,90', priceAnnualMonthlyFormatted: 'R$ 249,99', annualFreeMonths: 2, trialDays: 14, maxProfessionals: null, features: ['Ana ilimitada', 'Prontuário e galeria', 'Página pública de agendamento'] },
   ],
-  anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'beta' },
+  anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'plano em atualização' },
 };
 
 function loadManualPrompt(): string {
@@ -71,7 +71,7 @@ async function main() {
   const client = new Anthropic({ apiKey });
   const phone = '5516999990000';
 
-  // Preços permitidos (do bloco de planos; beta não expõe preço).
+  // Preços permitidos (do bloco de planos; plano pausado não expõe preço).
   const allowedPrices = new Set<string>();
   for (const p of salesConfig.plans) {
     if (!p.sellable) continue;
@@ -180,12 +180,12 @@ async function main() {
       console.log(`  ✓ preços OK (${prices.length} citados, todos da config)`);
     }
 
-    // HARD: plano beta nunca vendido com sucesso (link gerado).
+    // HARD: plano pausado nunca vendido com sucesso (link gerado).
     const betaSold = convo.toolCalls.some(
       (t) => t.name === 'sendSignupLink' && String((t.input as { plan?: string }).plan).includes('atendente-ia') && (t.result as { success?: boolean })?.success === true
     );
     if (betaSold) {
-      console.error(`  ❌ HARD: plano beta (atendente-ia) foi vendido com link!`);
+      console.error(`  ❌ HARD: plano pausado (atendente-ia) foi vendido com link!`);
       hardFail += 1;
     }
 

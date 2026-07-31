@@ -4,7 +4,10 @@ import { customerPhoneVariants } from './conversationActivity';
 import type { TenantBotConfig } from '../configProvider';
 import { getTenantConfig } from '../configProvider';
 import { isConversationPaused } from './pauseService';
-import { markFollowupOptedOut } from './salesFollowups';
+import {
+  markFollowupOptedOut,
+  scheduleOnboardingFollowup,
+} from './salesFollowups';
 import { sendFreeformMessage } from '../whatsappCloudService';
 import { Sentry } from '../observability/sentry';
 import { isRenataVoiceEnabled } from '../voice/voiceConfig';
@@ -33,6 +36,8 @@ export type SalesNotifyEvent = 'trial_started';
 /** Copy do manual (§D4). Freeform, dentro da janela — custo zero de template. */
 export const TRIAL_STARTED_MESSAGE =
   'Vi que sua conta tá pronta! 🎉 Bem-vinda à Receps. Quer aproveitar e agendar a configuração assistida de 30min com o Victor? Ele conecta tudo com você.';
+export const ONBOARDING_TRIAL_STARTED_MESSAGE =
+  'Vi que sua conta tá pronta! 🎉 Bem-vinda à Receps. Quer que eu configure sua clínica com você agora, por aqui mesmo? Leva uns 10 minutinhos.';
 
 export type TrialNoticeDecision =
   | { send: true }
@@ -106,6 +111,12 @@ export interface SalesNotifyDeps {
   findConversation: (customerPhone: string) => Promise<SalesConversationRef | null>;
   getConfig: (phoneNumberId: string) => Promise<TenantBotConfig | null>;
   endFollowups: (phoneNumberId: string, customerPhone: string) => Promise<void>;
+  activateOnboarding?: (
+    phoneNumberId: string,
+    customerPhone: string,
+    customerName: string | null,
+    anchorAtMs?: number
+  ) => Promise<void>;
   isPaused: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
   lastInboundAt: (phoneNumberId: string, customerPhone: string) => Promise<number | null>;
   send: (to: string, text: string, config: TenantBotConfig) => Promise<void>;
@@ -117,6 +128,7 @@ const defaultDeps: SalesNotifyDeps = {
   findConversation: findSalesConversation,
   getConfig: getTenantConfig,
   endFollowups: markFollowupOptedOut,
+  activateOnboarding: scheduleOnboardingFollowup,
   isPaused: isConversationPaused,
   lastInboundAt: getLastInboundAtMs,
   send: (to, text, config) =>
@@ -143,7 +155,8 @@ export type SalesNotifyResult =
  */
 export async function handleTrialStarted(
   customerPhone: string,
-  deps: SalesNotifyDeps = defaultDeps
+  deps: SalesNotifyDeps = defaultDeps,
+  onboarding = false
 ): Promise<SalesNotifyResult> {
   const conversation = await deps.findConversation(customerPhone);
   if (!conversation) {
@@ -155,12 +168,9 @@ export async function handleTrialStarted(
 
   const { phoneNumberId, customerPhone: phone } = conversation;
 
-  // 1) A pessoa converteu: a régua de venda para AQUI, mande-se a mensagem ou
-  //    não (pausada/fora da janela não deve deixar follow-up de venda vivo).
-  await deps.endFollowups(phoneNumberId, phone).catch(() => undefined);
-
   const config = await deps.getConfig(phoneNumberId);
   if (!config || !config.isActive || config.botRole !== 'sales') {
+    await deps.endFollowups(phoneNumberId, phone).catch(() => undefined);
     console.info(
       `[sales-notify] sem config ativa de vendas — só a régua foi encerrada | ${phoneNumberId}`
     );
@@ -171,12 +181,33 @@ export async function handleTrialStarted(
     deps.isPaused(phoneNumberId, phone),
     deps.lastInboundAt(phoneNumberId, phone),
   ]);
-
   const decision = shouldSendTrialNotice({
     lastInboundAtMs,
     nowMs: deps.now(),
     paused,
   });
+
+  // 1) A pessoa converteu: a régua de venda para AQUI. Quando o Receps abriu a
+  // sessão, a mesma linha troca de ciclo de vida para o toque único de
+  // onboarding, mas somente dentro da janela vigente. Pausa, ausência de
+  // inbound ou janela expirada são terminadores e nunca armam um toque.
+  if (
+    onboarding &&
+    decision.send &&
+    lastInboundAtMs !== null &&
+    deps.activateOnboarding
+  ) {
+    await deps
+      .activateOnboarding(
+        phoneNumberId,
+        phone,
+        null,
+        lastInboundAtMs
+      )
+      .catch(() => undefined);
+  } else {
+    await deps.endFollowups(phoneNumberId, phone).catch(() => undefined);
+  }
 
   if (!decision.send) {
     console.info(
@@ -185,9 +216,12 @@ export async function handleTrialStarted(
     return { handled: true, sent: false, reason: decision.reason };
   }
 
-  await deps.send(phone, TRIAL_STARTED_MESSAGE, config);
+  const message = onboarding
+    ? ONBOARDING_TRIAL_STARTED_MESSAGE
+    : TRIAL_STARTED_MESSAGE;
+  await deps.send(phone, message, config);
   await deps
-    .record(buildConversationKey(phoneNumberId, phone), 'assistant', TRIAL_STARTED_MESSAGE)
+    .record(buildConversationKey(phoneNumberId, phone), 'assistant', message)
     .catch(() => undefined);
 
   console.info(`[sales-notify] mensagem de trial enviada | ${phoneNumberId}`);
@@ -198,7 +232,8 @@ export async function handleTrialStarted(
 export async function handleSalesNotify(
   event: string,
   customerPhone: string,
-  deps: SalesNotifyDeps = defaultDeps
+  deps: SalesNotifyDeps = defaultDeps,
+  onboarding = false
 ): Promise<void> {
   if (event !== 'trial_started') {
     console.warn(`[sales-notify] evento desconhecido ignorado: ${event}`);
@@ -206,7 +241,7 @@ export async function handleSalesNotify(
   }
 
   try {
-    await handleTrialStarted(customerPhone, deps);
+    await handleTrialStarted(customerPhone, deps, onboarding);
   } catch (err) {
     Sentry.captureException(err, {
       tags: { service: 'sales-notify', operation: 'trial-started' },

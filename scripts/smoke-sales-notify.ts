@@ -53,6 +53,11 @@ function salesConfig(overrides: Partial<TenantBotConfig> = {}): TenantBotConfig 
 interface Recorded {
   sent: Array<{ to: string; text: string }>;
   ended: Array<{ phoneNumberId: string; customerPhone: string }>;
+  onboarding: Array<{
+    phoneNumberId: string;
+    customerPhone: string;
+    anchorAtMs?: number;
+  }>;
   recorded: string[];
 }
 
@@ -64,7 +69,12 @@ function makeDeps(
     lastInboundAtMs?: number | null;
   } = {}
 ): { deps: SalesNotifyDeps; log: Recorded } {
-  const log: Recorded = { sent: [], ended: [], recorded: [] };
+  const log: Recorded = {
+    sent: [],
+    ended: [],
+    onboarding: [],
+    recorded: [],
+  };
   const deps: SalesNotifyDeps = {
     now: () => NOW,
     findConversation: async () =>
@@ -74,6 +84,18 @@ function makeDeps(
     getConfig: async () => (opts.config === undefined ? salesConfig() : opts.config),
     endFollowups: async (phoneNumberId, customerPhone) => {
       log.ended.push({ phoneNumberId, customerPhone });
+    },
+    activateOnboarding: async (
+      phoneNumberId,
+      customerPhone,
+      _customerName,
+      anchorAtMs
+    ) => {
+      log.onboarding.push({
+        phoneNumberId,
+        customerPhone,
+        anchorAtMs,
+      });
     },
     isPaused: async () => opts.paused ?? false,
     lastInboundAt: async () =>
@@ -89,7 +111,7 @@ function makeDeps(
 }
 
 async function main() {
-  const { shouldSendTrialNotice, handleTrialStarted, handleSalesNotify, SERVICE_WINDOW_MS, TRIAL_STARTED_MESSAGE } =
+  const { shouldSendTrialNotice, handleTrialStarted, handleSalesNotify, SERVICE_WINDOW_MS, TRIAL_STARTED_MESSAGE, ONBOARDING_TRIAL_STARTED_MESSAGE } =
     await import('../src/services/salesNotify');
 
   console.log('\n=== 1. Decisão pura da janela de 24h ===');
@@ -161,6 +183,30 @@ async function main() {
     check('gravou no histórico da conversa', log.recorded[0] === 'PN_VENDAS:5516988870001');
   }
 
+  console.log('\n=== 2b. trial com sessão troca a régua para onboarding ===');
+  {
+    const { deps, log } = makeDeps();
+    const result = await handleTrialStarted(
+      '+5516988870001',
+      deps,
+      true
+    );
+    check(
+      'ativa jornada onboarding e não encerra a linha',
+      result.handled === true &&
+        result.sent === true &&
+        log.onboarding.length === 1 &&
+        log.onboarding[0]?.anchorAtMs === NOW - HOUR &&
+        log.ended.length === 0
+    );
+    check(
+      'copy oferece configuração por conversa em 10min',
+      log.sent[0]?.text ===
+        ONBOARDING_TRIAL_STARTED_MESSAGE &&
+        /10 minutinhos/.test(log.sent[0]?.text ?? '')
+    );
+  }
+
   console.log('\n=== 3. Fora da janela de 24h → skip silencioso, régua AINDA encerra ===');
   {
     const { deps, log } = makeDeps({ lastInboundAtMs: NOW - 30 * HOUR });
@@ -174,6 +220,26 @@ async function main() {
     check('régua encerrada mesmo assim (converteu)', log.ended.length === 1);
   }
 
+  console.log('\n=== 3b. Onboarding fora da janela não arma toque ===');
+  {
+    const { deps, log } = makeDeps({
+      lastInboundAtMs: NOW - 30 * HOUR,
+    });
+    const result = await handleTrialStarted(
+      '+5516988870001',
+      deps,
+      true
+    );
+    check(
+      'skip é silencioso e termina a linha',
+      result.handled === true &&
+        result.sent === false &&
+        result.reason === 'outside-window' &&
+        log.onboarding.length === 0 &&
+        log.ended.length === 1
+    );
+  }
+
   console.log('\n=== 4. Conversa pausada → skip, régua encerra ===');
   {
     const { deps, log } = makeDeps({ paused: true });
@@ -181,6 +247,23 @@ async function main() {
     check('não enviou', result.handled === true && result.sent === false);
     check('Renata calada durante o handoff', log.sent.length === 0);
     check('régua encerrada', log.ended.length === 1);
+  }
+
+  console.log('\n=== 4b. Onboarding pausado não arma toque ===');
+  {
+    const { deps, log } = makeDeps({ paused: true });
+    const result = await handleTrialStarted(
+      '+5516988870001',
+      deps,
+      true
+    );
+    check(
+      'pausa termina a jornada sem ativar onboarding',
+      result.handled === true &&
+        result.sent === false &&
+        log.onboarding.length === 0 &&
+        log.ended.length === 1
+    );
   }
 
   console.log('\n=== 5. Conversa desconhecida (cadastro pelo site) → no-op ===');

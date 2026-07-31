@@ -8,7 +8,7 @@ import {
   type Message,
 } from './contextManager';
 import { buildResetConversationKeys } from './adminReset';
-import { getSalesReplyFromHistory } from './salesBrain';
+import { getSalesConversationReplyFromHistory } from './brainService';
 import { clearSalesRecoveryState } from './salesRecovery';
 
 export type AdminReprocessReason =
@@ -30,7 +30,7 @@ export interface AdminReprocessInput {
 export interface AdminReprocessDeps {
   getConfig: (phoneNumberId: string) => Promise<TenantBotConfig | null>;
   getHistory: (conversationKey: string) => Promise<Message[]>;
-  generate: typeof getSalesReplyFromHistory;
+  generate: typeof getSalesConversationReplyFromHistory;
   send: (
     phone: string,
     replyText: string,
@@ -42,7 +42,7 @@ export interface AdminReprocessDeps {
 const defaultDeps: AdminReprocessDeps = {
   getConfig: getTenantConfig,
   getHistory,
-  generate: getSalesReplyFromHistory,
+  generate: getSalesConversationReplyFromHistory,
   send: sendConfiguredReply,
   clearRecovery: clearSalesRecoveryState,
 };

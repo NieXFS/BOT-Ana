@@ -68,14 +68,14 @@ export async function getSalesConfig(): Promise<SalesConfig> {
 
 /**
  * Renderiza o bloco {{PLANOS}} em texto corrido (compliance: valores absolutos,
- * sem comparação, sem promessa de lucro). Plano NÃO vendável (beta) vira aviso de
- * lista de espera com o link — a Renata NUNCA o vende.
+ * sem comparação, sem promessa de lucro). Plano NÃO vendável vira aviso de
+ * lista de interesse com o link — a Renata NUNCA o vende.
  */
 export function renderPlansBlock(config: SalesConfig): string {
   const lines = config.plans.map((plan) => {
     if (!plan.sellable) {
       const href = plan.waitlist?.href ?? config.anaBeta.waitlistHref;
-      return `- ${plan.name}: EM FASE DE TESTES — NÃO vender. Se a pessoa quiser só o atendimento, ofereça a lista de espera (link: ${href}) e apresente o Essencial como opção disponível hoje.`;
+      return `- ${plan.name}: EM ATUALIZAÇÃO — NÃO vender agora. Se a pessoa quiser só o atendimento, ofereça a lista de interesse (link: ${href}) e apresente o Essencial como opção disponível hoje. A conexão da Ana funciona normalmente no Essencial e no Pro.`;
     }
 
     const limite =
