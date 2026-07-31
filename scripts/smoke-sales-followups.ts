@@ -85,6 +85,9 @@ async function main(): Promise<void> {
     MIN_FOLLOWUP_POLL_MS,
     MAX_FOLLOWUP_BACKOFF_MS,
     resolveFollowupPollIntervalMs,
+    resolveFollowupPollOffsetMin,
+    msUntilAlignedTick,
+    DEFAULT_FOLLOWUP_POLL_OFFSET_MIN,
     createFollowupPollerState,
     runFollowupPollerCycle,
     startFollowupPoller,
@@ -154,6 +157,57 @@ async function main(): Promise<void> {
         pollWarnings.length === warningsBeforeExplicit
     );
     __stopFollowupPollerForTest();
+
+    delete process.env.SALES_FOLLOWUP_POLL_MS;
+    check(
+      'startFollowupPoller é idempotente (2ª chamada devolve o mesmo intervalo)',
+      startFollowupPoller() === DEFAULT_FOLLOWUP_POLL_MS &&
+        startFollowupPoller() === DEFAULT_FOLLOWUP_POLL_MS
+    );
+    __stopFollowupPollerForTest();
+
+    console.log('▶ alinhamento de fase com o cron fiscal');
+    const HALF_HOUR_MS = 30 * 60_000;
+    check(
+      '12:00Z com offset :07 espera 7min',
+      msUntilAlignedTick(HALF_HOUR_MS, 7, Date.UTC(2026, 6, 30, 12, 0, 0)) === 7 * 60_000
+    );
+    check(
+      '12:10Z com offset :07 espera 27min (cai em :37)',
+      msUntilAlignedTick(HALF_HOUR_MS, 7, Date.UTC(2026, 6, 30, 12, 10, 0)) === 27 * 60_000
+    );
+    check(
+      'now exatamente no alvo devolve o clamp de 1s',
+      msUntilAlignedTick(HALF_HOUR_MS, 7, Date.UTC(2026, 6, 30, 12, 7, 0)) === 1_000
+    );
+    check(
+      'intervalo que não divide a hora cai no fallback (intervalMs)',
+      msUntilAlignedTick(25 * 60_000, 7, Date.UTC(2026, 6, 30, 12, 0, 0)) === 25 * 60_000
+    );
+
+    const originalOffsetEnv = process.env.SALES_FOLLOWUP_POLL_OFFSET_MIN;
+    delete process.env.SALES_FOLLOWUP_POLL_OFFSET_MIN;
+    check(
+      'offset sem env usa o default :07',
+      resolveFollowupPollOffsetMin() === DEFAULT_FOLLOWUP_POLL_OFFSET_MIN
+    );
+    process.env.SALES_FOLLOWUP_POLL_OFFSET_MIN = '37';
+    check('offset por env sobrescreve', resolveFollowupPollOffsetMin() === 37);
+    for (const invalidOffset of ['60', '-1', '2.5', 'abc']) {
+      process.env.SALES_FOLLOWUP_POLL_OFFSET_MIN = invalidOffset;
+      const warningsBeforeOffset = pollWarnings.length;
+      check(
+        `offset inválido (${invalidOffset}) cai no default e avisa`,
+        resolveFollowupPollOffsetMin() === DEFAULT_FOLLOWUP_POLL_OFFSET_MIN &&
+          pollWarnings.length === warningsBeforeOffset + 1
+      );
+    }
+    check('offset explícito é seam e não é validado', resolveFollowupPollOffsetMin(61) === 61);
+    if (originalOffsetEnv === undefined) {
+      delete process.env.SALES_FOLLOWUP_POLL_OFFSET_MIN;
+    } else {
+      process.env.SALES_FOLLOWUP_POLL_OFFSET_MIN = originalOffsetEnv;
+    }
   } finally {
     console.warn = originalConsoleWarn;
     if (originalPollEnv === undefined) {

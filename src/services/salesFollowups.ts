@@ -30,6 +30,9 @@ const REQUEST_TIMEOUT_MS = 10_000;
 export const DEFAULT_FOLLOWUP_POLL_MS = 30 * 60 * 1000;
 export const MIN_FOLLOWUP_POLL_MS = 10 * 60 * 1000;
 export const MAX_FOLLOWUP_BACKOFF_MS = 2 * HOUR_MS;
+/** Minuto-da-hora em que o tick deve cair, para compartilhar a janela de atividade
+ *  do Neon com o cron fiscal do Receps (`7,37 * * * *`). Ver docs/features/crons.md. */
+export const DEFAULT_FOLLOWUP_POLL_OFFSET_MIN = 7;
 const SENTRY_FAILURE_CAPTURE_INTERVAL_MS = HOUR_MS;
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? process.env.ERP_BASE_URL ?? 'http://localhost:3000';
@@ -782,6 +785,42 @@ export function resolveFollowupPollIntervalMs(
   return configured;
 }
 
+/** Offset sobrescritível por `SALES_FOLLOWUP_POLL_OFFSET_MIN` (inteiro 0–59);
+ *  inválido cai no default com o mesmo padrão de aviso do intervalo. Argumento
+ *  explícito é seam de teste e, por contrato, não é validado. */
+export function resolveFollowupPollOffsetMin(
+  offsetMin?: number,
+  observability: FollowupPollIntervalObservability = defaultPollIntervalObservability
+): number {
+  if (offsetMin !== undefined) return offsetMin;
+
+  const raw = process.env.SALES_FOLLOWUP_POLL_OFFSET_MIN;
+  if (raw === undefined) return DEFAULT_FOLLOWUP_POLL_OFFSET_MIN;
+
+  const configured = Number(raw);
+  if (!Number.isInteger(configured) || configured < 0 || configured > 59) {
+    warnPollInterval(
+      `⚠️ SALES_FOLLOWUP_POLL_OFFSET_MIN inválido; usando o default de ${DEFAULT_FOLLOWUP_POLL_OFFSET_MIN}.`,
+      'invalid',
+      DEFAULT_FOLLOWUP_POLL_OFFSET_MIN,
+      observability
+    );
+    return DEFAULT_FOLLOWUP_POLL_OFFSET_MIN;
+  }
+
+  return configured;
+}
+
+/** ms até o próximo instante alinhado a `offsetMin` dentro do ciclo de `intervalMs`.
+ *  Só alinha quando o intervalo divide a hora exatamente; caso contrário devolve
+ *  `intervalMs` (comportamento antigo), porque alinhar não faria sentido. */
+export function msUntilAlignedTick(intervalMs: number, offsetMin: number, now: number): number {
+  if (HOUR_MS % intervalMs !== 0) return intervalMs;
+  const offsetMs = offsetMin * 60_000;
+  const next = Math.ceil((now - offsetMs) / intervalMs) * intervalMs + offsetMs;
+  return Math.max(1_000, next - now);
+}
+
 export interface FollowupPollerState {
   consecutiveFailures: number;
   skipUntilMs: number;
@@ -900,14 +939,19 @@ export async function runFollowupPollerCycle(
 let pollerState = createFollowupPollerState();
 let pollerIntervalMs: number | null = null;
 
-/** Liga o poller (30min por default). Idempotente; retorna o intervalo efetivo. */
+/** Liga o poller (30min por default; primeiro tick no próximo minuto-da-hora
+ *  alinhado ao cron fiscal do Receps — ver msUntilAlignedTick). Idempotente;
+ *  retorna o intervalo efetivo. */
 export function startFollowupPoller(intervalMs?: number): number {
   if (pollerHandle) return pollerIntervalMs as number;
 
   const effectiveIntervalMs = resolveFollowupPollIntervalMs(intervalMs);
+  const offsetMin = resolveFollowupPollOffsetMin();
+  const firstTickInMs = msUntilAlignedTick(effectiveIntervalMs, offsetMin, Date.now());
   pollerState = createFollowupPollerState();
   pollerIntervalMs = effectiveIntervalMs;
-  pollerHandle = setInterval(() => {
+
+  const runCycle = (): void => {
     void runFollowupPollerCycle({
       state: pollerState,
       intervalMs: effectiveIntervalMs,
@@ -918,7 +962,19 @@ export function startFollowupPoller(intervalMs?: number): number {
       captureMessage: (message, context) =>
         Sentry.captureMessage(message, context),
     });
-  }, effectiveIntervalMs);
+  };
+
+  pollerHandle = setTimeout(() => {
+    runCycle();
+    pollerHandle = setInterval(runCycle, effectiveIntervalMs);
+    // Não segura o processo vivo só por causa do poller.
+    if (typeof pollerHandle.unref === 'function') pollerHandle.unref();
+  }, firstTickInMs);
+  console.log(
+    `⏱️ Poller de follow-up: intervalo de ${Math.round(effectiveIntervalMs / 60_000)}min, ` +
+      `primeiro tick em ${new Date(Date.now() + firstTickInMs).toISOString()} ` +
+      `(alinhado ao minuto :${String(offsetMin).padStart(2, '0')})`
+  );
   // Não segura o processo vivo só por causa do poller.
   if (typeof pollerHandle.unref === 'function') pollerHandle.unref();
   return effectiveIntervalMs;
