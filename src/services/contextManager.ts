@@ -1,5 +1,6 @@
 import { Pool } from 'pg';
 import { customerPhoneVariants } from './conversationActivity';
+import { Sentry } from '../observability/sentry';
 
 export interface Message {
   role: 'user' | 'assistant';
@@ -25,6 +26,27 @@ export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: 10,
   idleTimeoutMillis: 30_000,
+});
+
+/**
+ * O `pg` emite `'error'` no Pool quando um client morre fora de uma query —
+ * tipicamente quando o compute do Neon suspende (5 min de ociosidade) e derruba
+ * as conexões. Sem este listener o Node trata o evento como exceção não
+ * capturada e MATA o processo inteiro: foi o que aconteceu em 02/08 00:07 UTC
+ * (ANA-6), levando o bot junto. O pool já descarta o client quebrado sozinho;
+ * aqui só registramos e seguimos vivos.
+ */
+pool.on('error', (err) => {
+  console.error('[pg-pool] client derrubado (compute do Neon suspendeu?):', err);
+  try {
+    Sentry.captureException(err, {
+      level: 'warning',
+      tags: { service: 'pg-pool', operation: 'idle-client' },
+    });
+  } catch {
+    // Um handler de erro que lança é exatamente o bug que este listener existe
+    // para matar. Observabilidade é secundária; continuar vivo é o ponto.
+  }
 });
 
 export function buildConversationKey(phoneNumberId: string, phone: string): string {
