@@ -1,7 +1,8 @@
 /**
  * Smoke dos CONTRATOS das ferramentas de venda da Renata (Workstream B).
- * - buildSignupLink: URL builder puro (utm + cid + plano + interval; plano pausado →
- *   lista de interesse; plano inválido → recusa; ctwaClid > wa:hash).
+ * - buildSignupLink: URL builder puro (utm + cid + plano + track; plano/track
+ *   indisponível → lista de interesse; payload v1 → só Flexível; ctwaClid >
+ *   wa:hash).
  * - registerQualifiedLead / handoffToHuman: contrato HTTP contra um MOCK do
  *   Receps (express local) — sem tocar no Receps real nem no DB (a régua de
  *   follow-up é best-effort e falha em silêncio no smoke).
@@ -25,20 +26,25 @@ function check(label: string, cond: boolean) {
 }
 
 const salesConfig: SalesConfig = {
+  version: 2,
   currency: 'BRL',
   annualFreeMonths: 2,
+  annualSellable: false,
+  deprecationNote: 'Não ofertar anual; use Flexível ou Fidelidade.',
   signupBaseUrl: 'https://receps.com.br/cadastro',
   plans: [
     {
       slug: 'atendente-ia',
       name: 'Somente Atendente IA',
       sellable: false,
+      tracks: { flexivel: null, fidelidade: null },
       priceMonthly: 99.99,
       priceMonthlyFormatted: 'R$ 99,99',
       priceAnnualTotalFormatted: 'R$ 999,90',
       priceAnnualMonthlyFormatted: 'R$ 83,32',
       annualFreeMonths: 2,
-      trialDays: 7,
+      annualSellable: false,
+      trialDays: 14,
       maxProfessionals: 1,
       features: [],
       waitlist: { reason: 'em atualização', href: 'https://wa.me/5516991113783' },
@@ -47,12 +53,30 @@ const salesConfig: SalesConfig = {
       slug: 'essencial',
       name: 'Essencial',
       sellable: true,
+      tracks: {
+        flexivel: {
+          priceMonthly: 159.99,
+          priceMonthlyFormatted: 'R$ 159,99',
+          trialDays: 14,
+          trialRequiresCard: false,
+        },
+        fidelidade: {
+          priceMonthly: 129.99,
+          priceMonthlyFormatted: 'R$ 129,99',
+          commitmentMonths: 12,
+          penaltyPercent: 20,
+          regretDays: 7,
+          trialDays: 0,
+          firstChargeAtSignup: true,
+        },
+      },
       priceMonthly: 159.99,
       priceMonthlyFormatted: 'R$ 159,99',
       priceAnnualTotalFormatted: 'R$ 1.599,90',
       priceAnnualMonthlyFormatted: 'R$ 133,32',
       annualFreeMonths: 2,
-      trialDays: 7,
+      annualSellable: false,
+      trialDays: 14,
       maxProfessionals: 3,
       features: [],
     },
@@ -60,17 +84,48 @@ const salesConfig: SalesConfig = {
       slug: 'pro',
       name: 'Pro',
       sellable: true,
+      tracks: {
+        flexivel: {
+          priceMonthly: 299.99,
+          priceMonthlyFormatted: 'R$ 299,99',
+          trialDays: 14,
+          trialRequiresCard: false,
+        },
+        fidelidade: {
+          priceMonthly: 249.99,
+          priceMonthlyFormatted: 'R$ 249,99',
+          commitmentMonths: 12,
+          penaltyPercent: 20,
+          regretDays: 7,
+          trialDays: 0,
+          firstChargeAtSignup: true,
+        },
+      },
       priceMonthly: 299.99,
       priceMonthlyFormatted: 'R$ 299,99',
       priceAnnualTotalFormatted: 'R$ 2.999,90',
       priceAnnualMonthlyFormatted: 'R$ 249,99',
       annualFreeMonths: 2,
+      annualSellable: false,
       trialDays: 14,
       maxProfessionals: null,
       features: [],
     },
   ],
   anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'plano em atualização' },
+};
+
+const v1SalesConfig: SalesConfig = {
+  currency: salesConfig.currency,
+  annualFreeMonths: salesConfig.annualFreeMonths,
+  signupBaseUrl: salesConfig.signupBaseUrl,
+  plans: salesConfig.plans.map((plan) => {
+    const legacyPlan = { ...plan };
+    delete legacyPlan.tracks;
+    delete legacyPlan.annualSellable;
+    return legacyPlan;
+  }),
+  anaBeta: salesConfig.anaBeta,
 };
 
 type Captured = { path: string; body: Record<string, unknown> };
@@ -82,10 +137,18 @@ async function main() {
   app.use(express.json());
   app.post('/api/v1/bot/sales-lead', (req, res) => {
     captured.push({ path: '/sales-lead', body: req.body });
+    if (req.body?.reason === 'force-register-failure') {
+      res.status(500).json({ error: 'synthetic register failure' });
+      return;
+    }
     res.json({ id: 'lead1', status: req.body?.status ?? 'novo' });
   });
   app.post('/api/v1/bot/pause-conversation', (req, res) => {
     captured.push({ path: '/pause-conversation', body: req.body });
+    if (req.body?.phoneNumberId === 'FAIL_PAUSE') {
+      res.status(500).json({ error: 'synthetic pause failure' });
+      return;
+    }
     res.json({ pausedUntil: new Date(Date.now() + 3600_000).toISOString() });
   });
   // v1.1: o endpoint devolve SÓ o token opaco na URL (sem PII, sem utm/cid).
@@ -121,11 +184,46 @@ async function main() {
     check('essencial: plan=essencial', essencial.url.includes('plan=essencial'));
     check('essencial: utm completo', essencial.url.includes('utm_source=whatsapp&utm_medium=renata&utm_campaign=ctwa'));
     check('essencial: cid=wa:<hash>', essencial.url.includes(`cid=wa%3A${hashPhoneForCid(phone)}`) || essencial.url.includes(`cid=wa:${hashPhoneForCid(phone)}`));
-    check('essencial: sem interval (mensal)', !essencial.url.includes('interval=annual'));
+    check('essencial: default = Flexível', essencial.track === 'flexivel');
+    check('essencial Flexível: URL sem track explícita', !essencial.url.includes('track='));
+    check('links novos nunca emitem interval', !essencial.url.includes('interval='));
   }
-  const proAnnual = buildSignupLink('pro', 'annual', phone, salesConfig);
-  check('pro anual: interval=annual', proAnnual.success === true && proAnnual.url.includes('interval=annual'));
-  check('pro anual: plan=pro', proAnnual.success === true && proAnnual.url.includes('plan=pro'));
+  const proFidelity = buildSignupLink('pro', 'fidelidade', phone, salesConfig);
+  check(
+    'Pro Fidelidade: track=fidelidade',
+    proFidelity.success === true && proFidelity.url.includes('track=fidelidade')
+  );
+  check('Pro Fidelidade: plan=pro', proFidelity.success === true && proFidelity.url.includes('plan=pro'));
+  check(
+    'Pro Fidelidade: nunca emite interval legado',
+    proFidelity.success === true && !proFidelity.url.includes('interval=')
+  );
+
+  const unavailableTrackConfig: SalesConfig = {
+    ...salesConfig,
+    plans: salesConfig.plans.map((plan) =>
+      plan.slug === 'pro' && plan.tracks
+        ? { ...plan, tracks: { ...plan.tracks, fidelidade: null } }
+        : plan
+    ),
+  };
+  const unavailableTrack = buildSignupLink(
+    'pro',
+    'fidelidade',
+    phone,
+    unavailableTrackConfig
+  );
+  check('track nula: recusa', unavailableTrack.success === false);
+  check(
+    'track nula: devolve lista de interesse',
+    unavailableTrack.success === false &&
+      unavailableTrack.waitlistHref === 'https://wa.me/5516991113783'
+  );
+
+  const v1Flexible = buildSignupLink('essencial', undefined, phone, v1SalesConfig);
+  const v1Fidelity = buildSignupLink('essencial', 'fidelidade', phone, v1SalesConfig);
+  check('payload v1: Flexível implícita continua vendável', v1Flexible.success === true);
+  check('payload v1: Fidelidade falha fechado', v1Fidelity.success === false);
 
   const beta = buildSignupLink('atendente-ia', undefined, phone, salesConfig);
   check('plano pausado: recusa (não vende)', beta.success === false);
@@ -147,7 +245,7 @@ async function main() {
       name: 'Maria',
       clinicName: 'Clínica Bella',
       plan: 'pro',
-      interval: 'annual',
+      track: 'flexivel',
       niche: 'estetica_facial_corporal',
       professionalsCount: 3,
     },
@@ -170,7 +268,13 @@ async function main() {
   check('prefill: customerPhone injetado (o modelo não fornece)', prefillReq?.body.customerPhone === phone);
   check('prefill: e-mail repassado', prefillReq?.body.email === 'maria@clinica.com.br');
   check('prefill: nome e clínica repassados', prefillReq?.body.name === 'Maria' && prefillReq?.body.clinicName === 'Clínica Bella');
-  check('prefill: plano/intervalo normalizados', prefillReq?.body.plan === 'pro' && prefillReq?.body.interval === 'annual');
+  check('prefill: plano normalizado', prefillReq?.body.plan === 'pro');
+  check(
+    'prefill Flexível: POST não envia track nem interval legado',
+    prefillReq !== undefined &&
+      !('track' in prefillReq.body) &&
+      !('interval' in prefillReq.body)
+  );
   check(
     'prefill: niche/professionalsCount repassados',
     prefillReq?.body.niche === 'estetica_facial_corporal' &&
@@ -194,6 +298,34 @@ async function main() {
     prefillWithoutQualification !== undefined &&
       !('niche' in prefillWithoutQualification.body) &&
       !('professionalsCount' in prefillWithoutQualification.body)
+  );
+
+  const prefillRequestsBeforeFidelity = captured.filter(
+    (c) => c.path === '/signup-prefill'
+  ).length;
+  const fidelityPrefill = await createPrefilledSignupLink(
+    phone,
+    'PNID',
+    { email: 'fidelidade@clinica.com.br', plan: 'essencial', track: 'fidelidade' },
+    salesConfig
+  );
+  check(
+    'prefill Fidelidade: retorna link comum com track=fidelidade',
+    fidelityPrefill.success === true &&
+      fidelityPrefill.prefilled === false &&
+      fidelityPrefill.url.includes('track=fidelidade')
+  );
+  check(
+    'prefill Fidelidade: reporta limitação estável',
+    fidelityPrefill.success === true &&
+      fidelityPrefill.prefilled === false &&
+      fidelityPrefill.fallbackReason === 'prefill_nao_suporta_fidelidade' &&
+      /não suporta/i.test(fidelityPrefill.warning)
+  );
+  check(
+    'prefill Fidelidade: não chama POST incompatível',
+    captured.filter((c) => c.path === '/signup-prefill').length ===
+      prefillRequestsBeforeFidelity
   );
 
   console.log('▶ createPrefilledSignupLink — guardas de plano (sem round-trip)');
@@ -293,6 +425,25 @@ async function main() {
   check('handoff: pause-conversation source=handoff', pauseReq?.body.source === 'handoff');
   check('handoff: pause-conversation phoneNumberId', pauseReq?.body.phoneNumberId === 'PNID');
   check('handoff: pause-conversation customerPhone', pauseReq?.body.customerPhone === phone);
+
+  const partialRegister = await handoffToHuman(
+    phone,
+    'PNID',
+    'force-register-failure'
+  );
+  check(
+    'handoff: registro sem confirmação não licencia success',
+    partialRegister.success === false
+  );
+  const partialPause = await handoffToHuman(
+    phone,
+    'FAIL_PAUSE',
+    'force-pause-failure'
+  );
+  check(
+    'handoff: pausa sem confirmação não licencia success',
+    partialPause.success === false
+  );
 
   server.close();
 

@@ -1,7 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Sentry } from '../observability/sentry';
 import type { TenantBotConfig } from '../configProvider';
-import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
 import {
   callAnthropicWithRetry,
   type AnthropicRetryPolicy,
@@ -44,43 +43,38 @@ import {
 import { resolveDemoServiceId } from './demoScheduling';
 import { sendDemoVideo } from '../media/demoVideo';
 import { getConversationAdHeadline } from './salesAdState';
+import {
+  buildSalesMessageRequest,
+  getSalesAiClient,
+  resolveSalesAiRuntime,
+  type SalesThinkingMode,
+} from './salesLlmProvider';
+import {
+  authorizeSalesToolCall,
+  buildDeterministicSalesGuardReply,
+  buildSafeSalesRecoveryReply,
+  inspectSalesReplyActionClaims,
+  isThinkingOnlyResponse,
+  normalizeSalesReplyStyle,
+  resolveConfirmedSalesPrefill,
+  requiresImmediateTerminalHandoff,
+  salesToolSucceeded,
+  type SalesToolTraceLike,
+} from './salesGuards';
 
 /**
- * Brain de VENDAS da Renata (Workstream B). Provider Anthropic (claude-sonnet-5),
- * tool calling + prompt caching. SEPARADO do brain de recepção (que fica 100%
- * intocado). Preço NUNCA vem da memória do modelo — sai do {{PLANOS}} (sales-config).
- * Pula o service-gate da recepção (não se aplica). Guardrail A do calendarService
- * continua valendo no scheduleDemo (bookAppointment embute horários reais na falha).
+ * Brain de VENDAS da Renata (Workstream B). Provider selecionado pela config
+ * (Anthropic ou DeepSeek, sem fallback cruzado), tool calling + prompt caching.
+ * SEPARADO do brain de recepção. Preço NUNCA vem da memória do modelo — sai do
+ * {{PLANOS}} (sales-config). Pula o service-gate da recepção (não se aplica).
+ * Guardrail A do calendarService continua valendo no scheduleDemo.
  */
-
-const clientCache = new Map<string, Anthropic>();
-
-function getAnthropicClient(): Anthropic {
-  const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY não configurada — necessária para o brain de vendas.');
-  }
-  const cached = clientCache.get(apiKey);
-  if (cached) return cached;
-  const client = new Anthropic({ apiKey });
-  clientCache.set(apiKey, client);
-  return client;
-}
-
-function sanitizeMaxTokens(value: number): number {
-  if (!Number.isFinite(value)) return 500;
-  return Math.max(Math.round(value), 100);
-}
-
-function getFallbackMessage(config: TenantBotConfig): string {
-  return config.fallbackMessage?.trim() || DEFAULT_FALLBACK_MESSAGE;
-}
 
 const PLANOS_PLACEHOLDER = '{{PLANOS}}';
 
 /** Bloco seguro quando a sales-config está indisponível — NUNCA inventa preço. */
 const PLANS_UNAVAILABLE_BLOCK =
-  'PLANOS E PREÇOS: não consegui puxar os valores agora. NÃO invente preço, plano nem trial. Se perguntarem valor, diga que confirma em instantes ou ofereça falar com o Victor.';
+  'PLANOS E PREÇOS: não consegui puxar os valores e as trilhas agora. NÃO invente preço, plano, trilha nem trial. NÃO ofereça plano anual nem a oferta aposentada de 2 meses grátis. Se perguntarem valor ou condição, diga que confirma em instantes ou ofereça falar com o Victor.';
 
 /**
  * Bloco ESTÁVEL do system prompt (persona + manual + {{PLANOS}}) — é o que o
@@ -184,7 +178,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'sendSignupLink',
     description:
-      'Gera o link de cadastro do trial grátis (sem cartão) de um plano. Retorna a URL para você enviar ao lead. NÃO gere link de plano temporariamente pausado (ele volta com a lista de interesse).',
+      'Gera o link de cadastro de um plano na trilha escolhida. Flexível é o padrão e tem teste grátis sem cartão; Fidelidade exige compromisso de 12 meses, não tem teste grátis e cobra no ato. Retorna a URL para você enviar ao lead. NÃO gere link de plano ou trilha indisponível (a tool recusa e retorna a lista de interesse).',
     input_schema: {
       type: 'object',
       properties: {
@@ -193,10 +187,11 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
           description:
             'Slug do plano ("essencial" ou "pro"; "atendente-ia" está em atualização e não é vendável agora). Use o slug exato do bloco PLANOS.',
         },
-        interval: {
+        track: {
           type: 'string',
-          enum: ['monthly', 'annual'],
-          description: 'Cobrança mensal (padrão) ou anual. Omita para mensal.',
+          enum: ['flexivel', 'fidelidade'],
+          description:
+            'Trilha Flexível (padrão) ou Fidelidade 12m. Omita somente quando a escolha for Flexível.',
         },
       },
       required: ['plan'],
@@ -205,7 +200,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'sendPrefilledSignup',
     description:
-      'Gera ou reenvia o MESMO link vigente de cadastro JÁ PREENCHIDO com os dados do lead (e-mail, nome, clínica, plano e, quando descobertos, nicho e número de profissionais); informar o nicho faz o cadastro já chegar com uma agenda pronta. Ela só precisa criar a senha. PREFIRA esta tool ao sendSignupLink sempre que você souber o e-mail, inclusive se ela pedir "manda o link de novo" ou disser que perdeu o link. Antes de chamar, CONFIRME o e-mail repetindo de volta pra ela ("só confirma pra mim: maria@gmail.com, certo?"). Se ela não quiser dar o e-mail, use o sendSignupLink e não insista. Retorna a URL pra você enviar.',
+      'Na trilha Flexível, gera ou reenvia o MESMO link vigente de cadastro JÁ PREENCHIDO com os dados do lead (e-mail, nome, clínica, plano e, quando descobertos, nicho e número de profissionais); informar o nicho faz o cadastro já chegar com uma agenda pronta. Na Fidelidade, enquanto o prefill do Receps não aceita track, a tool retorna um LINK COMUM com track=fidelidade e avisa para não prometer dados preenchidos. PREFIRA esta tool ao sendSignupLink sempre que você souber o e-mail, inclusive se ela pedir "manda o link de novo" ou disser que perdeu o link. GATE OBRIGATÓRIO EM DOIS TURNOS — CONFIRME O E-MAIL antes de gerar: (1) em uma resposta sua, repita o e-mail exato e pergunte se está correto; (2) encerre essa resposta SEM chamar esta tool; (3) somente depois de uma NOVA mensagem da lead confirmando, chame sendPrefilledSignup. Receber o e-mail e pedir o link no mesmo inbound nunca conta como confirmação. Correção exige repetir o novo e-mail e esperar outra resposta. Se ela não quiser dar o e-mail, use o sendSignupLink e não insista. Retorna a URL pra você enviar.',
     input_schema: {
       type: 'object',
       properties: {
@@ -220,10 +215,11 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
           description:
             'Slug do plano ("essencial" ou "pro"; "atendente-ia" está em atualização e não é vendável agora). Use o slug exato do bloco PLANOS.',
         },
-        interval: {
+        track: {
           type: 'string',
-          enum: ['monthly', 'annual'],
-          description: 'Cobrança mensal (padrão) ou anual. Omita para mensal.',
+          enum: ['flexivel', 'fidelidade'],
+          description:
+            'Trilha Flexível (padrão) ou Fidelidade 12m. Omita somente quando a escolha for Flexível.',
         },
         niche: {
           type: 'string',
@@ -359,7 +355,7 @@ async function executeSalesFunction(
         }
         const result = buildSignupLink(
           String(input.plan ?? ''),
-          typeof input.interval === 'string' ? input.interval : undefined,
+          typeof input.track === 'string' ? input.track : undefined,
           phone,
           salesConfig
         );
@@ -367,7 +363,7 @@ async function executeSalesFunction(
           await markFollowupPostLink(config.phoneNumberId, phone);
           void emitSalesEvent(config.phoneNumberId, phone, 'link_enviado', {
             plan: result.plan,
-            interval: result.interval,
+            track: result.track,
           }).catch(() => undefined);
         }
         return JSON.stringify(result);
@@ -389,7 +385,7 @@ async function executeSalesFunction(
             name: typeof input.name === 'string' ? input.name : undefined,
             clinicName: typeof input.clinicName === 'string' ? input.clinicName : undefined,
             plan: String(input.plan ?? ''),
-            interval: typeof input.interval === 'string' ? input.interval : undefined,
+            track: typeof input.track === 'string' ? input.track : undefined,
             niche:
               typeof input.niche === 'string' &&
               (PREFILL_NICHES as readonly string[]).includes(input.niche)
@@ -404,6 +400,20 @@ async function executeSalesFunction(
         );
         if (result.success) {
           await markFollowupPostLink(config.phoneNumberId, phone);
+          // Fidelidade não chama o prefill atual (ele ainda não aceita track),
+          // então este link comum precisa registrar o próprio marco. Nos demais
+          // casos o endpoint do Receps continua sendo a fonte, evitando dupla.
+          if (
+            result.prefilled === false &&
+            result.fallbackReason === 'prefill_nao_suporta_fidelidade'
+          ) {
+            void emitSalesEvent(
+              config.phoneNumberId,
+              phone,
+              'link_enviado',
+              { plan: result.plan, track: result.track }
+            ).catch(() => undefined);
+          }
         }
         return JSON.stringify(result);
       }
@@ -518,6 +528,8 @@ const defaultSalesReplyDeps: SalesReplyDeps = {
 
 export interface SalesReplyOptions {
   retryPolicy?: AnthropicRetryPolicy;
+  /** Seam de testes/recovery. Produção usa default adaptativo no Sonnet e OFF no DeepSeek. */
+  thinkingMode?: SalesThinkingMode;
 }
 
 /** Falha terminal pública do miolo de vendas; nunca vira copy pro lead. */
@@ -564,30 +576,162 @@ async function runSalesReplyFromLoadedHistory(
     isFirstResponse,
     adHeadline,
   });
+  const runtime = resolveSalesAiRuntime(config);
+  const client = getSalesAiClient(runtime);
+  const toolTrace: SalesToolTraceLike[] = [];
+  let forceThinkingDisabled = false;
+  let thinkingOnlyRetries = 0;
+  let replyRepairAttempts = 0;
+
+  const performTerminalHandoff = async (
+    reasons: readonly string[]
+  ): Promise<string> => {
+    console.warn(
+      `🛡️ Renata auto-handoff terminal | provider=${runtime.provider} | tenant=${config.tenantSlug} | reasons=${reasons.join(',') || 'tool_rounds_exhausted'}`
+    );
+    const result = await executeSalesFunction(
+      'handoffToHuman',
+      {
+        reason: `guardrail_terminal:${
+          reasons.join('|') || 'tool_rounds_exhausted'
+        }`,
+      },
+      phone,
+      userName,
+      config,
+      salesConfig,
+      partnerSlug
+    );
+    toolTrace.push({ name: 'handoffToHuman', result });
+    if (!salesToolSucceeded(toolTrace, 'handoffToHuman')) {
+      throw new Error('Auto-handoff terminal não foi confirmado.');
+    }
+    return buildSafeSalesRecoveryReply(toolTrace, '');
+  };
+
+  const performTerminalResolution = async (
+    reasons: Parameters<
+      typeof buildDeterministicSalesGuardReply
+    >[0]
+  ): Promise<string> => {
+    const deterministicReply = buildDeterministicSalesGuardReply(
+      reasons,
+      history
+    );
+    if (deterministicReply) return deterministicReply;
+
+    if (reasons.includes('required_prefill_missing')) {
+      const prefill = resolveConfirmedSalesPrefill(history);
+      if (prefill) {
+        console.warn(
+          `🛡️ Renata prefill terminal por código | provider=${runtime.provider} | tenant=${config.tenantSlug}`
+        );
+        const result = await executeSalesFunction(
+          'sendPrefilledSignup',
+          prefill,
+          phone,
+          userName,
+          config,
+          salesConfig,
+          partnerSlug
+        );
+        toolTrace.push({ name: 'sendPrefilledSignup', result });
+        if (salesToolSucceeded(toolTrace, 'sendPrefilledSignup')) {
+          return buildSafeSalesRecoveryReply(toolTrace, '');
+        }
+      }
+    }
+
+    return performTerminalHandoff(reasons);
+  };
 
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const response = await callAnthropicWithRetry(
         () =>
-          getAnthropicClient().messages.create({
-            model: config.aiModel,
-            max_tokens: sanitizeMaxTokens(config.aiMaxTokens),
-            // NÃO enviar `temperature`: o claude-sonnet-5 a rejeita (400
-            // "temperature is deprecated for this model"). Usa o default do modelo.
-            system,
-            tools: SALES_TOOLS,
-            messages,
-          }),
-        `sales tenant=${config.tenantSlug} round=${round + 1}/${MAX_TOOL_ROUNDS}`,
+          client.messages.create(
+            buildSalesMessageRequest({
+              runtime,
+              maxTokens: config.aiMaxTokens,
+              system,
+              tools: SALES_TOOLS,
+              messages,
+              thinkingMode: forceThinkingDisabled
+                ? 'disabled'
+                : options.thinkingMode,
+            })
+          ),
+        `sales provider=${runtime.provider} tenant=${config.tenantSlug} round=${
+          round + 1
+        }/${MAX_TOOL_ROUNDS}`,
         options.retryPolicy ?? 'patient'
       );
 
       const toolUses = response.content.filter(
         (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
       );
+      // A API expõe o identificador que respondeu, mas hoje ele pode ser o
+      // mesmo alias solicitado. Registramos os dois sem inferir uma pinagem
+      // imutável e sem incluir conteúdo, telefone ou outro PII.
+      console.info(
+        `🧭 Renata model response | provider=${runtime.provider} | requested_model=${runtime.model} | response_model=${response.model || 'ausente'}`
+      );
 
       if (toolUses.length === 0) {
-        const reply = extractText(response.content) || getFallbackMessage(config);
+        const rawReply = extractText(response.content);
+        if (
+          thinkingOnlyRetries < 1 &&
+          isThinkingOnlyResponse({
+            stopReason: response.stop_reason,
+            contentTypes: response.content.map((block) => block.type),
+            text: rawReply,
+          })
+        ) {
+          thinkingOnlyRetries += 1;
+          forceThinkingDisabled = true;
+          console.warn(
+            `🛡️ Renata retry thinking-only | provider=${runtime.provider} | tenant=${config.tenantSlug}`
+          );
+          continue;
+        }
+
+        const inspection = inspectSalesReplyActionClaims(
+          rawReply,
+          toolTrace,
+          history,
+          {
+            // A autoridade de preço é SOMENTE a sales-config renderizada. O
+            // resto do prompt pode mencionar valores de contexto (por exemplo,
+            // custo de recepcionista), que nunca podem autorizar plano/link.
+            priceAuthorityText: plansBlock,
+          }
+        );
+        if (
+          !inspection.safe &&
+          !requiresImmediateTerminalHandoff(inspection.reasons) &&
+          replyRepairAttempts < 2
+        ) {
+          replyRepairAttempts += 1;
+          console.warn(
+            `🛡️ Renata reparando promessa sem tool | provider=${runtime.provider} | tenant=${config.tenantSlug} | reasons=${inspection.reasons.join(',')}`
+          );
+          messages.push({
+            role: 'assistant',
+            content: response.content as Anthropic.ContentBlockParam[],
+          });
+          messages.push({
+            role: 'user',
+            content: inspection.hintMessage ??
+              'INTERNAL_HINT: refaça a resposta sem afirmar ação não concluída.',
+          });
+          continue;
+        }
+
+        const reply = normalizeSalesReplyStyle(
+          inspection.safe
+            ? rawReply
+            : await performTerminalResolution(inspection.reasons)
+        );
         await deps.addMessage(conversationKey, 'assistant', reply);
         if (isFirstResponse) {
           void deps
@@ -607,15 +751,32 @@ async function runSalesReplyFromLoadedHistory(
       for (const toolUse of toolUses) {
         const args = (toolUse.input ?? {}) as Record<string, unknown>;
         console.log(`🔧 Renata chamou: ${toolUse.name} para ${config.phoneNumberId}`);
-        const result = await executeSalesFunction(
-          toolUse.name,
-          args,
-          phone,
-          userName,
-          config,
-          salesConfig,
-          partnerSlug
-        );
+        const guard = authorizeSalesToolCall({
+          toolName: toolUse.name,
+          toolInput: args,
+          history,
+        });
+        const result = guard.ok
+          ? await executeSalesFunction(
+              toolUse.name,
+              args,
+              phone,
+              userName,
+              config,
+              salesConfig,
+              partnerSlug
+            )
+          : JSON.stringify({
+              success: false,
+              code: guard.reason,
+              message: guard.hintMessage,
+            });
+        if (!guard.ok) {
+          console.warn(
+            `🛡️ Renata bloqueou ${toolUse.name} | tenant=${config.tenantSlug} | reason=${guard.reason}`
+          );
+        }
+        toolTrace.push({ name: toolUse.name, result });
         toolResults.push({
           type: 'tool_result',
           tool_use_id: toolUse.id,
@@ -625,6 +786,20 @@ async function runSalesReplyFromLoadedHistory(
 
       messages.push({ role: 'user', content: toolResults });
     }
+
+    // Se houve escrita confirmada, a resposta determinística pode descrevê-la.
+    // Sem evidência autoritativa, esgotar rounds vira handoff por código.
+    const confirmedRecovery = buildSafeSalesRecoveryReply(toolTrace, '');
+    const fallbackReply = normalizeSalesReplyStyle(
+      confirmedRecovery || (await performTerminalHandoff([]))
+    );
+    await deps.addMessage(conversationKey, 'assistant', fallbackReply);
+    if (isFirstResponse) {
+      void deps
+        .emitEvent(config.phoneNumberId, phone, 'primeira_resposta')
+        .catch(() => undefined);
+    }
+    return fallbackReply;
   } catch (error) {
     if (!isCaptured(error)) {
       Sentry.captureException(error, {
@@ -645,17 +820,6 @@ async function runSalesReplyFromLoadedHistory(
     );
     throw new SalesBrainFailure(error);
   }
-
-  // O provider respondeu, mas esgotou MAX_TOOL_ROUNDS sem texto final. Este
-  // fallback de modelo vivo continua sendo uma resposta normal, como antes.
-  const fallbackReply = getFallbackMessage(config);
-  await deps.addMessage(conversationKey, 'assistant', fallbackReply);
-  if (isFirstResponse) {
-    void deps
-      .emitEvent(config.phoneNumberId, phone, 'primeira_resposta')
-      .catch(() => undefined);
-  }
-  return fallbackReply;
 }
 
 /**

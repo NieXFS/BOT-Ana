@@ -60,7 +60,7 @@ function requireModel(config: TenantBotConfig): string {
   return model;
 }
 
-function assertDeepSeekProductionApproved(): void {
+export function assertDeepSeekProductionApproved(): void {
   if (process.env.NODE_ENV !== 'production') return;
 
   const approved =

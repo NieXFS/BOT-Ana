@@ -25,13 +25,46 @@ const MODEL = process.env.RENATA_MODEL || 'claude-sonnet-5';
 
 // ── Preços REAIS (espelham PLAN_METADATA; a fonte da verdade é a sales-config) ──
 const salesConfig: SalesConfig = {
+  version: 2,
   currency: 'BRL',
   annualFreeMonths: 2,
+  annualSellable: false,
+  deprecationNote: 'Não ofertar anual; use Flexível ou Fidelidade.',
   signupBaseUrl: 'https://receps.com.br/cadastro',
   plans: [
-    { slug: 'atendente-ia', name: 'Somente Atendente IA', sellable: false, priceMonthly: 99.99, priceMonthlyFormatted: 'R$ 99,99', priceAnnualTotalFormatted: 'R$ 999,90', priceAnnualMonthlyFormatted: 'R$ 83,32', annualFreeMonths: 2, trialDays: 7, maxProfessionals: 1, features: ['Ana 24h no WhatsApp'], waitlist: { reason: 'em atualização', href: 'https://wa.me/5516991113783' } },
-    { slug: 'essencial', name: 'Essencial', sellable: true, priceMonthly: 159.99, priceMonthlyFormatted: 'R$ 159,99', priceAnnualTotalFormatted: 'R$ 1.599,90', priceAnnualMonthlyFormatted: 'R$ 133,32', annualFreeMonths: 2, trialDays: 7, maxProfessionals: 3, features: ['Agenda completa', 'Financeiro (caixa, comissões)', 'Clientes, serviços e pacotes'] },
-    { slug: 'pro', name: 'Pro', sellable: true, priceMonthly: 299.99, priceMonthlyFormatted: 'R$ 299,99', priceAnnualTotalFormatted: 'R$ 2.999,90', priceAnnualMonthlyFormatted: 'R$ 249,99', annualFreeMonths: 2, trialDays: 14, maxProfessionals: null, features: ['Ana ilimitada', 'Prontuário e galeria', 'Página pública de agendamento'] },
+    {
+      slug: 'atendente-ia', name: 'Somente Atendente IA', sellable: false,
+      tracks: { flexivel: null, fidelidade: null },
+      priceMonthly: 99.99, priceMonthlyFormatted: 'R$ 99,99',
+      priceAnnualTotalFormatted: 'R$ 999,90', priceAnnualMonthlyFormatted: 'R$ 83,32',
+      annualFreeMonths: 2, annualSellable: false, trialDays: 14,
+      maxProfessionals: 1, features: ['Ana 24h no WhatsApp'],
+      waitlist: { reason: 'em atualização', href: 'https://wa.me/5516991113783' },
+    },
+    {
+      slug: 'essencial', name: 'Essencial', sellable: true,
+      tracks: {
+        flexivel: { priceMonthly: 159.99, priceMonthlyFormatted: 'R$ 159,99', trialDays: 14, trialRequiresCard: false },
+        fidelidade: { priceMonthly: 129.99, priceMonthlyFormatted: 'R$ 129,99', commitmentMonths: 12, penaltyPercent: 20, regretDays: 7, trialDays: 0, firstChargeAtSignup: true },
+      },
+      priceMonthly: 159.99, priceMonthlyFormatted: 'R$ 159,99',
+      priceAnnualTotalFormatted: 'R$ 1.599,90', priceAnnualMonthlyFormatted: 'R$ 133,32',
+      annualFreeMonths: 2, annualSellable: false, trialDays: 14,
+      maxProfessionals: 3,
+      features: ['Agenda completa', 'Financeiro (caixa, comissões)', 'Clientes, serviços e pacotes'],
+    },
+    {
+      slug: 'pro', name: 'Pro', sellable: true,
+      tracks: {
+        flexivel: { priceMonthly: 299.99, priceMonthlyFormatted: 'R$ 299,99', trialDays: 14, trialRequiresCard: false },
+        fidelidade: { priceMonthly: 249.99, priceMonthlyFormatted: 'R$ 249,99', commitmentMonths: 12, penaltyPercent: 20, regretDays: 7, trialDays: 0, firstChargeAtSignup: true },
+      },
+      priceMonthly: 299.99, priceMonthlyFormatted: 'R$ 299,99',
+      priceAnnualTotalFormatted: 'R$ 2.999,90', priceAnnualMonthlyFormatted: 'R$ 249,99',
+      annualFreeMonths: 2, annualSellable: false, trialDays: 14,
+      maxProfessionals: null,
+      features: ['Ana ilimitada', 'Prontuário e galeria', 'Página pública de agendamento'],
+    },
   ],
   anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'plano em atualização' },
 };
@@ -75,9 +108,8 @@ async function main() {
   const allowedPrices = new Set<string>();
   for (const p of salesConfig.plans) {
     if (!p.sellable) continue;
-    allowedPrices.add(p.priceMonthlyFormatted);
-    allowedPrices.add(p.priceAnnualTotalFormatted);
-    allowedPrices.add(p.priceAnnualMonthlyFormatted);
+    if (p.tracks?.flexivel) allowedPrices.add(p.tracks.flexivel.priceMonthlyFormatted);
+    if (p.tracks?.fidelidade) allowedPrices.add(p.tracks.fidelidade.priceMonthlyFormatted);
   }
   // Custo de "recepcionista" citado nas objeções do manual (permitido — não é preço de plano).
   ['R$ 1.800', 'R$ 2.500', 'R$ 1.800,00', 'R$ 2.500,00'].forEach((v) => allowedPrices.add(v));
@@ -89,7 +121,24 @@ async function main() {
       case 'scheduleDemo':
         return { success: true, message: `Demonstração agendada para ${input.date} às ${input.time} com o Victor.` };
       case 'sendSignupLink':
-        return buildSignupLink(String(input.plan ?? ''), typeof input.interval === 'string' ? input.interval : undefined, phone, salesConfig);
+        return buildSignupLink(String(input.plan ?? ''), typeof input.track === 'string' ? input.track : undefined, phone, salesConfig);
+      case 'sendPrefilledSignup':
+        return input.track === 'fidelidade'
+          ? {
+              success: true,
+              prefilled: false,
+              url: 'https://receps.com.br/cadastro?plan=essencial&track=fidelidade',
+              plan: input.plan,
+              track: 'fidelidade',
+              fallbackReason: 'prefill_nao_suporta_fidelidade',
+            }
+          : {
+              success: true,
+              prefilled: true,
+              url: 'https://receps.com.br/cadastro?pf=TOKEN_G3',
+              plan: input.plan,
+              track: 'flexivel',
+            };
       case 'registerQualifiedLead':
         return { success: true };
       case 'handoffToHuman':

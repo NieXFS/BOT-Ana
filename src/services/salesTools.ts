@@ -51,8 +51,11 @@ export function hashPhoneForCid(phone: string): string {
   return crypto.createHash('sha256').update(phone).digest('hex').slice(0, 16);
 }
 
+export const SIGNUP_TRACKS = ['flexivel', 'fidelidade'] as const;
+export type SignupTrack = (typeof SIGNUP_TRACKS)[number];
+
 export type SignupLinkResult =
-  | { success: true; url: string; plan: string; interval: 'monthly' | 'annual' }
+  | { success: true; url: string; plan: string; track: SignupTrack }
   | { success: false; message: string; waitlistHref?: string };
 
 /**
@@ -63,7 +66,7 @@ export type SignupLinkResult =
  */
 export function buildSignupLink(
   planInput: string,
-  intervalInput: string | undefined,
+  trackInput: string | undefined,
   phone: string,
   config: SalesConfig,
   ctwaClid?: string | null
@@ -88,21 +91,44 @@ export function buildSignupLink(
     };
   }
 
-  const interval: 'monthly' | 'annual' =
-    (intervalInput ?? '').trim().toLowerCase() === 'annual' ? 'annual' : 'monthly';
+  const normalizedTrack = (trackInput ?? '').trim().toLowerCase();
+  if (
+    normalizedTrack &&
+    !(SIGNUP_TRACKS as readonly string[]).includes(normalizedTrack)
+  ) {
+    return {
+      success: false,
+      message: `Trilha "${trackInput}" não existe. Trilhas válidas: flexivel, fidelidade.`,
+    };
+  }
+
+  const track: SignupTrack =
+    normalizedTrack === 'fidelidade' ? 'fidelidade' : 'flexivel';
+  const trackAvailable = plan.tracks
+    ? plan.tracks[track] != null
+    : track === 'flexivel';
+
+  if (!trackAvailable) {
+    const href = plan.waitlist?.href ?? config.anaBeta.waitlistHref;
+    return {
+      success: false,
+      message: `A trilha ${track === 'fidelidade' ? 'Fidelidade' : 'Flexível'} do plano ${plan.name} não está disponível agora. Não gere link; ofereça a lista de interesse.`,
+      waitlistHref: href,
+    };
+  }
 
   const cid = ctwaClid?.trim() ? ctwaClid.trim() : `wa:${hashPhoneForCid(phone)}`;
 
   const params = new URLSearchParams();
   params.set('plan', plan.slug);
-  if (interval === 'annual') {
-    params.set('interval', 'annual');
+  if (track === 'fidelidade') {
+    params.set('track', 'fidelidade');
   }
   // UTM em texto fixo (não re-encode) + atribuição. URLSearchParams cuida do cid.
   params.set('cid', cid);
 
   const url = `${config.signupBaseUrl}?${UTM}&${params.toString()}`;
-  return { success: true, url, plan: plan.slug, interval };
+  return { success: true, url, plan: plan.slug, track };
 }
 
 export type PrefilledSignupInput = {
@@ -110,7 +136,7 @@ export type PrefilledSignupInput = {
   name?: string;
   clinicName?: string;
   plan: string;
-  interval?: string;
+  track?: string;
   niche?: string;
   professionalsCount?: number;
 };
@@ -129,15 +155,17 @@ export type PrefilledSignupLinkResult =
       url: string;
       prefilled: true;
       plan: string;
-      interval: 'monthly' | 'annual';
+      track: SignupTrack;
     }
   | {
       success: true;
       url: string;
       prefilled: false;
       plan: string;
-      interval: 'monthly' | 'annual';
-      fallbackReason: 'prefill_indisponivel';
+      track: SignupTrack;
+      fallbackReason:
+        | 'prefill_indisponivel'
+        | 'prefill_nao_suporta_fidelidade';
       warning: string;
     }
   | { success: false; message: string; waitlistHref?: string };
@@ -166,9 +194,25 @@ export async function createPrefilledSignupLink(
   input: PrefilledSignupInput,
   config: SalesConfig
 ): Promise<PrefilledSignupLinkResult> {
-  const validation = buildSignupLink(input.plan, input.interval, phone, config);
+  const validation = buildSignupLink(input.plan, input.track, phone, config);
   if (!validation.success) {
     return validation;
+  }
+
+  // O POST vigente do Receps ainda aceita apenas `plan` + o legado `interval`.
+  // Não enviamos nenhum dos dois campos de seleção para a Fidelidade: neste
+  // caso o único contrato correto é o link comum com `track=fidelidade`.
+  if (validation.track === 'fidelidade') {
+    return {
+      success: true,
+      url: validation.url,
+      prefilled: false,
+      plan: validation.plan,
+      track: validation.track,
+      fallbackReason: 'prefill_nao_suporta_fidelidade',
+      warning:
+        'O cadastro pré-preenchido ainda não suporta a trilha Fidelidade. ESTE É O LINK COMUM DA FIDELIDADE (com track=fidelidade). NÃO diga que já vem com os dados nem que só falta a senha; explique que ela preencherá o cadastro normalmente.',
+    };
   }
 
   try {
@@ -180,7 +224,6 @@ export async function createPrefilledSignupLink(
         name: input.name,
         clinicName: input.clinicName,
         plan: validation.plan,
-        interval: validation.interval,
         ...(input.niche !== undefined ? { niche: input.niche } : {}),
         ...(input.professionalsCount !== undefined
           ? { professionalsCount: input.professionalsCount }
@@ -202,7 +245,7 @@ export async function createPrefilledSignupLink(
       url: data.url,
       prefilled: true,
       plan: validation.plan,
-      interval: validation.interval,
+      track: validation.track,
     };
   } catch (error) {
     capture(error, 'create-prefilled-signup', phoneNumberId);
@@ -218,7 +261,7 @@ function buildPrefillFallback(
     url: validation.url,
     prefilled: false,
     plan: validation.plan,
-    interval: validation.interval,
+    track: validation.track,
     fallbackReason: 'prefill_indisponivel',
     warning:
       'ESTE É O LINK COMUM (não pré-preenchido). NÃO diga que já vem com os dados nem que só falta a senha — peça pra ela preencher e-mail e dados no cadastro normalmente.',
@@ -288,7 +331,8 @@ export async function registerQualifiedLead(
  * Handoff pro Victor: (1) registra o lead com status "handoff" + motivo (dispara
  * o e-mail interno no Receps); (2) pausa a conversa (source=handoff → MANUAL) pra
  * Renata calar até o Victor assumir; (3) encerra a régua de follow-up. Cada passo
- * é best-effort; nunca lança. Devolve uma dica pra Renata avisar o lead.
+ * é best-effort e nunca lança, mas `success:true` só existe quando registro E
+ * pausa foram confirmados. Assim a Renata nunca afirma um handoff parcial.
  */
 export async function handoffToHuman(
   phone: string,
@@ -296,6 +340,9 @@ export async function handoffToHuman(
   reason: string,
   payload: QualifiedLeadPayload = {}
 ): Promise<{ success: boolean; message: string }> {
+  let leadRegistered = false;
+  let conversationPaused = false;
+
   try {
     await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
@@ -308,6 +355,7 @@ export async function handoffToHuman(
         timeout: REQUEST_TIMEOUT_MS,
       }
     );
+    leadRegistered = true;
   } catch (error) {
     capture(error, 'handoff-register', phoneNumberId);
   }
@@ -324,11 +372,20 @@ export async function handoffToHuman(
         timeout: REQUEST_TIMEOUT_MS,
       }
     );
+    conversationPaused = true;
   } catch (error) {
     capture(error, 'handoff-pause', phoneNumberId);
   }
 
   await markFollowupOptedOut(phoneNumberId, phone).catch(() => undefined);
+
+  if (!leadRegistered || !conversationPaused) {
+    return {
+      success: false,
+      message:
+        'Não consegui confirmar a transferência completa. Não diga que o Victor já foi acionado; deixe o recovery tentar novamente.',
+    };
+  }
 
   return {
     success: true,

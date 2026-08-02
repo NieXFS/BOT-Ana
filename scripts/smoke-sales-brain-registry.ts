@@ -49,20 +49,25 @@ function makeConfig(botRole: string, systemPrompt = 'Persona.'): TenantBotConfig
 }
 
 const salesConfig: SalesConfig = {
+  version: 2,
   currency: 'BRL',
   annualFreeMonths: 2,
+  annualSellable: false,
+  deprecationNote: 'Não ofertar anual; use Flexível ou Fidelidade.',
   signupBaseUrl: 'https://receps.com.br/cadastro',
   plans: [
     {
       slug: 'atendente-ia',
       name: 'Somente Atendente IA',
       sellable: false,
+      tracks: { flexivel: null, fidelidade: null },
       priceMonthly: 99.99,
       priceMonthlyFormatted: 'R$ 99,99',
       priceAnnualTotalFormatted: 'R$ 999,90',
       priceAnnualMonthlyFormatted: 'R$ 83,32',
       annualFreeMonths: 2,
-      trialDays: 7,
+      annualSellable: false,
+      trialDays: 14,
       maxProfessionals: 1,
       features: ['Ana 24h no WhatsApp'],
       waitlist: { reason: 'em atualização', href: 'https://wa.me/5516991113783' },
@@ -71,12 +76,30 @@ const salesConfig: SalesConfig = {
       slug: 'essencial',
       name: 'Essencial',
       sellable: true,
+      tracks: {
+        flexivel: {
+          priceMonthly: 159.99,
+          priceMonthlyFormatted: 'R$ 159,99',
+          trialDays: 14,
+          trialRequiresCard: false,
+        },
+        fidelidade: {
+          priceMonthly: 129.99,
+          priceMonthlyFormatted: 'R$ 129,99',
+          commitmentMonths: 12,
+          penaltyPercent: 20,
+          regretDays: 7,
+          trialDays: 0,
+          firstChargeAtSignup: true,
+        },
+      },
       priceMonthly: 159.99,
       priceMonthlyFormatted: 'R$ 159,99',
       priceAnnualTotalFormatted: 'R$ 1.599,90',
       priceAnnualMonthlyFormatted: 'R$ 133,32',
       annualFreeMonths: 2,
-      trialDays: 7,
+      annualSellable: false,
+      trialDays: 14,
       maxProfessionals: 3,
       features: ['Agenda completa', 'Financeiro'],
     },
@@ -84,17 +107,48 @@ const salesConfig: SalesConfig = {
       slug: 'pro',
       name: 'Pro',
       sellable: true,
+      tracks: {
+        flexivel: {
+          priceMonthly: 299.99,
+          priceMonthlyFormatted: 'R$ 299,99',
+          trialDays: 14,
+          trialRequiresCard: false,
+        },
+        fidelidade: {
+          priceMonthly: 249.99,
+          priceMonthlyFormatted: 'R$ 249,99',
+          commitmentMonths: 12,
+          penaltyPercent: 20,
+          regretDays: 7,
+          trialDays: 0,
+          firstChargeAtSignup: true,
+        },
+      },
       priceMonthly: 299.99,
       priceMonthlyFormatted: 'R$ 299,99',
       priceAnnualTotalFormatted: 'R$ 2.999,90',
       priceAnnualMonthlyFormatted: 'R$ 249,99',
       annualFreeMonths: 2,
+      annualSellable: false,
       trialDays: 14,
       maxProfessionals: null,
       features: ['Ana ilimitada', 'Prontuário'],
     },
   ],
   anaBeta: { testing: true, waitlistHref: 'https://wa.me/5516991113783', notice: 'plano em atualização' },
+};
+
+const v1SalesConfig: SalesConfig = {
+  currency: salesConfig.currency,
+  annualFreeMonths: salesConfig.annualFreeMonths,
+  signupBaseUrl: salesConfig.signupBaseUrl,
+  plans: salesConfig.plans.map((plan) => {
+    const legacyPlan = { ...plan };
+    delete legacyPlan.tracks;
+    delete legacyPlan.annualSellable;
+    return legacyPlan;
+  }),
+  anaBeta: salesConfig.anaBeta,
 };
 
 async function main() {
@@ -113,6 +167,7 @@ async function main() {
     clearConversationAdHeadlines,
   } = await import('../src/services/salesAdState');
   const { renderPlansBlock } = await import('../src/salesConfigProvider');
+  const { inspectSalesReplyActionClaims } = await import('../src/services/salesGuards');
 
   console.log('▶ brain registry (botRole)');
   check('sales → sales', resolveBrainRole(makeConfig('sales')) === 'sales');
@@ -152,6 +207,20 @@ async function main() {
       const required = (tool?.input_schema as { required?: string[] })?.required ?? [];
       return required.join(',') === 'email,plan';
     })()
+  );
+  check(
+    'tools de signup expõem track Flexível/Fidelidade e removem interval',
+    ['sendSignupLink', 'sendPrefilledSignup'].every((name) => {
+      const properties = (
+        SALES_TOOLS.find((tool) => tool.name === name)?.input_schema as {
+          properties?: Record<string, { enum?: string[] }>;
+        }
+      )?.properties;
+      return (
+        properties?.track?.enum?.join(',') === 'flexivel,fidelidade' &&
+        properties?.interval === undefined
+      );
+    })
   );
   check(
     'sendPrefilledSignup expõe niche enum + professionalsCount integer opcionais',
@@ -263,25 +332,134 @@ async function main() {
   check('sem placeholder → bloco anexado no fim', withoutPlaceholder.includes('R$ 299,99'));
 
   console.log('▶ preços SÓ da sales-config (adversarial: nada de memória)');
-  check('essencial mensal presente', plansBlock.includes('R$ 159,99'));
-  check('pro mensal presente', plansBlock.includes('R$ 299,99'));
-  check('equivalente mensal anual presente', plansBlock.includes('R$ 133,32'));
+  check('Essencial Flexível presente', plansBlock.includes('R$ 159,99'));
+  check('Pro Flexível presente', plansBlock.includes('R$ 299,99'));
+  check('Essencial Fidelidade presente', plansBlock.includes('R$ 129,99'));
+  check('Pro Fidelidade presente', plansBlock.includes('R$ 249,99'));
   check('header "NUNCA cite preço de memória"', plansBlock.includes('NUNCA cite preço de memória'));
   check('plano pausado NÃO é vendido (sem preço no bloco)', !plansBlock.includes('R$ 99,99'));
   check(
     'plano pausado → lista de interesse com link',
     plansBlock.includes('lista de interesse') && plansBlock.includes('wa.me/5516991113783')
   );
+  const fidelityLines = plansBlock
+    .split('\n')
+    .filter((line) => line.includes('Fidelidade 12m:'));
+  check(
+    'Fidelidade sempre traz compromisso de 12 meses + multa',
+    fidelityLines.length === 2 &&
+      fidelityLines.every(
+        (line) =>
+          /compromisso de 12 meses/i.test(line) &&
+          /multa de 20%/i.test(line) &&
+          !/sem compromisso/i.test(line)
+      )
+  );
+  check(
+    'Flexível concentra o teste de 14 dias sem cartão',
+    plansBlock
+      .split('\n')
+      .filter((line) => line.includes('Flexível:'))
+      .every((line) => /teste grátis de 14 dias, sem cartão/i.test(line))
+  );
+  check(
+    'oferta anual aposentada aparece somente como proibição, sem valores legados',
+    /NUNCA ofereça plano anual/i.test(plansBlock) &&
+      /2 meses grátis/i.test(plansBlock) &&
+      !plansBlock.includes('R$ 1.599,90') &&
+      !plansBlock.includes('R$ 2.999,90') &&
+      !plansBlock.includes('R$ 133,32')
+  );
   const allowed = new Set<string>();
   for (const p of salesConfig.plans) {
     if (!p.sellable) continue;
-    allowed.add(p.priceMonthlyFormatted);
-    allowed.add(p.priceAnnualTotalFormatted);
-    allowed.add(p.priceAnnualMonthlyFormatted);
+    if (p.tracks?.flexivel) {
+      allowed.add(p.tracks.flexivel.priceMonthlyFormatted);
+    }
+    if (p.tracks?.fidelidade) {
+      allowed.add(p.tracks.fidelidade.priceMonthlyFormatted);
+    }
   }
   const found = plansBlock.match(/R\$\s[\d.]+,\d{2}/g) ?? [];
   const stray = found.filter((v) => !allowed.has(v));
   check(`nenhum preço fora da config (${found.length} achados)`, stray.length === 0);
+
+  // Simula um repricing futuro SEM editar nenhum preço em código da Ana. A
+  // mesma config recebida do Receps alimenta {{PLANOS}} e é a fonte da guard:
+  // o valor novo passa; o preço de ontem e um valor inventado são bloqueados.
+  const repricedConfig: SalesConfig = {
+    ...salesConfig,
+    plans: salesConfig.plans.map((plan) =>
+      plan.slug === 'essencial' && plan.tracks?.flexivel
+        ? {
+            ...plan,
+            priceMonthly: 161.11,
+            priceMonthlyFormatted: 'R$ 161,11',
+            tracks: {
+              ...plan.tracks,
+              flexivel: {
+                ...plan.tracks.flexivel,
+                priceMonthly: 161.11,
+                priceMonthlyFormatted: 'R$ 161,11',
+              },
+            },
+          }
+        : plan
+    ),
+  };
+  const repricedPlansBlock = renderPlansBlock(repricedConfig);
+  check(
+    'repricing: preço novo da sales-config é autorizado dinamicamente',
+    inspectSalesReplyActionClaims(
+      'O Essencial Flexível custa R$ 161,11.',
+      [],
+      [],
+      { priceAuthorityText: repricedPlansBlock }
+    ).safe
+  );
+  check(
+    'repricing: preço anterior é bloqueado após config nova',
+    inspectSalesReplyActionClaims(
+      'O Essencial Flexível custa R$ 159,99.',
+      [],
+      [],
+      { priceAuthorityText: repricedPlansBlock }
+    ).reasons.includes('unconfigured_price')
+  );
+  check(
+    'repricing: preço inventado continua bloqueado',
+    inspectSalesReplyActionClaims(
+      'O Essencial Flexível custa R$ 111,11.',
+      [],
+      [],
+      { priceAuthorityText: repricedPlansBlock }
+    ).reasons.includes('unconfigured_price')
+  );
+  check(
+    'preço de contexto do prompt não autoriza plano',
+    inspectSalesReplyActionClaims(
+      'O Essencial custa R$ 1.800.',
+      [],
+      [],
+      { priceAuthorityText: repricedPlansBlock }
+    ).reasons.includes('unconfigured_price')
+  );
+
+  console.log('▶ tolerância ao payload v1');
+  const v1PlansBlock = renderPlansBlock(v1SalesConfig);
+  check('payload v1 renderiza sem crash', v1PlansBlock.includes('PLANOS E PREÇOS'));
+  check(
+    'payload v1 oferece somente mensal como Flexível',
+    v1PlansBlock.includes('Flexível: R$ 159,99/mês') &&
+      !v1PlansBlock.includes('  - Fidelidade 12m:')
+  );
+  check(
+    'payload v1 omite qualquer menção à oferta anual legada',
+    !v1PlansBlock.includes('R$ 133,32') &&
+      !v1PlansBlock.includes('R$ 1.599,90') &&
+      !v1PlansBlock.includes('à vista') &&
+      !/anual|\b2 meses/i.test(v1PlansBlock)
+  );
 
   if (failures > 0) {
     console.error(`\n❌ ${failures} check(s) falharam.`);

@@ -199,11 +199,14 @@ async function exhaustRecovery(state: RecoveryState): Promise<void> {
   }
 
   try {
-    await deps.handoff(
+    const handoff = await deps.handoff(
       state.phone,
       state.config.phoneNumberId,
       'falha_resposta'
     );
+    if (!handoff.success) {
+      captureRecoveryError('handoff_unconfirmed', state, new Error('unconfirmed'));
+    }
   } catch (error) {
     captureRecoveryError('handoff', state, error);
   }
