@@ -14,6 +14,7 @@ import {
   inspectSalesReplyActionClaims,
   isThinkingOnlyResponse,
   normalizeSalesReplyStyle,
+  resolveRequiredCommonSignup,
   resolveConfirmedSalesPrefill,
   requiresImmediateTerminalHandoff,
   salesToolSucceeded,
@@ -627,6 +628,33 @@ async function runScenario(
               result: JSON.stringify(result),
             });
             if (salesToolSucceeded(toolTrace, 'sendPrefilledSignup')) {
+              return buildSafeSalesRecoveryReply(toolTrace, '');
+            }
+          }
+        }
+
+        if (reasons.includes('required_common_signup_missing')) {
+          const signup = resolveRequiredCommonSignup(conversationHistory);
+          if (signup) {
+            guardActivations.terminalDeterministicResolution += 1;
+            const result = syntheticToolResult(
+              scenario,
+              'sendSignupLink',
+              signup
+            );
+            toolCalls.push({
+              turn: turnIndex + 1,
+              name: 'sendSignupLink',
+              input: signup,
+              result,
+              source: 'guard-terminal',
+              guardBlocked: false,
+            });
+            toolTrace.push({
+              name: 'sendSignupLink',
+              result: JSON.stringify(result),
+            });
+            if (salesToolSucceeded(toolTrace, 'sendSignupLink')) {
               return buildSafeSalesRecoveryReply(toolTrace, '');
             }
           }

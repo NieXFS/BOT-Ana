@@ -8,6 +8,7 @@ import {
 
 export const DEEPSEEK_ANTHROPIC_BASE_URL =
   'https://api.deepseek.com/anthropic';
+export const CLAUDE_SONNET_5_MODEL = 'claude-sonnet-5';
 export const SONNET_SALES_MIN_MAX_TOKENS = 1200;
 
 export type SalesAiProvider = 'anthropic' | 'deepseek';
@@ -39,9 +40,9 @@ export function resolveSalesAiRuntime(
   const model = requireModel(config);
 
   if (provider === 'anthropic') {
-    if (!model.startsWith('claude-')) {
+    if (model !== CLAUDE_SONNET_5_MODEL) {
       throw new Error(
-        `Configuração incompatível: provider anthropic não pode usar ${model}.`
+        `Configuração incompatível: provider anthropic exige ${CLAUDE_SONNET_5_MODEL}.`
       );
     }
     const apiKey = process.env.ANTHROPIC_API_KEY?.trim();

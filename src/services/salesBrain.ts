@@ -56,6 +56,7 @@ import {
   inspectSalesReplyActionClaims,
   isThinkingOnlyResponse,
   normalizeSalesReplyStyle,
+  resolveRequiredCommonSignup,
   resolveConfirmedSalesPrefill,
   requiresImmediateTerminalHandoff,
   salesToolSucceeded,
@@ -637,6 +638,28 @@ async function runSalesReplyFromLoadedHistory(
         );
         toolTrace.push({ name: 'sendPrefilledSignup', result });
         if (salesToolSucceeded(toolTrace, 'sendPrefilledSignup')) {
+          return buildSafeSalesRecoveryReply(toolTrace, '');
+        }
+      }
+    }
+
+    if (reasons.includes('required_common_signup_missing')) {
+      const signup = resolveRequiredCommonSignup(history);
+      if (signup) {
+        console.warn(
+          `🛡️ Renata link comum terminal por código | provider=${runtime.provider} | tenant=${config.tenantSlug}`
+        );
+        const result = await executeSalesFunction(
+          'sendSignupLink',
+          signup,
+          phone,
+          userName,
+          config,
+          salesConfig,
+          partnerSlug
+        );
+        toolTrace.push({ name: 'sendSignupLink', result });
+        if (salesToolSucceeded(toolTrace, 'sendSignupLink')) {
           return buildSafeSalesRecoveryReply(toolTrace, '');
         }
       }

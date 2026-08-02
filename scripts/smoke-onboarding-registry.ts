@@ -24,6 +24,11 @@ async function main(): Promise<void> {
   const onboarding = await import('../src/services/onboardingBrain');
   const session = await import('../src/services/onboardingSession');
 
+  check(
+    'onboarding permanece no Sonnet fora do canário de vendas',
+    onboarding.resolveOnboardingModel() === 'claude-sonnet-5'
+  );
+
   console.log('▶ precedência da ponte por conversa');
   check(
     'recepcionista não entra na ponte',

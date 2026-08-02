@@ -25,6 +25,7 @@ export type SalesReplyClaimReason =
   | 'required_handoff_missing'
   | 'required_schedule_demo_missing'
   | 'required_prefill_missing'
+  | 'required_common_signup_missing'
   | 'required_demo_video_missing'
   | 'required_lgpd_answer_missing'
   | 'required_paused_plan_explanation_missing'
@@ -372,19 +373,76 @@ function requiresPrefilledSignup(history: ConversationMessage[]): boolean {
   );
 }
 
+function singleKnownPlanFromHistory(
+  history: ConversationMessage[]
+): 'essencial' | 'pro' | null {
+  const plans = [
+    ...new Set(
+      conversationalMessages(history)
+        .filter((message) => message.role === 'user')
+        .flatMap((message) => normalize(message.text).match(/\b(?:essencial|pro)\b/g) ?? [])
+    ),
+  ].filter(
+    (plan): plan is 'essencial' | 'pro' =>
+      plan === 'essencial' || plan === 'pro'
+  );
+  return plans.length === 1 ? plans[0] : null;
+}
+
+/**
+ * Link comum só é obrigatório quando a pessoa recusa o e-mail no inbound
+ * atual, pede explicitamente o cadastro/link normal e já escolheu um único
+ * plano. Isso não transforma curiosidade, mera recusa ou comparação entre
+ * planos em intenção de compra.
+ */
+function requiresCommonSignupLink(history: ConversationMessage[]): boolean {
+  const latestUser = normalize(
+    conversationalMessages(history)
+      .filter((message) => message.role === 'user')
+      .at(-1)?.text ?? ''
+  );
+  const explicitlyRefusesEmail =
+    /\b(?:nao\s+(?:quero\s+)?(?:passar|informar|dar|usar)|prefiro\s+nao\s+(?:passar|informar|dar|usar)|sem)\s+(?:o\s+)?e-?mail\b/.test(
+      latestUser
+    );
+  const explicitlyRequestsCommonSignup =
+    /\b(?:manda|envia|(?:pode|consegue|ja pode)\s+(?:mandar|enviar)|quero)\s+(?:o\s+)?(?:link|cadastro)(?:\s+normal)?\b/.test(
+      latestUser
+    );
+  return (
+    explicitlyRefusesEmail &&
+    explicitlyRequestsCommonSignup &&
+    singleKnownPlanFromHistory(history) !== null
+  );
+}
+
+export function resolveRequiredCommonSignup(
+  history: ConversationMessage[]
+): { plan: 'essencial' | 'pro' } | null {
+  const plan = singleKnownPlanFromHistory(history);
+  return requiresCommonSignupLink(history) && plan ? { plan } : null;
+}
+
 /**
  * O prefill pode falhar sem encerrar a venda: nesse caso ainda existe o link
  * comum como alternativa. Mas, se as duas entregas já falharam, o modelo não
  * pode encerrar prometendo uma nova tentativa. A única saída segura é o
  * handoff confirmado por código.
  */
-function requiresTerminalSignupHandoff(trace: SalesToolTraceLike[]): boolean {
-  return (
-    toolAttemptedWithoutSuccess(trace, 'sendPrefilledSignup') &&
-    toolAttemptedWithoutSuccess(trace, 'sendSignupLink') &&
+function requiresTerminalSignupHandoff(
+  trace: SalesToolTraceLike[],
+  history: ConversationMessage[]
+): boolean {
+  const noDeliveryOrHandoff =
     !hasDeliveredSignupLink(trace) &&
-    !salesToolSucceeded(trace, 'handoffToHuman')
-  );
+    !salesToolSucceeded(trace, 'handoffToHuman');
+  const failedPrefillAndCommonLink =
+    toolAttemptedWithoutSuccess(trace, 'sendPrefilledSignup') &&
+    toolAttemptedWithoutSuccess(trace, 'sendSignupLink');
+  const failedRequiredCommonLink =
+    requiresCommonSignupLink(history) &&
+    toolAttemptedWithoutSuccess(trace, 'sendSignupLink');
+  return noDeliveryOrHandoff && (failedPrefillAndCommonLink || failedRequiredCommonLink);
 }
 
 export function requiresImmediateTerminalHandoff(
@@ -540,7 +598,13 @@ export function inspectSalesReplyActionClaims(
   ) {
     reasons.add('required_prefill_missing');
   }
-  if (requiresTerminalSignupHandoff(trace)) {
+  if (
+    requiresCommonSignupLink(history) &&
+    !toolHadAuthorizedAttempt(trace, 'sendSignupLink')
+  ) {
+    reasons.add('required_common_signup_missing');
+  }
+  if (requiresTerminalSignupHandoff(trace, history)) {
     reasons.add('terminal_signup_delivery_failed');
   }
   if (

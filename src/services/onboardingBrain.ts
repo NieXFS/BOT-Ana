@@ -44,6 +44,15 @@ import { handoffToHuman } from './salesTools';
 
 const clientCache = new Map<string, Anthropic>();
 const MAX_TOOL_ROUNDS = 8;
+export const ONBOARDING_SONNET_MODEL = 'claude-sonnet-5';
+
+/**
+ * Onboarding escreve no ERP e permanece no Sonnet mesmo se o canário de
+ * vendas trocar o provider/modelo salvo no BotConfig da Renata.
+ */
+export function resolveOnboardingModel(): string {
+  return ONBOARDING_SONNET_MODEL;
+}
 
 function getAnthropicClient(): Anthropic {
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
@@ -439,7 +448,7 @@ async function runOnboardingFromLoadedHistory(
       const response = await callAnthropicWithRetry(
         () =>
           getAnthropicClient().messages.create({
-            model: config.aiModel,
+            model: resolveOnboardingModel(),
             max_tokens: sanitizeMaxTokens(config.aiMaxTokens),
             // Sonnet 5 rejeita temperature; usa o default do provider.
             system,

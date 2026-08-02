@@ -11,6 +11,7 @@ import {
   inspectSalesReplyActionClaims,
   isThinkingOnlyResponse,
   normalizeSalesReplyStyle,
+  resolveRequiredCommonSignup,
   resolveConfirmedSalesPrefill,
   requiresImmediateTerminalHandoff,
   salesToolSucceeded,
@@ -170,6 +171,86 @@ assert.equal(
 );
 assert.equal(requiresImmediateTerminalHandoff(doubleSignupFailure.reasons), true);
 console.log('  ✓ sucesso parcial preserva a entrega; falha dupla exige handoff por código');
+
+console.log('▶ link comum após recusa de e-mail');
+const commonSignupAfterEmailRefusal = [
+  {
+    role: 'user',
+    content:
+      'Quero assinar o Essencial para o Espaço Bela, com duas profissionais.',
+  },
+  {
+    role: 'user',
+    content: 'Não quero passar e-mail agora. Manda o link normal mesmo.',
+  },
+];
+assert.deepEqual(
+  inspectSalesReplyActionClaims(
+    'Perfeito, vou preparar seu cadastro.',
+    [],
+    commonSignupAfterEmailRefusal
+  ).reasons,
+  ['required_common_signup_missing']
+);
+assert.deepEqual(resolveRequiredCommonSignup(commonSignupAfterEmailRefusal), {
+  plan: 'essencial',
+});
+const failedRequiredCommonLink = inspectSalesReplyActionClaims(
+  'O link falhou, vou tentar de novo.',
+  [fail('sendSignupLink')],
+  commonSignupAfterEmailRefusal
+);
+assert.equal(
+  failedRequiredCommonLink.reasons.includes('terminal_signup_delivery_failed'),
+  true
+);
+assert.equal(
+  requiresImmediateTerminalHandoff(failedRequiredCommonLink.reasons),
+  true
+);
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Tudo certo.',
+    [ok('sendSignupLink')],
+    commonSignupAfterEmailRefusal
+  ).reasons.includes('terminal_signup_delivery_failed'),
+  false
+);
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Tudo certo.',
+    [fail('sendSignupLink'), ok('handoffToHuman')],
+    commonSignupAfterEmailRefusal
+  ).reasons.includes('terminal_signup_delivery_failed'),
+  false
+);
+const noCommonSignupForCuriosity = [
+  { role: 'user', content: 'Não quero passar e-mail agora.' },
+];
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Sem problema, podemos conversar por aqui.',
+    [],
+    noCommonSignupForCuriosity
+  ).reasons.includes('required_common_signup_missing'),
+  false
+);
+const noCommonSignupForMultiplePlans = [
+  {
+    role: 'user',
+    content:
+      'Não quero passar e-mail. Manda o link normal do Essencial ou do Pro?',
+  },
+];
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Qual dos dois planos você prefere?',
+    [],
+    noCommonSignupForMultiplePlans
+  ).reasons.includes('required_common_signup_missing'),
+  false
+);
+console.log('  ✓ exige plano único + recusa explícita + pedido de link, escala falha sem entrega e não libera prefill');
 
 console.log('▶ coerência promessa ↔ tool');
 assert.deepEqual(

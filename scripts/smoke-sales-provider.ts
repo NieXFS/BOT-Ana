@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import type { TenantBotConfig } from '../src/configProvider';
 import {
   buildSalesMessageRequest,
+  CLAUDE_SONNET_5_MODEL,
   DEEPSEEK_ANTHROPIC_BASE_URL,
   resolveSalesMaxTokens,
   resolveSalesAiRuntime,
@@ -62,7 +63,7 @@ try {
   console.log('▶ registry sem fallback cruzado');
   const anthropic = resolveSalesAiRuntime(config());
   assert.equal(anthropic.provider, 'anthropic');
-  assert.equal(anthropic.model, 'claude-sonnet-5');
+  assert.equal(anthropic.model, CLAUDE_SONNET_5_MODEL);
   console.log('  ✓ Anthropic resolvido');
 
   const deepseek = resolveSalesAiRuntime(
@@ -86,7 +87,7 @@ try {
       resolveSalesAiRuntime(
         config({ aiProvider: 'anthropic', aiModel: 'deepseek-v4-flash' })
       ),
-    /incompatível/
+    /exige claude-sonnet-5/
   );
   assert.throws(
     () =>
@@ -94,6 +95,20 @@ try {
         config({ aiProvider: 'deepseek', aiModel: 'claude-sonnet-5' })
       ),
     /incompatível/
+  );
+  assert.throws(
+    () =>
+      resolveSalesAiRuntime(
+        config({ aiProvider: 'anthropic', aiModel: 'claude-opus-4-8' })
+      ),
+    /exige claude-sonnet-5/
+  );
+  assert.throws(
+    () =>
+      resolveSalesAiRuntime(
+        config({ aiProvider: 'anthropic', aiModel: 'claude-haiku-4-5' })
+      ),
+    /exige claude-sonnet-5/
   );
   console.log('  ✓ combinações cruzadas falham fechadas');
 
