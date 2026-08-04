@@ -6,7 +6,8 @@ export type CustomerReplyLeakReason =
   | 'professional_id'
   | 'appointment_id'
   | 'technical_id'
-  | 'false_write_claim';
+  | 'false_write_claim'
+  | 'unverified_availability';
 
 export interface CustomerReplyInspection {
   safe: boolean;
@@ -16,6 +17,11 @@ export interface CustomerReplyInspection {
 export type ToolTraceLike = {
   name: string;
   result: string;
+  /**
+   * Só existe nos traces do benchmark/reauditoria. Em produção, o trace é
+   * sempre do turno que acabou de ser processado e pode omitir este campo.
+   */
+  userTurn?: number;
 };
 
 type WriteKind = 'book' | 'cancel' | 'reschedule';
@@ -205,8 +211,16 @@ function localClaimIsNegatedOrFuture(
     /(?:\b(?:vou|vamos|iremos|vai|vao|sera|serao|estara|estarao|ficara|ficarao|ficaria|ficariam|poderia|poderiam|posso|podemos|pretendo)\b(?:\s+\w+){0,6}|\b(?:assim que|quando|caso|depois que|se)\b(?:\s+\w+){0,8})\s*$/.test(
       localPrefix
     );
+  // "Pode ser que" e "talvez" são hipóteses sobre um estado, não uma
+  // confirmação de write. Não dividimos em vírgulas aqui: a mesma hipótese
+  // pode governar alternativas coordenadas ("... confirmado, ou ...
+  // cancelado"). Um contraste posterior ("mas") continua isolando a oração
+  // positiva, como na regra acima.
+  const hypothesisPrefix =
+    beforeClaim.split(/\b(?:mas|porem|contudo|entretanto)\b/).pop() ?? beforeClaim;
+  const isHedgedHypothesis = /\b(?:pode ser que|talvez)\b/.test(hypothesisPrefix);
 
-  return isNegated || isFutureOrConditional;
+  return isNegated || isFutureOrConditional || isHedgedHypothesis;
 }
 
 function appointmentLocalParts(startTime: string): {
@@ -256,6 +270,121 @@ function mentionedTimes(clause: string): string[] {
     );
   }
   return [...times];
+}
+
+function normalizeAvailabilitySlot(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = normalizeClaimText(value);
+  const match = /^([01]?\d|2[0-3])(?::([0-5]\d)|h([0-5]\d)?)$/.exec(
+    normalized
+  );
+  if (!match) return null;
+
+  return `${String(Number(match[1])).padStart(2, '0')}:${
+    match[2] ?? match[3] ?? '00'
+  }`;
+}
+
+function currentTurnSuccessfulAvailabilitySlots(
+  toolTrace: ToolTraceLike[]
+): Set<string> {
+  const turns = toolTrace
+    .map((entry) => entry.userTurn)
+    .filter((turn): turn is number => Number.isInteger(turn));
+  const currentTurn = turns.length > 0 ? Math.max(...turns) : null;
+  const slots = new Set<string>();
+
+  for (const entry of toolTrace) {
+    // O runtime real constrói o trace por chamada de getReply, então todos os
+    // itens já pertencem ao turno atual. Na reauditoria, ignorar qualquer slot
+    // de turno anterior impede a resposta de reciclar disponibilidade velha.
+    if (currentTurn !== null && entry.userTurn !== currentTurn) continue;
+    if (entry.name !== 'getAvailableSlots') continue;
+
+    try {
+      const parsed = JSON.parse(entry.result) as {
+        success?: unknown;
+        slots?: unknown;
+      };
+      if (parsed.success !== true || !Array.isArray(parsed.slots)) continue;
+      for (const slot of parsed.slots) {
+        const normalized = normalizeAvailabilitySlot(slot);
+        if (normalized) slots.add(normalized);
+      }
+    } catch {
+      // Resposta de tool inválida não licencia disponibilidade.
+    }
+  }
+
+  return slots;
+}
+
+const AVAILABILITY_POSITIVE_CUE_RE =
+  /\b(?:tenho|tem|temos|ha|existem|encontrei|achei|posso\s+(?:te\s+)?oferecer|disponiveis?|livres?|vagas?)\b/;
+const AVAILABILITY_NEGATIVE_CUE_RE =
+  /\b(?:nao|sem)\s+(?:temos?|ha|horarios?|vagas?|disponibilidade)|\b(?:indisponiveis?|ocupad[oa]s?|esgotad[oa]s?)\b/;
+const OPERATING_HOURS_CUE_RE =
+  /\b(?:horario\s+de\s+funcionamento|horario\s+comercial|expediente|funcionamos|funciona|atendemos|atendimento|abrimos|fechamos|aberto)\b/;
+
+/**
+ * Extrai apenas horários apresentados como oferta de disponibilidade. A regra
+ * é deliberadamente estreita: duração, preço, horário de funcionamento,
+ * pergunta ao cliente e negativa de disponibilidade não são ofertas e não
+ * devem derrubar uma resposta correta.
+ */
+function offeredAvailabilitySlots(reply: string): string[] {
+  const normalized = normalizeClaimText(reply);
+  if (!normalized) return [];
+
+  const offered = new Set<string>();
+  const sentences = normalized.match(/[^.!?\n]+[.!?\n]?/g) ?? [normalized];
+
+  for (const sentenceValue of sentences) {
+    const sentence = sentenceValue.trim();
+    if (!sentence || sentence.endsWith('?')) continue;
+
+    // Um contraste pode conter uma negativa legítima seguida de uma oferta
+    // válida: "não temos 09:00, mas temos 10:30". Cada lado é analisado
+    // sozinho para não licenciar nem bloquear o horário errado.
+    const segments = sentence.split(/\b(?:mas|porem|contudo|entretanto)\b/);
+    for (const rawSegment of segments) {
+      const segment = rawSegment.trim();
+      const times = mentionedTimes(segment);
+      if (times.length === 0) continue;
+      if (OPERATING_HOURS_CUE_RE.test(segment)) continue;
+      if (AVAILABILITY_NEGATIVE_CUE_RE.test(segment)) continue;
+      if (!AVAILABILITY_POSITIVE_CUE_RE.test(segment)) continue;
+
+      // "dura 60 min" nem entra em mentionedTimes; esta guarda adicional
+      // torna explícito que duração/preço não são disponibilidade mesmo se a
+      // frase contiver um horário em outro contexto.
+      if (/\b(?:dura(?:cao)?|duracao|preco|valor|r\$)\b/.test(segment)) {
+        continue;
+      }
+
+      for (const time of times) offered.add(time);
+    }
+  }
+
+  return [...offered];
+}
+
+/**
+ * Uma oferta concreta de horário é uma afirmação operacional. Só pode seguir
+ * para o WhatsApp se `getAvailableSlots` tiver respondido `success:true` NO
+ * TURNO ATUAL e contiver cada horário citado. Falta de tool, falha da tool ou
+ * divergência de slots bloqueiam fail-closed; não usamos histórico, prompt ou
+ * uma disponibilidade consultada em turno anterior como evidência.
+ */
+export function hasUnverifiedAvailabilityClaim(
+  reply: string,
+  toolTrace: ToolTraceLike[]
+): boolean {
+  const offered = offeredAvailabilitySlots(reply);
+  if (offered.length === 0) return false;
+
+  const verified = currentTurnSuccessfulAvailabilitySlots(toolTrace);
+  return offered.some((slot) => !verified.has(slot));
 }
 
 function mentionedDates(
@@ -546,6 +675,9 @@ export function inspectCustomerReply(
   }
   if (hasFalseWriteClaim(reply, toolTrace)) {
     reasons.add('false_write_claim');
+  }
+  if (hasUnverifiedAvailabilityClaim(reply, toolTrace)) {
+    reasons.add('unverified_availability');
   }
 
   for (const service of servicesResult.services ?? []) {

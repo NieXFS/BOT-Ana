@@ -91,11 +91,11 @@ export function offeredTimes(text: string): string[] {
   let offerContinuesIntoNextSegment = false;
   for (const segment of segments) {
     const hasOfferCue =
-      /(dispon[ií]ve|hor[aá]rios? (?:livres?|dispon[ií]ve|são)|tenho|opç(?:ão|ões)|alternativ|posso oferecer|qual (?:deles|hor[aá]rio))/i.test(
+      /(dispon[ií]ve|hor[aá]rios? (?:livres?|dispon[ií]ve|são)|tenho|temos|opç(?:ão|ões)|alternativ|posso oferecer|qual (?:deles|hor[aá]rio))/i.test(
         segment
       );
     const hasUnavailableCue =
-      /(indispon[ií]ve|preenchid|ocupad|acabou|sem vaga|não está dispon|nao esta dispon)/i.test(
+      /(indispon[ií]ve|preenchid|ocupad|acabou|sem vaga|n[aã]o temos|não está dispon|nao esta dispon)/i.test(
         segment
       );
     const times = normalizeMentionedTimes(segment);

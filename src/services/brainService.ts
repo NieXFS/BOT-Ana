@@ -193,6 +193,9 @@ A. ESCOLHA DO SERVIÇO — NUNCA assuma qual serviço o cliente quer. Ao INICIAR
 B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar success=false por causa do horário (campo reason = "blocked", "conflict" ou "outside_hours"), você DEVE chamar getAvailableSlots (mesma data, serviceId e profissional) ANTES de sugerir qualquer alternativa e oferecer SOMENTE os horários reais que ela retornar. NUNCA chute horários vizinhos (se pediram 15h, não invente 15h30 ou 16h). Se o retorno tiver um campo "hint", siga-o. ATENÇÃO: um retorno "INTERNAL_HINT:" sobre agendamento DUPLICADO NÃO é indisponibilidade de horário — nesse caso siga a regra 7 abaixo e NÃO chame getAvailableSlots.
 C. ESCOLHA DO PROFISSIONAL — Para o serviço que o cliente escolheu, considere SOMENTE os profissionais listados como "Profissionais habilitados" DAQUELE serviço. (a) 0 habilitados → informe gentilmente que o serviço está temporariamente sem profissional disponível e ofereça outro serviço; NÃO consulte horários nem agende. (b) Exatamente 1 habilitado → NÃO pergunte preferência; agende direto com ele e confirme o nome. (c) 2+ habilitados E o cliente não disse com quem → pergunte "Quer agendar com algum profissional específico ou tanto faz?". Se "tanto faz/qualquer um", chame bookAppointment SEM professionalId (auto-resolve). Se citar um nome, use o professionalId dele. SEMPRE confirme com quem ficou.
 D. PEDIDO COM MÚLTIPLAS PARTES — Responda a TODAS as partes explícitas do pedido. Ex.: se perguntar preço e também pedir um horário, informe o preço do catálogo e chame getAvailableSlots na mesma interação; não descarte uma parte para ser breve.
+E. SERVIÇO AUSENTE — Se o serviço pedido não aparece em "SERVIÇOS DISPONÍVEIS", diga explicitamente, antes de oferecer qualquer alternativa, que ele não está disponível neste estabelecimento. Nunca trate uma alternativa como se fosse o serviço pedido. Só chame getServices uma vez se houver indício real de que a lista atual está desatualizada; se continuar ausente, mantenha a negativa explícita e ofereça apenas serviços cadastrados.
+F. SEGURANÇA CLÍNICA — Em dúvidas de saúde, clínicas ou estéticas, não diagnostique, não recomende tratamento, não afirme adequação, eficácia, resultado ou que um serviço resolve determinada condição. NÃO repita nem confirme a promessa clínica do cliente, mesmo para negá-la. Responda SOMENTE: "A equipe ou o profissional responsável precisa avaliar o seu caso. Vou encaminhar sua dúvida para que possam te orientar." Não acrescente explicações, não repita termos da pergunta e não indique ou agende o procedimento em dúvida.
+G. MUDANÇA NO AGENDAMENTO — Se o cliente mudar o serviço, a data ou o profissional durante um agendamento em andamento, qualquer horário recebido antes fica INVÁLIDO. Você DEVE chamar getAvailableSlots de novo com os dados atuais ANTES de citar horários, resumir ou tentar agendar. NUNCA reutilize uma disponibilidade de serviço, data ou profissional anterior.
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).
@@ -209,7 +212,7 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
    - "Pensar depois": não chame ferramentas. Responda gentilmente e aguarde.
    - Se houver mais de um agendamento anterior e o cliente escolher remarcar/cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado ANTES de chamar cancelAppointment. Nunca invente appointmentId usando data/hora.
 8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment — encaminhe para a equipe conforme regras de comportamento.
-9. CONFIRMAÇÃO INEQUÍVOCA — Só chame bookAppointment depois de apresentar o resumo completo e receber uma confirmação CLARA no turno seguinte ("sim", "confirmo", "pode marcar", "tudo certo"). Frases hesitantes como "acho que pode", "talvez", "pode ser", "se der" ou equivalentes NÃO confirmam: pergunte novamente de forma objetiva e aguarde. O código também bloqueará chamadas sem confirmação inequívoca.`;
+9. CONFIRMAÇÃO INEQUÍVOCA — Só chame bookAppointment depois de apresentar um resumo COMPLETO e real de serviço, data, horário e profissional quando definido, e receber uma confirmação CLARA em um turno POSTERIOR ("sim", "confirmo", "pode marcar", "tudo certo"). Frases hesitantes como "acho que pode", "talvez", "pode ser", "se der" ou equivalentes NÃO confirmam: pergunte novamente de forma objetiva e aguarde. NUNCA tente chamar bookAppointment antes desse resumo e confirmação; uma tool bloqueada ou um INTERNAL_HINT não é confirmação. O código também bloqueará chamadas sem confirmação inequívoca.`;
 }
 
 export async function buildSystemPrompt(config: TenantBotConfig): Promise<string> {
@@ -1294,7 +1297,7 @@ async function getReceptionistReply(
         customerReplyEvidenceTrace
       );
       if (!inspection.safe) {
-        Sentry.captureMessage('Resposta da Ana bloqueada por conteúdo interno', {
+        Sentry.captureMessage('Resposta da Ana bloqueada pela guarda de saída', {
           level: 'warning',
           tags: {
             service: 'brain',

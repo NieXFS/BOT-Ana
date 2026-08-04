@@ -4,6 +4,7 @@ import {
   buildSafeRecoveryReply,
   buildSafeWriteConfirmation,
   hasFalseWriteClaim,
+  hasUnverifiedAvailabilityClaim,
   inspectCustomerReply,
   normalizeCustomerReplyStyle,
 } from '../src/services/customerReplyGuard';
@@ -36,8 +37,93 @@ assert.deepEqual(
     'Tenho horários às 9h e 10h30 com a Júlia. Qual você prefere?',
     services
   ),
-  { safe: true, reasons: [] }
+  { safe: false, reasons: ['unverified_availability'] }
 );
+
+const currentAvailabilityTrace = [
+  {
+    userTurn: 3,
+    name: 'getAvailableSlots',
+    result: JSON.stringify({ success: true, slots: ['09:00', '10:30', '15:00'] }),
+  },
+];
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Para amanhã, temos horários disponíveis às 09:00, 10:30 e 15:00. Qual você prefere?',
+    services,
+    [],
+    currentAvailabilityTrace
+  ),
+  { safe: true, reasons: [] },
+  'getAvailableSlots success:true do turno atual licencia os horários concretos retornados'
+);
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Para amanhã, temos horários disponíveis às 09:00 e 10:30.',
+    services,
+    [],
+    [
+      {
+        userTurn: 3,
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: true, slots: ['10:30', '15:00'] }),
+      },
+    ]
+  ),
+  { safe: false, reasons: ['unverified_availability'] },
+  'slot citado que não veio no resultado atual bloqueia fail-closed'
+);
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Tenho horário às 09:00 amanhã.',
+    services,
+    [],
+    [
+      {
+        userTurn: 3,
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: false, message: 'indisponível' }),
+      },
+    ]
+  ),
+  { safe: false, reasons: ['unverified_availability'] },
+  'falha de getAvailableSlots nunca licencia oferta'
+);
+
+assert.equal(
+  hasUnverifiedAvailabilityClaim(
+    'Temos horário às 09:00 amanhã.',
+    [
+      {
+        userTurn: 2,
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: true, slots: ['09:00'] }),
+      },
+      {
+        userTurn: 3,
+        name: 'getServices',
+        result: JSON.stringify({ success: true }),
+      },
+    ]
+  ),
+  true,
+  'disponibilidade de turno anterior não licencia oferta após mudança de contexto'
+);
+
+for (const reply of [
+  'Não temos horário às 09:00 amanhã.',
+  'O procedimento dura 60 min.',
+  'Nosso horário de funcionamento é das 08:00 às 18:00.',
+]) {
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(reply, []),
+    false,
+    `negação, duração e horário de funcionamento não são oferta: ${reply}`
+  );
+}
 
 assert.deepEqual(
   inspectCustomerReply(
@@ -274,6 +360,31 @@ for (const reply of safeWithoutWriteClaims) {
   );
 }
 
+assert.equal(
+  hasFalseWriteClaim(
+    'Pode ser que o horário de quarta não tenha sido confirmado no sistema, ou que já tenha sido cancelado antes.',
+    failedWriteTrace
+  ),
+  false,
+  'hipótese com “pode ser que” não deve ser tratada como escrita concluída'
+);
+assert.equal(
+  hasFalseWriteClaim(
+    'Talvez o horário de quarta já tenha sido cancelado antes.',
+    failedWriteTrace
+  ),
+  false,
+  'hipótese com “talvez” não deve ser tratada como escrita concluída'
+);
+assert.equal(
+  hasFalseWriteClaim(
+    'O horário de quarta já foi cancelado.',
+    failedWriteTrace
+  ),
+  true,
+  'afirmação positiva de cancelamento sem sucesso da tool continua bloqueada'
+);
+
 const successfulBookTrace = [
   {
     name: 'bookAppointment',
@@ -399,5 +510,5 @@ assert.equal(
 );
 
 console.log(
-  `✅ smoke customer reply guard: leaks, state×read evidence, act×write evidence, ${permanentActRegressions.length} permanent act regressions, ${falseWriteClaims.length} additional false claims, polarity and recovery`
+  `✅ smoke customer reply guard: leaks, state×read evidence, act×write evidence, availability×current-turn evidence, ${permanentActRegressions.length} permanent act regressions, ${falseWriteClaims.length} additional false claims, polarity and recovery`
 );

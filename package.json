@@ -20,6 +20,8 @@
     "smoke:outside-hours-throttle": "npx tsx scripts/smoke-outside-hours-throttle.ts",
     "smoke:services-block-eligibility": "npx tsx scripts/smoke-services-block-eligibility.ts",
     "smoke:receptionist-provider": "ts-node -T scripts/smoke-receptionist-provider.ts",
+    "smoke:receptionist-prompt-guards": "npx tsx scripts/smoke-receptionist-prompt-guards.ts",
+    "smoke:ana-benchmark-detectors": "npx tsx scripts/smoke-ana-benchmark-detectors.ts",
     "smoke:booking-confirmation-gate": "ts-node -T scripts/smoke-booking-confirmation-gate.ts",
     "smoke:customer-reply-guard": "ts-node -T scripts/smoke-customer-reply-guard.ts",
     "smoke:cancel-appointment-guard": "ts-node -T scripts/smoke-cancel-appointment-guard.ts",

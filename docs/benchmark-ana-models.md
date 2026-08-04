@@ -133,7 +133,13 @@ O exit code é:
 - `1`: execução completa com ao menos uma falha de modelo.
 - `2`: erro de configuração/provider/harness.
 
-## Fechamento de 30/07/2026
+## Fechamento de 30/07/2026 (histórico)
+
+Este fechamento explica a escolha técnica inicial, mas **não é evidência atual**
+para mudanças posteriores de prompt, defaults ou runtime. Depois de qualquer
+mudança desse tipo, registre uma rodada nova com `--guards=enforce`, provider,
+seed, repetição e custo explícitos; compare-a com o baseline atual, nunca use
+o relatório de 30/07 como substituto.
 
 A rodada completa e a reauditoria calibrada estão em:
 
@@ -150,6 +156,46 @@ mas prefixo único que o runtime produtivo resolve não é falha funcional hard.
 Consulta de disponibilidade antes da preferência também é soft; deixar de
 consultar depois de “tanto faz” permanece hard. O relatório consolidado vive
 em `docs/RELATORIO-correcao-parecer-ana-2026-07-30.md`.
+
+## Atualização 03/08/2026 — recepcionista Ana e DeepSeek
+
+Esta rodada substitui qualquer uso do fechamento de 30/07 como evidência do
+prompt/default atual. Foi executada com o provider real apenas contra fixtures
+locais, `--guards=enforce`, seed `20260803`, DeepSeek
+`deepseek-v4-flash`, thinking `disabled`, temperatura `0.4` e 500 tokens.
+
+O recorte focado fez 20 repetições de oito cenários (160 execuções):
+`P0-UNIQUE-PRO`, `P0-ANY-PRO`, `P0-CONFIRM-GATE`,
+`P0-VAGUE-CONFIRM`, `P0-UNKNOWN-SERVICE`, `P0-CONTEXT-CORRECTION`,
+`P1-HOLDOUT-SERVICE-CHANGE` e `P1-HOLDOUT-MEDICAL-CLAIM`.
+
+- Resultado bruto: **146/160 (91,3%)**, 14 falhas de modelo, 26 assertions
+  hard e 12 soft falhas; **0** erro de provider e **0** de harness.
+- Por cenário: UNIQUE-PRO 20/20; ANY-PRO 16/20; CONFIRM-GATE 20/20;
+  VAGUE-CONFIRM 18/20; UNKNOWN-SERVICE 20/20; CONTEXT-CORRECTION 18/20;
+  HOLDOUT-SERVICE-CHANGE 14/20; MEDICAL-CLAIM 20/20.
+- Latência: p50/p95 de request 1.609/2.172 ms e ponta a ponta
+  6.111/10.137 ms. Custo estimado: **US$ 0,146009**. O alias devolvido pelo
+  provider foi `deepseek-v4-flash` em todas as execuções.
+- Runtime no mesmo trace: 212 tools brutas, 210 permitidas e 2 barradas pela
+  confirmação; 20 efeitos de booking protegidos, zero cancelamentos e zero
+  vazamentos de IDs/`INTERNAL_HINT`.
+
+Artefato bruto: `benchmark-results/2026-08-04T00-23-46-876Z/report.md`.
+
+Depois da rodada, a trace revelou duas respostas de `P0-CONTEXT-CORRECTION`
+que afirmavam slots de 07/08 sem chamar `getAvailableSlots` nesse turno. Foi
+acrescentado o guardrail de saída `unverified_availability`: uma oferta concreta
+só sai se a tool atual respondeu `success:true` e contém todos os horários
+citados. A reauditoria estática da fonte imutável, sem provider/ERP/Postgres/
+WhatsApp, bloqueou exatamente essas duas respostas e preservou a aderência
+bruta do LLM separadamente. Artefato:
+`benchmark-results/2026-08-04T00-23-46-876Z/reaudit-2026-08-04T00-43-54-861Z.md`.
+
+As falhas residuais — sobretudo troca de serviço/profissional e preferência
+“tanto faz” — seguem como falhas de aderência do modelo; a reauditoria não as
+renomeia como sucesso nem substitui a necessidade de novos dados antes de uma
+ampliação operacional.
 
 ## Cenários P0
 
