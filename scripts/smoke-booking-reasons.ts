@@ -4,8 +4,10 @@
  *  - Falha 1 (desambiguação de serviço): getAvailableSlots/bookAppointment SEM
  *    serviceId devolvem INTERNAL_HINT orientando a perguntar qual serviço; e o
  *    system prompt tem a regra de fluxo "ESCOLHA DO SERVIÇO".
- *  - Falha 2 (sempre consultar horários após falha): o system prompt tem a regra
- *    "HORÁRIO INDISPONÍVEL" e as falhas de book carregam um `hint`.
+ *  - Falha 2 (alternativas após falha): erro de horário qualificado devolve
+ *    `availableSlots` já consultados pelo calendário e não pede nova consulta;
+ *    lista vazia não tem alternativa. Sem `availableSlots`, hint/consulta ainda
+ *    são o fallback antes de sugerir horário.
  *  - Falha 3 (mensagens por motivo): normalizeBookReason + customerMessageForReason
  *    mapeiam blocked/conflict/outside_hours/package_exhausted/other corretamente.
  *
@@ -147,14 +149,37 @@ async function main() {
     brainSrc.includes("HORÁRIO INDISPONÍVEL") && brainSrc.includes("getAvailableSlots"),
   );
   record(
+    "system prompt trata availableSlots qualificado como disponibilidade já consultada (Falha 2)",
+    brainSrc.includes("availableSlots") &&
+      /já consultou a disponibilidade internamente/i.test(brainSrc) &&
+      brainSrc.includes("NÃO chame getAvailableSlots de novo"),
+  );
+  record(
+    "system prompt conserva hint/consulta quando a falha qualificada não traz availableSlots",
+    brainSrc.includes("não trouxer availableSlots, siga o hint e chame getAvailableSlots"),
+  );
+  record(
     "system prompt diferencia duplicidade de indisponibilidade (não chamar getAvailableSlots no fluxo de duplicata)",
     brainSrc.includes("DUPLICADO") || brainSrc.includes("duplicad"),
   );
 
   const calSrc = readFileSync(resolve(here, "../src/services/calendarService.ts"), "utf8");
   record(
-    "falhas de book carregam hint pra consultar horários reais (Falha 2)",
-    calSrc.includes("BOOK_ALTERNATIVES_HINT") && calSrc.includes("ANTES de sugerir qualquer alternativa"),
+    "falhas qualificadas de book carregam availableSlots autoritativos sem requery (Falha 2)",
+    calSrc.includes("availableSlots: alternatives") &&
+      calSrc.includes("já consultados pelo sistema") &&
+      calSrc.includes("NÃO chame getAvailableSlots de novo"),
+  );
+  record(
+    "falha qualificada sem slots mantém fallback de nenhuma alternativa no dia",
+    calSrc.includes("availableSlots: []") &&
+      calSrc.includes("Não há horários reais nesse dia") &&
+      calSrc.includes("ofereça tentar outra data"),
+  );
+  record(
+    "package_exhausted/other não viram disponibilidade e preservam hint de fallback",
+    calSrc.includes("package_exhausted / other: oferecer horários não resolve") &&
+      calSrc.includes("BOOK_ALTERNATIVES_HINT"),
   );
 
   const failed = checks.filter((c) => !c.ok);

@@ -91,11 +91,11 @@ export function offeredTimes(text: string): string[] {
   let offerContinuesIntoNextSegment = false;
   for (const segment of segments) {
     const hasOfferCue =
-      /(dispon[ií]ve|hor[aá]rios? (?:livres?|dispon[ií]ve|são)|tenho|temos|opç(?:ão|ões)|alternativ|posso oferecer|qual (?:deles|hor[aá]rio))/i.test(
+      /(dispon[ií]ve|hor[aá]rios? (?:livres?|dispon[ií]ve|são)|tenho|temos|\btem\s+hor[aá]rios?\b|opç(?:ão|ões)|alternativ|posso oferecer|qual (?:deles|hor[aá]rio))/i.test(
         segment
       );
     const hasUnavailableCue =
-      /(indispon[ií]ve|preenchid|ocupad|acabou|sem vaga|n[aã]o temos|não está dispon|nao esta dispon)/i.test(
+      /(indispon[ií]ve|preenchid|ocupad|acabou|sem vaga|n[aã]o temos|\bn[aã]o tem\s+hor[aá]rios?\b|não está dispon|nao esta dispon)/i.test(
         segment
       );
     const times = normalizeMentionedTimes(segment);
@@ -108,6 +108,78 @@ export function offeredTimes(text: string): string[] {
       !hasUnavailableCue && hasOfferCue && times.length === 0;
   }
   return [...offered];
+}
+
+function normalizeDetectorText(value: string): string {
+  return value
+    .toLocaleLowerCase('pt-BR')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function requestedServicePattern(requestedService: string): string {
+  return normalizeDetectorText(requestedService)
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('\\s+');
+}
+
+function hasConditionalOrUncertainPrefix(
+  normalizedReply: string,
+  matchIndex: number
+): boolean {
+  const sentenceStart = Math.max(
+    normalizedReply.lastIndexOf('.', matchIndex - 1),
+    normalizedReply.lastIndexOf('!', matchIndex - 1),
+    normalizedReply.lastIndexOf('?', matchIndex - 1),
+    normalizedReply.lastIndexOf(';', matchIndex - 1)
+  );
+  const prefix = normalizedReply.slice(sentenceStart + 1, matchIndex);
+
+  return /\b(?:se|caso|talvez|nao\s+sei\s+se|pode\s+ser\s+que|acho\s+que)\b/.test(
+    prefix
+  );
+}
+
+export function deniesRequestedServiceAvailability(
+  reply: string,
+  requestedService: string
+): boolean {
+  const service = requestedServicePattern(requestedService);
+  if (!service) {
+    return false;
+  }
+
+  const requested = `(?:o\\s+|a\\s+)?${service}`;
+  const denialPatterns = [
+    new RegExp(`\\bnao\\s+temos\\s+${requested}\\b`),
+    new RegExp(`\\bnao\\s+oferecemos\\s+${requested}\\b`),
+    new RegExp(`\\bnao\\s+trabalhamos\\s+com\\s+${requested}\\b`),
+    new RegExp(`\\bnao\\s+encontrei\\s+${requested}\\b`),
+    new RegExp(`\\b${requested}\\s+nao\\s+esta\\s+disponivel\\b`),
+    new RegExp(`\\b${requested}\\s+nao\\s+esta\\s+na\\s+(?:nossa\\s+)?lista\\b`),
+    new RegExp(`\\b${requested}\\s+nao\\s+aparece\\b`),
+    new RegExp(
+      `\\b${requested}\\s+nao\\s+(?:e|eh)\\s+(?:um\\s+)?servico\\s+(?:disponivel|oferecido|cadastrado|listado)\\b`
+    ),
+    new RegExp(
+      `\\b${requested}\\s+nao\\s+faz\\s+parte\\s+dos\\s+servicos\\s+oferecidos\\b`
+    ),
+  ];
+
+  const normalizedReply = normalizeDetectorText(reply);
+  return denialPatterns.some((pattern) => {
+    const matches = normalizedReply.matchAll(new RegExp(pattern.source, 'g'));
+    for (const match of matches) {
+      if (!hasConditionalOrUncertainPrefix(normalizedReply, match.index)) {
+        return true;
+      }
+    }
+    return false;
+  });
 }
 
 function claimsBookingSuccess(text: string): boolean {
@@ -879,8 +951,52 @@ export const P0_SCENARIOS: BenchmarkScenario[] = [
       const bookIndex = thirdTurn.findIndex(
         (entry) => entry.name === 'bookAppointment'
       );
-      const slotsIndex = thirdTurn.findIndex(
-        (entry) => entry.name === 'getAvailableSlots'
+      const failedBook = thirdTurn[bookIndex];
+      const failedBookHasAuthoritativeAlternatives = (() => {
+        if (!failedBook) return false;
+        try {
+          const parsed = JSON.parse(failedBook.result) as {
+            success?: unknown;
+            reason?: unknown;
+            availableSlots?: unknown;
+          };
+          const availableSlots = parsed.availableSlots;
+          if (
+            parsed.success !== false ||
+            parsed.reason !== 'conflict' ||
+            !Array.isArray(availableSlots)
+          ) {
+            return false;
+          }
+          return (
+            availableSlots.length === CONFLICT_ALTERNATIVES.length &&
+            availableSlots.every(
+              (slot) =>
+                typeof slot === 'string' &&
+                (CONFLICT_ALTERNATIVES as readonly string[]).includes(slot)
+            ) &&
+            (CONFLICT_ALTERNATIVES as readonly string[]).every((slot) =>
+              availableSlots.includes(slot)
+            )
+          );
+        } catch {
+          return false;
+        }
+      })();
+      const offeredAlternatives = offeredTimes(reply);
+      const mentionedTimes = normalizeMentionedTimes(reply);
+      const hasExactConflictAlternatives =
+        offeredAlternatives.length === CONFLICT_ALTERNATIVES.length &&
+        (CONFLICT_ALTERNATIVES as readonly string[]).every((time) =>
+          offeredAlternatives.includes(time)
+        ) &&
+        offeredAlternatives.every((time) =>
+          (CONFLICT_ALTERNATIVES as readonly string[]).includes(time)
+        );
+      const mentionsOnlyConflictOrAuthoritativeAlternatives = mentionedTimes.every(
+        (time) =>
+          time === '15:00' ||
+          (CONFLICT_ALTERNATIVES as readonly string[]).includes(time)
       );
       return [
         assertion(
@@ -896,9 +1012,13 @@ export const P0_SCENARIOS: BenchmarkScenario[] = [
           run.fixtureState.bookEffects
         ),
         assertion(
-          'failed-book-rechecks-slots',
-          bookIndex >= 0 && slotsIndex > bookIndex,
-          ['bookAppointment', 'getAvailableSlots'],
+          'failed-book-does-not-recheck-authoritative-slots',
+          bookIndex >= 0 &&
+            failedBookHasAuthoritativeAlternatives &&
+            !thirdTurn
+              .slice(bookIndex + 1)
+              .some((entry) => entry.name === 'getAvailableSlots'),
+          'bookAppointment conflict com availableSlots e nenhum getAvailableSlots posterior',
           thirdTurn.map((entry) => entry.name),
           'soft'
         ),
@@ -910,14 +1030,12 @@ export const P0_SCENARIOS: BenchmarkScenario[] = [
         ),
         assertion(
           'failed-book-only-real-alternatives',
-          offeredTimes(reply).length > 0 &&
-            offeredTimes(reply).every((time) =>
-              (CONFLICT_ALTERNATIVES as readonly string[]).includes(time)
-            ),
+          hasExactConflictAlternatives &&
+            mentionsOnlyConflictOrAuthoritativeAlternatives,
           [...CONFLICT_ALTERNATIVES],
           {
-            mentioned: normalizeMentionedTimes(reply),
-            offered: offeredTimes(reply),
+            mentioned: mentionedTimes,
+            offered: offeredAlternatives,
             conflicted: '15:00',
           }
         ),
@@ -1200,9 +1318,7 @@ export const P0_SCENARIOS: BenchmarkScenario[] = [
         ),
         assertion(
           'unknown-service-no-false-availability',
-          /(não temos|não oferecemos|não trabalhamos|não encontrei|não está (?:disponível|na (?:nossa )?lista)|não aparece)/i.test(
-            reply
-          ),
+          deniesRequestedServiceAvailability(reply, 'Botox'),
           'nega disponibilidade de Botox',
           reply
         ),

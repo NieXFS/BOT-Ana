@@ -13,6 +13,7 @@
     "smoke:security": "node scripts/smoke-security.ts",
     "smoke:booking-reasons": "npx tsx scripts/smoke-booking-reasons.ts",
     "smoke:service-gate": "node scripts/smoke-service-gate.ts",
+    "smoke:professional-selection-gate": "npx tsx scripts/smoke-professional-selection-gate.ts",
     "smoke:debounce-flush": "ts-node scripts/smoke-debounce-flush-error.ts",
     "smoke:scrub-message": "ts-node -T scripts/smoke-ana-scrub-message.ts",
     "smoke:erp-token": "ts-node -T scripts/smoke-erp-api-token.ts",

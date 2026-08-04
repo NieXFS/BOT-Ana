@@ -24,6 +24,7 @@ import {
   shouldAskServiceUpfront,
   buildServiceQuestion,
 } from './service-gate';
+import { professionalSelectionGate } from './professional-selection-gate';
 import {
   getSalesReply,
   getSalesReplyFromHistory,
@@ -141,14 +142,14 @@ ${professionals
     if (eligible.length === 1) {
       const only = eligible[0];
       return `${head}
-    Profissional único habilitado: ${only.name} — id: ${only.id}. Agende DIRETO com ele(a); NÃO pergunte preferência de profissional.`;
+    Profissional único habilitado: ${only.name} — id: ${only.id}. Agende DIRETO com ele(a); NÃO pergunte preferência de profissional. Se o cliente MUDAR PARA ESTE SERVIÇO, CHAME getAvailableSlots NO MESMO TURNO antes de citar QUALQUER horário, mesmo que data e profissional já sejam conhecidos.`;
     }
 
     const eligibleList = eligible
       .map((professional) => `${professional.name} — id: ${professional.id}`)
       .join('; ');
     return `${head}
-    Profissionais habilitados: ${eligibleList}`;
+    Profissionais habilitados: ${eligibleList} — OBRIGATÓRIO: com 2+ profissionais, NÃO consulte horários antes de o cliente dizer profissional específico ou "tanto faz". Depois de um nome, use o ID dele; depois de "tanto faz", OMITA professionalId. Após a preferência estar resolvida, se o cliente MUDAR PARA ESTE SERVIÇO, CHAME getAvailableSlots NO MESMO TURNO antes de citar QUALQUER horário, mesmo que data e profissional já sejam conhecidos.`;
   });
 
   return `${header}
@@ -180,7 +181,7 @@ export function buildSystemPromptFromServices(
 
 IDENTIDADE DO ATENDIMENTO: Seu nome é ${botName}. Se houver qualquer conflito com instruções antigas, sempre priorize este nome.
 
-ESTILO DE WHATSAPP: use texto corrido, curto e natural; evite Markdown, bullets e listas numeradas. Quando precisar oferecer as quatro opções de duplicidade, coloque-as em uma única frase curta. Use no máximo 1 emoji. Concisão nunca autoriza pular uma ferramenta obrigatória nem omitir uma parte do pedido.
+ESTILO DE WHATSAPP: use texto corrido, curto e natural; evite Markdown, bullets e listas numeradas. Quando precisar oferecer as quatro opções de duplicidade, coloque-as em uma única frase curta. Use no máximo 1 emoji. Concisão nunca autoriza pular uma ferramenta obrigatória nem omitir uma parte do pedido. NUNCA narre plano, raciocínio, regras internas ou escolha de tool. NÃO escreva "Peeling tem dois profissionais habilitados (Júlia e Marina). Preciso perguntar a preferência antes de consultar horários.", nem "O cliente quer..."/"O cliente pediu...", nem nomes técnicos como getAvailableSlots, bookAppointment, getServices, getUpcomingAppointments ou cancelAppointment. Converta diretamente em fala ao cliente, por exemplo: "Peeling é com Júlia ou Marina. Você prefere uma profissional específica ou tanto faz?"
 
 MENSAGENS DE ATENDENTE HUMANO: No histórico, mensagens que começam com "${HUMAN_ECHO_PREFIX.trim()}" foram enviadas por um ATENDENTE HUMANO da recepção (não por você), enquanto o atendimento estava pausado com uma pessoa. Trate-as como contexto e dê continuidade ao atendimento a partir delas; NUNCA diga "como eu te falei" sobre o que está nessas mensagens (não foi você quem falou) e NÃO repita perguntas que o atendente humano já respondeu.
 
@@ -190,19 +191,19 @@ ${config.systemPrompt}
 
 REGRAS DE FLUXO DE ATENDIMENTO (prioridade máxima, leia primeiro):
 A. ESCOLHA DO SERVIÇO — NUNCA assuma qual serviço o cliente quer. Ao INICIAR um novo agendamento, se a mensagem ATUAL não nomear o serviço com clareza (ex.: "quero marcar", "quero marcar para o dia 31", "quero marcar amanhã", "quero remarcar") E houver mais de um item na lista "SERVIÇOS DISPONÍVEIS", você DEVE listar TODOS os serviços disponíveis de forma NEUTRA (texto natural) e perguntar qual ele deseja ANTES de consultar horários (getAvailableSlots) ou agendar. NÃO faça pergunta direcionada como "quer o mesmo serviço de antes?" nem cite só um serviço — apresente as opções e deixe o cliente escolher. NUNCA reaproveite o serviço de um agendamento JÁ CONCLUÍDO, de mensagens antigas ou do histórico desta conversa — cada NOVO pedido recomeça perguntando o serviço (o fato de o cliente ter marcado/citado Depilação antes NÃO significa que o próximo agendamento também é Depilação). Exceção: durante um agendamento EM ANDAMENTO, mantenha o serviço que o cliente já escolheu NESSE mesmo fluxo (não repergunte a cada mensagem). Só siga direto, sem perguntar, se existir exatamente UM serviço disponível.
-B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar success=false por causa do horário (campo reason = "blocked", "conflict" ou "outside_hours"), você DEVE chamar getAvailableSlots (mesma data, serviceId e profissional) ANTES de sugerir qualquer alternativa e oferecer SOMENTE os horários reais que ela retornar. NUNCA chute horários vizinhos (se pediram 15h, não invente 15h30 ou 16h). Se o retorno tiver um campo "hint", siga-o. ATENÇÃO: um retorno "INTERNAL_HINT:" sobre agendamento DUPLICADO NÃO é indisponibilidade de horário — nesse caso siga a regra 7 abaixo e NÃO chame getAvailableSlots.
-C. ESCOLHA DO PROFISSIONAL — Para o serviço que o cliente escolheu, considere SOMENTE os profissionais listados como "Profissionais habilitados" DAQUELE serviço. (a) 0 habilitados → informe gentilmente que o serviço está temporariamente sem profissional disponível e ofereça outro serviço; NÃO consulte horários nem agende. (b) Exatamente 1 habilitado → NÃO pergunte preferência; agende direto com ele e confirme o nome. (c) 2+ habilitados E o cliente não disse com quem → pergunte "Quer agendar com algum profissional específico ou tanto faz?". Se "tanto faz/qualquer um", chame bookAppointment SEM professionalId (auto-resolve). Se citar um nome, use o professionalId dele. SEMPRE confirme com quem ficou.
+B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar JSON success=false, reason exatamente "blocked", "conflict" ou "outside_hours" E uma lista availableSlots, o calendário JÁ consultou a disponibilidade internamente: NÃO chame getAvailableSlots de novo. Ofereça SOMENTE os valores exatos de availableSlots; se a lista vier vazia, não há alternativa naquele dia — ofereça tentar outra data, sem inventar horário. message e hint nunca são horários. Se essa falha qualificada não trouxer availableSlots, siga o hint e chame getAvailableSlots (mesma data, serviceId e profissional) ANTES de sugerir qualquer alternativa. NUNCA chute horários vizinhos (se pediram 15h, não invente 15h30 ou 16h). ATENÇÃO: um retorno "INTERNAL_HINT:" sobre agendamento DUPLICADO NÃO é indisponibilidade de horário — nesse caso siga a regra 7 abaixo e NÃO chame getAvailableSlots.
+C. ESCOLHA DO PROFISSIONAL — Para o serviço que o cliente escolheu, considere SOMENTE os profissionais listados como "Profissionais habilitados" DAQUELE serviço. (a) 0 habilitados → informe gentilmente que o serviço está temporariamente sem profissional disponível e ofereça outro serviço; NÃO consulte horários nem agende. (b) Exatamente 1 habilitado → NÃO pergunte preferência; use o ID desse profissional e siga direto. (c) 2+ habilitados E o cliente não disse com quem → pergunte "Profissional específico ou tanto faz?" e NÃO chame getAvailableSlots nem bookAppointment antes da resposta. Se "tanto faz/qualquer um", chame getAvailableSlots/bookAppointment SEM professionalId (auto-resolve). Se citar um nome, use o professionalId técnico EXATO dele. SEMPRE confirme com quem ficou.
 D. PEDIDO COM MÚLTIPLAS PARTES — Responda a TODAS as partes explícitas do pedido. Ex.: se perguntar preço e também pedir um horário, informe o preço do catálogo e chame getAvailableSlots na mesma interação; não descarte uma parte para ser breve.
 E. SERVIÇO AUSENTE — Se o serviço pedido não aparece em "SERVIÇOS DISPONÍVEIS", diga explicitamente, antes de oferecer qualquer alternativa, que ele não está disponível neste estabelecimento. Nunca trate uma alternativa como se fosse o serviço pedido. Só chame getServices uma vez se houver indício real de que a lista atual está desatualizada; se continuar ausente, mantenha a negativa explícita e ofereça apenas serviços cadastrados.
 F. SEGURANÇA CLÍNICA — Em dúvidas de saúde, clínicas ou estéticas, não diagnostique, não recomende tratamento, não afirme adequação, eficácia, resultado ou que um serviço resolve determinada condição. NÃO repita nem confirme a promessa clínica do cliente, mesmo para negá-la. Responda SOMENTE: "A equipe ou o profissional responsável precisa avaliar o seu caso. Vou encaminhar sua dúvida para que possam te orientar." Não acrescente explicações, não repita termos da pergunta e não indique ou agende o procedimento em dúvida.
-G. MUDANÇA NO AGENDAMENTO — Se o cliente mudar o serviço, a data ou o profissional durante um agendamento em andamento, qualquer horário recebido antes fica INVÁLIDO. Você DEVE chamar getAvailableSlots de novo com os dados atuais ANTES de citar horários, resumir ou tentar agendar. NUNCA reutilize uma disponibilidade de serviço, data ou profissional anterior.
+G. MUDANÇA NO AGENDAMENTO — Se o cliente mudar o serviço, a data ou o profissional durante um agendamento em andamento, qualquer horário recebido antes fica INVÁLIDO. Você DEVE chamar getAvailableSlots DE NOVO NO MESMO TURNO com os dados atuais ANTES de citar horários, resumir ou tentar agendar, MESMO que os horários antigos pareçam coincidir. NUNCA reutilize uma disponibilidade de serviço, data ou profissional anterior.
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).
 2. serviceId e professionalId são IDs TÉCNICOS retornados na lista acima (formato cuid, ex: "cmnpffkiq000vl16krhv4ifzg"). Nunca são nomes legíveis ("depilacao", "samantha", "seed-svc-..."). Se o cliente diz "com a Samantha", encontre o ID dela na lista acima.
 3. Se algum exemplo de ID aparecer em qualquer instrução anterior (incluindo nomes que comecem com "seed-"), IGNORE — são placeholders, não IDs reais. Use SOMENTE IDs da lista "SERVIÇOS DISPONÍVEIS" / "PROFISSIONAIS DISPONÍVEIS" acima.
 4. Se a ferramenta retornar erro de "Serviço não encontrado", chame getServices uma vez pra atualizar e use o ID exato retornado.
-5. FONTE DA VERDADE — Os horários retornados por getAvailableSlots são a única fonte da verdade sobre disponibilidade. Se o cliente pedir um horário que ESTÁ na lista (incluindo variações como "15h" = "15:00", "15h30" = "15:30", "às 8 da manhã" = "08:00"), prossiga DIRETO para a confirmação do agendamento. NUNCA, EM HIPÓTESE ALGUMA, invente que está ocupado se o horário aparece na lista retornada pela ferramenta. Só diga que está indisponível se a ferramenta retornar erro 409 explicitamente.
+5. FONTE DA VERDADE — Há SOMENTE duas fontes de disponibilidade: (a) getAvailableSlots com JSON success:true e slots; ou (b) bookAppointment com JSON success:false, reason exatamente "blocked", "conflict" ou "outside_hours" e availableSlots. No caso (b), availableSlots já veio de uma consulta interna do calendário: não chame getAvailableSlots novamente e ofereça SOMENTE os valores exatos recebidos; lista vazia significa que não há alternativa naquele dia. message, hint, package_exhausted, other, bookAppointment success:true, slots inválidos e dados de outro turno NÃO são disponibilidade. Sem uma dessas fontes com o slot exato, siga o hint e consulte getAvailableSlots antes de oferecer alternativa. Se o cliente pedir um horário que ESTÁ na lista autoritativa (incluindo variações como "15h" = "15:00", "15h30" = "15:30", "às 8 da manhã" = "08:00"), prossiga DIRETO para a confirmação do agendamento. NUNCA, EM HIPÓTESE ALGUMA, invente que está ocupado se o horário aparece na lista autoritativa.
 6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. NÃO responda ao cliente, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente em nenhuma forma.
  7. DETECÇÃO DE AGENDAMENTO EXISTENTE — Quando bookAppointment retornar INTERNAL_HINT informando que o cliente já tem agendamento(s) futuro(s), NÃO crie o novo ainda. Pergunte ao cliente conforme as opções listadas no hint. Aguarde a resposta. Agir conforme:
     - "Manter os dois": chame bookAppointment de novo com confirmedDuplicate=true e os mesmos demais parâmetros.
@@ -212,7 +213,9 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
    - "Pensar depois": não chame ferramentas. Responda gentilmente e aguarde.
    - Se houver mais de um agendamento anterior e o cliente escolher remarcar/cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado ANTES de chamar cancelAppointment. Nunca invente appointmentId usando data/hora.
 8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment — encaminhe para a equipe conforme regras de comportamento.
-9. CONFIRMAÇÃO INEQUÍVOCA — Só chame bookAppointment depois de apresentar um resumo COMPLETO e real de serviço, data, horário e profissional quando definido, e receber uma confirmação CLARA em um turno POSTERIOR ("sim", "confirmo", "pode marcar", "tudo certo"). Frases hesitantes como "acho que pode", "talvez", "pode ser", "se der" ou equivalentes NÃO confirmam: pergunte novamente de forma objetiva e aguarde. NUNCA tente chamar bookAppointment antes desse resumo e confirmação; uma tool bloqueada ou um INTERNAL_HINT não é confirmação. O código também bloqueará chamadas sem confirmação inequívoca.`;
+9. CONFIRMAÇÃO INEQUÍVOCA — Só chame bookAppointment depois de apresentar um resumo COMPLETO e real de serviço, data, horário e profissional quando definido, e receber uma confirmação CLARA em um turno POSTERIOR ("sim", "confirmo", "pode marcar", "tudo certo"). Após esse resumo COMPLETO anterior, "pode sim", "tá bom", "ta bom" e "pode ser sim" são confirmações CLARAS: DEVE CHAMAR bookAppointment. Frases hesitantes como "acho que pode", "talvez", "pode ser" SOZINHO, "se der" ou equivalentes NÃO confirmam: pergunte novamente de forma objetiva e aguarde. NUNCA tente chamar bookAppointment antes desse resumo e confirmação; uma tool bloqueada ou um INTERNAL_HINT não é confirmação. NUNCA diga que o agendamento foi confirmado, marcado ou agendado antes de bookAppointment retornar success:true. O código também bloqueará chamadas sem confirmação inequívoca.
+
+CHECKLIST FINAL DE DISPONIBILIDADE (ANTES DE ENVIAR QUALQUER RESPOSTA): Toda resposta que cite horário concreto COMO DISPONIBILIDADE exige uma fonte autoritativa NESTE TURNO: getAvailableSlots com success:true e slots, OU bookAppointment com success:false, reason exatamente blocked/conflict/outside_hours e availableSlots. No segundo caso, ofereça SOMENTE os valores exatos de availableSlots e NÃO chame getAvailableSlots de novo; lista vazia significa que não há alternativa naquele dia. Sem uma dessas fontes — inclusive se a falha não trouxer availableSlots — NÃO escreva horários como disponíveis: siga o hint e chame getAvailableSlots antes de oferecer alternativa. Se serviço, data ou profissional mudaram, a regra G exige getAvailableSlots fresco no mesmo turno. Preço, duração e horário de funcionamento NÃO são disponibilidade; responda-os normalmente com os dados atuais.`;
 }
 
 export async function buildSystemPrompt(config: TenantBotConfig): Promise<string> {
@@ -303,7 +306,7 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
     function: {
       name: 'getAvailableSlots',
       description:
-        'Consulta os horários disponíveis para um serviço específico em uma data específica, com opção de profissional',
+        'Consulta horários disponíveis REAIS para um serviço e data específicos. Com 2+ profissionais habilitados, NÃO chame antes de o cliente escolher um profissional específico ou dizer "tanto faz"; após qualquer correção de data, serviço ou profissional, chame de novo no mesmo turno, mesmo que slots antigos coincidam.',
       parameters: {
         type: 'object',
         properties: {
@@ -320,7 +323,7 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
           professionalId: {
             type: 'string',
             description:
-              "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
+              "ID técnico do profissional (formato cuid) listado para ESTE serviço no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Com 2+ habilitados, só chame depois da preferência: após nome, preencha o ID dele; após 'tanto faz'/'qualquer um', OMITA este campo. Com 1 habilitado, use o ID do profissional único.",
           },
         },
         required: ['date', 'serviceId'],
@@ -345,7 +348,7 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
     function: {
       name: 'bookAppointment',
       description:
-        'Agenda um horário no ERP. O telefone e o nome do cliente são preenchidos automaticamente pelo sistema.',
+        'Agenda um horário no ERP. O telefone e o nome do cliente são preenchidos automaticamente pelo sistema. Só chame DEPOIS de um resumo completo e real e de confirmação clara em turno POSTERIOR. Após esse resumo, "pode sim", "tá bom", "ta bom" e "pode ser sim" são confirmações claras: CHAME bookAppointment; escolher horário não confirma, e "acho que pode", "pode ser" SOZINHO, "talvez" ou "se der" NÃO autorizam chamada. NUNCA diga que o agendamento foi confirmado, marcado ou agendado antes de bookAppointment retornar success:true.',
       parameters: {
         type: 'object',
         properties: {
@@ -363,7 +366,7 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
           professionalId: {
             type: 'string',
             description:
-              "ID técnico do profissional (formato cuid) listado em PROFISSIONAIS DISPONÍVEIS no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). OMITA este campo quando o cliente NÃO escolheu um profissional (disse 'tanto faz', 'qualquer um' ou não mencionou) — o sistema escolhe automaticamente um profissional livre. Só preencha quando o cliente especificar o profissional pelo nome.",
+              "ID técnico do profissional (formato cuid) listado para ESTE serviço no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Com 2+ habilitados, depois de um nome use o ID dele; depois de 'tanto faz'/'qualquer um', OMITA este campo. Com 1 habilitado, use o ID do profissional único.",
           },
           confirmedDuplicate: {
             type: 'boolean',
@@ -409,6 +412,14 @@ async function executeFunction(
   conversationKey: string
 ): Promise<string> {
   try {
+    // O trace do loop preserva `args` como o modelo os enviou. Se um prefixo de
+    // profissional for globalmente unívoco, o gate devolve o ID canônico só
+    // para a I/O efetiva abaixo — nunca reescrevemos a tentativa bruta.
+    let effectiveProfessionalId =
+      typeof args.professionalId === 'string'
+        ? args.professionalId
+        : undefined;
+
     // GUARDRAIL B (gate determinístico de serviço): antes de consultar horários
     // ou agendar, se o tenant tem 2+ serviços, o serviço escolhido precisa estar
     // ancorado numa escolha EXPLÍCITA recente do cliente — não no histórico. Se
@@ -441,6 +452,30 @@ async function executeFunction(
       }
     }
 
+    // GUARDRAIL D (seleção de profissional): vem DEPOIS da validação de
+    // serviço e ANTES de qualquer I/O de calendário. O gate só confia nas
+    // mensagens do cliente na intenção recente; não deixa uma resposta da Ana
+    // inventar/reciclar preferência, nem aceita a profissional antiga após a
+    // troca de serviço. Também canonicaliza um prefixo globalmente unívoco.
+    if (
+      functionName === 'getAvailableSlots' ||
+      functionName === 'bookAppointment'
+    ) {
+      const selection = professionalSelectionGate({
+        serviceId: String(args.serviceId ?? ''),
+        professionalId: effectiveProfessionalId,
+        servicesResult,
+        userMessages,
+      });
+      if (!selection.ok) {
+        console.log(
+          `🚧 ${config.botName} gate de profissional bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId} reason=${selection.reason}`
+        );
+        return JSON.stringify({ success: false, message: selection.hintMessage });
+      }
+      effectiveProfessionalId = selection.effectiveProfessionalId;
+    }
+
     switch (functionName) {
       case 'getServices': {
         const result = await getServices(config);
@@ -451,7 +486,7 @@ async function executeFunction(
           String(args.date ?? ''),
           String(args.serviceId ?? ''),
           config,
-          typeof args.professionalId === 'string' ? args.professionalId : undefined
+          effectiveProfessionalId
         );
         return JSON.stringify(result);
       }
@@ -465,10 +500,7 @@ async function executeFunction(
         const shouldBypassDuplicateCheck =
           args.confirmedDuplicate === true || cancellationEvidence !== null;
         const serviceId = String(args.serviceId ?? '');
-        const professionalId =
-          typeof args.professionalId === 'string'
-            ? args.professionalId
-            : undefined;
+        const professionalId = effectiveProfessionalId;
         const expectedBooking: BookingProposal = {
           date: String(args.date ?? ''),
           time: String(args.time ?? ''),

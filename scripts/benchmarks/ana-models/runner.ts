@@ -14,6 +14,10 @@ import {
   DEFAULT_GREETING_MESSAGE,
 } from '../../../src/botDefaults';
 import type { TenantBotConfig } from '../../../src/configProvider';
+import type {
+  ProfessionalSelectionGateInput,
+  ProfessionalSelectionGateResult,
+} from '../../../src/services/professional-selection-gate';
 import {
   DEEPSEEK_V4_FLASH_MODEL,
 } from '../../../src/services/receptionistLlmProvider';
@@ -41,7 +45,7 @@ import type {
   BenchmarkTranscriptEntry,
 } from './types';
 
-const BENCHMARK_VERSION = 'ana-models-v4';
+const BENCHMARK_VERSION = 'ana-models-v5';
 const DEFAULT_SEED = 20260727;
 const DEFAULT_MAX_COST_USD = 1;
 const MAX_TOOL_ROUNDS = 8;
@@ -375,6 +379,15 @@ function toolResultSucceeded(result: string): boolean {
   }
 }
 
+function argsForEffectiveProfessional(
+  args: Record<string, unknown>,
+  effectiveProfessionalId: string | undefined
+): Record<string, unknown> {
+  return effectiveProfessionalId
+    ? { ...args, professionalId: effectiveProfessionalId }
+    : args;
+}
+
 type GuardReason =
   BenchmarkScenarioRun['toolTrace'][number]['runtimeGuard']['blockedBy'][number];
 
@@ -384,6 +397,9 @@ interface RuntimeGuardDeps {
     services: NonNullable<typeof SERVICES_RESULT.services>,
     userMessages: string[]
   ) => { ok: true } | { ok: false; hintMessage: string };
+  professionalSelectionGate: (
+    input: ProfessionalSelectionGateInput
+  ) => ProfessionalSelectionGateResult;
   bookingConfirmationGate: (input: {
     currentUserMessage: string;
     history: Array<{ role: string; content?: unknown }>;
@@ -423,6 +439,8 @@ interface RuntimeGuardEvaluation {
     blockedBy: GuardReason[];
   };
   blockedResult: string | null;
+  /** Canonicaliza só a I/O; o trace continua guardando args brutos do modelo. */
+  effectiveProfessionalId?: string;
   resolvedCancellationId?: string;
   consumesCancellationEvidence: boolean;
 }
@@ -470,6 +488,32 @@ function evaluateRuntimeGuard(
     }
   }
 
+  // Mesmo após uma remarcação autorizada, a escolha do profissional precisa
+  // continuar compatível com o serviço atual. Produção aplica este gate depois
+  // do de serviço e antes de toda I/O de calendário.
+  let effectiveProfessionalId: string | undefined;
+  if (
+    (input.functionName === 'getAvailableSlots' ||
+      input.functionName === 'bookAppointment') &&
+    blockedBy.length === 0
+  ) {
+    const selection = deps.professionalSelectionGate({
+      serviceId: String(input.args.serviceId ?? ''),
+      professionalId:
+        typeof input.args.professionalId === 'string'
+          ? input.args.professionalId
+          : undefined,
+      servicesResult: SERVICES_RESULT,
+      userMessages,
+    });
+    if (!selection.ok) {
+      blockedBy.push('professional_selection');
+      primaryHint = selection.hintMessage;
+    } else {
+      effectiveProfessionalId = selection.effectiveProfessionalId;
+    }
+  }
+
   // Produção retorna no primeiro gate bloqueado; não audita confirmação depois
   // que o serviço já falhou.
   if (
@@ -478,9 +522,10 @@ function evaluateRuntimeGuard(
   ) {
     const serviceId = String(input.args.serviceId ?? '');
     const professionalId =
-      typeof input.args.professionalId === 'string'
+      effectiveProfessionalId ??
+      (typeof input.args.professionalId === 'string'
         ? input.args.professionalId
-        : undefined;
+        : undefined);
     const confirmation = deps.bookingConfirmationGate({
       currentUserMessage: input.userText,
       history: input.gateHistory,
@@ -549,6 +594,7 @@ function evaluateRuntimeGuard(
         ? null
         : JSON.stringify({ success: false, message: primaryHint }),
     ...(resolvedCancellationId ? { resolvedCancellationId } : {}),
+    ...(effectiveProfessionalId ? { effectiveProfessionalId } : {}),
     consumesCancellationEvidence,
   };
 }
@@ -566,6 +612,8 @@ function addRuntimeGuardObservation(
   for (const guard of runtimeGuard.blockedBy) {
     if (guard === 'service_selection') {
       protection.blockedBy.serviceSelection += 1;
+    } else if (guard === 'professional_selection') {
+      protection.blockedBy.professionalSelection += 1;
     } else if (guard === 'booking_confirmation') {
       protection.blockedBy.bookingConfirmation += 1;
     } else if (guard === 'cancellation_intent') {
@@ -622,6 +670,7 @@ function emptyRuntimeProtection(): BenchmarkScenarioRun['runtimeProtection'] {
     allowedToolCalls: 0,
     blockedBy: {
       serviceSelection: 0,
+      professionalSelection: 0,
       bookingConfirmation: 0,
       cancellationIntent: 0,
       cancellationTarget: 0,
@@ -634,6 +683,29 @@ function emptyRuntimeProtection(): BenchmarkScenarioRun['runtimeProtection'] {
     replyLeakReasons: [],
     lastReplyLeakReasons: [],
     screenedRawFinalReply: null,
+  };
+}
+
+/** Mantém reauditoria de JSONL v3 honesta após novos contadores de guardrail. */
+function normalizeRuntimeProtection(
+  protection: BenchmarkScenarioRun['runtimeProtection'] | undefined
+): BenchmarkScenarioRun['runtimeProtection'] {
+  const defaults = emptyRuntimeProtection();
+  if (!protection) return defaults;
+
+  return {
+    ...defaults,
+    ...protection,
+    blockedBy: {
+      ...defaults.blockedBy,
+      ...protection.blockedBy,
+    },
+    replyLeakReasons: Array.isArray(protection.replyLeakReasons)
+      ? protection.replyLeakReasons
+      : [],
+    lastReplyLeakReasons: Array.isArray(protection.lastReplyLeakReasons)
+      ? protection.lastReplyLeakReasons
+      : [],
   };
 }
 
@@ -990,8 +1062,8 @@ function buildReport(
     '',
     '## Proteções do runtime (simulação sobre a mesma trace)',
     '',
-    '| Provider | Variante | Tools brutas | Permitidas | Bloqueadas | Args | Serviço | Confirmação | Intenção cancel. | Alvo cancel. | Efeitos booking protegidos | Efeitos cancelamento protegidos | Respostas barradas por leak guard |',
-    '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
+    '| Provider | Variante | Tools brutas | Permitidas | Bloqueadas | Args | Serviço | Profissional | Confirmação | Intenção cancel. | Alvo cancel. | Efeitos booking protegidos | Efeitos cancelamento protegidos | Respostas barradas por leak guard |',
+    '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
     ...summary.map((arm) => {
       const armResults = results.filter(
         (result) =>
@@ -1010,6 +1082,8 @@ function buildReport(
         (result) => result.runtimeProtection.blockedBy.toolArguments
       )} | ${total(
         (result) => result.runtimeProtection.blockedBy.serviceSelection
+      )} | ${total(
+        (result) => result.runtimeProtection.blockedBy.professionalSelection
       )} | ${total(
         (result) => result.runtimeProtection.blockedBy.bookingConfirmation
       )} | ${total(
@@ -1140,6 +1214,9 @@ async function runScenario(
     serviceSelectionGate,
   } = await import('../../../src/services/service-gate');
   const {
+    professionalSelectionGate,
+  } = await import('../../../src/services/professional-selection-gate');
+  const {
     resolveCancellationTarget,
   } = await import('../../../src/services/calendarService');
 
@@ -1202,6 +1279,7 @@ async function runScenario(
           const evaluation = evaluateRuntimeGuard(
             {
               serviceSelectionGate,
+              professionalSelectionGate,
               bookingConfirmationGate,
               cancellationIntentGate,
               resolveCancellationTarget,
@@ -1225,6 +1303,11 @@ async function runScenario(
           addRuntimeGuardObservation(
             runtimeProtection,
             evaluation.runtimeGuard
+          );
+
+          const effectiveArgs = argsForEffectiveProfessional(
+            args,
+            evaluation.effectiveProfessionalId
           );
 
           let result: string;
@@ -1253,7 +1336,7 @@ async function runScenario(
             result = evaluation.blockedResult;
           } else {
             try {
-              result = await harness.execute(functionName, args);
+              result = await harness.execute(functionName, effectiveArgs);
             } catch (error) {
               throw new BenchmarkHarnessError(
                 'fixture_execute_failed',
@@ -1281,7 +1364,7 @@ async function runScenario(
                 String(args.date ?? ''),
                 String(args.time ?? ''),
                 String(args.serviceId ?? ''),
-                String(args.professionalId ?? 'auto'),
+                String(effectiveArgs.professionalId ?? 'auto'),
               ].join('|');
               protectedBookKeys.add(key);
               runtimeProtection.protectedBookEffects =
@@ -1542,6 +1625,9 @@ async function reauditStoredResult(
       ...storedInput.arm,
       promptVariant: storedInput.arm.promptVariant ?? 'base',
     },
+    runtimeProtection: normalizeRuntimeProtection(
+      storedInput.runtimeProtection
+    ),
   } as BenchmarkResult;
   const runtimeProtection = emptyRuntimeProtection();
   const protectedBookKeys = new Set<string>();
@@ -1616,6 +1702,10 @@ async function reauditStoredResult(
         runtimeGuard: evaluation.runtimeGuard,
       };
       recomputedTrace.push(recomputed);
+      const effectiveArgs = argsForEffectiveProfessional(
+        entry.args,
+        evaluation.effectiveProfessionalId
+      );
       const consumedCancellationEvidence =
         evaluation.runtimeGuard.wouldExecute &&
         entry.name === 'bookAppointment' &&
@@ -1671,7 +1761,7 @@ async function reauditStoredResult(
               String(entry.args.date ?? ''),
               String(entry.args.time ?? ''),
               String(entry.args.serviceId ?? ''),
-              String(entry.args.professionalId ?? 'auto'),
+              String(effectiveArgs.professionalId ?? 'auto'),
             ].join('|')
           );
           runtimeProtection.protectedBookEffects =
@@ -1856,12 +1946,14 @@ async function runReaudit(inputDir: string): Promise<void> {
   const [
     bookingGuards,
     serviceGuards,
+    professionalGuards,
     calendarGuards,
     replyGuards,
     brain,
   ] = await Promise.all([
     import('../../../src/services/bookingConfirmationGate'),
     import('../../../src/services/service-gate'),
+    import('../../../src/services/professional-selection-gate'),
     import('../../../src/services/calendarService'),
     import('../../../src/services/customerReplyGuard'),
     import('../../../src/services/brainService'),
@@ -1872,6 +1964,8 @@ async function runReaudit(inputDir: string): Promise<void> {
     cancellationIntentGate:
       bookingGuards.cancellationIntentGate,
     serviceSelectionGate: serviceGuards.serviceSelectionGate,
+    professionalSelectionGate:
+      professionalGuards.professionalSelectionGate,
     resolveCancellationTarget:
       calendarGuards.resolveCancellationTarget,
     inspectCustomerReply: replyGuards.inspectCustomerReply,
@@ -2014,8 +2108,8 @@ async function runReaudit(inputDir: string): Promise<void> {
     '',
     '### Motivos atuais',
     '',
-    '| Braço | Args | Serviço | Confirmação | Intenção cancel. | Alvo cancel. |',
-    '|---|---:|---:|---:|---:|---:|',
+    '| Braço | Args | Serviço | Profissional | Confirmação | Intenção cancel. | Alvo cancel. |',
+    '|---|---:|---:|---:|---:|---:|---:|',
     ...[...groups.entries()].map(([label, group]) => {
       const total = (
         selector: (
@@ -2031,6 +2125,8 @@ async function runReaudit(inputDir: string): Promise<void> {
         (blockedBy) => blockedBy.toolArguments
       )} | ${total(
         (blockedBy) => blockedBy.serviceSelection
+      )} | ${total(
+        (blockedBy) => blockedBy.professionalSelection
       )} | ${total(
         (blockedBy) => blockedBy.bookingConfirmation
       )} | ${total(
@@ -2379,7 +2475,7 @@ async function main(): Promise<void> {
   await mkdir(outputDir, { recursive: true });
 
   const manifest = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     benchmarkVersion: BENCHMARK_VERSION,
     runId,
     createdAt: new Date().toISOString(),
@@ -2477,7 +2573,7 @@ async function main(): Promise<void> {
         accumulatedCost += estimatedCostUsd ?? unknownUsageReserve;
         const result: BenchmarkResult = {
           ...run,
-          schemaVersion: 3,
+          schemaVersion: 4,
           benchmarkVersion: BENCHMARK_VERSION,
           runId,
           seed: options.seed,

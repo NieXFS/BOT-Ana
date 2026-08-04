@@ -186,16 +186,62 @@ Artefato bruto: `benchmark-results/2026-08-04T00-23-46-876Z/report.md`.
 Depois da rodada, a trace revelou duas respostas de `P0-CONTEXT-CORRECTION`
 que afirmavam slots de 07/08 sem chamar `getAvailableSlots` nesse turno. Foi
 acrescentado o guardrail de saída `unverified_availability`: uma oferta concreta
-só sai se a tool atual respondeu `success:true` e contém todos os horários
-citados. A reauditoria estática da fonte imutável, sem provider/ERP/Postgres/
-WhatsApp, bloqueou exatamente essas duas respostas e preservou a aderência
-bruta do LLM separadamente. Artefato:
+só sai com todos os horários em uma fonte autoritativa do turno atual:
+`getAvailableSlots` com `success:true` e `slots`, ou `bookAppointment` com
+`success:false`, reason `blocked`/`conflict`/`outside_hours` e
+`availableSlots`. Neste segundo caso, a lista já foi consultada internamente;
+só seus valores exatos podem ser ofertados e não se repete `getAvailableSlots`.
+Mensagem, hint, falha não qualificada, array ausente/inválido ou turno anterior
+continuam sem licença. A reauditoria estática da fonte imutável, sem
+provider/ERP/Postgres/WhatsApp, bloqueou exatamente essas duas respostas e
+preservou a aderência bruta do LLM separadamente. Artefato:
 `benchmark-results/2026-08-04T00-23-46-876Z/reaudit-2026-08-04T00-43-54-861Z.md`.
 
 As falhas residuais — sobretudo troca de serviço/profissional e preferência
 “tanto faz” — seguem como falhas de aderência do modelo; a reauditoria não as
 renomeia como sucesso nem substitui a necessidade de novos dados antes de uma
 ampliação operacional.
+
+### Hardening de seleção profissional em 04/08/2026
+
+Em **2026-08-04**, após a rodada acima, foi incorporado o Guardrail D puro
+`professionalSelectionGate` na produção, no executor do benchmark e na
+reauditoria. Ele roda depois do gate de serviço e antes de `getAvailableSlots`
+ou `bookAppointment`, usando somente as mensagens do usuário na intenção
+recente e a elegibilidade `services[].professionalIds ∩ professionals` ativos.
+`professionalIds: []` significa nenhum habilitado; campo ausente (`undefined`)
+mantém o fallback global para ERP legado/misto.
+
+Para um habilitado, a tool só segue com aquele ID (prefixo globalmente unívoco é
+canonicalizado só na I/O). Para 2+, a consulta prematura é bloqueada até a
+preferência: “tanto faz/qualquer um/sem preferência” exige `professionalId`
+ausente apenas em resposta curta/autônoma (cortesia simples permitida), ou nas
+formas inequívocas “qualquer profissional” e “quem estiver disponível”.
+“Qualquer horário”, “tanto faz o horário” e “sem preferência de horário” não
+autorizam escolher profissional; exclusão/negação como “qualquer um menos
+Marina” falha fechada. O pronome “qualquer um/uma” também só vale como resposta
+curta: “qualquer um dos horários”, “qualquer uma das datas” e “qualquer um
+desses horários” não são escolha profissional. Nome explícito exige o ID
+correspondente; nome em rejeição/exclusão (“não quero a Júlia”, “menos a Júlia”)
+nunca vira escolha positiva. “Outra profissional”, “profissional diferente” e
+“trocar/mudar de profissional” resetam a preferência até uma resposta posterior
+inequívoca. Nome completo é aceito; primeiro nome/token só é aceito se for
+unívoco entre os profissionais ativos. Correção de data mantém a preferência do
+fluxo — inclusive “mudei de ideia, quero nesta sexta” — e só há reinício por
+novo agendamento, troca de serviço comprovada no texto do cliente ou
+“outro/novo/trocar o serviço”.
+
+O schema novo é `4`/`ana-models-v5` e acrescenta `professional_selection` aos
+motivos e tabelas de proteção. `entry.args` permanece a tentativa **bruta** do
+modelo — o ID canônico usado na fixture/produção não a reescreve. A reauditoria
+continua aceitando JSONL `v3`, preenchendo esse contador histórico com zero
+antes de aplicar os guardrails atuais.
+
+Isto é hardening funcional, **não uma nova medição de aderência**. Os
+**146/160 (91,3%)** de 03/08/2026, gerados no artefato de 04/08/2026 acima,
+continuam sendo o baseline bruto até uma bateria nova, paga e explicitamente
+autorizada com `--guards=enforce`. Um bloqueio `professional_selection` não
+transforma uma tentativa errada em sucesso do LLM.
 
 ## Cenários P0
 

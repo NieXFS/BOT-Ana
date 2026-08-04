@@ -32,6 +32,76 @@ assert.equal(
   'saída WhatsApp remove Markdown/list markers e limita emoji sem cortar conteúdo'
 );
 
+const directProfessionalQuestion =
+  'Peeling é com a Júlia ou a Marina. Você prefere uma profissional específica ou tanto faz?';
+assert.equal(
+  normalizeCustomerReplyStyle(
+    `Peeling tem dois profissionais habilitados (Júlia e Marina). Preciso perguntar a preferência antes de consultar horários.\n\n${directProfessionalQuestion}`
+  ),
+  directProfessionalQuestion,
+  'prefácio exato de metarraciocínio de P0-CONTEXT-CORRECTION some e sobra a pergunta ao cliente'
+);
+
+for (const [label, reply, expected] of [
+  [
+    'o cliente quer',
+    'O cliente quer marcar Peeling amanhã.\n\nQual profissional você prefere?',
+    'Qual profissional você prefere?',
+  ],
+  [
+    'o cliente pediu',
+    'O cliente pediu a Limpeza de Pele.\n\nQual horário você prefere?',
+    'Qual horário você prefere?',
+  ],
+  [
+    'a cliente disse',
+    'A cliente disse que quer Peeling.\n\nQual profissional você prefere?',
+    'Qual profissional você prefere?',
+  ],
+  [
+    'tool no primeiro parágrafo',
+    'Vou chamar getAvailableSlots antes de responder.\n\nQual data você prefere?',
+    'Qual data você prefere?',
+  ],
+  [
+    'múltiplos prefácios internos contíguos',
+    'O cliente quer Peeling.\n\nVou usar bookAppointment depois.\n\nQual profissional você prefere?',
+    'Qual profissional você prefere?',
+  ],
+] as const) {
+  assert.equal(
+    normalizeCustomerReplyStyle(reply),
+    expected,
+    `${label} no início some somente quando resta uma resposta ao cliente`
+  );
+}
+
+for (const reply of [
+  'Preciso confirmar alguns dados com você.',
+  'Vou verificar os horários para você.',
+]) {
+  assert.equal(
+    normalizeCustomerReplyStyle(reply),
+    reply,
+    `fala ao cliente é preservada: ${reply}`
+  );
+}
+
+const legitimateOpeningThenMeta =
+  'Olá! Como posso ajudar?\n\nO cliente quer Peeling amanhã.';
+assert.equal(
+  normalizeCustomerReplyStyle(legitimateOpeningThenMeta),
+  legitimateOpeningThenMeta,
+  'marcador em parágrafo posterior a abertura legítima é preservado'
+);
+const onlyMetaParagraph =
+  'O cliente pediu Peeling e preciso usar getAvailableSlots antes de responder.';
+assert.equal(
+  normalizeCustomerReplyStyle(onlyMetaParagraph),
+  onlyMetaParagraph,
+  'mensagem somente interna é preservada quando não há resposta restante'
+);
+
 assert.deepEqual(
   inspectCustomerReply(
     'Tenho horários às 9h e 10h30 com a Júlia. Qual você prefere?',
@@ -48,6 +118,110 @@ const currentAvailabilityTrace = [
   },
 ];
 
+const qualifiedBookFailureAvailabilityTrace = [
+  {
+    userTurn: 3,
+    name: 'bookAppointment',
+    result: JSON.stringify({
+      success: false,
+      reason: 'conflict',
+      availableSlots: ['09:00', '10:30'],
+      message: 'Esse horário acabou de ser preenchido.',
+      hint: 'Estes slots já foram consultados pelo sistema.',
+    }),
+  },
+];
+
+const duplicateArtifactReply = `Encontrei que você já tem uma Limpeza de Pele agendada para 05/08 às 14:00 com a Júlia. Como prefere seguir?
+
+1. Manter os dois
+2. Remarcar (cancelar o anterior e marcar este novo)
+3. Só cancelar o anterior
+4. Pensar depois`;
+assert.equal(
+  hasUnverifiedAvailabilityClaim(duplicateArtifactReply, []),
+  false,
+  'texto de duplicidade do artefato com "Encontrei que" não é oferta de disponibilidade'
+);
+for (const reply of [
+  'Achei que o horário às 09:00 já está ocupado.',
+  duplicateArtifactReply,
+]) {
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(reply, []),
+    false,
+    `encontrei/achei sem contexto positivo de disponibilidade não vira oferta: ${reply}`
+  );
+}
+for (const reply of [
+  'Encontrei horários às 09:00 e 10:30.',
+  'Encontrei os horários às 09:00 e 10:30.',
+  'Achei opções às 09:00 e 10:30.',
+]) {
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(reply, []),
+    true,
+    `encontrei/achei contextualizado sem fonte atual continua bloqueado: ${reply}`
+  );
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(reply, currentAvailabilityTrace),
+    false,
+    `encontrei/achei contextualizado é licenciado por getAvailableSlots atual compatível: ${reply}`
+  );
+}
+
+for (const reply of [
+  `Identifiquei que você já tem um agendamento de Limpeza de Pele com a Júlia no dia 05/08 às 14h. Como deseja proceder?
+
+1. Manter os dois
+2. Remarcar (cancelar o anterior e marcar este novo)
+3. Só cancelar o anterior
+4. Pensar depois`,
+  `Identifiquei que você já tem dois agendamentos futuros:
+
+Limpeza de Pele com a Júlia em 05/08 às 14:00 e Peeling com a Marina em 06/08 às 16:00.
+
+Como você quer proceder com o novo agendamento de amanhã? Posso manter os dois, remarcar (cancelando um deles e marcando o novo), ou só cancelar um dos anteriores?`,
+]) {
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(reply, []),
+    false,
+    `narrativa de duplicidade não é oferta de disponibilidade: ${reply}`
+  );
+}
+
+assert.equal(
+  hasUnverifiedAvailabilityClaim('Tem horário às 15h amanhã.', []),
+  true,
+  'tem horário sem getAvailableSlots continua bloqueado'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim(
+    'Tem horário às 15h amanhã.',
+    currentAvailabilityTrace
+  ),
+  false,
+  'tem horário é seguro com getAvailableSlots atual compatível'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim('Tem horários às 09:00 e 10h30 amanhã.', []),
+  true,
+  'tem horários sem getAvailableSlots continua bloqueado'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim(
+    'Tem horários às 09:00 e 10h30 amanhã.',
+    currentAvailabilityTrace
+  ),
+  false,
+  'tem horários é seguro quando todos os slots vierem do turno atual'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim('Não tem horários às 15h amanhã.', []),
+  false,
+  'não tem horários é negativa, não oferta de disponibilidade'
+);
+
 assert.deepEqual(
   inspectCustomerReply(
     'Para amanhã, temos horários disponíveis às 09:00, 10:30 e 15:00. Qual você prefere?',
@@ -58,6 +232,267 @@ assert.deepEqual(
   { safe: true, reasons: [] },
   'getAvailableSlots success:true do turno atual licencia os horários concretos retornados'
 );
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Para amanhã, temos horários disponíveis às 09:00 e 10:30. Qual você prefere?',
+    services,
+    [],
+    qualifiedBookFailureAvailabilityTrace
+  ),
+  { safe: true, reasons: [] },
+  'bookAppointment conflict com availableSlots atual licencia somente as alternativas já consultadas'
+);
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Confirmei que às 09:00 e 10h30 estão disponíveis amanhã.',
+    services,
+    [],
+    qualifiedBookFailureAvailabilityTrace
+  ),
+  { safe: true, reasons: [] },
+  'a mesma fonte qualificada licencia confirmação factual, não só oferta direta'
+);
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Para amanhã, temos horários disponíveis às 09:00 e 16:00. Qual você prefere?',
+    services,
+    [],
+    qualifiedBookFailureAvailabilityTrace
+  ),
+  { safe: false, reasons: ['unverified_availability'] },
+  'slot extra fora de availableSlots de falha qualificada bloqueia fail-closed'
+);
+
+for (const [label, toolTrace] of [
+  [
+    'package_exhausted',
+    [
+      {
+        userTurn: 3,
+        name: 'bookAppointment',
+        result: JSON.stringify({
+          success: false,
+          reason: 'package_exhausted',
+          availableSlots: ['09:00', '10:30'],
+        }),
+      },
+    ],
+  ],
+  [
+    'other',
+    [
+      {
+        userTurn: 3,
+        name: 'bookAppointment',
+        result: JSON.stringify({
+          success: false,
+          reason: 'other',
+          availableSlots: ['09:00', '10:30'],
+        }),
+      },
+    ],
+  ],
+  [
+    'book success:true',
+    [
+      {
+        userTurn: 3,
+        name: 'bookAppointment',
+        result: JSON.stringify({
+          success: true,
+          reason: 'conflict',
+          availableSlots: ['09:00', '10:30'],
+        }),
+      },
+    ],
+  ],
+  [
+    'availableSlots misto com item inválido',
+    [
+      {
+        userTurn: 3,
+        name: 'bookAppointment',
+        result: JSON.stringify({
+          success: false,
+          reason: 'conflict',
+          availableSlots: ['09:00', { time: '10:30' }],
+        }),
+      },
+    ],
+  ],
+  [
+    'availableSlots somente inválido',
+    [
+      {
+        userTurn: 3,
+        name: 'bookAppointment',
+        result: JSON.stringify({
+          success: false,
+          reason: 'conflict',
+          availableSlots: [{ time: '09:00' }],
+        }),
+      },
+    ],
+  ],
+  [
+    'message e hint sem availableSlots',
+    [
+      {
+        userTurn: 3,
+        name: 'bookAppointment',
+        result: JSON.stringify({
+          success: false,
+          reason: 'conflict',
+          message: 'Tenho 09:00 e 10:30.',
+          hint: 'Ofereça 09:00 e 10:30.',
+        }),
+      },
+    ],
+  ],
+  [
+    'evidência de book no turno anterior',
+    [
+      {
+        userTurn: 2,
+        name: 'bookAppointment',
+        result: JSON.stringify({
+          success: false,
+          reason: 'conflict',
+          availableSlots: ['09:00', '10:30'],
+        }),
+      },
+      {
+        userTurn: 3,
+        name: 'getServices',
+        result: JSON.stringify({ success: true }),
+      },
+    ],
+  ],
+] as const) {
+  assert.deepEqual(
+    inspectCustomerReply(
+      'Para amanhã, temos horários disponíveis às 09:00 e 10:30. Qual você prefere?',
+      services,
+      [],
+      toolTrace
+    ),
+    { safe: false, reasons: ['unverified_availability'] },
+    `${label} não licencia disponibilidade`
+  );
+}
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Confirmei que 15h está disponível amanhã.',
+    services,
+    [],
+    currentAvailabilityTrace
+  ),
+  { safe: true, reasons: [] },
+  'confirmação factual de disponibilidade com slot atual não é escrita'
+);
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Confirmei que às 09:00 e 10h30 estão disponíveis amanhã.',
+    services,
+    [],
+    currentAvailabilityTrace
+  ),
+  { safe: true, reasons: [] },
+  'confirmação factual plural exige todos os slots no resultado atual'
+);
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Confirmei que 15h tá disponível amanhã.',
+    services,
+    [],
+    currentAvailabilityTrace
+  ),
+  { safe: true, reasons: [] },
+  'confirmação factual aceita a forma coloquial de estado disponível'
+);
+
+for (const [reply, toolTrace, label] of [
+  [
+    'Confirmei que 16h está disponível amanhã.',
+    currentAvailabilityTrace,
+    'slot divergente não licencia confirmação factual',
+  ],
+  [
+    'Confirmei que 15h está disponível amanhã.',
+    [],
+    'sem tool não licencia confirmação factual',
+  ],
+  [
+    'Confirmei que 15h está disponível amanhã.',
+    [
+      {
+        userTurn: 3,
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: false, message: 'indisponível' }),
+      },
+    ],
+    'tool com success:false não licencia confirmação factual',
+  ],
+  [
+    'Confirmei que 15h está disponível amanhã.',
+    [
+      {
+        userTurn: 2,
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: true, slots: ['15:00'] }),
+      },
+      {
+        userTurn: 3,
+        name: 'getServices',
+        result: JSON.stringify({ success: true }),
+      },
+    ],
+    'evidência de disponibilidade em turno anterior não licencia confirmação factual',
+  ],
+  [
+    'Confirmei que 09:00 e 16h estão disponíveis amanhã.',
+    currentAvailabilityTrace,
+    'todos os slots da confirmação factual precisam estar no resultado atual',
+  ],
+] as const) {
+  assert.equal(
+    hasFalseWriteClaim(reply, toolTrace),
+    true,
+    label
+  );
+}
+
+for (const reply of [
+  'Confirmei seu agendamento para amanhã.',
+  'Confirmei que o agendamento está confirmado.',
+  'Agendei seu agendamento para amanhã.',
+  'Marquei seu agendamento para amanhã.',
+]) {
+  assert.equal(
+    hasFalseWriteClaim(reply, currentAvailabilityTrace),
+    true,
+    `gramática de agendamento continua bloqueada: ${reply}`
+  );
+}
+
+for (const reply of [
+  'Confirmei que 15h está disponível amanhã e marquei seu agendamento.',
+  'Confirmei que 15h está disponível amanhã e agendei seu agendamento.',
+  'Confirmei que 15h está disponível amanhã e seu agendamento foi confirmado.',
+  'Confirmei que 15h está disponível amanhã e seu agendamento foi realizado.',
+]) {
+  assert.equal(
+    hasFalseWriteClaim(reply, currentAvailabilityTrace),
+    true,
+    `claim de escrita posterior continua bloqueada: ${reply}`
+  );
+}
 
 assert.deepEqual(
   inspectCustomerReply(
@@ -91,6 +526,26 @@ assert.deepEqual(
   ),
   { safe: false, reasons: ['unverified_availability'] },
   'falha de getAvailableSlots nunca licencia oferta'
+);
+
+assert.deepEqual(
+  inspectCustomerReply(
+    'Tenho horário às 09:00 amanhã.',
+    services,
+    [],
+    [
+      {
+        userTurn: 3,
+        name: 'getAvailableSlots',
+        result: JSON.stringify({
+          success: true,
+          slots: ['09:00', { time: '10:30' }],
+        }),
+      },
+    ]
+  ),
+  { safe: false, reasons: ['unverified_availability'] },
+  'slots mistos de getAvailableSlots também rejeitam a fonte inteira fail-closed'
 );
 
 assert.equal(
@@ -272,6 +727,24 @@ assert.equal(
   false,
   'descrição factual de quem realiza o serviço não é ato de agenda'
 );
+assert.equal(
+  hasFalseWriteClaim(
+    'O Peeling é realizado pelas profissionais Júlia e Marina.',
+    []
+  ),
+  false,
+  'descrição factual plural de quem realiza o serviço não é ato de agenda'
+);
+for (const reply of [
+  'O agendamento foi realizado.',
+  'O agendamento foi confirmado.',
+]) {
+  assert.equal(
+    hasFalseWriteClaim(reply, []),
+    true,
+    `ato de agendamento sem write success:true continua bloqueado: ${reply}`
+  );
+}
 
 const readOnlyCannotLicenseActs = [
   'Agendei para você na quinta às 14h.',
@@ -359,6 +832,35 @@ for (const reply of safeWithoutWriteClaims) {
     `não deveria bloquear pergunta/negação/futuro: ${reply}`
   );
 }
+
+// Uma negação explícita de estado com percentual não é uma afirmação de
+// escrita. O trace vazio garante que esta regressão não depende de chamada ou
+// efeito de booking para ser considerada segura.
+for (const reply of [
+  'Entendo que ainda não está 100% confirmado. Posso confirmar o agendamento para você?',
+  'O agendamento não está totalmente confirmado.',
+  'O agendamento não está completamente confirmado.',
+]) {
+  assert.equal(
+    hasFalseWriteClaim(reply, []),
+    false,
+    `negação explícita de estado não deve virar falsa escrita: ${reply}`
+  );
+}
+
+assert.equal(
+  hasFalseWriteClaim('O agendamento está 100% confirmado.', []),
+  true,
+  'confirmação positiva com percentual continua bloqueada sem write success:true'
+);
+assert.equal(
+  hasFalseWriteClaim(
+    'Ainda não está 100% confirmado, mas o novo ficou confirmado.',
+    []
+  ),
+  true,
+  'contraste posterior positivo continua bloqueado sem write success:true'
+);
 
 assert.equal(
   hasFalseWriteClaim(

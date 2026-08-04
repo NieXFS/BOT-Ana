@@ -80,6 +80,9 @@ export const SERVICES_RESULT: ServicesResult = {
 export const DEFAULT_SLOTS = ['09:00', '10:30', '15:00'] as const;
 export const CONFLICT_ALTERNATIVES = ['09:00', '10:30'] as const;
 
+const BOOK_FAILURE_AVAILABLE_SLOTS_HINT =
+  'Estes (availableSlots) são os ÚNICOS horários reais disponíveis — já consultados pelo sistema. Ofereça SOMENTE eles, exatamente como vieram. NUNCA invente, arredonde ou acrescente outros horários, e NÃO chame getAvailableSlots de novo.';
+
 export function fixtureUpcomingAppointments(
   mode: FixtureMode,
   cancelledAppointmentIds: readonly string[] = []
@@ -288,8 +291,7 @@ export function createFixtureToolHarness(
             success: false,
             reason: 'conflict',
             message: 'Esse horário não está disponível.',
-            hint:
-              'Chame getAvailableSlots antes de sugerir alternativas e use somente os horários reais.',
+            hint: BOOK_FAILURE_AVAILABLE_SLOTS_HINT,
             availableSlots: [...DEFAULT_SLOTS],
           });
         }
@@ -299,8 +301,7 @@ export function createFixtureToolHarness(
             success: false,
             reason: 'conflict',
             message: 'Esse horário acabou de ser preenchido.',
-            hint:
-              'Chame getAvailableSlots antes de sugerir alternativas e use somente os horários reais.',
+            hint: BOOK_FAILURE_AVAILABLE_SLOTS_HINT,
             availableSlots: [...CONFLICT_ALTERNATIVES],
           });
         }

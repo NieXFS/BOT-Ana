@@ -47,6 +47,45 @@ function normalizeClaimText(value: string): string {
     .trim();
 }
 
+function isInitialInternalMetaParagraph(paragraph: string): boolean {
+  const normalized = normalizeClaimText(paragraph);
+  return (
+    normalized.includes(
+      'preciso perguntar a preferencia antes de consultar horarios'
+    ) ||
+    /\b[oa] cliente (?:quer|pediu|disse)\b/.test(normalized) ||
+    /\b(?:getavailableslots|bookappointment|getservices|getupcomingappointments|cancelappointment)\b/.test(
+      normalized
+    )
+  );
+}
+
+/**
+ * Remove somente uma sequência de parágrafos internos no INÍCIO da resposta.
+ * Se todos os parágrafos forem internos, preserva a mensagem: esta camada não
+ * cria fallback, não devolve vazio e nunca recorta uma frase no meio.
+ */
+function stripLeadingInternalMetaParagraphs(normalizedReply: string): string {
+  const paragraphs = normalizedReply
+    .split(/\n[ \t]*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  let initialMetaCount = 0;
+
+  while (
+    initialMetaCount < paragraphs.length &&
+    isInitialInternalMetaParagraph(paragraphs[initialMetaCount])
+  ) {
+    initialMetaCount += 1;
+  }
+
+  if (initialMetaCount === 0 || initialMetaCount === paragraphs.length) {
+    return normalizedReply;
+  }
+
+  return paragraphs.slice(initialMetaCount).join('\n\n');
+}
+
 /**
  * Normalização mecânica e conservadora para WhatsApp. Não resume nem corta
  * conteúdo operacional: remove apenas sintaxe Markdown/list markers e limita
@@ -54,7 +93,7 @@ function normalizeClaimText(value: string): string {
  */
 export function normalizeCustomerReplyStyle(reply: string): string {
   let emojiSeen = false;
-  return reply
+  const normalizedReply = reply
     .replace(/\*\*([^*\n]+)\*\*/g, '$1')
     .replace(/__([^_\n]+)__/g, '$1')
     .replace(/^\s*#{1,6}\s+/gm, '')
@@ -68,6 +107,8 @@ export function normalizeCustomerReplyStyle(reply: string): string {
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+
+  return stripLeadingInternalMetaParagraphs(normalizedReply);
 }
 
 function toolSucceeded(result: string): boolean {
@@ -183,7 +224,7 @@ function isServicePerformanceDescription(
   const beforeClaim = clause.slice(0, matchIndex);
   const afterClaim = clause.slice(matchIndex + claim.length);
   return (
-    /^\s+(?:por|pelo|pela)\b/.test(afterClaim) &&
+    /^\s+(?:por|pelo|pela|pelos|pelas)\b/.test(afterClaim) &&
     (/\b(?:servico|procedimento|tratamento|ele|ela)\s+(?:e|eh)\s*$/.test(
       beforeClaim
     ) ||
@@ -207,6 +248,14 @@ function localClaimIsNegatedOrFuture(
     /(?:\b(?:nao|nunca)\b(?:\s+\w+){0,6}|\bainda\s+nao\b(?:\s+\w+){0,6}|\bsem\b(?:\s+\w+){0,4})\s*$/.test(
       localPrefix
     );
+  // O quantificador genérico acima usa \w por segurança e, portanto, não
+  // atravessa "100%". Este caso de estado negativo é deliberadamente estreito:
+  // só reconhece uma negação explícita imediatamente antes de estar/ficar com
+  // percentual ou intensificador; nunca licencia uma confirmação positiva.
+  const isExplicitNegatedStatus =
+    /\b(?:ainda\s+)?nao\s+(?:esta|ta|ficou|permanece)\s+(?:(?:\d+(?:[.,]\d+)?\s*%|totalmente|completamente)\s+)?$/.test(
+      localPrefix
+    );
   const isFutureOrConditional =
     /(?:\b(?:vou|vamos|iremos|vai|vao|sera|serao|estara|estarao|ficara|ficarao|ficaria|ficariam|poderia|poderiam|posso|podemos|pretendo)\b(?:\s+\w+){0,6}|\b(?:assim que|quando|caso|depois que|se)\b(?:\s+\w+){0,8})\s*$/.test(
       localPrefix
@@ -220,7 +269,12 @@ function localClaimIsNegatedOrFuture(
     beforeClaim.split(/\b(?:mas|porem|contudo|entretanto)\b/).pop() ?? beforeClaim;
   const isHedgedHypothesis = /\b(?:pode ser que|talvez)\b/.test(hypothesisPrefix);
 
-  return isNegated || isFutureOrConditional || isHedgedHypothesis;
+  return (
+    isNegated ||
+    isExplicitNegatedStatus ||
+    isFutureOrConditional ||
+    isHedgedHypothesis
+  );
 }
 
 function appointmentLocalParts(startTime: string): {
@@ -285,7 +339,19 @@ function normalizeAvailabilitySlot(value: unknown): string | null {
   }`;
 }
 
-function currentTurnSuccessfulAvailabilitySlots(
+const QUALIFIED_BOOK_AVAILABILITY_FAILURE_REASONS = new Set([
+  'blocked',
+  'conflict',
+  'outside_hours',
+]);
+
+/**
+ * Coleta disponibilidade concreta apenas de fontes autoritativas do turno
+ * atual: leitura `getAvailableSlots success:true` ou falha qualificada de
+ * `bookAppointment` que já devolveu `availableSlots` após consultar o
+ * calendário internamente. `message` e `hint` nunca são evidência.
+ */
+function currentTurnAuthoritativeAvailabilitySlots(
   toolTrace: ToolTraceLike[]
 ): Set<string> {
   const turns = toolTrace
@@ -299,17 +365,42 @@ function currentTurnSuccessfulAvailabilitySlots(
     // itens já pertencem ao turno atual. Na reauditoria, ignorar qualquer slot
     // de turno anterior impede a resposta de reciclar disponibilidade velha.
     if (currentTurn !== null && entry.userTurn !== currentTurn) continue;
-    if (entry.name !== 'getAvailableSlots') continue;
-
     try {
       const parsed = JSON.parse(entry.result) as {
         success?: unknown;
         slots?: unknown;
+        reason?: unknown;
+        availableSlots?: unknown;
       };
-      if (parsed.success !== true || !Array.isArray(parsed.slots)) continue;
-      for (const slot of parsed.slots) {
+      const rawSlots =
+        entry.name === 'getAvailableSlots' &&
+        parsed.success === true &&
+        Array.isArray(parsed.slots)
+          ? parsed.slots
+          : entry.name === 'bookAppointment' &&
+              parsed.success === false &&
+              typeof parsed.reason === 'string' &&
+              QUALIFIED_BOOK_AVAILABILITY_FAILURE_REASONS.has(parsed.reason) &&
+              Array.isArray(parsed.availableSlots)
+            ? parsed.availableSlots
+            : null;
+      if (!rawSlots) continue;
+
+      const normalizedSlots: string[] = [];
+      for (const slot of rawSlots) {
         const normalized = normalizeAvailabilitySlot(slot);
-        if (normalized) slots.add(normalized);
+        // Um payload parcialmente malformado não prova que o subconjunto que
+        // parece válido seja completo. Rejeita a fonte inteira fail-closed.
+        if (!normalized) {
+          normalizedSlots.length = 0;
+          break;
+        }
+        normalizedSlots.push(normalized);
+      }
+      if (normalizedSlots.length !== rawSlots.length) continue;
+
+      for (const slot of normalizedSlots) {
+        slots.add(slot);
       }
     } catch {
       // Resposta de tool inválida não licencia disponibilidade.
@@ -319,10 +410,36 @@ function currentTurnSuccessfulAvailabilitySlots(
   return slots;
 }
 
+/**
+ * Exceção estrita para a leitura factual "confirmei que 15h está disponível".
+ * Não licencia agendamento: exige o verbo exato, a gramática de disponibilidade
+ * e cada horário citado no mesmo conjunto autoritativo do turno atual.
+ */
+function isVerifiedAvailabilityConfirmation(
+  clause: string,
+  matchIndex: number,
+  claim: string,
+  verifiedSlots: Set<string>
+): boolean {
+  if (claim !== 'confirmei' || matchIndex !== 0 || verifiedSlots.size === 0) {
+    return false;
+  }
+
+  const afterClaim = clause.slice(matchIndex + claim.length);
+  const isAvailabilityStatement =
+    /^\s+que\s+(?:as\s+)?(?:[01]?\d|2[0-3])(?::[0-5]\d|h(?:[0-5]\d)?)?(?:\s*(?:,|e)\s*(?:as\s+)?(?:[01]?\d|2[0-3])(?::[0-5]\d|h(?:[0-5]\d)?)?)*\s+(?:esta|ta|estao)\s+disponiv(?:el|eis)\b/.test(
+      afterClaim
+    );
+  if (!isAvailabilityStatement) return false;
+
+  const times = mentionedTimes(clause);
+  return times.length > 0 && times.every((time) => verifiedSlots.has(time));
+}
+
 const AVAILABILITY_POSITIVE_CUE_RE =
-  /\b(?:tenho|tem|temos|ha|existem|encontrei|achei|posso\s+(?:te\s+)?oferecer|disponiveis?|livres?|vagas?)\b/;
+  /\b(?:tenho|temos|tem\s+(?:horarios?|vagas?|disponibilidade)\b|ha|existem|(?:encontrei|achei)\s+(?:(?:os|as|um|uma|uns|umas|alguns?|algumas?|est[ea]s?|ess[ea]s?|nov[oa]s?|\d+)\s+)?(?:horarios?|vagas?|disponibilidade|opcao|opcoes|alternativa|alternativas)\b|posso\s+(?:te\s+)?oferecer|disponiveis?|livres?|vagas?)\b/;
 const AVAILABILITY_NEGATIVE_CUE_RE =
-  /\b(?:nao|sem)\s+(?:temos?|ha|horarios?|vagas?|disponibilidade)|\b(?:indisponiveis?|ocupad[oa]s?|esgotad[oa]s?)\b/;
+  /\b(?:nao|sem)\s+(?:tem(?:os)?|ha|horarios?|vagas?|disponibilidade)|\b(?:indisponiveis?|ocupad[oa]s?|esgotad[oa]s?)\b/;
 const OPERATING_HOURS_CUE_RE =
   /\b(?:horario\s+de\s+funcionamento|horario\s+comercial|expediente|funcionamos|funciona|atendemos|atendimento|abrimos|fechamos|aberto)\b/;
 
@@ -371,10 +488,11 @@ function offeredAvailabilitySlots(reply: string): string[] {
 
 /**
  * Uma oferta concreta de horário é uma afirmação operacional. Só pode seguir
- * para o WhatsApp se `getAvailableSlots` tiver respondido `success:true` NO
- * TURNO ATUAL e contiver cada horário citado. Falta de tool, falha da tool ou
- * divergência de slots bloqueiam fail-closed; não usamos histórico, prompt ou
- * uma disponibilidade consultada em turno anterior como evidência.
+ * para o WhatsApp se uma fonte autoritativa tiver retornado cada slot NO TURNO
+ * ATUAL: `getAvailableSlots success:true` ou `bookAppointment success:false`
+ * qualificado com `availableSlots`. Falta de fonte, falha não qualificada ou
+ * divergência bloqueiam fail-closed; não usamos histórico, prompt, `message`,
+ * `hint` ou uma disponibilidade consultada em turno anterior como evidência.
  */
 export function hasUnverifiedAvailabilityClaim(
   reply: string,
@@ -383,7 +501,7 @@ export function hasUnverifiedAvailabilityClaim(
   const offered = offeredAvailabilitySlots(reply);
   if (offered.length === 0) return false;
 
-  const verified = currentTurnSuccessfulAvailabilitySlots(toolTrace);
+  const verified = currentTurnAuthoritativeAvailabilitySlots(toolTrace);
   return offered.some((slot) => !verified.has(slot));
 }
 
@@ -564,6 +682,7 @@ function inspectCompletedClaims(
 
   const successfulWrites = successfulWriteKinds(toolTrace);
   const appointments = parseSuccessfulAppointmentReads(toolTrace);
+  const verifiedAvailabilitySlots = currentTurnAuthoritativeAvailabilitySlots(toolTrace);
   const clauses = normalized.match(/[^.!?\n]+[.!?]?/g) ?? [normalized];
   let needsAppointmentRead = false;
 
@@ -601,6 +720,16 @@ function inspectCompletedClaims(
           clause,
           matchIndex,
           claim
+        )
+      ) {
+        continue;
+      }
+      if (
+        isVerifiedAvailabilityConfirmation(
+          clause,
+          matchIndex,
+          claim,
+          verifiedAvailabilitySlots
         )
       ) {
         continue;

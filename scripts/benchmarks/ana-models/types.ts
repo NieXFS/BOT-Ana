@@ -31,6 +31,7 @@ export interface BenchmarkToolTrace {
     wouldExecute: boolean;
     blockedBy: Array<
       | 'service_selection'
+      | 'professional_selection'
       | 'booking_confirmation'
       | 'cancellation_intent'
       | 'cancellation_target'
@@ -79,6 +80,7 @@ export interface BenchmarkScenarioRun {
     allowedToolCalls: number;
     blockedBy: {
       serviceSelection: number;
+      professionalSelection: number;
       bookingConfirmation: number;
       cancellationIntent: number;
       cancellationTarget: number;
@@ -115,7 +117,8 @@ export interface BenchmarkScenario {
 }
 
 export interface BenchmarkResult extends BenchmarkScenarioRun {
-  schemaVersion: 3;
+  /** v3 continua aceito para reauditar artefatos históricos imutáveis. */
+  schemaVersion: 3 | 4;
   benchmarkVersion: string;
   runId: string;
   seed: number;
