@@ -60,9 +60,13 @@ import {
   needsAuthoritativeAppointmentRead,
   normalizeCustomerReplyStyle,
 } from './customerReplyGuard';
+import { applyPromiseGuard } from './promiseGuard';
 
 const rescheduleCancellationEvidence =
   new RescheduleCancellationEvidenceStore();
+
+export const RESCHEDULE_CANCELLATION_EVIDENCE_EXPIRED_HINT =
+  'INTERNAL_HINT: a evidência autoritativa do cancelamento expirou ou já foi consumida. Não agende como duplicidade; consulte os agendamentos atuais e reinicie o fluxo de remarcação.';
 
 function getCurrentYear(timezone: string, now: Date): number {
   return Number(
@@ -195,8 +199,9 @@ B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar JSON success=false, re
 C. ESCOLHA DO PROFISSIONAL — Para o serviço que o cliente escolheu, considere SOMENTE os profissionais listados como "Profissionais habilitados" DAQUELE serviço. (a) 0 habilitados → informe gentilmente que o serviço está temporariamente sem profissional disponível e ofereça outro serviço; NÃO consulte horários nem agende. (b) Exatamente 1 habilitado → NÃO pergunte preferência; use o ID desse profissional e siga direto. (c) 2+ habilitados E o cliente não disse com quem → pergunte "Profissional específico ou tanto faz?" e NÃO chame getAvailableSlots nem bookAppointment antes da resposta. Se "tanto faz/qualquer um", chame getAvailableSlots/bookAppointment SEM professionalId (auto-resolve). Se citar um nome, use o professionalId técnico EXATO dele. SEMPRE confirme com quem ficou.
 D. PEDIDO COM MÚLTIPLAS PARTES — Responda a TODAS as partes explícitas do pedido. Ex.: se perguntar preço e também pedir um horário, informe o preço do catálogo e chame getAvailableSlots na mesma interação; não descarte uma parte para ser breve.
 E. SERVIÇO AUSENTE — Se o serviço pedido não aparece em "SERVIÇOS DISPONÍVEIS", diga explicitamente, antes de oferecer qualquer alternativa, que ele não está disponível neste estabelecimento. Nunca trate uma alternativa como se fosse o serviço pedido. Só chame getServices uma vez se houver indício real de que a lista atual está desatualizada; se continuar ausente, mantenha a negativa explícita e ofereça apenas serviços cadastrados.
-F. SEGURANÇA CLÍNICA — Em dúvidas de saúde, clínicas ou estéticas, não diagnostique, não recomende tratamento, não afirme adequação, eficácia, resultado ou que um serviço resolve determinada condição. NÃO repita nem confirme a promessa clínica do cliente, mesmo para negá-la. Responda SOMENTE: "A equipe ou o profissional responsável precisa avaliar o seu caso. Vou encaminhar sua dúvida para que possam te orientar." Não acrescente explicações, não repita termos da pergunta e não indique ou agende o procedimento em dúvida.
+F. SEGURANÇA CLÍNICA — Em dúvidas de saúde, clínicas ou estéticas, não diagnostique, não recomende tratamento, não afirme adequação, eficácia, resultado ou que um serviço resolve determinada condição. NÃO repita nem confirme a promessa clínica do cliente, mesmo para negá-la. Responda SOMENTE: "A equipe ou o profissional responsável precisa avaliar o seu caso. Se quiser, posso apresentar os serviços cadastrados e, depois que você escolher um deles, verificar os horários disponíveis." NÃO prometa nenhuma ação futura sua nem da equipe: nada de contato, resposta de terceiros, retorno ou prazo. A apresentação de serviços e a consulta de horários seguem as regras normais de catálogo e disponibilidade. Não acrescente explicações, não repita termos da pergunta e não indique ou agende o procedimento em dúvida.
 G. MUDANÇA NO AGENDAMENTO — Se o cliente mudar o serviço, a data ou o profissional durante um agendamento em andamento, qualquer horário recebido antes fica INVÁLIDO. Você DEVE chamar getAvailableSlots DE NOVO NO MESMO TURNO com os dados atuais ANTES de citar horários, resumir ou tentar agendar, MESMO que os horários antigos pareçam coincidir. NUNCA reutilize uma disponibilidade de serviço, data ou profissional anterior.
+H. TRANSFERÊNCIA E RECADOS — Você NÃO transfere a conversa, NÃO avisa ninguém, NÃO deixa recado e NÃO aciona a equipe. Se o cliente pedir para falar com alguém, para ser transferido ou para que você avise alguém, diga com clareza que isso não é possível por aqui e que esses assuntos são tratados diretamente com a equipe do estabelecimento. NÃO prometa nenhuma ação futura sua nem da equipe e NÃO peça para o cliente aguardar por alguém.
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).
@@ -212,7 +217,7 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
    - Se o cliente escolher "só cancelar" ou pedir para escolher o novo horário depois e, em outro turno, retomar a remarcação: consulte a disponibilidade do novo horário, apresente um NOVO resumo completo e aguarde confirmação. Depois da confirmação, chame bookAppointment; NUNCA responda que confirmou sem executar a ferramenta. Como o agendamento anterior já foi cancelado, confirmedDuplicate pode ser omitido.
    - "Pensar depois": não chame ferramentas. Responda gentilmente e aguarde.
    - Se houver mais de um agendamento anterior e o cliente escolher remarcar/cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado ANTES de chamar cancelAppointment. Nunca invente appointmentId usando data/hora.
-8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment — encaminhe para a equipe conforme regras de comportamento.
+8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment. Responda SOMENTE: "Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui." Não prometa nenhuma ação futura sua nem da equipe.
 9. CONFIRMAÇÃO INEQUÍVOCA — Só chame bookAppointment depois de apresentar um resumo COMPLETO e real de serviço, data, horário e profissional quando definido, e receber uma confirmação CLARA em um turno POSTERIOR ("sim", "confirmo", "pode marcar", "tudo certo"). Após esse resumo COMPLETO anterior, "pode sim", "tá bom", "ta bom" e "pode ser sim" são confirmações CLARAS: DEVE CHAMAR bookAppointment. Frases hesitantes como "acho que pode", "talvez", "pode ser" SOZINHO, "se der" ou equivalentes NÃO confirmam: pergunte novamente de forma objetiva e aguarde. NUNCA tente chamar bookAppointment antes desse resumo e confirmação; uma tool bloqueada ou um INTERNAL_HINT não é confirmação. NUNCA diga que o agendamento foi confirmado, marcado ou agendado antes de bookAppointment retornar success:true. O código também bloqueará chamadas sem confirmação inequívoca.
 
 CHECKLIST FINAL DE DISPONIBILIDADE (ANTES DE ENVIAR QUALQUER RESPOSTA): Toda resposta que cite horário concreto COMO DISPONIBILIDADE exige uma fonte autoritativa NESTE TURNO: getAvailableSlots com success:true e slots, OU bookAppointment com success:false, reason exatamente blocked/conflict/outside_hours e availableSlots. No segundo caso, ofereça SOMENTE os valores exatos de availableSlots e NÃO chame getAvailableSlots de novo; lista vazia significa que não há alternativa naquele dia. Sem uma dessas fontes — inclusive se a falha não trouxer availableSlots — NÃO escreva horários como disponíveis: siga o hint e chame getAvailableSlots antes de oferecer alternativa. Se serviço, data ou profissional mudaram, a regra G exige getAvailableSlots fresco no mesmo turno. Preço, duração e horário de funcionamento NÃO são disponibilidade; responda-os normalmente com os dados atuais.`;
@@ -383,7 +388,7 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
     function: {
       name: 'cancelAppointment',
       description:
-        'Cancela um agendamento futuro do cliente. Use APENAS no fluxo de detecção de agendamento existente (após o cliente escolher remarcar). NUNCA use em outros contextos — cancelamentos avulsos devem ser encaminhados para a equipe.',
+        'Cancela um agendamento futuro do cliente. Use APENAS no fluxo de detecção de agendamento existente (após o cliente escolher remarcar). NUNCA use em outros contextos. Para cancelamento avulso, a resposta obrigatória é: "Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui."',
       parameters: {
         type: 'object',
         properties: {
@@ -545,8 +550,7 @@ async function executeFunction(
         ) {
           return JSON.stringify({
             success: false,
-            message:
-              'INTERNAL_HINT: a evidência autoritativa do cancelamento expirou ou já foi consumida. Não agende como duplicidade; consulte os agendamentos atuais e reinicie o fluxo de remarcação.',
+            message: RESCHEDULE_CANCELLATION_EVIDENCE_EXPIRED_HINT,
           });
         }
 
@@ -650,6 +654,8 @@ export interface RunReceptionistModelLoopInput {
   userId?: string;
   thinkingMode?: DeepSeekThinkingMode;
   maxToolRounds?: number;
+  /** O harness comportamental desativa retries para tratar toda falha como bug. */
+  retryOnFailure?: boolean;
 }
 
 type ExtendedCompletionUsage = NonNullable<
@@ -729,6 +735,21 @@ function validateToolArguments(
   }
   return null;
 }
+
+export function buildInvalidToolArgumentsHint(
+  functionName: string,
+  schemaIssue: string
+): string {
+  return `INTERNAL_HINT: argumentos inválidos para ${functionName}: ${schemaIssue}. Corrija e refaça a chamada sem responder ao cliente.`;
+}
+
+export const BRAIN_SERVICE_INTERNAL_HINT_SAMPLES = [
+  RESCHEDULE_CANCELLATION_EVIDENCE_EXPIRED_HINT,
+  buildInvalidToolArgumentsHint(
+    'bookAppointment',
+    'campo obrigatório inválido ou ausente: serviceId'
+  ),
+] as const;
 
 class AiCompletionResponseError extends Error {
   status?: number;
@@ -855,21 +876,25 @@ export async function runReceptionistModelLoop(
   for (let index = 0; index < maxToolRounds; index += 1) {
     const round = index + 1;
     const startedAt = Date.now();
-    const response = await callAiWithRetry(
-      async () =>
-        validateCompletionResponse(
-          await createReceptionistChatCompletion(runtime, {
+    const requestCompletion = async () =>
+      validateCompletionResponse(
+        await createReceptionistChatCompletion(runtime, {
           messages,
           tools: RECEPTIONIST_TOOLS,
           temperature: sanitizeTemperature(input.config.aiTemperature),
           maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
           userId: input.userId,
           thinkingMode,
-          })
-        ),
-      `receptionist tenant=${input.config.tenantSlug} round=${round}/${maxToolRounds}`,
-      runtime.provider
-    );
+        })
+      );
+    const response =
+      input.retryOnFailure === false
+        ? await requestCompletion()
+        : await callAiWithRetry(
+            requestCompletion,
+            `receptionist tenant=${input.config.tenantSlug} round=${round}/${maxToolRounds}`,
+            runtime.provider
+          );
     const durationMs = Date.now() - startedAt;
     if (response.model) {
       providerReportedModels.push(response.model);
@@ -918,7 +943,7 @@ export async function runReceptionistModelLoop(
       const result = schemaIssue
         ? JSON.stringify({
             success: false,
-            message: `INTERNAL_HINT: argumentos inválidos para ${functionName}: ${schemaIssue}. Corrija e refaça a chamada sem responder ao cliente.`,
+            message: buildInvalidToolArgumentsHint(functionName, schemaIssue),
           })
         : await input.executeTool(functionName, parsed.args);
 
@@ -1269,11 +1294,32 @@ async function getReceptionistReply(
       const safeWriteConfirmation = buildSafeWriteConfirmation(
         modelResult.toolTrace
       );
+      const hasModelReply = Boolean(modelResult.rawReply);
       const candidateReply = normalizeCustomerReplyStyle(
         modelResult.rawReply ||
           safeWriteConfirmation ||
           getFallbackMessage(config)
       );
+      const promiseGuard = hasModelReply
+        ? applyPromiseGuard(candidateReply)
+        : { reply: candidateReply, blocked: false as const };
+      if (promiseGuard.blocked) {
+        console.warn(
+          `🛑 Promise guard bloqueou resposta da recepcionista | phoneNumberId=${config.phoneNumberId} pattern=${promiseGuard.pattern}`
+        );
+        Sentry.captureMessage(
+          'Resposta da recepcionista bloqueada por promessa proibida',
+          {
+            level: 'warning',
+            tags: {
+              service: 'receptionist_promise_guard',
+              pattern: promiseGuard.pattern,
+              phoneNumberId: config.phoneNumberId,
+            },
+          }
+        );
+      }
+      const guardedCandidateReply = promiseGuard.reply;
       const forbiddenAppointmentIds = modelResult.toolTrace.flatMap((entry) => {
         const ids: string[] = [];
         if (
@@ -1305,7 +1351,7 @@ async function getReceptionistReply(
       let customerReplyEvidenceTrace = modelResult.toolTrace;
       if (
         needsAuthoritativeAppointmentRead(
-          candidateReply,
+          guardedCandidateReply,
           customerReplyEvidenceTrace
         )
       ) {
@@ -1323,7 +1369,7 @@ async function getReceptionistReply(
         ];
       }
       const inspection = inspectCustomerReply(
-        candidateReply,
+        guardedCandidateReply,
         servicesForGate,
         forbiddenAppointmentIds,
         customerReplyEvidenceTrace
@@ -1349,7 +1395,7 @@ async function getReceptionistReply(
       }
       const finalReply = maybePrependGreeting(
         inspection.safe
-          ? candidateReply
+          ? guardedCandidateReply
           : safeWriteConfirmation || getFallbackMessage(config),
         isFirstContact,
         config

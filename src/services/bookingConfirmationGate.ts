@@ -104,14 +104,20 @@ export type CancellationIntentDecision =
   | { ok: true }
   | { ok: false; hintMessage: string };
 
-const CONFIRMATION_HINT =
+export const CONFIRMATION_HINT =
   'INTERNAL_HINT: O cliente ainda não confirmou o resumo de forma inequívoca. Faça ou repita o resumo com serviço, data, horário e profissional; pergunte se está tudo certo e só chame bookAppointment depois de uma resposta explícita como "sim", "confirmo" ou "pode marcar".';
 
-const DUPLICATE_CONFIRMATION_HINT =
+export const DUPLICATE_CONFIRMATION_HINT =
   'INTERNAL_HINT: confirmedDuplicate só pode ser usado depois que a Ana apresentou o conflito de agendamentos e o cliente escolheu explicitamente manter os dois ou remarcar. Se a escolha foi remarcar, o cancelamento anterior precisa ter concluído com sucesso antes do novo agendamento.';
 
-const CANCELLATION_HINT =
-  'INTERNAL_HINT: cancelAppointment só pode ser usado no fluxo de agendamento duplicado, depois que a Ana apresentou as opções e o cliente escolheu explicitamente remarcar ou cancelar um agendamento anterior. Não cancele nada; encaminhe cancelamentos avulsos para a equipe.';
+export const CANCELLATION_HINT =
+  'INTERNAL_HINT: cancelAppointment só pode ser usado no fluxo de agendamento duplicado, depois que a Ana apresentou as opções e o cliente escolheu explicitamente remarcar ou cancelar um agendamento anterior. Não cancele nada. Ao cliente, responda SOMENTE: "Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui." Não prometa nenhuma ação futura sua nem da equipe.';
+
+export const BOOKING_CONFIRMATION_INTERNAL_HINTS = [
+  CONFIRMATION_HINT,
+  DUPLICATE_CONFIRMATION_HINT,
+  CANCELLATION_HINT,
+] as const;
 
 function normalize(value: string): string {
   return value

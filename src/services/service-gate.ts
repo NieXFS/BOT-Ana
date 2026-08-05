@@ -182,6 +182,12 @@ export function buildServiceAmbiguationHint(services: ServiceLike[]): string {
   );
 }
 
+export const SERVICE_SELECTION_INTERNAL_HINT_SAMPLE =
+  buildServiceAmbiguationHint([
+    { id: 'service-smoke-a', name: 'Serviço Smoke A' },
+    { id: 'service-smoke-b', name: 'Serviço Smoke B' },
+  ]);
+
 /** Pergunta amigável (vai DIRETO ao cliente) listando os serviços de forma neutra. */
 export function buildServiceQuestion(services: ServiceLike[]): string {
   const names = services.map((s) => s.name);

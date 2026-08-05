@@ -173,8 +173,29 @@ export type BookAppointmentResult = {
 
 // Empurra a Ana a SEMPRE consultar a disponibilidade real antes de oferecer
 // alternativas — em vez de chutar horários vizinhos (Falha 2 do relato).
-const BOOK_ALTERNATIVES_HINT =
+export const BOOK_ALTERNATIVES_HINT =
   'Chame getAvailableSlots(date, serviceId, professionalId?) ANTES de sugerir qualquer alternativa e ofereça SOMENTE os horários reais retornados. NUNCA chute horários vizinhos.';
+
+export const CANCEL_UPCOMING_APPOINTMENTS_LOOKUP_FAILURE_HINT =
+  'INTERNAL_HINT: não consegui consultar os agendamentos futuros do cliente agora para confirmar qual cancelar. NÃO responda como se tivesse cancelado. Ao cliente, responda SOMENTE: "Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui." NÃO prometa nenhuma ação futura sua nem da equipe.';
+
+export const GET_AVAILABLE_SLOTS_MISSING_SERVICE_HINT =
+  'INTERNAL_HINT: getAvailableSlots foi chamado sem serviceId. NÃO ofereça horários ainda. Se houver mais de um serviço disponível, liste os serviços ao cliente e pergunte qual ele quer ANTES de consultar horários; depois refaça esta chamada com o serviceId correto. Se houver apenas um serviço, use o id dele.';
+
+export const INVALID_SERVICE_ID_HINT =
+  'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.';
+
+export const INVALID_PROFESSIONAL_ID_HINT =
+  'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.';
+
+export const PROFESSIONAL_SERVICE_MISMATCH_HINT =
+  'INTERNAL_HINT: o profissional escolhido NÃO atende o serviço selecionado (ou está inativo). NÃO ofereça horários com ele. Ofereça outro profissional habilitado pra este serviço (veja "Profissionais habilitados" no system prompt) ou, se não houver, avise gentilmente que o serviço está sem profissional disponível no momento. NÃO repasse esta mensagem ao cliente.';
+
+export const NO_UPCOMING_APPOINTMENTS_HINT =
+  'INTERNAL_HINT: o cliente não tem nenhum agendamento futuro para cancelar. Informe gentilmente que não encontrou agendamento futuro; NÃO diga que cancelou.';
+
+export const BOOK_APPOINTMENT_MISSING_SERVICE_HINT =
+  'INTERNAL_HINT: bookAppointment foi chamado sem serviceId. NÃO confirme nada ao cliente. Se há mais de um serviço, pergunte qual ele quer; depois refaça a chamada com o serviceId correto.';
 
 /** Normaliza o reason vindo do ERP (ou infere pelo status) pro enum da Ana. */
 export function normalizeBookReason(
@@ -556,6 +577,14 @@ export type CancellationTargetResolution =
       message: string;
     };
 
+export function buildCancellationMultipleReferenceHint(list: string): string {
+  return `INTERNAL_HINT: há mais de um agendamento futuro e a mensagem ATUAL do cliente não identifica de forma inequívoca o mesmo agendamento do appointmentId recebido. Agendamentos futuros:\n- ${list}\n\nPergunte qual cancelar (peça data e/ou horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`;
+}
+
+export function buildCancellationTargetNotFoundHint(list: string): string {
+  return `INTERNAL_HINT: não deu pra identificar com segurança qual agendamento cancelar — o appointmentId não corresponde exatamente a um agendamento futuro e a mensagem ATUAL do cliente não traz uma referência inequívoca de data/horário. Agendamentos futuros:\n- ${list}\n\nPergunte qual cancelar (peça data e/ou horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`;
+}
+
 /**
  * Resolve o alvo destrutivo sem rede. É exportado para que smokes e o benchmark
  * auditem exatamente a mesma decisão usada em produção, sem reimplementar uma
@@ -592,7 +621,7 @@ export function resolveCancellationTarget(input: {
       return {
         ok: false,
         reason: 'multiple_reference_required',
-        message: `INTERNAL_HINT: há mais de um agendamento futuro e a mensagem ATUAL do cliente não identifica de forma inequívoca o mesmo agendamento do appointmentId recebido. Agendamentos futuros:\n- ${list}\n\nPergunte qual cancelar (peça data e/ou horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`,
+        message: buildCancellationMultipleReferenceHint(list),
       };
     }
 
@@ -615,7 +644,7 @@ export function resolveCancellationTarget(input: {
   return {
     ok: false,
     reason: 'target_not_found',
-    message: `INTERNAL_HINT: não deu pra identificar com segurança qual agendamento cancelar — o appointmentId não corresponde exatamente a um agendamento futuro e a mensagem ATUAL do cliente não traz uma referência inequívoca de data/horário. Agendamentos futuros:\n- ${list}\n\nPergunte qual cancelar (peça data e/ou horário). NÃO escolha por conta própria nem chame cancelAppointment de novo neste turno.`,
+    message: buildCancellationTargetNotFoundHint(list),
   };
 }
 
@@ -674,16 +703,14 @@ export async function getAvailableSlots(
   if (!serviceId?.trim()) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: getAvailableSlots foi chamado sem serviceId. NÃO ofereça horários ainda. Se houver mais de um serviço disponível, liste os serviços ao cliente e pergunte qual ele quer ANTES de consultar horários; depois refaça esta chamada com o serviceId correto. Se houver apenas um serviço, use o id dele.',
+      message: GET_AVAILABLE_SLOTS_MISSING_SERVICE_HINT,
     };
   }
 
   if (serviceId.startsWith('seed-') || /^[a-z]+$/.test(serviceId)) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
+      message: INVALID_SERVICE_ID_HINT,
     };
   }
 
@@ -694,8 +721,7 @@ export async function getAvailableSlots(
   ) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
+      message: INVALID_PROFESSIONAL_ID_HINT,
     };
   }
 
@@ -753,8 +779,7 @@ export async function getAvailableSlots(
       if (/não pode realizar|não está ativo/i.test(erpMessage)) {
         return {
           success: false,
-          message:
-            'INTERNAL_HINT: o profissional escolhido NÃO atende o serviço selecionado (ou está inativo). NÃO ofereça horários com ele. Ofereça outro profissional habilitado pra este serviço (veja "Profissionais habilitados" no system prompt) ou, se não houver, avise gentilmente que o serviço está sem profissional disponível no momento. NÃO repasse esta mensagem ao cliente.',
+          message: PROFESSIONAL_SERVICE_MISMATCH_HINT,
         };
       }
     }
@@ -844,8 +869,7 @@ export async function cancelAppointment(
   if (!upcoming.success) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: não consegui consultar os agendamentos futuros do cliente agora para confirmar qual cancelar. NÃO responda como se tivesse cancelado; peça desculpas e diga que vai encaminhar para a equipe.',
+      message: CANCEL_UPCOMING_APPOINTMENTS_LOOKUP_FAILURE_HINT,
     };
   }
 
@@ -853,8 +877,7 @@ export async function cancelAppointment(
   if (upcomingAppointments.length === 0) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: o cliente não tem nenhum agendamento futuro para cancelar. Informe gentilmente que não encontrou agendamento futuro; NÃO diga que cancelou.',
+      message: NO_UPCOMING_APPOINTMENTS_HINT,
     };
   }
 
@@ -909,6 +932,13 @@ export async function cancelAppointment(
   }
 }
 
+export function buildExistingAppointmentsHint(
+  appointmentCount: number,
+  list: string
+): string {
+  return `INTERNAL_HINT: o cliente já tem ${appointmentCount} agendamento(s) futuro(s) marcado(s):\n- ${list}\n\nPergunte ao cliente:\n"Vi que você já tem outro(s) agendamento(s). Quer:\n1. Manter os dois (este novo + o anterior)\n2. Remarcar (cancelar o anterior e marcar este novo)\n3. Só cancelar o anterior (sem criar este novo)\n4. Pensar e decidir depois"\n\nAguarde a resposta. Conforme a escolha:\n- Opção 1: chame bookAppointment novamente com confirmedDuplicate=true\n- Opção 2: chame cancelAppointment(appointmentId do anterior) E DEPOIS chame bookAppointment novamente com confirmedDuplicate=true\n- Opção 3: chame cancelAppointment(appointmentId do anterior). NÃO chame bookAppointment.\n- Opção 4: não chame ferramenta nenhuma, responda gentilmente.\nSe houver mais de um agendamento anterior e o cliente escolher remarcar ou só cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado e peça para responder com data e horário antes de chamar cancelAppointment.`;
+}
+
 export async function bookAppointment(
   date: string,
   time: string,
@@ -930,16 +960,14 @@ export async function bookAppointment(
   if (!serviceId?.trim()) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: bookAppointment foi chamado sem serviceId. NÃO confirme nada ao cliente. Se há mais de um serviço, pergunte qual ele quer; depois refaça a chamada com o serviceId correto.',
+      message: BOOK_APPOINTMENT_MISSING_SERVICE_HINT,
     };
   }
 
   if (serviceId.startsWith('seed-') || /^[a-z]+$/.test(serviceId)) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: o serviceId fornecido parece ser um exemplo ou nome em vez do ID real. Chame getServices nesta conversa e use o "id" exato retornado. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
+      message: INVALID_SERVICE_ID_HINT,
     };
   }
 
@@ -950,8 +978,7 @@ export async function bookAppointment(
   ) {
     return {
       success: false,
-      message:
-        'INTERNAL_HINT: o professionalId parece ser um nome em vez do ID real. Chame getServices, encontre o profissional pelo nome na lista e use o "id" técnico dele. Não pergunte nada ao cliente; refaça esta chamada imediatamente com os IDs corretos.',
+      message: INVALID_PROFESSIONAL_ID_HINT,
     };
   }
 
@@ -1058,7 +1085,10 @@ export async function bookAppointment(
 
         return {
           success: false,
-          message: `INTERNAL_HINT: o cliente já tem ${upcoming.appointments.length} agendamento(s) futuro(s) marcado(s):\n- ${list}\n\nPergunte ao cliente:\n"Vi que você já tem outro(s) agendamento(s). Quer:\n1. Manter os dois (este novo + o anterior)\n2. Remarcar (cancelar o anterior e marcar este novo)\n3. Só cancelar o anterior (sem criar este novo)\n4. Pensar e decidir depois"\n\nAguarde a resposta. Conforme a escolha:\n- Opção 1: chame bookAppointment novamente com confirmedDuplicate=true\n- Opção 2: chame cancelAppointment(appointmentId do anterior) E DEPOIS chame bookAppointment novamente com confirmedDuplicate=true\n- Opção 3: chame cancelAppointment(appointmentId do anterior). NÃO chame bookAppointment.\n- Opção 4: não chame ferramenta nenhuma, responda gentilmente.\nSe houver mais de um agendamento anterior e o cliente escolher remarcar ou só cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado e peça para responder com data e horário antes de chamar cancelAppointment.`,
+          message: buildExistingAppointmentsHint(
+            upcoming.appointments.length,
+            list
+          ),
         };
       }
     }
@@ -1143,3 +1173,29 @@ export async function bookAppointment(
     };
   }
 }
+
+/**
+ * Amostras estáveis de toda instrução interna que pode alcançar o loop da
+ * recepcionista. Os builders dinâmicos recebem apenas dados sintéticos; o smoke
+ * usa esta lista para auditar promessas operacionais sem tocar no ERP.
+ */
+export const CALENDAR_RECEPTIONIST_INTERNAL_HINT_SAMPLES = [
+  BOOK_ALTERNATIVES_HINT,
+  CANCEL_UPCOMING_APPOINTMENTS_LOOKUP_FAILURE_HINT,
+  GET_AVAILABLE_SLOTS_MISSING_SERVICE_HINT,
+  INVALID_SERVICE_ID_HINT,
+  INVALID_PROFESSIONAL_ID_HINT,
+  PROFESSIONAL_SERVICE_MISMATCH_HINT,
+  NO_UPCOMING_APPOINTMENTS_HINT,
+  BOOK_APPOINTMENT_MISSING_SERVICE_HINT,
+  buildCancellationMultipleReferenceHint(
+    '05/08/2026 às 14:00 (Serviço Smoke com Profissional Smoke) [id: appointment-smoke]'
+  ),
+  buildCancellationTargetNotFoundHint(
+    '05/08/2026 às 14:00 (Serviço Smoke com Profissional Smoke) [id: appointment-smoke]'
+  ),
+  buildExistingAppointmentsHint(
+    1,
+    '05/08/2026 às 14:00 (Serviço Smoke com Profissional Smoke) [id: appointment-smoke]'
+  ),
+] as const;

@@ -107,7 +107,8 @@ async function main() {
   check(
     'prompt canônico não ecoa promessa clínica nem inventa agendamento de avaliação',
     DEFAULT_BOT_SYSTEM_PROMPT.includes('Não repita nem confirme a promessa clínica') &&
-      DEFAULT_BOT_SYSTEM_PROMPT.includes('Vou encaminhar sua dúvida para que possam te orientar.') &&
+      DEFAULT_BOT_SYSTEM_PROMPT.includes('Se quiser, posso apresentar os serviços cadastrados e, depois que você escolher um deles, verificar os horários disponíveis.') &&
+      DEFAULT_BOT_SYSTEM_PROMPT.includes('Não prometa nenhuma ação futura sua nem da equipe') &&
       !DEFAULT_BOT_SYSTEM_PROMPT.includes('marcar uma avaliação')
   );
   check(
@@ -149,6 +150,10 @@ async function main() {
   const unavailableServiceGuardIndex = runtimePrompt.indexOf('E. SERVIÇO AUSENTE');
   const clinicalGuardIndex = runtimePrompt.indexOf('F. SEGURANÇA CLÍNICA');
   const staleAvailabilityGuardIndex = runtimePrompt.indexOf('G. MUDANÇA NO AGENDAMENTO');
+  const transferGuardIndex = runtimePrompt.indexOf('H. TRANSFERÊNCIA E RECADOS');
+  const criticalToolsIndex = runtimePrompt.indexOf(
+    'REGRAS CRÍTICAS DE FERRAMENTAS'
+  );
 
   check(
     'guarda de serviço ausente é adicionada depois do prompt editável do tenant',
@@ -161,6 +166,14 @@ async function main() {
   check(
     'guarda contra reutilizar slots é adicionada depois do prompt editável do tenant',
     tenantInstructionIndex >= 0 && staleAvailabilityGuardIndex > tenantInstructionIndex
+  );
+  const exactTransferRule =
+    'H. TRANSFERÊNCIA E RECADOS — Você NÃO transfere a conversa, NÃO avisa ninguém, NÃO deixa recado e NÃO aciona a equipe. Se o cliente pedir para falar com alguém, para ser transferido ou para que você avise alguém, diga com clareza que isso não é possível por aqui e que esses assuntos são tratados diretamente com a equipe do estabelecimento. NÃO prometa nenhuma ação futura sua nem da equipe e NÃO peça para o cliente aguardar por alguém.';
+  check(
+    'regra H é byte-idêntica e fica após G, antes das regras de ferramentas',
+    runtimePrompt.includes(exactTransferRule) &&
+      transferGuardIndex > staleAvailabilityGuardIndex &&
+      criticalToolsIndex > transferGuardIndex
   );
   check(
     'runtime proíbe alternativa que finja disponibilidade do serviço pedido',

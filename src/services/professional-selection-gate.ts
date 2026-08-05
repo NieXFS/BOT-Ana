@@ -658,6 +658,35 @@ function ineligibleProfessionalHint(): string {
   );
 }
 
+export const PROFESSIONAL_SERVICES_UNAVAILABLE_HINT =
+  'INTERNAL_HINT: não foi possível validar a elegibilidade de profissionais agora. NÃO consulte horários nem agende; informe que vai verificar novamente em instantes.';
+
+export const PROFESSIONAL_SERVICE_NOT_RESOLVED_HINT =
+  'INTERNAL_HINT: o serviceId não corresponde a um serviço atual. Chame getServices se a lista puder ter mudado e refaça com o ID técnico correto; NÃO consulte horários nem agende antes disso.';
+
+export const PROFESSIONAL_SELECTION_INTERNAL_HINT_SAMPLES = [
+  PROFESSIONAL_SERVICES_UNAVAILABLE_HINT,
+  PROFESSIONAL_SERVICE_NOT_RESOLVED_HINT,
+  noEligibleHint({
+    id: 'service-smoke',
+    name: 'Serviço Smoke',
+    durationMinutes: 30,
+    price: null,
+    priceFormatted: null,
+  }),
+  singleProfessionalHint({
+    id: 'professional-smoke',
+    name: 'Profissional Smoke',
+  }),
+  preferenceRequiredHint(),
+  anyPreferenceHint(),
+  namedProfessionalHint({
+    id: 'professional-smoke',
+    name: 'Profissional Smoke',
+  }),
+  ineligibleProfessionalHint(),
+] as const;
+
 /**
  * Decide se getAvailableSlots/bookAppointment pode atingir o calendário.
  *
@@ -675,8 +704,7 @@ export function professionalSelectionGate(
     return {
       ok: false,
       reason: 'services_unavailable',
-      hintMessage:
-        'INTERNAL_HINT: não foi possível validar a elegibilidade de profissionais agora. NÃO consulte horários nem agende; informe que vai verificar novamente em instantes.',
+      hintMessage: PROFESSIONAL_SERVICES_UNAVAILABLE_HINT,
     };
   }
 
@@ -685,8 +713,7 @@ export function professionalSelectionGate(
     return {
       ok: false,
       reason: 'service_not_resolved',
-      hintMessage:
-        'INTERNAL_HINT: o serviceId não corresponde a um serviço atual. Chame getServices se a lista puder ter mudado e refaça com o ID técnico correto; NÃO consulte horários nem agende antes disso.',
+      hintMessage: PROFESSIONAL_SERVICE_NOT_RESOLVED_HINT,
     };
   }
 

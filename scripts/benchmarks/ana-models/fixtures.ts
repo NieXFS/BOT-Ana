@@ -150,8 +150,8 @@ function json(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function serviceById(id: string) {
-  const services = SERVICES_RESULT.services ?? [];
+function serviceById(servicesResult: ServicesResult, id: string) {
+  const services = servicesResult.services ?? [];
   const normalizedId = id.trim();
   const exact = services.find((service) => service.id === normalizedId);
   if (exact) return exact;
@@ -161,8 +161,8 @@ function serviceById(id: string) {
   return normalizedId && prefixes.length === 1 ? prefixes[0] : undefined;
 }
 
-function professionalById(id: string) {
-  const professionals = SERVICES_RESULT.professionals ?? [];
+function professionalById(servicesResult: ServicesResult, id: string) {
+  const professionals = servicesResult.professionals ?? [];
   const normalizedId = id.trim();
   const exact = professionals.find(
     (professional) => professional.id === normalizedId
@@ -175,10 +175,11 @@ function professionalById(id: string) {
 }
 
 function validateServiceAndProfessional(
+  servicesResult: ServicesResult,
   args: Record<string, unknown>
 ): string | null {
   const serviceId = String(args.serviceId ?? '');
-  const service = serviceById(serviceId);
+  const service = serviceById(servicesResult, serviceId);
   if (!service) {
     return 'INTERNAL_HINT: Serviço não encontrado. Chame getServices e use o ID técnico exato.';
   }
@@ -188,7 +189,10 @@ function validateServiceAndProfessional(
   }
 
   if (typeof args.professionalId === 'string') {
-    const professional = professionalById(args.professionalId);
+    const professional = professionalById(
+      servicesResult,
+      args.professionalId
+    );
     if (
       !professional ||
       !service.professionalIds?.includes(professional.id)
@@ -212,7 +216,8 @@ Pergunte qual agendamento deve ser cancelado antes de continuar.`;
 }
 
 export function createFixtureToolHarness(
-  mode: FixtureMode = 'normal'
+  mode: FixtureMode = 'normal',
+  servicesResult: ServicesResult = SERVICES_RESULT
 ): FixtureToolHarness {
   const state: FixtureToolState = {
     dryRun: true,
@@ -228,10 +233,13 @@ export function createFixtureToolHarness(
   const execute: ReceptionistToolExecutor = async (functionName, args) => {
     switch (functionName) {
       case 'getServices':
-        return json(SERVICES_RESULT);
+        return json(servicesResult);
 
       case 'getAvailableSlots': {
-        const validationHint = validateServiceAndProfessional(args);
+        const validationHint = validateServiceAndProfessional(
+          servicesResult,
+          args
+        );
         if (validationHint) {
           return json({ success: false, message: validationHint });
         }
@@ -269,7 +277,10 @@ export function createFixtureToolHarness(
 
       case 'bookAppointment': {
         state.bookAttempts += 1;
-        const validationHint = validateServiceAndProfessional(args);
+        const validationHint = validateServiceAndProfessional(
+          servicesResult,
+          args
+        );
         if (validationHint) {
           return json({ success: false, message: validationHint });
         }
@@ -336,13 +347,15 @@ export function createFixtureToolHarness(
         const professionalId =
           typeof args.professionalId === 'string'
             ? args.professionalId
-            : IDS.professional.julia;
+            : servicesResult.professionals?.[0]?.id ?? IDS.professional.julia;
         return json({
           success: true,
           message: 'Agendamento realizado com sucesso.',
           professional: {
             id: professionalId,
-            name: professionalById(professionalId)?.name ?? 'Júlia',
+            name:
+              professionalById(servicesResult, professionalId)?.name ??
+              'Profissional',
           },
         });
       }
