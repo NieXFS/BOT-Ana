@@ -162,6 +162,85 @@ expect('FIX#3a: "quero marcar corte e barba" + escolhe "Corte e Barba" → liber
 expect('FIX#3b: "quero marcar corte e barba" mas escolhe só "Corte" (errado) → desambigua', serviceSelectionGate('n-corte', NESTED, ['quero marcar corte e barba']).ok, false);
 expect('FIX#3c: "quero marcar corte" (só Corte) + escolhe "Corte" → libera', serviceSelectionGate('n-corte', NESTED, ['quero marcar corte']).ok, true);
 
+// ===== Onda 4.1: seleção por mensagem, preservando ordem =====
+const limpeza = { id: 'svc-limpeza', name: 'Limpeza de Pele' };
+const peeling = { id: 'svc-peeling', name: 'Peeling Facial' };
+const FACIAL = [limpeza, peeling];
+const changedServiceHistory = [
+  'Quero Limpeza de Pele amanhã. Quais horários estão disponíveis?',
+  'Mudei de ideia: quero Peeling Facial no mesmo dia. Quais horários tem?',
+];
+
+expect('O4.1 #1: escolha explícita mais recente libera Peeling', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  changedServiceHistory
+).ok, true);
+expect('O4.1 #2: após a troca, tentativa do serviço anterior bloqueia', serviceSelectionGate(
+  limpeza.id,
+  FACIAL,
+  changedServiceHistory
+).ok, false);
+expect('O4.1 #3: "Na verdade, prefiro Peeling Facial" libera', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  ['Quero Limpeza de Pele amanhã', 'Na verdade, prefiro Peeling Facial']
+).ok, true);
+expect('O4.1 #4: "Troque para Peeling Facial" libera', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  ['Quero Limpeza de Pele amanhã', 'Troque para Peeling Facial']
+).ok, true);
+expect('O4.1 #5: escolha nova no mesmo dia libera sem apagar continuidade temporal', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  ['Quero Limpeza de Pele amanhã', 'Quero Peeling Facial no mesmo dia']
+).ok, true);
+expect('O4.1 #6: mudança só de horário preserva o serviço anterior', serviceSelectionGate(
+  limpeza.id,
+  FACIAL,
+  ['Quero Limpeza de Pele amanhã', 'Mudei o horário para a tarde']
+).ok, true);
+expect('O4.1 #7: mensagem recente entre dois serviços é ambígua', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  ['Quero Limpeza de Pele amanhã', 'Ainda estou entre Limpeza de Pele e Peeling Facial']
+).ok, false);
+expect('O4.1 #8: comparação entre dois serviços não é escolha', serviceSelectionGate(
+  limpeza.id,
+  FACIAL,
+  ['Qual é melhor, Limpeza de Pele ou Peeling Facial?']
+).ok, false);
+expect('O4.1 #9: hierárquico específico continua prevalecendo', serviceSelectionGate(
+  'n-cb',
+  NESTED,
+  ['Quero Corte', 'Na verdade, prefiro Corte e Barba']
+).ok, true);
+expect('O4.1 #10: serviço apenas no fluxo velho não autoriza intenção nova', serviceSelectionGate(
+  limpeza.id,
+  FACIAL,
+  ['Quero Limpeza de Pele amanhã', 'obrigada', 'Quero agendar para sexta']
+).ok, false);
+expect('O4.1 #11: escolha mais recente por token distintivo funciona', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  ['Quero Limpeza de Pele amanhã', 'Na verdade, prefiro o Facial']
+).ok, true);
+expect('O4.1 #12: continuação clara sem serviço não apaga escolha anterior', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  ['Quero Peeling Facial amanhã', 'Pode ser depois das 15h']
+).ok, true);
+expect('O4.1 extra: dois nomes com preferência direcional não são falsa ambiguidade', serviceSelectionGate(
+  peeling.id,
+  FACIAL,
+  ['Prefiro Peeling Facial em vez de Limpeza de Pele']
+).ok, true);
+expectAsk('O4.1 upfront: escolha inequívoca recente não repete pergunta', shouldAskServiceUpfront(
+  FACIAL,
+  changedServiceHistory
+), false);
+
 // buildServiceQuestion lista os serviços de forma neutra
 const q = buildServiceQuestion(TWO);
 checks.push({ name: 'buildServiceQuestion lista os 2 serviços (neutro)', ok: q.includes('Corte de cabelo') && q.includes('Depilação a Laser') && /qual|prefere/i.test(q) });

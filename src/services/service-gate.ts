@@ -13,7 +13,10 @@
  *
  * Tudo PURO/determinístico. Janela = msgs do USUÁRIO (nunca do assistant — senão
  * validaria a suposição do modelo), delimitada por max(abridor de intenção, teto
- * de 6). Match em 3 camadas (nome completo > token distintivo > anti-ambiguidade).
+ * de 6). Os matches são avaliados POR MENSAGEM e em ordem: a escolha explícita
+ * inequívoca mais recente substitui a anterior; duas escolhas na mesma mensagem
+ * continuam ambíguas. Match em 3 camadas (nome completo > token distintivo >
+ * anti-ambiguidade).
  */
 
 export interface ServiceLike {
@@ -116,9 +119,12 @@ function buildDistinctiveTokens(services: ServiceLike[]): Map<string, Set<string
 }
 
 /** Janela de intenção sobre as msgs do usuário + se contém abridor de NOVO agendamento. */
-function computeWindow(userMessages: string[]): { windowText: string; hasNewBooking: boolean } {
+function computeWindow(userMessages: string[]): {
+  windowMessages: string[];
+  hasNewBooking: boolean;
+} {
   const messages = (userMessages ?? []).filter((m) => typeof m === 'string' && m.trim().length > 0);
-  if (messages.length === 0) return { windowText: '', hasNewBooking: false };
+  if (messages.length === 0) return { windowMessages: [], hasNewBooking: false };
   const lastIdx = messages.length - 1;
   let openerIdx = -1;
   for (let i = lastIdx; i >= Math.max(0, lastIdx - OPENER_SCAN_LIMIT); i--) {
@@ -136,7 +142,6 @@ function computeWindow(userMessages: string[]): { windowText: string; hasNewBook
   // negativo e slice(-1) pegaria só a última (janela pequena → falso-bloqueio).
   const windowStart = Math.max(0, openerIdx, lastIdx - (RECENT_USER_TURNS - 1));
   const windowMsgs = messages.slice(windowStart);
-  const windowText = windowMsgs.map((m) => normalizeServiceText(m)).join(' \n ');
   const hasNewBooking = windowMsgs.some((message) => {
     const normalized = normalizeServiceText(message);
     return (
@@ -144,7 +149,7 @@ function computeWindow(userMessages: string[]): { windowText: string; hasNewBook
       (NEW_BOOKING_RE.test(normalized) && !isFlowContinuation(normalized))
     );
   });
-  return { windowText, hasNewBooking };
+  return { windowMessages: windowMsgs, hasNewBooking };
 }
 
 type MatchKind = 'full' | 'token';
@@ -172,9 +177,103 @@ function matchedServices(
   return out;
 }
 
+/**
+ * Remove o falso match do nome-pai em nomes hierárquicos. Ex.: a mensagem
+ * "Corte e Barba" casa também "Corte", mas representa uma única escolha: o
+ * full-match mais específico. Matches disjuntos permanecem ambíguos.
+ */
+function collapseHierarchicalMatches(
+  matches: Array<{ id: string; kind: MatchKind }>,
+  services: ServiceLike[]
+): Array<{ id: string; kind: MatchKind }> {
+  const full = matches.filter((match) => match.kind === 'full');
+  if (full.length <= 1) return matches;
+
+  return matches.filter((candidate) => {
+    const candidateService = services.find((service) => service.id === candidate.id);
+    if (!candidateService) return true;
+    const candidateName = normalizeServiceText(candidateService.name);
+    return !full.some((other) => {
+      if (other.id === candidate.id) return false;
+      const otherService = services.find((service) => service.id === other.id);
+      if (!otherService) return false;
+      const otherName = normalizeServiceText(otherService.name);
+      return otherName.length > candidateName.length && otherName.includes(candidateName);
+    });
+  });
+}
+
+const INFORMATIONAL_SERVICE_QUESTION_RE =
+  /\b(?:qual|quais)\s+(?:e|eh|seria)\s+(?:o\s+)?melhor\b|\b(?:quanto\s+custa|qual\s+(?:o\s+)?preco|voces?\s+(?:faz|fazem|tem|t[eê]m)|tem\s+como)\b/;
+const EXPLICIT_CHOICE_RE =
+  /\b(?:quero|prefiro|escolho|vou\s+(?:de|querer)|pode\s+ser|troque\s+para|trocar\s+para|mude\s+para|agende|agenda|marque|marca)\b/;
+
+type LatestSelection =
+  | { kind: 'none' }
+  | { kind: 'chosen'; serviceId: string }
+  | { kind: 'ambiguous' };
+
+function decisiveChoiceTarget(
+  normalizedMessage: string,
+  services: ServiceLike[]
+): string | null {
+  const targetPatterns = [
+    /\b(?:quero|prefiro|escolho|troque\s+para|mude\s+para)\s+(.+?)(?=\s+(?:em\s+vez\s+de|ao\s+inves\s+de|e\s+nao)\b|$)/,
+    /\btroque\s+de\b.+\bpara\s+(.+)$/,
+  ];
+  for (const pattern of targetPatterns) {
+    const target = normalizedMessage.match(pattern)?.[1];
+    if (!target) continue;
+    const targetMatches = collapseHierarchicalMatches(
+      matchedServices(target, services),
+      services
+    );
+    if (targetMatches.length === 1) return targetMatches[0]!.id;
+  }
+  return null;
+}
+
+/**
+ * Resolve a escolha do fim para o começo. Uma menção informativa isolada não
+ * troca o serviço em curso; respostas curtas como "o Peeling" continuam sendo
+ * escolhas válidas quando contêm exatamente um match.
+ */
+function latestServiceSelection(
+  windowMessages: string[],
+  services: ServiceLike[]
+): LatestSelection {
+  for (let index = windowMessages.length - 1; index >= 0; index -= 1) {
+    const normalized = normalizeServiceText(windowMessages[index] ?? '');
+    const matches = collapseHierarchicalMatches(
+      matchedServices(normalized, services),
+      services
+    );
+    if (matches.length >= 2) {
+      const decisiveTarget = decisiveChoiceTarget(normalized, services);
+      return decisiveTarget
+        ? { kind: 'chosen', serviceId: decisiveTarget }
+        : { kind: 'ambiguous' };
+    }
+    if (matches.length === 0) continue;
+
+    const isInformationalQuestion = INFORMATIONAL_SERVICE_QUESTION_RE.test(normalized);
+    const isExplicitChoice = EXPLICIT_CHOICE_RE.test(normalized);
+    const isTerseAnswer =
+      !/[?]/.test(normalized) &&
+      normalized.split(/\s+/).length <= 6;
+    if (!isInformationalQuestion && (isExplicitChoice || isTerseAnswer)) {
+      return { kind: 'chosen', serviceId: matches[0]!.id };
+    }
+  }
+  return { kind: 'none' };
+}
+
+export const SERVICE_SELECTION_HINT_PREFIX =
+  'INTERNAL_HINT: o cliente ainda não escolheu o serviço nesta intenção de agendamento.';
+
 export function buildServiceAmbiguationHint(services: ServiceLike[]): string {
   return (
-    'INTERNAL_HINT: o cliente ainda não escolheu o serviço nesta intenção de agendamento. ' +
+    `${SERVICE_SELECTION_HINT_PREFIX} ` +
     'NÃO assuma o serviço pelo histórico nem por agendamentos anteriores. NÃO consulte horários nem agende ainda. ' +
     'Liste de forma NEUTRA estes serviços e pergunte qual o cliente quer: ' +
     services.map((service) => service.name).join(', ') +
@@ -206,9 +305,9 @@ export function buildServiceQuestion(services: ServiceLike[]): string {
  */
 export function shouldAskServiceUpfront(services: ServiceLike[], userMessages: string[]): boolean {
   if (!services || services.length < 2) return false;
-  const { windowText, hasNewBooking } = computeWindow(userMessages);
-  if (!windowText || !hasNewBooking) return false;
-  return matchedServices(windowText, services).length === 0;
+  const { windowMessages, hasNewBooking } = computeWindow(userMessages);
+  if (windowMessages.length === 0 || !hasNewBooking) return false;
+  return latestServiceSelection(windowMessages, services).kind !== 'chosen';
 }
 
 /**
@@ -238,25 +337,10 @@ export function serviceSelectionGate(
   if (!services || services.length < 2) return { ok: true };
   const chosen = resolveChosen(services, serviceId);
   if (!chosen) return { ok: true };
-  const { windowText } = computeWindow(userMessages);
-  if (!windowText) return { ok: true };
+  const { windowMessages } = computeWindow(userMessages);
+  if (windowMessages.length === 0) return { ok: true };
 
-  const matches = matchedServices(windowText, services);
-  const chosenMatch = matches.find((match) => match.id === chosen.id);
-  if (chosenMatch) {
-    if (matches.length === 1) return { ok: true };
-    // Nomes hierárquicos (ex.: "Corte" ⊂ "Corte e Barba"): quando o cliente diz o
-    // nome mais específico, AMBOS casam como 'full'. Libera se o escolhido é o
-    // full-match MAIS ESPECÍFICO (nome mais longo), sem outro full igual/maior.
-    if (chosenMatch.kind === 'full') {
-      const chosenLen = normalizeServiceText(chosen.name).length;
-      const otherFullAtLeastAsLong = matches.some((m) => {
-        if (m.id === chosen.id || m.kind !== 'full') return false;
-        const other = services.find((s) => s.id === m.id);
-        return other ? normalizeServiceText(other.name).length >= chosenLen : false;
-      });
-      if (!otherFullAtLeastAsLong) return { ok: true };
-    }
-  }
+  const latest = latestServiceSelection(windowMessages, services);
+  if (latest.kind === 'chosen' && latest.serviceId === chosen.id) return { ok: true };
   return { ok: false, hintMessage: buildServiceAmbiguationHint(services) };
 }

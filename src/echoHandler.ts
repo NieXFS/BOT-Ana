@@ -9,6 +9,11 @@ import {
   unmarkMessageProcessed,
 } from './services/processedMessages';
 import { Sentry } from './observability/sentry';
+import { runtimeErrorKind } from './observability/safeRuntime';
+import {
+  canonicalConversationKey,
+  withConversationLock,
+} from './services/conversationOrder';
 
 export { HUMAN_ECHO_PREFIX };
 
@@ -30,13 +35,23 @@ export interface EchoMessage {
 export interface EchoDeps {
   pauseConversation: (phoneNumberId: string, customerPhone: string) => Promise<void>;
   /** Idempotência por message id do echo: true = 1ª vez (gravar); false = noop. */
-  markEchoProcessed: (messageId: string, phoneNumberId: string) => Promise<boolean>;
+  markEchoProcessed: (
+    messageId: string,
+    phoneNumberId: string,
+    conversationKey?: string
+  ) => Promise<boolean>;
   /** Desfaz a marca quando a gravação falha → a retransmissão da Meta re-tenta. */
   unmarkEcho: (messageId: string) => Promise<void>;
   recordMessage: (
     conversationKey: string,
     role: 'user' | 'assistant',
     content: string
+  ) => Promise<void>;
+  /** Mesma serialização PG do intake/envio. Omitida em smokes legados = inline. */
+  withConversationLock?: (
+    phoneNumberId: string,
+    customerPhone: string,
+    work: () => Promise<void>
   ) => Promise<void>;
 }
 
@@ -45,6 +60,8 @@ const defaultEchoDeps: EchoDeps = {
   markEchoProcessed: markMessageProcessed,
   unmarkEcho: unmarkMessageProcessed,
   recordMessage: addMessage,
+  withConversationLock: (phoneNumberId, customerPhone, work) =>
+    withConversationLock(phoneNumberId, customerPhone, async () => work()),
 };
 
 /** A Meta envia o campo "smb_message_echoes" em change.field (Coexistence). */
@@ -203,61 +220,90 @@ export async function handleSmbMessageEchoes(
   fallbackPhoneNumberId?: string,
   deps: EchoDeps = defaultEchoDeps
 ): Promise<void> {
-  // 1) Pausa (handoff). Não depende de id; dedup por cliente já no parser.
   const targets = parseEchoTargets(value, fallbackPhoneNumberId);
-  for (const target of targets) {
-    await deps.pauseConversation(target.phoneNumberId, target.customerPhone);
-  }
-
-  // 2) Captura no histórico (escuta enquanto pausada). Dedup por message id.
   const messages = parseEchoMessages(value, fallbackPhoneNumberId);
-  for (const message of messages) {
-    let fresh = true;
-    try {
-      fresh = await deps.markEchoProcessed(message.messageId, message.phoneNumberId);
-    } catch (err) {
-      // Sem o "carimbo" de idempotência não dá pra garantir 1x → NÃO grava
-      // (evita duplicar na retransmissão). Captura sem PII.
-      Sentry.captureException(err, {
-        tags: {
-          service: 'echo_handler',
-          operation: 'mark_echo_processed',
-          phoneNumberId: message.phoneNumberId,
-        },
-      });
-      continue;
-    }
-    if (!fresh) continue;
+  const serialize =
+    deps.withConversationLock ??
+    (async (_phoneNumberId: string, _customerPhone: string, work: () => Promise<void>) =>
+      work());
 
+  // Pausa + registros do mesmo cliente entram na MESMA advisory lock usada por
+  // intake e resposta manual. Assim o echo não se perde no meio de um envio.
+  for (const target of targets) {
     try {
-      await deps.recordMessage(
-        buildConversationKey(message.phoneNumberId, message.customerPhone),
-        'assistant',
-        message.content
-      );
+      await serialize(target.phoneNumberId, target.customerPhone, async () => {
+        await deps.pauseConversation(target.phoneNumberId, target.customerPhone);
+
+        for (const message of messages) {
+          if (
+            message.phoneNumberId !== target.phoneNumberId ||
+            message.customerPhone !== target.customerPhone
+          ) {
+            continue;
+          }
+          const conversationKey = canonicalConversationKey(
+            message.phoneNumberId,
+            message.customerPhone
+          );
+          let fresh = true;
+          try {
+            fresh = await deps.markEchoProcessed(
+              message.messageId,
+              message.phoneNumberId,
+              conversationKey
+            );
+          } catch (err) {
+            Sentry.captureException(new Error('echo dedup write failed'), {
+              tags: {
+                service: 'echo_handler',
+                operation: 'mark_echo_processed',
+                phoneNumberId: message.phoneNumberId,
+                error_kind: runtimeErrorKind(err),
+              },
+            });
+            continue;
+          }
+          if (!fresh) continue;
+
+          try {
+            await deps.recordMessage(
+              buildConversationKey(message.phoneNumberId, message.customerPhone),
+              'assistant',
+              message.content
+            );
+          } catch (err) {
+            Sentry.captureException(new Error('echo history write failed'), {
+              tags: {
+                service: 'echo_handler',
+                operation: 'record_echo',
+                phoneNumberId: message.phoneNumberId,
+                error_kind: runtimeErrorKind(err),
+              },
+            });
+            try {
+              await deps.unmarkEcho(message.messageId);
+            } catch (unmarkErr) {
+              Sentry.captureException(new Error('echo dedup rollback failed'), {
+                tags: {
+                  service: 'echo_handler',
+                  operation: 'unmark_echo',
+                  phoneNumberId: message.phoneNumberId,
+                  error_kind: runtimeErrorKind(unmarkErr),
+                },
+              });
+            }
+          }
+        }
+      });
     } catch (err) {
-      Sentry.captureException(err, {
+      Sentry.captureException(new Error('echo serialization failed'), {
         tags: {
           service: 'echo_handler',
-          operation: 'record_echo',
-          phoneNumberId: message.phoneNumberId,
+          operation: 'serialize_echo',
+          phoneNumberId: target.phoneNumberId,
+          error_kind: runtimeErrorKind(err),
         },
       });
-      // A marca de idempotência já foi gravada (markEchoProcessed acima); como a
-      // gravação no histórico FALHOU, desfaz a marca pra a retransmissão da Meta
-      // re-tentar — senão o echo (contexto do §8.2) sumiria de vez num blip de
-      // DB. Best-effort: se o unmark também falhar, capturamos e seguimos.
-      try {
-        await deps.unmarkEcho(message.messageId);
-      } catch (unmarkErr) {
-        Sentry.captureException(unmarkErr, {
-          tags: {
-            service: 'echo_handler',
-            operation: 'unmark_echo',
-            phoneNumberId: message.phoneNumberId,
-          },
-        });
-      }
     }
   }
 }

@@ -17,6 +17,12 @@ export interface PauseState {
   globalPausedUntil: string | null;
   conversationPausedUntil: string | null;
   schedulePausedUntil: string | null;
+  /** Rev. 3: campo aditivo. Ausente durante rollout = inactive. */
+  escalation?: {
+    active: boolean;
+    questionId: string | null;
+    version: number;
+  };
 }
 
 /** Um carimbo ISO está "pausado agora"? (futuro = sim; null/passado/inválido = não). */
@@ -35,6 +41,7 @@ export function isPausedFromState(state: PauseState, nowMs: number): boolean {
   return (
     isActivePause(state.globalPausedUntil, nowMs) ||
     isActivePause(state.conversationPausedUntil, nowMs) ||
-    isActivePause(state.schedulePausedUntil, nowMs)
+    isActivePause(state.schedulePausedUntil, nowMs) ||
+    state.escalation?.active === true
   );
 }

@@ -1,8 +1,17 @@
 import axios from 'axios';
 import type { TenantBotConfig } from '../configProvider';
 import { sendFreeformMessage, typingDelay } from '../whatsappCloudService';
+import {
+  canonicalReceptionistOutbound,
+  deliverValidatedReceptionistText,
+} from './receptionistOutbound';
 import { Sentry } from '../observability/sentry';
 import { ERP_API_TOKEN } from '../erpApiToken';
+import {
+  conversationHash,
+  runtimeErrorKind,
+  safeHttpStatus,
+} from '../observability/safeRuntime';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -113,23 +122,22 @@ async function callReceps(
     );
     return data;
   } catch (error) {
-    const message = axios.isAxiosError(error)
-      ? error.response?.status
-        ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
-        : error.message
-      : String(error);
     // M10: a falha de opt-out no Receps deixava o cliente "marcado" mas não
     // registrado — risco LGPD silencioso. Reporta ao Sentry. O telefone do
     // cliente (customerPhone) NÃO vai nas tags (PII); só o phoneNumberId do
     // negócio (allowlistado no scrub da Ana).
-    Sentry.captureException(error, {
+    Sentry.captureException(new Error('ana opt-out Receps request failed'), {
       tags: {
         service: 'ana-opt-out',
         operation: 'call-receps',
         phoneNumberId,
+        error_kind: runtimeErrorKind(error),
+        http_status: safeHttpStatus(error) ?? 'n/a',
       },
     });
-    console.error(`❌ [optOut] falha ao chamar Receps: ${message}`);
+    console.error(
+      `❌ [optOut] falha ao chamar Receps | phoneNumberId=${phoneNumberId} | error=${runtimeErrorKind(error)} | status=${safeHttpStatus(error) ?? 'n/a'}`
+    );
     return null;
   }
 }
@@ -141,18 +149,21 @@ export async function tryHandleOptOut(
 ): Promise<boolean> {
   if (!isOptOutMessage(text)) return false;
 
-  console.log(`🚫 [optOut] mensagem de ${from} identificada como opt-out: "${text}"`);
+  const convHash = conversationHash(config.phoneNumberId, from);
+  console.log(
+    `🚫 [optOut] detectado | phoneNumberId=${config.phoneNumberId} | convHash=${convHash} | chars=${text.length}`
+  );
 
   const result = await callReceps(config.phoneNumberId, from);
 
   if (result) {
     if (result.customerFound) {
-      console.log(`✅ [optOut] cliente ${result.customerId} marcado como optOut.`);
+      console.log(
+        `✅ [optOut] persistido | phoneNumberId=${config.phoneNumberId} | convHash=${convHash}`
+      );
     } else {
       console.log(
-        `ℹ️ [optOut] cliente não localizado no Receps${
-          result.reason ? ` (${result.reason})` : ''
-        }. Confirmação será enviada mesmo assim.`
+        `ℹ️ [optOut] cliente não localizado | phoneNumberId=${config.phoneNumberId} | convHash=${convHash}`
       );
     }
   }
@@ -161,19 +172,29 @@ export async function tryHandleOptOut(
   const reply = `Entendi! A partir de agora você não receberá mais mensagens automáticas da ${botName}. Se precisar de algo, é só nos chamar aqui.`;
 
   try {
-    await typingDelay(reply);
-    await sendFreeformMessage(from, reply, config);
+    if (config.botRole !== 'sales') {
+      const outbound = canonicalReceptionistOutbound('OPT_OUT', reply, config);
+      await typingDelay(outbound.payload);
+      await deliverValidatedReceptionistText(from, outbound, config);
+    } else {
+      await typingDelay(reply);
+      await sendFreeformMessage(from, reply, config);
+    }
   } catch (error) {
     // M10: confirmação de opt-out não enviada = cliente sem feedback de que
     // foi removido. Reporta ao Sentry sem o número do cliente (PII).
-    Sentry.captureException(error, {
+    Sentry.captureException(new Error('ana opt-out confirmation send failed'), {
       tags: {
         service: 'ana-opt-out',
         operation: 'send-confirmation',
         phoneNumberId: config.phoneNumberId,
+        error_kind: runtimeErrorKind(error),
+        http_status: safeHttpStatus(error) ?? 'n/a',
       },
     });
-    console.error(`❌ [optOut] falha ao enviar confirmação para ${from}:`, error);
+    console.error(
+      `❌ [optOut] falha ao enviar confirmação | phoneNumberId=${config.phoneNumberId} | convHash=${convHash} | error=${runtimeErrorKind(error)} | status=${safeHttpStatus(error) ?? 'n/a'}`
+    );
   }
 
   return true;

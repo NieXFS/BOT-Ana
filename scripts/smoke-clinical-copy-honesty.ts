@@ -36,6 +36,9 @@ const SOURCE_RADICAL_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   "src/security.ts": [
     " * O webhook da Ana recebe o payload ENCAMINHADO pelo Receps (não direto da",
   ],
+  "src/services/conversationOrder.ts": [
+    " * `-pooler` do Neon usa transaction pooling e pode encaminhar lock, trabalho e",
+  ],
 };
 const TECHNICAL_PROMISE_GUARD_PATTERN_LINE = /^\s*\/.*encaminh.*\/i,\s*$/i;
 
@@ -165,6 +168,8 @@ async function main(): Promise<void> {
     await import("../src/services/bookingConfirmationGate");
   const { CALENDAR_RECEPTIONIST_INTERNAL_HINT_SAMPLES } =
     await import("../src/services/calendarService");
+  const { PREFERENCES_END_DELIMITER, PREFERENCES_START_DELIMITER } =
+    await import("../src/services/structuredPreferences");
   const { PROFESSIONAL_SELECTION_INTERNAL_HINT_SAMPLES } =
     await import("../src/services/professional-selection-gate");
   const { SERVICE_SELECTION_INTERNAL_HINT_SAMPLE } =
@@ -394,9 +399,18 @@ async function main(): Promise<void> {
     servicesFixture,
     now,
   );
+  const stalePreferencesStart = staleCustomPrompt.indexOf(
+    PREFERENCES_START_DELIMITER,
+  );
+  const stalePreferencesEnd = staleCustomPrompt.indexOf(
+    PREFERENCES_END_DELIMITER,
+  );
+  const staleLegacyText = staleCustomPrompt.indexOf(OLD_CLINICAL_PROMISE);
   check(
-    "prompt custom antigo permanece visível para responsabilidade do migrador",
-    staleCustomPrompt.includes(OLD_CLINICAL_PROMISE),
+    "prompt custom antigo permanece visível, subordinado e posterior à guarda clínica",
+    staleLegacyText > stalePreferencesStart &&
+      staleLegacyText < stalePreferencesEnd &&
+      staleCustomPrompt.indexOf("F. SEGURANÇA CLÍNICA") < stalePreferencesStart,
   );
 
   for (const tool of RECEPTIONIST_TOOLS) {

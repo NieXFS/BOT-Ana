@@ -5,6 +5,23 @@ import {
   DEFAULT_GREETING_MESSAGE,
 } from './botDefaults';
 import { ERP_API_TOKEN } from './erpApiToken';
+import {
+  normalizeBookingMenuPayload,
+  normalizePostBookingInstructionsPayload,
+  normalizeStructuredPreferencesPayload,
+} from './services/structuredPreferences';
+import type {
+  BookingMenuItem,
+  PostBookingInstruction,
+  StructuredPreferencesConfig,
+} from './services/structuredPreferences';
+import type { AuthoritativeOutboundCatalog } from './services/receptionistOutbound';
+
+export type {
+  BookingMenuItem,
+  PostBookingInstruction,
+  StructuredPreferencesConfig,
+} from './services/structuredPreferences';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -72,6 +89,7 @@ const authoritativelyRejectedConfigs = new BoundedLruSet<string>(
 );
 
 export interface TenantBotConfig {
+  contractVersion?: number;
   tenantSlug: string;
   botName: string;
   // Papel do brain (brain registry): "receptionist" (default, caminho atual) |
@@ -95,6 +113,11 @@ export interface TenantBotConfig {
   waApiVersion: string;
   phoneNumberId: string;
   isActive: boolean;
+  structuredConfig?: StructuredPreferencesConfig;
+  bookingMenu?: BookingMenuItem[];
+  postBookingInstructions?: PostBookingInstruction[];
+  authoritativeCatalog?: AuthoritativeOutboundCatalog;
+  escalationResponsibleName?: string | null;
 }
 
 function parseNumber(
@@ -173,7 +196,9 @@ export async function getTenantConfig(
     });
 
     if (response.ok) {
-      const raw = (await response.json()) as Partial<TenantBotConfig>;
+      const raw = (await response.json()) as Partial<TenantBotConfig> & {
+        directionsMode?: unknown;
+      };
       // Fallbacks p/ tenants antigos cujo payload não traz os campos novos —
       // receptionist/openai = comportamento atual, 100% intocado.
       const aiProvider = raw.aiProvider ?? 'openai';
@@ -184,6 +209,30 @@ export async function getTenantConfig(
         aiModel:
           raw.aiModel ??
           (aiProvider === 'deepseek' ? 'deepseek-v4-flash' : 'gpt-4o-mini'),
+        contractVersion:
+          typeof raw.contractVersion === 'number' ? raw.contractVersion : undefined,
+        structuredConfig: normalizeStructuredPreferencesPayload(
+          raw.structuredConfig && typeof raw.structuredConfig === 'object'
+            ? {
+                ...(raw.structuredConfig as unknown as Record<string, unknown>),
+                directionsMode:
+                  (raw.structuredConfig as unknown as Record<string, unknown>)
+                    .directionsMode ?? raw.directionsMode,
+              }
+            : raw.structuredConfig
+        ),
+        bookingMenu: normalizeBookingMenuPayload(raw.bookingMenu),
+        postBookingInstructions: normalizePostBookingInstructionsPayload(
+          raw.postBookingInstructions
+        ),
+        authoritativeCatalog:
+          raw.authoritativeCatalog && typeof raw.authoritativeCatalog === 'object'
+            ? raw.authoritativeCatalog
+            : undefined,
+        escalationResponsibleName:
+          typeof raw.escalationResponsibleName === 'string'
+            ? raw.escalationResponsibleName
+            : null,
       };
       configCache.set(cacheKey, {
         data,

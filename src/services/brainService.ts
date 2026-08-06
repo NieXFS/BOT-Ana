@@ -4,13 +4,16 @@ import type { TenantBotConfig } from '../configProvider';
 import { DEFAULT_FALLBACK_MESSAGE } from '../botDefaults';
 import { callAiWithRetry } from '../utils/openaiRetry';
 import { isCaptured } from '../observability/captured';
+import { runtimeErrorKind } from '../observability/safeRuntime';
 import {
   addMessage,
   buildConversationKey,
   getHistory,
   hasConversation,
   HUMAN_ECHO_PREFIX,
+  currentSourceInboundMessageId,
 } from './contextManager';
+import { maybeEscalateReceptionistQuestion } from './questionEscalation';
 import {
   getServices,
   getAvailableSlots,
@@ -23,6 +26,8 @@ import {
   serviceSelectionGate,
   shouldAskServiceUpfront,
   buildServiceQuestion,
+  SERVICE_SELECTION_HINT_PREFIX,
+  type ServiceLike,
 } from './service-gate';
 import { professionalSelectionGate } from './professional-selection-gate';
 import {
@@ -61,6 +66,20 @@ import {
   normalizeCustomerReplyStyle,
 } from './customerReplyGuard';
 import { applyPromiseGuard } from './promiseGuard';
+import {
+  appendPostBookingInstructionsAfterSuccessfulBooking,
+  buildPreferencesBlock,
+  serializePublishedBookingMenu,
+} from './structuredPreferences';
+import {
+  buildReceptionistEnvelope,
+  canonicalReceptionistOutbound,
+  catalogFromServicesResult,
+  isSafeOwnerControlledText,
+  validateReceptionistOutbound,
+  type ReceptionistOutboundPurpose,
+  type ValidatedReceptionistOutbound,
+} from './receptionistOutbound';
 
 const rescheduleCancellationEvidence =
   new RescheduleCancellationEvidenceStore();
@@ -180,6 +199,23 @@ export function buildSystemPromptFromServices(
   const currentYear = getCurrentYear(config.timezone, now);
   const botName = config.botName.trim() || 'Ana';
   const servicesBlock = buildServicesBlock(servicesResult);
+  const bookingMenuBlock = serializePublishedBookingMenu(
+    config.bookingMenu,
+    servicesResult.services ?? []
+  );
+  const authoritativeDataBlock = [servicesBlock, bookingMenuBlock]
+    .filter(Boolean)
+    .join('\n\n');
+  const preferencesBlock = buildPreferencesBlock({
+    structuredConfig: config.structuredConfig,
+    legacySystemPrompt: config.systemPrompt,
+    catalog: {
+      serviceNames: (servicesResult.services ?? []).map((service) => service.name),
+      professionalNames: (servicesResult.professionals ?? []).map(
+        (professional) => professional.name
+      ),
+    },
+  });
 
   return `CONTEXTO TEMPORAL (OBRIGATÓRIO): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Quando o cliente mencionar datas relativas (amanhã, semana que vem, segunda, etc.), calcule a data correta a partir de HOJE. Quando o cliente mencionar apenas dia/mês (ex: "01/04"), SEMPRE assuma o ano ${currentYear}. NUNCA use anos anteriores.
 
@@ -189,18 +225,14 @@ ESTILO DE WHATSAPP: use texto corrido, curto e natural; evite Markdown, bullets 
 
 MENSAGENS DE ATENDENTE HUMANO: No histórico, mensagens que começam com "${HUMAN_ECHO_PREFIX.trim()}" foram enviadas por um ATENDENTE HUMANO da recepção (não por você), enquanto o atendimento estava pausado com uma pessoa. Trate-as como contexto e dê continuidade ao atendimento a partir delas; NUNCA diga "como eu te falei" sobre o que está nessas mensagens (não foi você quem falou) e NÃO repita perguntas que o atendente humano já respondeu.
 
-${servicesBlock}
-
-${config.systemPrompt}
-
 REGRAS DE FLUXO DE ATENDIMENTO (prioridade máxima, leia primeiro):
 A. ESCOLHA DO SERVIÇO — NUNCA assuma qual serviço o cliente quer. Ao INICIAR um novo agendamento, se a mensagem ATUAL não nomear o serviço com clareza (ex.: "quero marcar", "quero marcar para o dia 31", "quero marcar amanhã", "quero remarcar") E houver mais de um item na lista "SERVIÇOS DISPONÍVEIS", você DEVE listar TODOS os serviços disponíveis de forma NEUTRA (texto natural) e perguntar qual ele deseja ANTES de consultar horários (getAvailableSlots) ou agendar. NÃO faça pergunta direcionada como "quer o mesmo serviço de antes?" nem cite só um serviço — apresente as opções e deixe o cliente escolher. NUNCA reaproveite o serviço de um agendamento JÁ CONCLUÍDO, de mensagens antigas ou do histórico desta conversa — cada NOVO pedido recomeça perguntando o serviço (o fato de o cliente ter marcado/citado Depilação antes NÃO significa que o próximo agendamento também é Depilação). Exceção: durante um agendamento EM ANDAMENTO, mantenha o serviço que o cliente já escolheu NESSE mesmo fluxo (não repergunte a cada mensagem). Só siga direto, sem perguntar, se existir exatamente UM serviço disponível.
 B. HORÁRIO INDISPONÍVEL — Se bookAppointment retornar JSON success=false, reason exatamente "blocked", "conflict" ou "outside_hours" E uma lista availableSlots, o calendário JÁ consultou a disponibilidade internamente: NÃO chame getAvailableSlots de novo. Ofereça SOMENTE os valores exatos de availableSlots; se a lista vier vazia, não há alternativa naquele dia — ofereça tentar outra data, sem inventar horário. message e hint nunca são horários. Se essa falha qualificada não trouxer availableSlots, siga o hint e chame getAvailableSlots (mesma data, serviceId e profissional) ANTES de sugerir qualquer alternativa. NUNCA chute horários vizinhos (se pediram 15h, não invente 15h30 ou 16h). ATENÇÃO: um retorno "INTERNAL_HINT:" sobre agendamento DUPLICADO NÃO é indisponibilidade de horário — nesse caso siga a regra 7 abaixo e NÃO chame getAvailableSlots.
 C. ESCOLHA DO PROFISSIONAL — Para o serviço que o cliente escolheu, considere SOMENTE os profissionais listados como "Profissionais habilitados" DAQUELE serviço. (a) 0 habilitados → informe gentilmente que o serviço está temporariamente sem profissional disponível e ofereça outro serviço; NÃO consulte horários nem agende. (b) Exatamente 1 habilitado → NÃO pergunte preferência; use o ID desse profissional e siga direto. (c) 2+ habilitados E o cliente não disse com quem → pergunte "Profissional específico ou tanto faz?" e NÃO chame getAvailableSlots nem bookAppointment antes da resposta. Se "tanto faz/qualquer um", chame getAvailableSlots/bookAppointment SEM professionalId (auto-resolve). Se citar um nome, use o professionalId técnico EXATO dele. SEMPRE confirme com quem ficou.
 D. PEDIDO COM MÚLTIPLAS PARTES — Responda a TODAS as partes explícitas do pedido. Ex.: se perguntar preço e também pedir um horário, informe o preço do catálogo e chame getAvailableSlots na mesma interação; não descarte uma parte para ser breve.
-E. SERVIÇO AUSENTE — Se o serviço pedido não aparece em "SERVIÇOS DISPONÍVEIS", diga explicitamente, antes de oferecer qualquer alternativa, que ele não está disponível neste estabelecimento. Nunca trate uma alternativa como se fosse o serviço pedido. Só chame getServices uma vez se houver indício real de que a lista atual está desatualizada; se continuar ausente, mantenha a negativa explícita e ofereça apenas serviços cadastrados.
+E. SERVIÇO AUSENTE — Se o serviço pedido não aparece em "SERVIÇOS DISPONÍVEIS", diga explicitamente que esse serviço não está disponível neste estabelecimento antes de oferecer qualquer alternativa, mas não repita nem ecoe o termo ausente; use a frase canônica: "Esse tipo de atendimento não está disponível neste estabelecimento." Nunca trate uma alternativa como se fosse o serviço pedido. Só chame getServices uma vez se houver indício real de que a lista atual está desatualizada; se continuar ausente, mantenha a negativa explícita e ofereça apenas serviços cadastrados.
 F. SEGURANÇA CLÍNICA — Em dúvidas de saúde, clínicas ou estéticas, não diagnostique, não recomende tratamento, não afirme adequação, eficácia, resultado ou que um serviço resolve determinada condição. NÃO repita nem confirme a promessa clínica do cliente, mesmo para negá-la. Responda SOMENTE: "A equipe ou o profissional responsável precisa avaliar o seu caso. Se quiser, posso apresentar os serviços cadastrados e, depois que você escolher um deles, verificar os horários disponíveis." NÃO prometa nenhuma ação futura sua nem da equipe: nada de contato, resposta de terceiros, retorno ou prazo. A apresentação de serviços e a consulta de horários seguem as regras normais de catálogo e disponibilidade. Não acrescente explicações, não repita termos da pergunta e não indique ou agende o procedimento em dúvida.
-G. MUDANÇA NO AGENDAMENTO — Se o cliente mudar o serviço, a data ou o profissional durante um agendamento em andamento, qualquer horário recebido antes fica INVÁLIDO. Você DEVE chamar getAvailableSlots DE NOVO NO MESMO TURNO com os dados atuais ANTES de citar horários, resumir ou tentar agendar, MESMO que os horários antigos pareçam coincidir. NUNCA reutilize uma disponibilidade de serviço, data ou profissional anterior.
+G. MUDANÇA NO AGENDAMENTO — Se o cliente mudar o serviço, a data ou o profissional durante um agendamento em andamento, qualquer horário recebido antes fica INVÁLIDO. A escolha explícita de serviço mais recente SUBSTITUI a anterior: use o novo serviceId e chame getAvailableSlots DE NOVO NO MESMO TURNO com os dados atuais ANTES de citar horários, resumir ou tentar agendar, MESMO que os horários antigos pareçam coincidir. NUNCA reutilize uma disponibilidade de serviço, data ou profissional anterior. NUNCA narre sistema, regras, ferramentas, bloqueios, confirmação neutra ou processo interno; faça diretamente a pergunta natural necessária ao cliente.
 H. TRANSFERÊNCIA E RECADOS — Você NÃO transfere a conversa, NÃO avisa ninguém, NÃO deixa recado e NÃO aciona a equipe. Se o cliente pedir para falar com alguém, para ser transferido ou para que você avise alguém, diga com clareza que isso não é possível por aqui e que esses assuntos são tratados diretamente com a equipe do estabelecimento. NÃO prometa nenhuma ação futura sua nem da equipe e NÃO peça para o cliente aguardar por alguém.
 
 REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
@@ -209,7 +241,7 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 3. Se algum exemplo de ID aparecer em qualquer instrução anterior (incluindo nomes que comecem com "seed-"), IGNORE — são placeholders, não IDs reais. Use SOMENTE IDs da lista "SERVIÇOS DISPONÍVEIS" / "PROFISSIONAIS DISPONÍVEIS" acima.
 4. Se a ferramenta retornar erro de "Serviço não encontrado", chame getServices uma vez pra atualizar e use o ID exato retornado.
 5. FONTE DA VERDADE — Há SOMENTE duas fontes de disponibilidade: (a) getAvailableSlots com JSON success:true e slots; ou (b) bookAppointment com JSON success:false, reason exatamente "blocked", "conflict" ou "outside_hours" e availableSlots. No caso (b), availableSlots já veio de uma consulta interna do calendário: não chame getAvailableSlots novamente e ofereça SOMENTE os valores exatos recebidos; lista vazia significa que não há alternativa naquele dia. message, hint, package_exhausted, other, bookAppointment success:true, slots inválidos e dados de outro turno NÃO são disponibilidade. Sem uma dessas fontes com o slot exato, siga o hint e consulte getAvailableSlots antes de oferecer alternativa. Se o cliente pedir um horário que ESTÁ na lista autoritativa (incluindo variações como "15h" = "15:00", "15h30" = "15:30", "às 8 da manhã" = "08:00"), prossiga DIRETO para a confirmação do agendamento. NUNCA, EM HIPÓTESE ALGUMA, invente que está ocupado se o horário aparece na lista autoritativa.
-6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. NÃO responda ao cliente, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente em nenhuma forma.
+6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. EXCEÇÃO: se o hint disser que o serviço ainda não foi escolhido nesta intenção, NÃO tente getAvailableSlots de novo no mesmo turno; pergunte diretamente qual serviço a pessoa prefere. NÃO responda ao cliente com o conteúdo do hint, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente nem narradas/parafraseadas em nenhuma forma. NUNCA mencione sistema, regra, ferramenta, serviceId, processo interno, bloqueio, "confirmação neutra" ou "vou perguntar ao cliente".
  7. DETECÇÃO DE AGENDAMENTO EXISTENTE — Quando bookAppointment retornar INTERNAL_HINT informando que o cliente já tem agendamento(s) futuro(s), NÃO crie o novo ainda. Pergunte ao cliente conforme as opções listadas no hint. Aguarde a resposta. Agir conforme:
     - "Manter os dois": chame bookAppointment de novo com confirmedDuplicate=true e os mesmos demais parâmetros.
     - "Remarcar (cancelar e marcar este novo)": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos. PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior. Só após sucesso chame bookAppointment; confirmedDuplicate pode ser omitido porque o sistema deriva a autorização do cancelamento concluído.
@@ -220,7 +252,11 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment. Responda SOMENTE: "Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui." Não prometa nenhuma ação futura sua nem da equipe.
 9. CONFIRMAÇÃO INEQUÍVOCA — Só chame bookAppointment depois de apresentar um resumo COMPLETO e real de serviço, data, horário e profissional quando definido, e receber uma confirmação CLARA em um turno POSTERIOR ("sim", "confirmo", "pode marcar", "tudo certo"). Após esse resumo COMPLETO anterior, "pode sim", "tá bom", "ta bom" e "pode ser sim" são confirmações CLARAS: DEVE CHAMAR bookAppointment. Frases hesitantes como "acho que pode", "talvez", "pode ser" SOZINHO, "se der" ou equivalentes NÃO confirmam: pergunte novamente de forma objetiva e aguarde. NUNCA tente chamar bookAppointment antes desse resumo e confirmação; uma tool bloqueada ou um INTERNAL_HINT não é confirmação. NUNCA diga que o agendamento foi confirmado, marcado ou agendado antes de bookAppointment retornar success:true. O código também bloqueará chamadas sem confirmação inequívoca.
 
-CHECKLIST FINAL DE DISPONIBILIDADE (ANTES DE ENVIAR QUALQUER RESPOSTA): Toda resposta que cite horário concreto COMO DISPONIBILIDADE exige uma fonte autoritativa NESTE TURNO: getAvailableSlots com success:true e slots, OU bookAppointment com success:false, reason exatamente blocked/conflict/outside_hours e availableSlots. No segundo caso, ofereça SOMENTE os valores exatos de availableSlots e NÃO chame getAvailableSlots de novo; lista vazia significa que não há alternativa naquele dia. Sem uma dessas fontes — inclusive se a falha não trouxer availableSlots — NÃO escreva horários como disponíveis: siga o hint e chame getAvailableSlots antes de oferecer alternativa. Se serviço, data ou profissional mudaram, a regra G exige getAvailableSlots fresco no mesmo turno. Preço, duração e horário de funcionamento NÃO são disponibilidade; responda-os normalmente com os dados atuais.`;
+CHECKLIST FINAL DE DISPONIBILIDADE (ANTES DE ENVIAR QUALQUER RESPOSTA): Toda resposta que cite horário concreto COMO DISPONIBILIDADE exige uma fonte autoritativa NESTE TURNO: getAvailableSlots com success:true e slots, OU bookAppointment com success:false, reason exatamente blocked/conflict/outside_hours e availableSlots. No segundo caso, ofereça SOMENTE os valores exatos de availableSlots e NÃO chame getAvailableSlots de novo; lista vazia significa que não há alternativa naquele dia. Sem uma dessas fontes — inclusive se a falha não trouxer availableSlots — NÃO escreva horários como disponíveis: siga o hint e chame getAvailableSlots antes de oferecer alternativa. Se serviço, data ou profissional mudaram, a regra G exige getAvailableSlots fresco no mesmo turno. Preço, duração e horário de funcionamento NÃO são disponibilidade; responda-os normalmente com os dados atuais.
+
+${authoritativeDataBlock}
+
+${preferencesBlock}`;
 }
 
 export async function buildSystemPrompt(config: TenantBotConfig): Promise<string> {
@@ -290,6 +326,81 @@ export function maybePrependGreeting(
   }
 
   return `${greeting}\n\n${reply}`;
+}
+
+function validateComposedReceptionistReply(input: {
+  baseReply: string;
+  isFirstContact: boolean;
+  config: TenantBotConfig;
+  services: ServicesResult;
+  purpose: ReceptionistOutboundPurpose;
+  toolTrace?: Array<{ name: string; result: string; round?: number }>;
+  appendPostBooking?: boolean;
+}): ValidatedReceptionistOutbound {
+  const blocks: Array<{
+    source: 'GENERATED' | 'GREETING' | 'POST_BOOKING';
+    text: string;
+  }> = [];
+  const authoritativeCatalog = catalogFromServicesResult(input.services);
+  const safeGreeting = input.config.greetingMessage?.trim() &&
+    isSafeOwnerControlledText(
+      input.config.greetingMessage,
+      'GREETING',
+      authoritativeCatalog
+    )
+      ? input.config.greetingMessage
+      : null;
+  const safeConfig = { ...input.config, greetingMessage: safeGreeting };
+  const withGreeting = maybePrependGreeting(
+    input.baseReply,
+    input.isFirstContact,
+    safeConfig
+  );
+  const greetingPrefix = withGreeting.endsWith(input.baseReply)
+    ? withGreeting.slice(0, withGreeting.length - input.baseReply.length)
+    : '';
+  if (greetingPrefix) blocks.push({ source: 'GREETING', text: greetingPrefix });
+  blocks.push({ source: 'GENERATED', text: input.baseReply });
+
+  let exactPayload = withGreeting;
+  if (input.appendPostBooking) {
+    const safePostBookingInstructions = input.config.postBookingInstructions?.filter(
+      (instruction) =>
+        !instruction.active ||
+        isSafeOwnerControlledText(
+          instruction.text,
+          'POST_BOOKING',
+          authoritativeCatalog
+        )
+    );
+    const appended = appendPostBookingInstructionsAfterSuccessfulBooking(
+      withGreeting,
+      input.toolTrace ?? [],
+      safePostBookingInstructions,
+      input.config.botRole,
+      {
+        serviceNames: (input.services.services ?? []).map((service) => service.name),
+        professionalNames: (input.services.professionals ?? []).map(
+          (professional) => professional.name
+        ),
+      }
+    );
+    const suffix = appended.startsWith(withGreeting)
+      ? appended.slice(withGreeting.length)
+      : '';
+    if (suffix) blocks.push({ source: 'POST_BOOKING', text: suffix });
+    exactPayload = appended;
+  }
+
+  return validateReceptionistOutbound(
+    buildReceptionistEnvelope({
+      purpose: input.purpose,
+      blocks,
+      exactPayload,
+      authoritativeCatalog,
+      evidence: { toolTrace: input.toolTrace },
+    })
+  );
 }
 
 export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -450,7 +561,7 @@ async function executeFunction(
         );
         if (!gate.ok) {
           console.log(
-            `🚧 ${config.botName} gate de serviço bloqueou ${functionName} (serviço não escolhido pelo cliente) | phoneNumberId=${config.phoneNumberId}`
+            `🚧 Receptionist gate de serviço bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId}`
           );
           return JSON.stringify({ success: false, message: gate.hintMessage });
         }
@@ -474,7 +585,7 @@ async function executeFunction(
       });
       if (!selection.ok) {
         console.log(
-          `🚧 ${config.botName} gate de profissional bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId} reason=${selection.reason}`
+          `🚧 Receptionist gate de profissional bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId} reason=${selection.reason}`
         );
         return JSON.stringify({ success: false, message: selection.hintMessage });
       }
@@ -528,7 +639,7 @@ async function executeFunction(
         });
         if (!confirmation.ok) {
           console.log(
-            `🛑 ${config.botName} bloqueou book sem confirmação inequívoca | phoneNumberId=${config.phoneNumberId}`
+            `🛑 Receptionist bloqueou book sem confirmação inequívoca | phoneNumberId=${config.phoneNumberId}`
           );
           return JSON.stringify({
             success: false,
@@ -576,7 +687,7 @@ async function executeFunction(
         });
         if (!cancellation.ok) {
           console.log(
-            `🛑 ${config.botName} bloqueou cancelamento fora do fluxo de duplicidade | phoneNumberId=${config.phoneNumberId}`
+            `🛑 Receptionist bloqueou cancelamento fora do fluxo de duplicidade | phoneNumberId=${config.phoneNumberId}`
           );
           return JSON.stringify({
             success: false,
@@ -602,7 +713,9 @@ async function executeFunction(
         return JSON.stringify({ success: false, message: 'Função não reconhecida.' });
     }
   } catch (err) {
-    console.error(`❌ Erro ao executar função ${functionName}:`, err);
+    console.error(
+      `❌ Erro ao executar função ${functionName} | phoneNumberId=${config.phoneNumberId} | error=${runtimeErrorKind(err)}`
+    );
     return JSON.stringify({
       success: false,
       message: 'Tive um probleminha ao verificar a agenda, pode tentar de novo em um instante?',
@@ -656,6 +769,19 @@ export interface RunReceptionistModelLoopInput {
   maxToolRounds?: number;
   /** O harness comportamental desativa retries para tratar toda falha como bug. */
   retryOnFailure?: boolean;
+  /** Fixture offline de completion; omitida em produção. */
+  completionFactory?: (input: {
+    round: number;
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+  }) => Promise<OpenAI.Chat.Completions.ChatCompletion>;
+  /**
+   * Ativa o terminal determinístico quando o gate de serviço bloquear. A chave
+   * de intenção é opaca e existe apenas para separar tentativas do mesmo turno.
+   */
+  serviceSelectionAntiLoop?: {
+    services: ServiceLike[];
+    intentionKey: string;
+  };
 }
 
 type ExtendedCompletionUsage = NonNullable<
@@ -856,6 +982,19 @@ function normalizeUsage(
   };
 }
 
+function isServiceSelectionBlockedResult(result: string): boolean {
+  try {
+    const parsed = JSON.parse(result) as { success?: unknown; message?: unknown };
+    return (
+      parsed.success === false &&
+      typeof parsed.message === 'string' &&
+      parsed.message.startsWith(SERVICE_SELECTION_HINT_PREFIX)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Loop compartilhado pela produção e pelo benchmark. Não grava histórico, não
  * acessa o ERP e não envia WhatsApp por conta própria: todo efeito passa pelo
@@ -872,20 +1011,27 @@ export async function runReceptionistModelLoop(
   const toolTrace: ReceptionistToolTraceEntry[] = [];
   const usage: ReceptionistRequestUsage[] = [];
   const providerReportedModels: string[] = [];
+  const blockedServiceAttempts = new Set<string>();
+  const blockedServiceTools = new Set<string>();
+  const canonicalServiceQuestion = input.serviceSelectionAntiLoop
+    ? buildServiceQuestion(input.serviceSelectionAntiLoop.services)
+    : null;
 
   for (let index = 0; index < maxToolRounds; index += 1) {
     const round = index + 1;
     const startedAt = Date.now();
     const requestCompletion = async () =>
       validateCompletionResponse(
-        await createReceptionistChatCompletion(runtime, {
-          messages,
-          tools: RECEPTIONIST_TOOLS,
-          temperature: sanitizeTemperature(input.config.aiTemperature),
-          maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
-          userId: input.userId,
-          thinkingMode,
-        })
+        input.completionFactory
+          ? await input.completionFactory({ round, messages: [...messages] })
+          : await createReceptionistChatCompletion(runtime, {
+              messages,
+              tools: RECEPTIONIST_TOOLS,
+              temperature: sanitizeTemperature(input.config.aiTemperature),
+              maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
+              userId: input.userId,
+              thinkingMode,
+            })
       );
     const response =
       input.retryOnFailure === false
@@ -916,7 +1062,9 @@ export async function runReceptionistModelLoop(
 
     if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
       const rawReply =
-        typeof assistantMessage.content === 'string'
+        canonicalServiceQuestion && blockedServiceAttempts.size > 0
+          ? canonicalServiceQuestion
+          : typeof assistantMessage.content === 'string'
           ? assistantMessage.content.trim()
           : '';
       return {
@@ -940,6 +1088,35 @@ export async function runReceptionistModelLoop(
       const schemaIssue = parsed.valid
         ? validateToolArguments(functionName, parsed.args)
         : 'argumentos não são um objeto JSON válido';
+      const serviceAttemptKey = input.serviceSelectionAntiLoop
+        ? JSON.stringify([
+            functionName,
+            String(parsed.args.serviceId ?? ''),
+            input.serviceSelectionAntiLoop.intentionKey,
+          ])
+        : null;
+
+      // Depois de um bloqueio service_selection, uma nova tentativa da mesma
+      // tool no mesmo turno não executa I/O nem alimenta outro INTERNAL_HINT ao
+      // modelo. O turno termina na pergunta canônica, sem paráfrase/narração.
+      if (
+        canonicalServiceQuestion &&
+        serviceAttemptKey &&
+        (blockedServiceAttempts.has(serviceAttemptKey) ||
+          blockedServiceTools.has(functionName))
+      ) {
+        return {
+          rawReply: canonicalServiceQuestion,
+          exhausted: false,
+          provider: runtime.provider,
+          model: runtime.model,
+          providerReportedModels,
+          rounds: round,
+          messages,
+          toolTrace,
+          usage,
+        };
+      }
       const result = schemaIssue
         ? JSON.stringify({
             success: false,
@@ -954,6 +1131,15 @@ export async function runReceptionistModelLoop(
         argumentsValidJson: parsed.valid,
         result,
       });
+
+      if (
+        canonicalServiceQuestion &&
+        serviceAttemptKey &&
+        isServiceSelectionBlockedResult(result)
+      ) {
+        blockedServiceAttempts.add(serviceAttemptKey);
+        blockedServiceTools.add(functionName);
+      }
 
       messages.push({
         role: 'tool',
@@ -1090,7 +1276,7 @@ export async function getReply(
   userMessage: string,
   userName: string,
   config: TenantBotConfig
-): Promise<string> {
+): Promise<string | ValidatedReceptionistOutbound> {
   const baseRole = resolveBrainRole(config);
   if (baseRole === 'sales') {
     // A checagem duplicada fecha a corrida entre o pre-flush e o claim: uma
@@ -1213,13 +1399,34 @@ async function getReceptionistReply(
   userMessage: string,
   userName: string,
   config: TenantBotConfig
-): Promise<string> {
+): Promise<ValidatedReceptionistOutbound> {
   const conversationKey = buildConversationKey(config.phoneNumberId, phone);
   const isFirstContact = !(await hasConversation(conversationKey));
 
   await addMessage(conversationKey, 'user', userMessage);
 
   const history = await getHistory(conversationKey);
+
+  // Onda 2: gatilho completamente isolado por ANA_ESCALATION_ENABLED=false.
+  // Sem flag (default), retorna null antes de classificar/fazer I/O e o fluxo
+  // abaixo permanece byte-compatível. A origem vem somente do intake atômico.
+  const escalationReply = await maybeEscalateReceptionistQuestion({
+    phoneNumberId: config.phoneNumberId,
+    customerPhone: phone,
+    messageId: currentSourceInboundMessageId(),
+    text: userMessage,
+    responsibleName: config.escalationResponsibleName ?? undefined,
+  });
+  if (escalationReply) {
+    const validated = canonicalReceptionistOutbound(
+      'ESCALATION',
+      escalationReply,
+      config
+    );
+    await addMessage(conversationKey, 'assistant', validated.payload);
+    return validated;
+  }
+
   // Mensagens do USUÁRIO (cronológicas, a atual por último) — usadas pelo gate de
   // serviço (Guardrail B) pra checar se o cliente escolheu o serviço de fato.
   const userMessages = history
@@ -1235,15 +1442,17 @@ async function getReceptionistReply(
     servicesForGate.services.length >= 2 &&
     shouldAskServiceUpfront(servicesForGate.services, userMessages)
   ) {
-    const question = maybePrependGreeting(
-      buildServiceQuestion(servicesForGate.services),
+    const question = validateComposedReceptionistReply({
+      baseReply: buildServiceQuestion(servicesForGate.services),
       isFirstContact,
-      config
-    );
+      config,
+      services: servicesForGate,
+      purpose: 'SERVICE_QUESTION',
+    });
     console.log(
-      `🚦 ${config.botName} desambiguou o serviço proativamente | phoneNumberId=${config.phoneNumberId}`
+      `🚦 Receptionist desambiguou o serviço proativamente | phoneNumberId=${config.phoneNumberId}`
     );
-    await addMessage(conversationKey, 'assistant', question);
+    await addMessage(conversationKey, 'assistant', question.payload);
     return question;
   }
 
@@ -1264,9 +1473,13 @@ async function getReceptionistReply(
     const modelResult = await runReceptionistModelLoop({
       config,
       messages,
+      serviceSelectionAntiLoop: {
+        services: servicesForGate.services ?? [],
+        intentionKey: `turn:${userMessages.length}`,
+      },
       executeTool: async (functionName, args) => {
         console.log(
-          `🔧 ${config.botName} chamou ${functionName} | phoneNumberId=${config.phoneNumberId}`
+          `🔧 Receptionist chamou ${functionName} | phoneNumberId=${config.phoneNumberId}`
         );
         const result = await executeFunction(
           functionName,
@@ -1393,40 +1606,56 @@ async function getReceptionistReply(
           },
         });
       }
-      const finalReply = maybePrependGreeting(
-        inspection.safe
+      const finalReply = validateComposedReceptionistReply({
+        baseReply: inspection.safe
           ? guardedCandidateReply
           : safeWriteConfirmation || getFallbackMessage(config),
         isFirstContact,
-        config
-      );
+        config,
+        services: servicesForGate,
+        purpose: 'REACTIVE',
+        toolTrace: modelResult.toolTrace,
+        appendPostBooking: true,
+      });
 
-      await addMessage(conversationKey, 'assistant', finalReply);
+      await addMessage(conversationKey, 'assistant', finalReply.payload);
       return finalReply;
     }
   } catch (error) {
     // Erros do provider já foram capturados no funil provider-aware; aqui
     // pegamos o resto (ex.: falha de persistência) sem duplicar.
     if (!isCaptured(error)) {
-      Sentry.captureException(error, {
-        tags: { service: 'brain', operation: 'get_reply' },
+      Sentry.captureException(new Error('receptionist reply generation failed'), {
+        tags: {
+          service: 'brain',
+          operation: 'get_reply',
+          error_kind: runtimeErrorKind(error),
+        },
         contexts: {
           get_reply: {
             tenant_slug: config.tenantSlug,
             phone_number_id: config.phoneNumberId,
-            bot_name: config.botName,
           },
         },
       });
     }
-    console.error(`❌ Erro ao gerar resposta da ${config.botName}:`, error);
+    console.error(
+      `❌ Erro ao gerar resposta | phoneNumberId=${config.phoneNumberId} | error=${runtimeErrorKind(error)}`
+    );
   }
 
-  const fallbackReply = maybePrependGreeting(
-    buildSafeRecoveryReply(completedWriteTrace, getFallbackMessage(config)),
+  const fallbackReply = validateComposedReceptionistReply({
+    baseReply: buildSafeRecoveryReply(
+      completedWriteTrace,
+      getFallbackMessage(config)
+    ),
     isFirstContact,
-    config
-  );
-  await addMessage(conversationKey, 'assistant', fallbackReply);
+    config,
+    services: servicesForGate,
+    purpose: 'RECOVERY',
+    toolTrace: completedWriteTrace,
+    appendPostBooking: true,
+  });
+  await addMessage(conversationKey, 'assistant', fallbackReply.payload);
   return fallbackReply;
 }

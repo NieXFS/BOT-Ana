@@ -2,6 +2,10 @@ import axios from 'axios';
 import * as Sentry from '@sentry/node';
 import type { TenantBotConfig } from '../configProvider';
 import { ERP_API_TOKEN } from '../erpApiToken';
+import {
+  runtimeErrorKind,
+  safeHttpStatus,
+} from '../observability/safeRuntime';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 
@@ -39,12 +43,13 @@ erpApi.interceptors.response.use(
       const isRaceCondition = status === 409;
       const isExpectedScheduling = status === 409 || status === 422;
       const responseData = isAxios ? error.response?.data : undefined;
-      const bookReason =
+      const rawBookReason =
         responseData && typeof responseData === 'object' && 'reason' in responseData
           ? String((responseData as { reason?: unknown }).reason ?? 'n/a')
           : 'n/a';
+      const bookReason = rawBookReason.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
 
-      Sentry.captureException(error, {
+      Sentry.captureException(new Error('erp calendar request failed'), {
         level: isExpectedScheduling ? 'warning' : 'error',
         tags: {
           service: 'erp_calendar',
@@ -52,6 +57,7 @@ erpApi.interceptors.response.use(
           erp_status: status ?? 'network',
           race_condition: isRaceCondition,
           book_reason: bookReason,
+          error_kind: runtimeErrorKind(error),
         },
         contexts: {
           erp_request: {
@@ -348,7 +354,7 @@ function normalizeDate(date: string, timezone: string): string {
   }
 
   const correctedDate = `${currentYear}-${month}-${day}`;
-  console.log(`⚠️ Ano corrigido automaticamente de ${year} para ${currentYear}: ${correctedDate}`);
+  console.log('⚠️ Ano de agendamento corrigido automaticamente.');
   return correctedDate;
 }
 
@@ -681,7 +687,9 @@ export async function getServices(
     });
     return result;
   } catch (err) {
-    console.error('❌ Erro ao consultar serviços no ERP:', err);
+    console.error(
+      `❌ Erro ao consultar serviços no ERP | error=${runtimeErrorKind(err)} | status=${safeHttpStatus(err) ?? 'n/a'}`
+    );
     return {
       success: false,
       message:
@@ -767,7 +775,9 @@ export async function getAvailableSlots(
       professionalId: availabilityProfessionalId,
     };
   } catch (err) {
-    console.error('❌ Erro ao consultar disponibilidade no ERP:', err);
+    console.error(
+      `❌ Erro ao consultar disponibilidade no ERP | error=${runtimeErrorKind(err)} | status=${safeHttpStatus(err) ?? 'n/a'}`
+    );
 
     // FIX 3 (defesa em profundidade): se o ERP recusou com 400 porque o
     // profissional não atende/está inativo pra este serviço, devolve um
@@ -818,7 +828,9 @@ export async function getCustomerUpcomingAppointments(
 
     return { success: true, appointments };
   } catch (err) {
-    console.error('❌ Erro ao consultar agendamentos futuros no ERP:', err);
+    console.error(
+      `❌ Erro ao consultar agendamentos futuros no ERP | error=${runtimeErrorKind(err)} | status=${safeHttpStatus(err) ?? 'n/a'}`
+    );
     return {
       success: false,
       message:
@@ -914,16 +926,9 @@ export async function cancelAppointment(
         ? err.response.data.error
         : 'Não consegui cancelar esse agendamento agora.';
 
-    if (axios.isAxiosError(err)) {
-      console.error('❌ Erro ao cancelar agendamento no ERP:', {
-        status: err.response?.status,
-        data: err.response?.data,
-        code: err.code,
-        message: err.message,
-      });
-    } else {
-      console.error('❌ Erro ao cancelar agendamento no ERP:', err);
-    }
+    console.error(
+      `❌ Erro ao cancelar agendamento no ERP | error=${runtimeErrorKind(err)} | status=${safeHttpStatus(err) ?? 'n/a'}`
+    );
 
     return {
       success: false,
@@ -1130,10 +1135,11 @@ export async function bookAppointment(
       bookResponse.data?.professional?.name?.trim() || requestedProfessional?.name;
     const withProfessional = bookedProfessionalName ? ` com ${bookedProfessionalName}` : '';
 
-    return {
+    const successResult: BookAppointmentResult = {
       success: true,
       message: `Agendado com sucesso para ${formatDateBR(normalizedDate)} às ${time}${withProfessional} para ${selectedService.name}.`,
     };
+    return successResult;
   } catch (err) {
     // Falha HTTP do POST/availability: o ERP devolve um reason machine-readable
     // (blocked/conflict/outside_hours/package_exhausted/other). Traduzimos numa
@@ -1164,7 +1170,9 @@ export async function bookAppointment(
 
     // Erro de rede / inesperado: transitório, não é problema de horário —
     // sem hint (consultar horários não ajudaria) e mensagem de "tente de novo".
-    console.error('❌ Erro ao criar agendamento no ERP:', err);
+    console.error(
+      `❌ Erro ao criar agendamento no ERP | error=${runtimeErrorKind(err)} | status=${safeHttpStatus(err) ?? 'n/a'}`
+    );
     return {
       success: false,
       reason: 'other',

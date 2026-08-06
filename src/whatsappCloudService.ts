@@ -33,6 +33,44 @@ export async function sendFreeformMessage(
   );
 }
 
+export class WhatsAppReceiptMissingError extends Error {
+  readonly deliveryClassification = 'ambiguous' as const;
+
+  constructor() {
+    super('WhatsApp provider response contained no message id');
+    this.name = 'WhatsAppReceiptMissingError';
+  }
+}
+
+/**
+ * Transporte com recibo (Rev. 3 §5.2). Diferente do helper legado acima, esta
+ * variante só conclui sucesso quando a Meta devolve `messages[0].id`.
+ */
+export async function sendFreeformMessageWithReceipt(
+  to: string,
+  text: string,
+  waConfig: WhatsAppTenantConfig
+): Promise<{ providerMessageId: string }> {
+  const response = await axios.post<{
+    messages?: Array<{ id?: unknown }>;
+  }>(
+    buildApiUrl(waConfig),
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'text',
+      text: { body: text },
+    },
+    { headers: headers(waConfig) }
+  );
+
+  const providerMessageId = response.data?.messages?.[0]?.id;
+  if (typeof providerMessageId !== 'string' || !providerMessageId.trim()) {
+    throw new WhatsAppReceiptMissingError();
+  }
+  return { providerMessageId: providerMessageId.trim() };
+}
+
 // --- Simulação de digitação --------------------------------------------------
 export async function typingDelay(text: string): Promise<void> {
   const MS_PER_CHAR = 50;

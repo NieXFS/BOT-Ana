@@ -3,7 +3,11 @@ import {
   getLastResolvedSalesConversationRole,
   getReply,
 } from './services/brainService';
-import { addMessage, buildConversationKey } from './services/contextManager';
+import {
+  addMessage,
+  buildConversationKey,
+  withPersistedInboundContext,
+} from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
 import { markFollowupOptedOut } from './services/salesFollowups';
@@ -29,6 +33,34 @@ import {
   noteOnboardingInbound,
 } from './services/onboardingPolling';
 import { clearPendingOnboardingProposal } from './services/onboardingConfirmationGate';
+import {
+  markInboundTranscriptionFailed,
+  persistInboundAtomically,
+  updateInboundHistoryContent,
+  type AtomicInboundInput,
+  type InboundContentStatus,
+  type InboundMessageType,
+} from './services/anaWave2Store';
+import {
+  deliverInboundWithFastRetries,
+  shouldSuspendForPendingInbound,
+  type InboundDeliveryResult,
+} from './services/inboundOutbox';
+import {
+  conversationHash,
+  runtimeErrorKind,
+} from './observability/safeRuntime';
+import { truncateForW1 } from './services/inboundContent';
+import {
+  buildReceptionistEnvelope,
+  canonicalReceptionistOutbound,
+  catalogFromConfig,
+  deliverValidatedReceptionistText,
+  validateReceptionistOutbound,
+  type ValidatedReceptionistOutbound,
+} from './services/receptionistOutbound';
+
+type OutboundReply = string | ValidatedReceptionistOutbound;
 
 interface MessageBuffer {
   texts: string[];
@@ -40,6 +72,10 @@ interface MessageBuffer {
   from: string;
   isProcessing: boolean;
   pendingTexts: string[];
+  /** Onda 2 só-recepcionista: inbounds já estão no history pelo intake. */
+  inboundPersisted: boolean;
+  messageIds: string[];
+  pendingMessageIds: string[];
 }
 
 const messageBuffers = new Map<string, MessageBuffer>();
@@ -84,7 +120,9 @@ export interface FlushDeps {
   getReply: typeof getReply;
   sendReply: (
     from: string,
-    text: string,
+    // `any` apenas no seam de smoke legado; a implementação default abaixo
+    // continua apontando para a fronteira tipada `sendConfiguredReply`.
+    text: any,
     config: TenantBotConfig
   ) => Promise<void>;
   /** Caminho que ignora voz para fallbacks de sistema. */
@@ -135,44 +173,71 @@ const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
 /** Seam do ponto de entrega: permite provar o caminho byte-idêntico da recepção. */
 export async function sendConfiguredReply(
   from: string,
-  text: string,
+  text: OutboundReply,
   config: TenantBotConfig,
   deps: ConfiguredReplyDeps = defaultConfiguredReplyDeps
 ): Promise<void> {
+  if (config.botRole !== 'sales') {
+    const validated = typeof text === 'string'
+      ? validateReceptionistOutbound(buildReceptionistEnvelope({
+          purpose: 'REACTIVE',
+          blocks: [{ source: 'GENERATED', text }],
+          authoritativeCatalog: catalogFromConfig(config),
+        }))
+      : text;
+    if (!validated.originalAccepted) {
+      console.warn(
+        `[receptionist-outbound] fallback purpose=${validated.purpose} reasons=${validated.reasonCodes.join(',')} sources=${validated.sources.join(',')}`
+      );
+    }
+    if (typingSimEnabled(config)) await deps.waitTyping(validated.payload);
+    await deps.sendText(from, validated.payload, config);
+    return;
+  }
+  const salesText = typeof text === 'string' ? text : text.payload;
   if (deps.voiceEnabled(config)) {
-    await deps.deliverVoice(from, text, config);
+    await deps.deliverVoice(from, salesText, config);
     return;
   }
   if (typingSimEnabled(config)) {
-    await deps.waitTyping(text);
+    await deps.waitTyping(salesText);
   }
-  await deps.sendText(from, text, config);
+  await deps.sendText(from, salesText, config);
 }
 
 const defaultFlushDeps: FlushDeps = {
   getReply,
   sendReply: sendConfiguredReply,
   sendReplyPlain: async (from, text, config) => {
-    if (typingSimEnabled(config)) {
-      await typingDelay(text);
+    if (config.botRole !== 'sales') {
+      const outbound = canonicalReceptionistOutbound(
+        'FLUSH_FALLBACK',
+        text,
+        config
+      );
+      if (typingSimEnabled(config)) await typingDelay(outbound.payload);
+      await deliverValidatedReceptionistText(from, outbound, config);
+      return;
     }
-    await sendFreeformMessage(from, text, config);
+    const outbound = text;
+    if (typingSimEnabled(config)) {
+      await typingDelay(outbound);
+    }
+    await sendFreeformMessage(from, outbound, config);
   },
   isPaused: isConversationPaused,
   recordPausedInbound: recordInboundWhilePaused,
 };
 
-export function redactPhone(phone: string): string {
-  const prefix = phone.trim().slice(0, 4);
-  return prefix ? `${prefix}***` : '***';
-}
-
 function safeSalesContext(config: TenantBotConfig, from: string): string {
-  return `phoneNumberId=${config.phoneNumberId} lead=${redactPhone(from)}`;
+  return `phoneNumberId=${config.phoneNumberId} convHash=${conversationHash(
+    config.phoneNumberId,
+    from
+  )}`;
 }
 
 function errorKind(error: unknown): string {
-  return error instanceof Error ? error.name : typeof error;
+  return runtimeErrorKind(error);
 }
 
 /**
@@ -189,13 +254,9 @@ async function emitFlushFallback(
   const now = Date.now();
   const suppressedUntil = flushRecoveryUntil.get(bufferKey) ?? 0;
   if (now < suppressedUntil) {
-    if (config.botRole === 'sales') {
-      console.log(
-        `🟡 [flush] ${safeSalesContext(config, from)} em recovery — fallback suprimido`
-      );
-    } else {
-      console.log(`🟡 [flush] ${bufferKey} em janela de recovery — fallback suprimido`);
-    }
+    console.log(
+      `🟡 [flush] ${safeSalesContext(config, from)} em recovery — fallback suprimido`
+    );
     return;
   }
   flushRecoveryUntil.set(bufferKey, now + FLUSH_RECOVERY_WINDOW_MS);
@@ -205,31 +266,20 @@ async function emitFlushFallback(
       FLUSH_FALLBACK_MESSAGE,
       config
     );
-    if (config.botRole === 'sales') {
-      console.log(`🆘 [flush] fallback de erro enviado | ${safeSalesContext(config, from)}`);
-    } else {
-      console.log(`🆘 [flush] fallback de erro enviado para ${bufferKey}`);
-    }
+    console.log(`🆘 [flush] fallback de erro enviado | ${safeSalesContext(config, from)}`);
   } catch (sendErr) {
-    const capturedError =
-      config.botRole === 'sales'
-        ? new Error('message_handler flush fallback send failed')
-        : sendErr;
-    Sentry.captureException(capturedError, {
+    Sentry.captureException(new Error('message_handler flush fallback send failed'), {
       tags: {
         service: 'message_handler',
         operation: 'flush_fallback_send',
         phoneNumberId: config.phoneNumberId,
         tenantSlug: config.tenantSlug,
+        error_kind: runtimeErrorKind(sendErr),
       },
     });
-    if (config.botRole === 'sales') {
-      console.error(
-        `❌ [flush] falha ao enviar fallback | ${safeSalesContext(config, from)} | error=${errorKind(sendErr)}`
-      );
-    } else {
-      console.error(`❌ [flush] falha ao enviar fallback para ${bufferKey}:`, sendErr);
-    }
+    console.error(
+      `❌ [flush] falha ao enviar fallback | ${safeSalesContext(config, from)} | error=${errorKind(sendErr)}`
+    );
   }
 }
 
@@ -279,19 +329,34 @@ async function suppressFlushIfPaused(params: {
   const recordPausedInbound = deps.recordPausedInbound ?? recordInboundWhilePaused;
   const unprocessedTexts = [...alreadyProcessedTexts, ...buffer.pendingTexts];
   buffer.pendingTexts = [];
-  for (const text of unprocessedTexts) {
-    if (text.trim()) {
-      await recordPausedInbound(
-        buildConversationKey(buffer.config.phoneNumberId, buffer.from),
-        text,
-        buffer.config
-      );
+  buffer.pendingMessageIds = [];
+  if (!buffer.inboundPersisted) {
+    for (const text of unprocessedTexts) {
+      if (text.trim()) {
+        await recordPausedInbound(
+          buildConversationKey(buffer.config.phoneNumberId, buffer.from),
+          text,
+          buffer.config
+        );
+      }
     }
   }
 
   messageBuffers.delete(bufferKey);
   console.log('⏸️ [pausado] resposta pendente suprimida após intervenção humana.');
   return true;
+}
+
+async function getBufferedReply(
+  buffer: MessageBuffer,
+  bufferedMessageIds: string[],
+  consolidatedText: string,
+  deps: FlushDeps
+): Promise<OutboundReply> {
+  const work = () =>
+    deps.getReply(buffer.from, consolidatedText, buffer.name, buffer.config);
+  if (!buffer.inboundPersisted) return work();
+  return withPersistedInboundContext(bufferedMessageIds, work);
 }
 
 export async function flushBuffer(
@@ -308,9 +373,11 @@ export async function flushBuffer(
 
   buffer.isProcessing = true;
   const bufferedTexts = [...buffer.texts];
+  const bufferedMessageIds = [...buffer.messageIds];
   const consolidatedText = bufferedTexts.join(' ');
   const messageCount = buffer.texts.length;
   buffer.texts = [];
+  buffer.messageIds = [];
   const { name, config, from } = buffer;
 
   // A conversa pode ter sido pausada DEPOIS que o inbound entrou no debounce.
@@ -326,19 +393,21 @@ export async function flushBuffer(
     return;
   }
 
-  if (config.botRole === 'sales') {
-    console.log(
-      `🧠 Enviando para ${config.botName} | ${safeSalesContext(config, from)} | messages=${messageCount}`
-    );
-  } else {
-    console.log(`🧠 Enviando para ${config.botName} (${bufferKey}): "${consolidatedText}"`);
-  }
+  console.log(
+    `🧠 Processando mensagens | ${safeSalesContext(config, from)} | messages=${messageCount}`
+  );
 
   let flushFailed = false;
   if (config.botRole === 'sales') {
-    let reply: string;
+    let reply = '';
     try {
-      reply = await deps.getReply(from, consolidatedText, name, config);
+      const generated = await getBufferedReply(
+        buffer,
+        bufferedMessageIds,
+        consolidatedText,
+        deps
+      );
+      reply = typeof generated === 'string' ? generated : generated.payload;
     } catch (err) {
       flushFailed = true;
       Sentry.captureException(new Error('message_handler sales brain failed'), {
@@ -400,7 +469,7 @@ export async function flushBuffer(
         await deps.sendReply(from, reply!, config);
         notifySalesReplyDelivered(bufferKey, 'novo_inbound');
         console.log(
-          `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply!.length}`
+          `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply.length}`
         );
       } catch (err) {
         flushFailed = true;
@@ -439,7 +508,7 @@ export async function flushBuffer(
           phone: from,
           userName: name,
           config,
-          failure: { kind: 'send', replyText: reply! },
+          failure: { kind: 'send', replyText: reply },
           conversationRole:
             getLastResolvedSalesConversationRole(bufferKey),
         });
@@ -447,7 +516,12 @@ export async function flushBuffer(
     }
   } else {
     try {
-      const reply = await deps.getReply(from, consolidatedText, name, config);
+      const reply = await getBufferedReply(
+        buffer,
+        bufferedMessageIds,
+        consolidatedText,
+        deps
+      );
 
       // A mesma barreira pós-brain vale para a recepcionista.
       if (
@@ -462,19 +536,24 @@ export async function flushBuffer(
       }
 
       await deps.sendReply(from, reply, config);
-      console.log(`🤖 ${config.botName} respondeu para ${bufferKey}: "${reply}"`);
+      console.log(
+        `🤖 Resposta enviada | ${safeSalesContext(config, from)} | chars=${typeof reply === 'string' ? reply.length : reply.payload.length}`
+      );
     } catch (err) {
       flushFailed = true;
-      Sentry.captureException(err, {
+      Sentry.captureException(new Error('message_handler receptionist flush failed'), {
         tags: {
           service: 'message_handler',
           operation: 'flush_buffer',
           phoneNumberId: config.phoneNumberId,
           tenantSlug: config.tenantSlug,
           messageCount,
+          error_kind: runtimeErrorKind(err),
         },
       });
-      console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
+      console.error(
+        `❌ Erro no flush | ${safeSalesContext(config, from)} | error=${runtimeErrorKind(err)}`
+      );
 
       // Se o humano assumiu enquanto o brain/envio falhou, não manda M24 por
       // cima do atendimento e limpa o buffer sem rearmar.
@@ -506,46 +585,30 @@ export async function flushBuffer(
   }
 
   if (currentBuffer.pendingTexts.length > 0) {
-    if (config.botRole === 'sales') {
-      console.log(
-        `🔄 ${currentBuffer.pendingTexts.length} mensagem(s) pendente(s) | ${safeSalesContext(config, from)}`
-      );
-    } else {
-      console.log(
-        `🔄 ${currentBuffer.pendingTexts.length} mensagem(s) pendente(s) pra ${bufferKey}, abrindo novo debounce`
-      );
-    }
+    console.log(
+      `🔄 ${currentBuffer.pendingTexts.length} mensagem(s) pendente(s) | ${safeSalesContext(config, from)}`
+    );
     currentBuffer.texts = currentBuffer.pendingTexts;
     currentBuffer.pendingTexts = [];
+    currentBuffer.messageIds = currentBuffer.pendingMessageIds;
+    currentBuffer.pendingMessageIds = [];
     currentBuffer.isProcessing = false;
     currentBuffer.firstMessageAt = Date.now();
 
     currentBuffer.timer = setTimeout(() => {
       flushBuffer(bufferKey).catch((err) => {
-        if (config.botRole === 'sales') {
-          console.error(
-            `❌ Erro ao processar mensagens pendentes | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
-          );
-        } else {
-          console.error(`❌ Erro ao processar mensagens pendentes de ${bufferKey}:`, err);
-        }
+        console.error(
+          `❌ Erro ao processar mensagens pendentes | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+        );
       });
     }, DEBOUNCE_TIME_MS);
 
     currentBuffer.maxWaitTimer = setTimeout(() => {
-      if (config.botRole === 'sales') {
-        console.log(`⏰ Max wait atingido | ${safeSalesContext(config, from)}`);
-      } else {
-        console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
-      }
+      console.log(`⏰ Max wait atingido | ${safeSalesContext(config, from)}`);
       flushBuffer(bufferKey).catch((err) => {
-        if (config.botRole === 'sales') {
-          console.error(
-            `❌ Erro no max-wait flush | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
-          );
-        } else {
-          console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err);
-        }
+        console.error(
+          `❌ Erro no max-wait flush | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+        );
       });
     }, MAX_WAIT_TIME_MS);
   } else {
@@ -585,12 +648,13 @@ export async function recordInboundWhilePaused(
   try {
     await deps.recordMessage(conversationKey, 'user', text);
   } catch (err) {
-    Sentry.captureException(err, {
+    Sentry.captureException(new Error('message_handler paused history write failed'), {
       tags: {
         service: 'message_handler',
         operation: 'record_inbound_while_paused',
         phoneNumberId: config.phoneNumberId,
         tenantSlug: config.tenantSlug,
+        error_kind: runtimeErrorKind(err),
       },
     });
   }
@@ -604,6 +668,11 @@ export interface CloudMessage {
   text?: { body: string };
   audio?: { id: string; mime_type: string };
   button?: { text: string; payload: string };
+  interactive?: {
+    type?: 'button_reply' | 'list_reply' | string;
+    button_reply?: { id?: string; title?: string };
+    list_reply?: { id?: string; title?: string; description?: string };
+  };
   referral?: CtwaReferral;
 }
 
@@ -612,73 +681,253 @@ export interface CloudContact {
   wa_id?: string;
 }
 
+export interface NormalizedInboundContent {
+  messageType: InboundMessageType;
+  contentStatus: InboundContentStatus;
+  content: string;
+  contentOriginalLength: number | null;
+}
+
+/** Representação única: o mesmo texto vai para history, brain e W1. */
+export function normalizeInboundContent(
+  message: CloudMessage,
+  enforceW1Limit = true
+): NormalizedInboundContent {
+  let messageType: InboundMessageType = 'other';
+  let content = '';
+
+  if (message.type === 'text') {
+    messageType = 'text';
+    content = message.text?.body ?? '';
+  } else if (message.type === 'button') {
+    messageType = 'button';
+    content = message.button?.text ?? '';
+  } else if (message.type === 'interactive') {
+    if (message.interactive?.type === 'list_reply') {
+      messageType = 'list';
+      content = message.interactive.list_reply?.title ?? '';
+    } else if (message.interactive?.type === 'button_reply') {
+      messageType = 'button';
+      content = message.interactive.button_reply?.title ?? '';
+    }
+  } else if (message.type === 'audio') {
+    return {
+      messageType: 'audio',
+      contentStatus: 'pending',
+      content: '',
+      contentOriginalLength: null,
+    };
+  }
+
+  if (!content.trim()) {
+    return {
+      messageType,
+      contentStatus: 'no_text',
+      content: '',
+      contentOriginalLength: null,
+    };
+  }
+
+  if (!enforceW1Limit) {
+    return {
+      messageType,
+      contentStatus: 'final',
+      content,
+      contentOriginalLength: content.length,
+    };
+  }
+
+  const truncated = truncateForW1(content);
+
+  return {
+    messageType,
+    contentStatus: truncated.truncated ? 'truncated' : 'final',
+    content: truncated.text,
+    contentOriginalLength: truncated.originalLength,
+  };
+}
+
+function inboundReceivedAt(message: CloudMessage): Date {
+  const seconds = Number(message.timestamp);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    const parsed = new Date(seconds * 1000);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date();
+}
+
+export interface IncomingMessageDeps {
+  persistInbound: (input: AtomicInboundInput) => Promise<{
+    fresh: boolean;
+    conversationKey: string;
+    sequence: number | null;
+  }>;
+  deliverInbound: (messageId: string) => Promise<InboundDeliveryResult>;
+  updateInboundContent: (messageId: string, content: string) => Promise<void>;
+  markTranscriptionFailed: (messageId: string) => Promise<void>;
+  downloadAudio: typeof downloadMedia;
+  transcribeAudio: typeof transcreverAudioBuffer;
+  handleOptOut: typeof tryHandleOptOut;
+  shouldSuspend: typeof shouldSuspendForPendingInbound;
+  isPaused: typeof isConversationPaused;
+}
+
+const defaultIncomingMessageDeps: IncomingMessageDeps = {
+  persistInbound: persistInboundAtomically,
+  deliverInbound: deliverInboundWithFastRetries,
+  updateInboundContent: updateInboundHistoryContent,
+  markTranscriptionFailed: markInboundTranscriptionFailed,
+  downloadAudio: downloadMedia,
+  transcribeAudio: transcreverAudioBuffer,
+  handleOptOut: tryHandleOptOut,
+  shouldSuspend: shouldSuspendForPendingInbound,
+  isPaused: isConversationPaused,
+};
+
 export async function handleIncomingMessage(
   message: CloudMessage,
   contact: CloudContact | undefined,
-  config: TenantBotConfig
+  config: TenantBotConfig,
+  deps: IncomingMessageDeps = defaultIncomingMessageDeps
 ): Promise<void> {
   const from = message.from;
   const name = contact?.profile?.name ?? 'Cliente';
-  const conversationKey = buildConversationKey(config.phoneNumberId, from);
+  let conversationKey = buildConversationKey(config.phoneNumberId, from);
+  const inboundPersisted = config.botRole !== 'sales';
+  let inboundDeliveryPending = false;
+  const normalizedInbound = normalizeInboundContent(message, inboundPersisted);
+  const convHash = conversationHash(config.phoneNumberId, from);
+
+  const deliverPersistedInbound = async (): Promise<void> => {
+    if (!inboundPersisted) return;
+    try {
+      const delivery = await deps.deliverInbound(message.id);
+      inboundDeliveryPending = !delivery.delivered;
+    } catch (error) {
+      // O registro já está durável no outbox. O sweep retomará sem repetir intake.
+      inboundDeliveryPending = true;
+      Sentry.captureException(new Error('ana inbound immediate delivery failed'), {
+        level: 'warning',
+        tags: {
+          service: 'message_handler',
+          operation: 'inbound_outbox_immediate',
+          phoneNumberId: config.phoneNumberId,
+          messageId: message.id,
+          error_kind: runtimeErrorKind(error),
+        },
+      });
+    }
+  };
+
+  // Rev. 3 §6.2 — somente a recepcionista Ana. Renata/onboarding permanecem no
+  // intake legado e não são tocados por esta onda.
+  if (inboundPersisted) {
+    const intake = await deps.persistInbound({
+      messageId: message.id,
+      phoneNumberId: config.phoneNumberId,
+      customerPhone: from,
+      content: normalizedInbound.content,
+      messageType: normalizedInbound.messageType,
+      contentStatus: normalizedInbound.contentStatus,
+      contentOriginalLength: normalizedInbound.contentOriginalLength,
+      receivedAt: inboundReceivedAt(message),
+    });
+    if (!intake.fresh) {
+      console.info(`↩️ Inbound ${message.id} repetida — intake atômico em noop.`);
+      return;
+    }
+    conversationKey = intake.conversationKey;
+  }
 
   let text = '';
 
-  if (message.type === 'button') {
-    text = message.button?.text ?? '';
+  if (
+    normalizedInbound.messageType === 'button' ||
+    normalizedInbound.messageType === 'list'
+  ) {
+    text = normalizedInbound.content;
     if (config.botRole === 'sales') {
       console.log(`🔘 Botão clicado | ${safeSalesContext(config, from)}`);
     } else {
-      console.log(`🔘 Botão clicado por ${conversationKey}: "${text}"`);
+      console.log(
+        `🔘 Interação recebida | phoneNumberId=${config.phoneNumberId} | convHash=${convHash} | type=${normalizedInbound.messageType}`
+      );
     }
-  } else if (message.type === 'text') {
-    text = message.text?.body ?? '';
+  } else if (normalizedInbound.messageType === 'text') {
+    text = normalizedInbound.content;
   } else if (message.type === 'audio') {
-    if (!message.audio?.id) return;
-
     try {
-      const buffer = await downloadMedia(message.audio.id, config);
-      text = await transcreverAudioBuffer(buffer, config.openaiApiKey);
-      if (config.botRole === 'sales') {
-        console.log(
-          `🎙️ Áudio transcrito | ${safeSalesContext(config, from)} | chars=${text.length}`
-        );
-      } else {
-        console.log(`🎙️ Áudio transcrito de ${conversationKey}: "${text}"`);
+      if (!message.audio?.id) {
+        throw new Error('InboundAudioMediaIdMissing');
       }
+      const buffer = await deps.downloadAudio(message.audio.id, config);
+      const transcription = await deps.transcribeAudio(buffer, config.openaiApiKey);
+      if (!transcription.trim()) {
+        throw new Error('InboundAudioTranscriptionEmpty');
+      }
+      if (inboundPersisted) {
+        // Só depois deste commit atômico o outbox deixa o estado `pending`.
+        await deps.updateInboundContent(message.id, transcription);
+        text = truncateForW1(transcription).text;
+      } else {
+        text = transcription;
+      }
+      console.log(
+        `🎙️ Áudio transcrito | phoneNumberId=${config.phoneNumberId} | convHash=${convHash} | chars=${text.length}`
+      );
     } catch (err) {
-      if (config.botRole === 'sales') {
-        Sentry.captureException(
-          new Error('message_handler sales audio transcription failed'),
-          {
-            tags: {
-              service: 'message_handler',
-              operation: 'audio_transcription',
-              phoneNumberId: config.phoneNumberId,
-              tenantSlug: config.tenantSlug,
-            },
-          }
-        );
-        console.error(
-          `❌ Falha ao transcrever áudio | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
-        );
-      } else {
-        Sentry.captureException(err, {
-          tags: { service: 'message_handler', operation: 'audio_transcription' },
-        });
-        console.error(`❌ Falha ao transcrever áudio de ${conversationKey}:`, err);
+      Sentry.captureException(
+        new Error('message_handler audio transcription failed'),
+        {
+          tags: {
+            service: 'message_handler',
+            operation: 'audio_transcription',
+            phoneNumberId: config.phoneNumberId,
+            tenantSlug: config.tenantSlug,
+            messageId: message.id,
+            error_kind: runtimeErrorKind(err),
+          },
+        }
+      );
+      console.error(
+        `❌ Falha ao transcrever áudio | phoneNumberId=${config.phoneNumberId} | convHash=${convHash} | error=${runtimeErrorKind(err)}`
+      );
+      if (inboundPersisted) {
+        try {
+          await deps.markTranscriptionFailed(message.id);
+          await deliverPersistedInbound();
+        } catch (finalizeError) {
+          Sentry.captureException(
+            new Error('ana inbound transcription failure finalization failed'),
+            {
+              tags: {
+                service: 'message_handler',
+                operation: 'finalize_audio_failure',
+                phoneNumberId: config.phoneNumberId,
+                messageId: message.id,
+                error_kind: runtimeErrorKind(finalizeError),
+              },
+            }
+          );
+        }
       }
-      await sendFreeformMessage(
-        from,
+      const transcriptionFallback = canonicalReceptionistOutbound(
+        'TRANSCRIPTION_FALLBACK',
         'Desculpe, não consegui ouvir o áudio. Pode me mandar por escrito?',
         config
       );
+      await sendConfiguredReply(from, transcriptionFallback, config);
       return;
     }
   }
 
+  // Texto/lista/botão já estavam finais na transação; áudio só chega aqui após
+  // history+content_status finalizados. Tipos sem texto enviam W1 `no_text`.
+  await deliverPersistedInbound();
+
   if (!text.trim()) return;
 
-  if (await tryHandleOptOut(text, from, config)) {
+  if (await deps.handleOptOut(text, from, config)) {
     // Sales-only: opt-out de compliance também encerra a régua de follow-up da
     // Renata (o receptionist não tem régua, então nada muda pra ele).
     if (config.botRole === 'sales') {
@@ -704,16 +953,28 @@ export async function handleIncomingMessage(
     }
   }
 
+  if (
+    inboundDeliveryPending &&
+    (await deps.shouldSuspend(config.phoneNumberId, from))
+  ) {
+    console.info(
+      `⏸️ [escalation] inbound ${message.id} pendente; conversa mantida suspensa.`
+    );
+    return;
+  }
+
   // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada
   // (sem OpenAI, sem buffer). FAIL-OPEN: erro/timeout/404 → responde normal.
   // Opt-out roda ANTES (compliance vale mesmo pausado). §8.2/INV-10: enquanto
   // pausada, a Ana NÃO responde mas REGISTRA o inbound no histórico (o echo do
   // humano é gravado pelo echoHandler) — assim ela tem contexto ao retomar.
-  if (await isConversationPaused(config.phoneNumberId, from)) {
+  if (await deps.isPaused(config.phoneNumberId, from)) {
     if (config.botRole === 'sales') {
       cancelOnboardingPolling(conversationKey);
     }
-    await recordInboundWhilePaused(conversationKey, text, config);
+    if (!inboundPersisted) {
+      await recordInboundWhilePaused(conversationKey, text, config);
+    }
     console.log('⏸️ [pausado] Ana não responde; inbound registrado no histórico.');
     return;
   }
@@ -727,7 +988,9 @@ export async function handleIncomingMessage(
       `💬 Mensagem de vendas recebida | ${safeSalesContext(config, from)} | chars=${text.length}`
     );
   } else {
-    console.log(`💬 Mensagem de ${conversationKey} (${name}): "${text}"`);
+    console.log(
+      `💬 Inbound recebida | phoneNumberId=${config.phoneNumberId} | convHash=${convHash} | chars=${text.length}`
+    );
   }
 
   const bufferKey = buildBufferKey(config, from);
@@ -737,16 +1000,19 @@ export async function handleIncomingMessage(
     // pra não spammar quem manda várias mensagens seguidas fora do expediente.
     if (shouldSendOutsideHoursNotice(bufferKey)) {
       const outsideHoursMessage = buildOutsideHoursMessage(config);
-      await typingDelay(outsideHoursMessage);
-      await sendFreeformMessage(from, outsideHoursMessage, config);
+      await sendConfiguredReply(
+        from,
+        canonicalReceptionistOutbound(
+          'OUTSIDE_HOURS',
+          outsideHoursMessage,
+          config
+        ),
+        config
+      );
     } else {
-      if (config.botRole === 'sales') {
-        console.log(
-          `🟡 [fora-de-horário] aviso suprimido | ${safeSalesContext(config, from)}`
-        );
-      } else {
-        console.log(`🟡 [fora-de-horário] aviso suprimido (throttle) para ${bufferKey}`);
-      }
+      console.log(
+        `🟡 [fora-de-horário] aviso suprimido | ${safeSalesContext(config, from)}`
+      );
     }
     return;
   }
@@ -760,29 +1026,23 @@ export async function handleIncomingMessage(
   if (existing) {
     if (existing.isProcessing) {
       existing.pendingTexts.push(text);
+      if (inboundPersisted) existing.pendingMessageIds.push(message.id);
       existing.name = name;
       existing.config = config;
-      if (config.botRole === 'sales') {
-        console.log(
-          `📥 Mensagem adicionada à fila pendente | ${safeSalesContext(config, from)}`
-        );
-      } else {
-        console.log(`📥 Mensagem adicionada à fila pendente de ${bufferKey} (Ana processando)`);
-      }
+      console.log(
+        `📥 Mensagem adicionada à fila pendente | ${safeSalesContext(config, from)}`
+      );
     } else {
       if (existing.timer) clearTimeout(existing.timer);
       existing.texts.push(text);
+      if (inboundPersisted) existing.messageIds.push(message.id);
       existing.name = name;
       existing.config = config;
       existing.timer = setTimeout(() => {
         flushBuffer(bufferKey).catch((err) => {
-          if (config.botRole === 'sales') {
-            console.error(
-              `❌ Erro ao processar mensagens de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
-            );
-          } else {
-            console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
-          }
+          console.error(
+            `❌ Erro ao processar mensagens | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+          );
         });
       }, DEBOUNCE_TIME_MS);
     }
@@ -798,34 +1058,25 @@ export async function handleIncomingMessage(
       from,
       isProcessing: false,
       pendingTexts: [],
+      inboundPersisted,
+      messageIds: inboundPersisted ? [message.id] : [],
+      pendingMessageIds: [],
     };
 
     newBuffer.timer = setTimeout(() => {
       flushBuffer(bufferKey).catch((err) => {
-        if (config.botRole === 'sales') {
-          console.error(
-            `❌ Erro ao processar mensagens de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
-          );
-        } else {
-          console.error(`❌ Erro ao processar mensagens de ${bufferKey}:`, err);
-        }
+        console.error(
+          `❌ Erro ao processar mensagens | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+        );
       });
     }, DEBOUNCE_TIME_MS);
 
     newBuffer.maxWaitTimer = setTimeout(() => {
-      if (config.botRole === 'sales') {
-        console.log(`⏰ Max wait atingido | ${safeSalesContext(config, from)}`);
-      } else {
-        console.log(`⏰ Max wait atingido pra ${bufferKey}, forçando flush`);
-      }
+      console.log(`⏰ Max wait atingido | ${safeSalesContext(config, from)}`);
       flushBuffer(bufferKey).catch((err) => {
-        if (config.botRole === 'sales') {
-          console.error(
-            `❌ Erro no max-wait flush | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
-          );
-        } else {
-          console.error(`❌ Erro no max-wait flush de ${bufferKey}:`, err);
-        }
+        console.error(
+          `❌ Erro no max-wait flush | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
+        );
       });
     }, MAX_WAIT_TIME_MS);
 
@@ -854,6 +1105,9 @@ export function __seedFlushBufferForTest(
     from,
     isProcessing: false,
     pendingTexts: [],
+    inboundPersisted: false,
+    messageIds: [],
+    pendingMessageIds: [],
   });
   return bufferKey;
 }

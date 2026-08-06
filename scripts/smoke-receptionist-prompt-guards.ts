@@ -6,6 +6,7 @@
  */
 process.env.DATABASE_URL ||= 'postgres://smoke:smoke@127.0.0.1:5432/smoke';
 process.env.OPENAI_API_KEY ||= 'sk-smoke-test';
+process.env.ERP_API_TOKEN ||= 'erp-smoke-test';
 
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -133,6 +134,11 @@ async function main() {
     buildSystemPromptFromServices,
     RECEPTIONIST_TOOLS,
   } = await import('../src/services/brainService');
+  const {
+    PREFERENCES_END_DELIMITER,
+    PREFERENCES_START_DELIMITER,
+    PREFERENCES_SUBORDINATION_INSTRUCTION,
+  } = await import('../src/services/structuredPreferences');
   const runtimePrompt = buildSystemPromptFromServices(
     config,
     servicesResult,
@@ -154,18 +160,35 @@ async function main() {
   const criticalToolsIndex = runtimePrompt.indexOf(
     'REGRAS CRÍTICAS DE FERRAMENTAS'
   );
+  const servicesBlockIndex = runtimePrompt.indexOf(
+    'SERVIÇOS DISPONÍVEIS (use estes IDs diretamente nas ferramentas'
+  );
+  const subordinationIndex = runtimePrompt.indexOf(
+    PREFERENCES_SUBORDINATION_INSTRUCTION
+  );
+  const preferencesStartIndex = runtimePrompt.indexOf(
+    PREFERENCES_START_DELIMITER
+  );
+  const preferencesEndIndex = runtimePrompt.indexOf(PREFERENCES_END_DELIMITER);
 
   check(
-    'guarda de serviço ausente é adicionada depois do prompt editável do tenant',
-    tenantInstructionIndex >= 0 && unavailableServiceGuardIndex > tenantInstructionIndex
+    'guarda de serviço ausente precede o tenant, que fica dentro do bloco subordinado',
+    unavailableServiceGuardIndex >= 0 &&
+      unavailableServiceGuardIndex < servicesBlockIndex &&
+      tenantInstructionIndex > preferencesStartIndex &&
+      tenantInstructionIndex < preferencesEndIndex
   );
   check(
-    'guarda clínica é adicionada depois do prompt editável do tenant',
-    tenantInstructionIndex >= 0 && clinicalGuardIndex > tenantInstructionIndex
+    'guarda clínica precede catálogo e preferências do tenant',
+    clinicalGuardIndex > unavailableServiceGuardIndex &&
+      clinicalGuardIndex < servicesBlockIndex &&
+      clinicalGuardIndex < tenantInstructionIndex
   );
   check(
-    'guarda contra reutilizar slots é adicionada depois do prompt editável do tenant',
-    tenantInstructionIndex >= 0 && staleAvailabilityGuardIndex > tenantInstructionIndex
+    'guarda contra reutilizar slots precede catálogo e preferências do tenant',
+    staleAvailabilityGuardIndex > clinicalGuardIndex &&
+      staleAvailabilityGuardIndex < servicesBlockIndex &&
+      staleAvailabilityGuardIndex < tenantInstructionIndex
   );
   const exactTransferRule =
     'H. TRANSFERÊNCIA E RECADOS — Você NÃO transfere a conversa, NÃO avisa ninguém, NÃO deixa recado e NÃO aciona a equipe. Se o cliente pedir para falar com alguém, para ser transferido ou para que você avise alguém, diga com clareza que isso não é possível por aqui e que esses assuntos são tratados diretamente com a equipe do estabelecimento. NÃO prometa nenhuma ação futura sua nem da equipe e NÃO peça para o cliente aguardar por alguém.';
@@ -173,7 +196,17 @@ async function main() {
     'regra H é byte-idêntica e fica após G, antes das regras de ferramentas',
     runtimePrompt.includes(exactTransferRule) &&
       transferGuardIndex > staleAvailabilityGuardIndex &&
-      criticalToolsIndex > transferGuardIndex
+      criticalToolsIndex > transferGuardIndex &&
+      servicesBlockIndex > criticalToolsIndex
+  );
+  check(
+    'dados autoritativos precedem instrução fixa e delimitadores únicos do bloco C',
+    servicesBlockIndex > criticalToolsIndex &&
+      subordinationIndex > servicesBlockIndex &&
+      preferencesStartIndex > subordinationIndex &&
+      preferencesEndIndex > preferencesStartIndex &&
+      runtimePrompt.split(PREFERENCES_START_DELIMITER).length - 1 === 1 &&
+      runtimePrompt.split(PREFERENCES_END_DELIMITER).length - 1 === 1
   );
   check(
     'runtime proíbe alternativa que finja disponibilidade do serviço pedido',

@@ -1,7 +1,16 @@
 import axios from 'axios';
 import { Sentry } from '../observability/sentry';
+import {
+  runtimeErrorKind,
+  safeHttpStatus,
+} from '../observability/safeRuntime';
 import { ERP_API_TOKEN } from '../erpApiToken';
 import { isPausedFromState, type PauseState } from './pauseDecision';
+import {
+  escalationCacheNeedsRefresh,
+  isEscalationKnownActive,
+  updateEscalationFromPauseState,
+} from './escalationCache';
 
 // Base + auth no MESMO padrão do optOutService (Bearer ERP_API_TOKEN).
 const RECEPS_INTERNAL_API_URL =
@@ -96,15 +105,19 @@ function writeConversationPauseToCache(
 // NUNCA logar PII: só phoneNumberId (id do salão, allowlistado no scrub). O número
 // e o nome do cliente NÃO entram em tags/log.
 function capture(error: unknown, phoneNumberId: string, operation: string): void {
-  Sentry.captureException(error, {
-    tags: { service: 'ana-pause', operation, phoneNumberId },
+  const status = safeHttpStatus(error);
+  Sentry.captureException(new Error('ana pause operation failed'), {
+    tags: {
+      service: 'ana-pause',
+      operation,
+      phoneNumberId,
+      error_kind: runtimeErrorKind(error),
+      http_status: status ?? 'n/a',
+    },
   });
-  const message = axios.isAxiosError(error)
-    ? error.response?.status
-      ? `HTTP ${error.response.status}`
-      : error.message
-    : String(error);
-  console.error(`❌ [pause] falha em ${operation}: ${message}`);
+  console.error(
+    `❌ [pause] falha em ${operation} | error=${runtimeErrorKind(error)} | status=${status ?? 'n/a'}`
+  );
 }
 
 async function fetchPauseState(
@@ -125,6 +138,7 @@ async function fetchPauseState(
       globalPausedUntil: data?.globalPausedUntil ?? null,
       conversationPausedUntil: data?.conversationPausedUntil ?? null,
       schedulePausedUntil: data?.schedulePausedUntil ?? null,
+      escalation: data?.escalation,
     };
   } catch (error) {
     // FAIL-OPEN: erro/timeout/404 → null → tratado como NÃO pausado pelo caller.
@@ -132,6 +146,19 @@ async function fetchPauseState(
     return null;
   }
 }
+
+export interface ConversationPauseDeps {
+  now: () => number;
+  fetchState: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<PauseState | null>;
+}
+
+const defaultConversationPauseDeps: ConversationPauseDeps = {
+  now: Date.now,
+  fetchState: fetchPauseState,
+};
 
 /**
  * Echo: o humano respondeu PELO app do WhatsApp → pausa a conversa no Receps
@@ -176,18 +203,36 @@ export async function pauseConversationByEcho(
  * "Esta conversa está pausada AGORA?" — combina pausa GERAL (salão) + pausa da
  * conversa. Usa cache curto por conversa + write-through do echo.
  *
- * FAIL-OPEN: qualquer erro/timeout/404 no GET → `false` (Ana responde normal).
+ * FAIL-OPEN legado: erro/timeout/404 continua `false`, EXCETO se o cache já
+ * conhecia escalation.active=true; somente esse motivo novo permanece fechado.
  */
 export async function isConversationPaused(
   phoneNumberId: string,
-  customerPhone: string
+  customerPhone: string,
+  deps: ConversationPauseDeps = defaultConversationPauseDeps
 ): Promise<boolean> {
-  const now = Date.now();
+  const now = deps.now();
   const key = cacheKey(phoneNumberId, customerPhone);
   const cached = pauseCache.get(key);
+  const escalationWasActive = isEscalationKnownActive(
+    phoneNumberId,
+    customerPhone
+  );
+  const escalationNeedsRefresh = escalationCacheNeedsRefresh(
+    phoneNumberId,
+    customerPhone,
+    now
+  );
+
+  // Escalada ativa é motivo independente de pausa. Enquanto o snapshot ainda
+  // está fresco, não há motivo para rede. Quando vence, reconsulta; se o Receps
+  // cair, o snapshot ativo anterior continua fail-closed.
+  if (escalationWasActive && !escalationNeedsRefresh) {
+    return true;
+  }
 
   // 1) Cache fresco (inclui o write-through imediato do echo) → decide sem rede.
-  if (cached && cached.expiresAt > now) {
+  if (cached && cached.expiresAt > now && !escalationNeedsRefresh) {
     return entryIsPaused(cached, now);
   }
 
@@ -198,10 +243,17 @@ export async function isConversationPaused(
   }
 
   // 3) Busca o estado fresco no Receps.
-  const state = await fetchPauseState(phoneNumberId, customerPhone);
+  const state = await deps.fetchState(phoneNumberId, customerPhone);
   if (!state) {
-    return false; // fail-open
+    return escalationWasActive; // só escalada conhecida muda o fail-open legado
   }
+
+  const escalation = updateEscalationFromPauseState(
+    phoneNumberId,
+    customerPhone,
+    state.escalation,
+    now
+  );
 
   pauseCache.set(key, {
     globalUntilMs: toMs(state.globalPausedUntil),
@@ -209,7 +261,7 @@ export async function isConversationPaused(
     scheduleUntilMs: toMs(state.schedulePausedUntil),
     expiresAt: now + PAUSE_STATE_TTL_MS,
   });
-  return isPausedFromState(state, now);
+  return isPausedFromState({ ...state, escalation }, now);
 }
 
 /** Seam de teste: limpa o cache entre casos do smoke. */

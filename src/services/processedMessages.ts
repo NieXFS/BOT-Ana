@@ -16,6 +16,15 @@ export async function ensureProcessedMessagesTable(): Promise<void> {
       processed_at    timestamptz NOT NULL DEFAULT now()
     )
   `);
+  await pool.query(`
+    ALTER TABLE processed_messages
+    ADD COLUMN IF NOT EXISTS conversation_key text
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS processed_messages_conversation_key_idx
+    ON processed_messages (conversation_key)
+    WHERE conversation_key IS NOT NULL
+  `);
 }
 
 /**
@@ -25,13 +34,15 @@ export async function ensureProcessedMessagesTable(): Promise<void> {
  */
 export async function markMessageProcessed(
   messageId: string,
-  phoneNumberId: string
+  phoneNumberId: string,
+  conversationKey?: string
 ): Promise<boolean> {
   const result = await pool.query(
-    `INSERT INTO processed_messages (message_id, phone_number_id)
-     VALUES ($1, $2)
+    `INSERT INTO processed_messages (
+       message_id, phone_number_id, conversation_key
+     ) VALUES ($1, $2, $3)
      ON CONFLICT (message_id) DO NOTHING`,
-    [messageId, phoneNumberId]
+    [messageId, phoneNumberId, conversationKey ?? null]
   );
   return result.rowCount === 1;
 }
@@ -49,10 +60,13 @@ export async function unmarkMessageProcessed(messageId: string): Promise<void> {
   await pool.query(`DELETE FROM processed_messages WHERE message_id = $1`, [messageId]);
 }
 
-/** Limpa registros com mais de 7 dias (chamado no boot — sem cron). */
+/**
+ * Limpa registros após a retenção máxima da Onda 2. Manter 90 dias evita que um
+ * replay tardio perca o dedup enquanto history.message_id/outbox ainda existem.
+ */
 export async function cleanupOldProcessedMessages(): Promise<number> {
   const result = await pool.query(
-    `DELETE FROM processed_messages WHERE processed_at < NOW() - INTERVAL '7 days'`
+    `DELETE FROM processed_messages WHERE processed_at < NOW() - INTERVAL '90 days'`
   );
   return result.rowCount ?? 0;
 }

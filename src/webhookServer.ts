@@ -8,7 +8,6 @@ import {
   handleIncomingMessage,
   CloudMessage,
   CloudContact,
-  redactPhone,
 } from './messageHandler';
 import {
   botSignatureMiddleware,
@@ -18,7 +17,6 @@ import {
 import {
   ensureProcessedMessagesTable,
   markMessageProcessed,
-  cleanupOldProcessedMessages,
 } from './services/processedMessages';
 import {
   ensureSalesFollowupsTable,
@@ -47,6 +45,31 @@ import {
   providerApiKey,
 } from './voice/voiceConfig';
 import { ensureMediaCacheTable } from './media/mediaCache';
+import { ensureAnaWave2Tables } from './services/anaWave2Store';
+import {
+  reprocessQuarantinedInbound,
+  startInboundOutboxSweep,
+} from './services/inboundOutbox';
+import {
+  getQuestionReplyStatus,
+  sendQuestionReply,
+} from './services/questionReplyService';
+import { purgeConversationData } from './services/privacyPurge';
+import {
+  handleWhatsAppStatuses,
+  startWhatsAppStatusCallbackSweep,
+} from './services/whatsappStatusHandler';
+import { questionReplyResultToHttp } from './services/questionReplyHttp';
+import {
+  conversationHash,
+  runtimeErrorKind,
+  technicalHash,
+} from './observability/safeRuntime';
+import {
+  getAnaRetentionState,
+  runAnaRetention,
+  startAnaRetentionScheduler,
+} from './services/anaRetention';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -56,6 +79,7 @@ interface CloudWebhookValue {
   metadata?: CloudWebhookMetadata;
   contacts?: CloudContact[];
   messages?: CloudMessage[];
+  statuses?: unknown[];
 }
 
 const app = express();
@@ -98,12 +122,16 @@ async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
   const contacts = value.contacts ?? [];
 
   for (const message of value.messages ?? []) {
-    // Idempotência: a Meta retransmite em timeout/erro. Marca atômico por
-    // message_id; reenvio vira noop (sem resposta/agendamento duplicado).
-    const fresh = await markMessageProcessed(message.id, phoneNumberId);
-    if (!fresh) {
-      console.log(`↩️ Mensagem ${message.id} já processada — ignorando retransmissão da Meta.`);
-      continue;
+    // Renata/onboarding ficam explicitamente no caminho legado. A recepcionista
+    // faz processed+history+seq+outbox dentro do próprio messageHandler.
+    if (config.botRole === 'sales') {
+      const fresh = await markMessageProcessed(message.id, phoneNumberId);
+      if (!fresh) {
+        console.log(
+          `↩️ Mensagem ${message.id} já processada — ignorando retransmissão da Meta.`
+        );
+        continue;
+      }
     }
 
     const contact = contacts.find((entry) => entry.wa_id === message.from);
@@ -129,11 +157,21 @@ async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
             new Error('webhook_server sales message processing failed')
           );
           console.error(
-            `❌ Erro ao processar mensagem de vendas | phoneNumberId=${phoneNumberId} | lead=${redactPhone(message.from)} | error=${err instanceof Error ? err.name : typeof err}`
+            `❌ Erro ao processar mensagem de vendas | phoneNumberId=${phoneNumberId} | convHash=${conversationHash(phoneNumberId, message.from)} | error=${runtimeErrorKind(err)}`
           );
         } else {
-          Sentry.captureException(err);
-          console.error(`❌ Erro ao processar mensagem de ${message.from}:`, err);
+          Sentry.captureException(new Error('webhook inbound processing failed'), {
+            tags: {
+              service: 'webhook_server',
+              operation: 'inbound_message',
+              phoneNumberId,
+              messageId: message.id,
+              error_kind: runtimeErrorKind(err),
+            },
+          });
+          console.error(
+            `❌ Erro ao processar inbound | phoneNumberId=${phoneNumberId} | messageId=${message.id} | error=${runtimeErrorKind(err)}`
+          );
         }
       });
     });
@@ -174,10 +212,32 @@ app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
       // então não vai pra handleIncomingMessage.
       if (isEchoChange(change?.field)) {
         handleSmbMessageEchoes(value, LEGACY_PHONE_NUMBER_ID).catch((err) => {
-          Sentry.captureException(err);
-          console.error('❌ Erro ao processar smb_message_echoes:', err);
+          Sentry.captureException(new Error('webhook echo processing failed'), {
+            tags: {
+              service: 'webhook_server',
+              operation: 'smb_message_echoes',
+              error_kind: runtimeErrorKind(err),
+            },
+          });
+          console.error(
+            `❌ Erro ao processar smb_message_echoes | error=${runtimeErrorKind(err)}`
+          );
         });
         continue;
+      }
+
+      // Status Meta (sent/delivered/read/failed) é um fato separado de inbound:
+      // não passa pelo dedup por message.id e não é mais descartado.
+      if (value.statuses?.length) {
+        handleWhatsAppStatuses(value).catch((err) => {
+          Sentry.captureException(new Error('whatsapp status handler failed'), {
+            tags: {
+              service: 'webhook_server',
+              operation: 'whatsapp_statuses',
+              error_kind: err instanceof Error ? err.name : typeof err,
+            },
+          });
+        });
       }
 
       if (!value.messages?.length) {
@@ -185,8 +245,16 @@ app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
       }
 
       processWebhookValue(value).catch((err) => {
-        Sentry.captureException(err);
-        console.error('❌ Erro ao processar payload do webhook:', err);
+        Sentry.captureException(new Error('webhook payload processing failed'), {
+          tags: {
+            service: 'webhook_server',
+            operation: 'process_payload',
+            error_kind: runtimeErrorKind(err),
+          },
+        });
+        console.error(
+          `❌ Erro ao processar payload do webhook | error=${runtimeErrorKind(err)}`
+        );
       });
     }
   }
@@ -222,10 +290,16 @@ app.post('/sales-notify', botSignatureMiddleware, (req: Request, res: Response) 
     undefined,
     onboarding
   ).catch((err) => {
-    Sentry.captureException(err, {
-      tags: { service: 'webhook_server', operation: 'sales_notify' },
+    Sentry.captureException(new Error('sales notify processing failed'), {
+      tags: {
+        service: 'webhook_server',
+        operation: 'sales_notify',
+        error_kind: runtimeErrorKind(err),
+      },
     });
-    console.error('❌ Erro ao processar sales-notify:', err);
+    console.error(
+      `❌ Erro ao processar sales-notify | error=${runtimeErrorKind(err)}`
+    );
   });
 });
 
@@ -261,11 +335,12 @@ app.post(
       );
       res.status(200).json(counts);
     } catch (err) {
-      Sentry.captureException(err, {
+      Sentry.captureException(new Error('admin reset failed'), {
         tags: {
           service: 'webhook_server',
           operation: 'admin_reset_conversation',
           phoneNumberId,
+          error_kind: runtimeErrorKind(err),
         },
       });
       console.error(`[admin-reset] falha | phoneNumberId=${phoneNumberId}`);
@@ -324,6 +399,200 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 /**
+ * POST /internal/question-replies/send (Rev. 3 §5.2/§5.5)
+ * Body já contém a copy final montada pelo Receps. A Ana não reescreve texto.
+ */
+app.post('/internal/question-replies/send', async (req: Request, res: Response) => {
+  if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+    res.sendStatus(401);
+    return;
+  }
+
+  const phoneNumberId =
+    typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId.trim() : '';
+  const customerPhone =
+    typeof req.body?.customerPhone === 'string' ? req.body.customerPhone.trim() : '';
+  const idempotencyKey =
+    typeof req.body?.idempotencyKey === 'string'
+      ? req.body.idempotencyKey.trim()
+      : '';
+  const text = typeof req.body?.text === 'string' ? req.body.text : '';
+  const sourceInboundMessageId =
+    typeof req.body?.sourceInboundMessageId === 'string'
+      ? req.body.sourceInboundMessageId.trim()
+      : '';
+
+  if (
+    !phoneNumberId ||
+    !customerPhone ||
+    !idempotencyKey ||
+    !text.trim() ||
+    !sourceInboundMessageId
+  ) {
+    res.status(400).json({ error: 'invalid payload' });
+    return;
+  }
+
+  try {
+    const config = await getTenantConfig(phoneNumberId);
+    if (!config || !config.isActive) {
+      res.status(404).json({ error: 'conversation owner not found' });
+      return;
+    }
+    const result = await sendQuestionReply(
+      {
+        contractVersion:
+          typeof req.body?.contractVersion === 'number'
+            ? req.body.contractVersion
+            : undefined,
+        phoneNumberId,
+        customerPhone,
+        idempotencyKey,
+        text,
+        sourceInboundMessageId,
+        blocks: Array.isArray(req.body?.blocks) ? req.body.blocks : undefined,
+        evidence:
+          req.body?.evidence && typeof req.body.evidence === 'object'
+            ? req.body.evidence
+            : undefined,
+        authoritativeCatalog:
+          req.body?.authoritativeCatalog &&
+          typeof req.body.authoritativeCatalog === 'object'
+            ? req.body.authoritativeCatalog
+            : undefined,
+        clinicalAuthorization:
+          req.body?.clinicalAuthorization &&
+          typeof req.body.clinicalAuthorization === 'object'
+            ? req.body.clinicalAuthorization
+            : undefined,
+      },
+      config
+    );
+    const response = questionReplyResultToHttp(result);
+    res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    Sentry.captureException(new Error('internal question reply send failed'), {
+      tags: {
+        service: 'webhook_server',
+        operation: 'question_reply_send',
+        phoneNumberHash: technicalHash(phoneNumberId),
+        error_kind: error instanceof Error ? error.name : typeof error,
+      },
+    });
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
+/** GET /internal/question-replies/status?key= — nunca devolve texto/telefone. */
+app.get('/internal/question-replies/status', async (req: Request, res: Response) => {
+  if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+    res.sendStatus(401);
+    return;
+  }
+  const key = typeof req.query.key === 'string' ? req.query.key.trim() : '';
+  if (!key) {
+    res.status(400).json({ error: 'key is required' });
+    return;
+  }
+  try {
+    const status = await getQuestionReplyStatus(key);
+    if (!status) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.status(200).json(status);
+  } catch (error) {
+    Sentry.captureException(new Error('internal question reply status failed'), {
+      tags: {
+        service: 'webhook_server',
+        operation: 'question_reply_status',
+        error_kind: error instanceof Error ? error.name : typeof error,
+      },
+    });
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
+/** Reprocessamento explícito: somente quarentena, nunca item entregue/pendente. */
+app.post(
+  '/internal/inbound-outbox/reprocess',
+  async (req: Request, res: Response) => {
+    if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+      res.sendStatus(401);
+      return;
+    }
+    const messageId =
+      typeof req.body?.messageId === 'string' ? req.body.messageId.trim() : '';
+    if (!messageId) {
+      res.status(400).json({ error: 'messageId is required' });
+      return;
+    }
+    try {
+      const rearmed = await reprocessQuarantinedInbound(messageId);
+      res.status(rearmed ? 200 : 409).json({ rearmed });
+    } catch (error) {
+      Sentry.captureException(new Error('inbound outbox reprocess failed'), {
+        tags: {
+          service: 'webhook_server',
+          operation: 'inbound_outbox_reprocess',
+          error_kind: runtimeErrorKind(error),
+        },
+      });
+      res.status(500).json({ error: 'internal error' });
+    }
+  }
+);
+
+/** Estado estritamente técnico da retenção, sem ids ou dados de conversa. */
+app.get('/internal/ana-retention/status', (req: Request, res: Response) => {
+  if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+    res.sendStatus(401);
+    return;
+  }
+  res.status(200).json(getAnaRetentionState());
+});
+
+/** Purge imediato acionado pelo Receps; retorno contém apenas contagens. */
+app.post(
+  '/internal/privacy/purge-conversation',
+  async (req: Request, res: Response) => {
+    if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+      res.sendStatus(401);
+      return;
+    }
+    const phoneNumberId =
+      typeof req.body?.phoneNumberId === 'string'
+        ? req.body.phoneNumberId.trim()
+        : '';
+    const customerPhone =
+      typeof req.body?.customerPhone === 'string'
+        ? req.body.customerPhone.trim()
+        : '';
+    if (!phoneNumberId || !customerPhone) {
+      res.status(400).json({ error: 'invalid payload' });
+      return;
+    }
+    try {
+      const counts = await purgeConversationData(phoneNumberId, customerPhone);
+      console.info(
+        `[privacy-purge] concluído | phoneNumberId=${phoneNumberId} | rows=${Object.values(counts).reduce((sum, value) => sum + value, 0)}`
+      );
+      res.status(200).json({ purged: true, counts });
+    } catch (error) {
+      Sentry.captureException(new Error('privacy conversation purge failed'), {
+        tags: {
+          service: 'webhook_server',
+          operation: 'privacy_purge_conversation',
+          phoneNumberId,
+          error_kind: error instanceof Error ? error.name : typeof error,
+        },
+      });
+      res.status(500).json({ error: 'internal error' });
+    }
+  }
+);
+
+/**
  * GET /internal/conversation-activity?phoneNumberId=&customerPhone= (§8.1/§11)
  *
  * O motor de automação do Receps consulta ANTES de cada envio proativo (guarda de
@@ -360,14 +629,17 @@ app.get('/internal/conversation-activity', (req: Request, res: Response) => {
       res.json(activity);
     })
     .catch((err) => {
-      Sentry.captureException(err, {
+      Sentry.captureException(new Error('conversation activity lookup failed'), {
         tags: {
           service: 'webhook_server',
           operation: 'conversation_activity',
           phoneNumberId,
+          error_kind: runtimeErrorKind(err),
         },
       });
-      console.error('❌ Erro ao consultar conversation-activity:', err);
+      console.error(
+        `❌ Erro ao consultar conversation-activity | phoneNumberId=${phoneNumberId} | error=${runtimeErrorKind(err)}`
+      );
       res.status(500).json({ error: 'internal error' });
     });
 });
@@ -412,14 +684,17 @@ app.get('/internal/conversations', (req: Request, res: Response) => {
       res.json(result);
     })
     .catch((err) => {
-      Sentry.captureException(err, {
+      Sentry.captureException(new Error('conversation list lookup failed'), {
         tags: {
           service: 'webhook_server',
           operation: 'list_conversations',
           phoneNumberId,
+          error_kind: runtimeErrorKind(err),
         },
       });
-      console.error('❌ Erro ao listar conversas:', err);
+      console.error(
+        `❌ Erro ao listar conversas | phoneNumberId=${phoneNumberId} | error=${runtimeErrorKind(err)}`
+      );
       res.status(500).json({ error: 'internal error' });
     });
 });
@@ -454,29 +729,30 @@ app.get('/internal/conversation-messages', (req: Request, res: Response) => {
       res.json({ messages });
     })
     .catch((err) => {
-      Sentry.captureException(err, {
+      Sentry.captureException(new Error('conversation messages lookup failed'), {
         tags: {
           service: 'webhook_server',
           operation: 'conversation_messages',
           phoneNumberId,
+          error_kind: runtimeErrorKind(err),
         },
       });
-      console.error('❌ Erro ao consultar conversation-messages:', err);
+      console.error(
+        `❌ Erro ao consultar conversation-messages | phoneNumberId=${phoneNumberId} | error=${runtimeErrorKind(err)}`
+      );
       res.status(500).json({ error: 'internal error' });
     });
 });
 
 async function boot(): Promise<void> {
-  // Garante a tabela de idempotência ANTES de aceitar tráfego, e limpa antigos.
+  // Garante a tabela de idempotência e o schema da Onda 2 antes do tráfego.
   await ensureProcessedMessagesTable();
-  cleanupOldProcessedMessages()
-    .then((n) => {
-      if (n > 0) console.log(`🧹 ${n} message_id(s) antigos removidos de processed_messages.`);
-    })
-    .catch((err) => {
-      Sentry.captureException(err);
-      console.error('❌ Cleanup de processed_messages falhou:', err);
-    });
+  await ensureAnaWave2Tables();
+  // Falha de retenção é observada/sanitizada no serviço e nunca impede o boot.
+  await runAnaRetention().catch(() => undefined);
+  startAnaRetentionScheduler();
+  startInboundOutboxSweep();
+  startWhatsAppStatusCallbackSweep();
 
   // Workstream B (Renata): régua de follow-up. Garante a tabela e liga o poller
   // de 30min por default (só VENDA — o receptionist não escreve na tabela).
@@ -515,7 +791,13 @@ async function boot(): Promise<void> {
 }
 
 boot().catch((err) => {
-  Sentry.captureException(err);
-  console.error('❌ Falha no boot da Ana:', err);
+  Sentry.captureException(new Error('ana boot failed'), {
+    tags: {
+      service: 'webhook_server',
+      operation: 'boot',
+      error_kind: runtimeErrorKind(err),
+    },
+  });
+  console.error(`❌ Falha no boot da Ana | error=${runtimeErrorKind(err)}`);
   process.exit(1);
 });

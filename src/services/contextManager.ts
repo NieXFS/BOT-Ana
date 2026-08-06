@@ -1,10 +1,36 @@
 import { Pool } from 'pg';
+import { AsyncLocalStorage } from 'async_hooks';
 import { customerPhoneVariants } from './conversationActivity';
 import { Sentry } from '../observability/sentry';
+import { runtimeErrorKind } from '../observability/safeRuntime';
 
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
+}
+
+interface PersistedInboundExecutionContext {
+  messageIds: readonly string[];
+}
+
+const persistedInboundContext =
+  new AsyncLocalStorage<PersistedInboundExecutionContext>();
+
+/**
+ * O intake da Onda 2 já gravou cada inbound antes da pausa/brain. Durante o
+ * turno, o brain legado ainda chama addMessage(user); este contexto transforma
+ * somente essa gravação redundante em noop, sem alterar entry points externos.
+ */
+export async function withPersistedInboundContext<T>(
+  messageIds: readonly string[],
+  work: () => Promise<T>
+): Promise<T> {
+  return persistedInboundContext.run({ messageIds: [...messageIds] }, work);
+}
+
+export function currentSourceInboundMessageId(): string | null {
+  const ids = persistedInboundContext.getStore()?.messageIds ?? [];
+  return ids.length > 0 ? ids[ids.length - 1] ?? null : null;
 }
 
 /**
@@ -37,11 +63,17 @@ export const pool = new Pool({
  * aqui só registramos e seguimos vivos.
  */
 pool.on('error', (err) => {
-  console.error('[pg-pool] client derrubado (compute do Neon suspendeu?):', err);
+  console.error(
+    `[pg-pool] client ocioso derrubado | error=${runtimeErrorKind(err)}`
+  );
   try {
-    Sentry.captureException(err, {
+    Sentry.captureException(new Error('postgres idle pool client failed'), {
       level: 'warning',
-      tags: { service: 'pg-pool', operation: 'idle-client' },
+      tags: {
+        service: 'pg-pool',
+        operation: 'idle-client',
+        error_kind: runtimeErrorKind(err),
+      },
     });
   } catch {
     // Um handler de erro que lança é exatamente o bug que este listener existe
@@ -58,6 +90,9 @@ export async function addMessage(
   role: 'user' | 'assistant',
   content: string
 ): Promise<void> {
+  if (role === 'user' && persistedInboundContext.getStore()) {
+    return;
+  }
   await pool.query(
     `INSERT INTO ana_conversation_history ("conversationKey", "role", "content")
      VALUES ($1, $2, $3)`,
@@ -68,6 +103,13 @@ export async function addMessage(
     .query(
       `DELETE FROM ana_conversation_history
        WHERE "conversationKey" = $1
+       AND (
+         message_id IS NULL OR NOT EXISTS (
+           SELECT 1 FROM inbound_event_outbox pending
+           WHERE pending.message_id = ana_conversation_history.message_id
+             AND pending.delivered_at IS NULL
+         )
+       )
        AND "id" NOT IN (
          SELECT "id" FROM ana_conversation_history
          WHERE "conversationKey" = $1
@@ -76,14 +118,22 @@ export async function addMessage(
        )`,
       [conversationKey, MAX_MESSAGES]
     )
-    .catch((err) => console.error('Erro ao trimar histórico:', err));
+    .catch((err) =>
+      console.error(
+        `Erro ao trimar histórico | error=${runtimeErrorKind(err)}`
+      )
+    );
 }
 
 export async function getHistory(conversationKey: string): Promise<Message[]> {
-  const result = await pool.query<{ role: string; content: string }>(
-    `SELECT "role", "content"
+  const result = await pool.query<{
+    role: string;
+    content: string;
+    message_id: string | null;
+  }>(
+    `SELECT "role", "content", message_id
      FROM (
-       SELECT "id", "role", "content", "createdAt"
+       SELECT "id", "role", "content", "createdAt", message_id
        FROM ana_conversation_history
        WHERE "conversationKey" = $1
        ORDER BY "createdAt" DESC, "id" DESC
@@ -93,10 +143,28 @@ export async function getHistory(conversationKey: string): Promise<Message[]> {
     [conversationKey, MAX_MESSAGES]
   );
 
-  return result.rows.map((row) => ({
-    role: row.role as 'user' | 'assistant',
-    content: row.content,
-  }));
+  // Cada message.id é uma linha física. Para o brain, inbounds atômicas
+  // consecutivas ainda sem resposta equivalem ao texto consolidado do debounce
+  // legado, mantendo o comportamento conversacional com a flag de escalada OFF.
+  const logical: Array<{ message: Message; atomicInbound: boolean }> = [];
+  for (const row of result.rows) {
+    const role = row.role === 'assistant' ? 'assistant' : 'user';
+    const atomicInbound = role === 'user' && row.message_id !== null;
+    const previous = logical[logical.length - 1];
+    if (
+      atomicInbound &&
+      previous?.atomicInbound &&
+      previous.message.role === 'user'
+    ) {
+      previous.message.content = `${previous.message.content} ${row.content}`;
+      continue;
+    }
+    logical.push({
+      message: { role, content: row.content },
+      atomicInbound,
+    });
+  }
+  return logical.map((entry) => entry.message);
 }
 
 export interface LastMessageMeta {
@@ -181,13 +249,19 @@ export async function getLastInboundAtMs(
 }
 
 export async function hasConversation(conversationKey: string): Promise<boolean> {
+  const currentMessageIds = persistedInboundContext.getStore()?.messageIds ?? [];
   const result = await pool.query<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM ana_conversation_history
        WHERE "conversationKey" = $1
+       AND (
+         cardinality($2::text[]) = 0
+         OR message_id IS NULL
+         OR NOT (message_id = ANY($2::text[]))
+       )
        LIMIT 1
      ) AS "exists"`,
-    [conversationKey]
+    [conversationKey, currentMessageIds]
   );
 
   return result.rows[0]?.exists ?? false;

@@ -4,8 +4,8 @@
  * Mensagens de WhatsApp são PII de cliente final. Regra firme: nada de PII de
  * cliente final escapa pro Sentry. Redige valores de chaves sensíveis (email,
  * telefone, número do cliente `from`/`wa_id`/`customerPhone`, nome do cliente,
- * cpf, tokens, segredos) e trunca texto livre (`text`/`body`/`message`...) > 60
- * chars pra `[REDACTED:N chars]`.
+ * cpf, tokens, segredos) e redige texto livre
+ * (`text`/`body`/`message`...) para `[REDACTED:N chars]`.
  *
  * Allowlist: `phoneNumberId` (ID Meta da linha do salão, não é número pessoal),
  * `tenantSlug` e `messageId` são contexto útil e ficam preservados.
@@ -17,7 +17,7 @@ import type { Event } from '@sentry/node';
 // (phoneNumberId/tenantSlug/messageId) usa esse nome e seria redigido inteiro.
 // O número do cliente chega em `from`/`to`/`wa_id`/`phone`/`telefone`.
 const SENSITIVE_KEY =
-  /(e-?mail|phone|telefone|fone|celular|wa_id|customer.?phone|customer.?name|client.?name|nome.?cliente|cpf|cnpj|rg|password|senha|secret|token|authorization|api[-_]?key|cookie)/i;
+  /(e-?mail|phone|telefone|fone|celular|wa_id|conversation.?key|customer.?phone|customer.?name|client.?name|nome.?cliente|cpf|cnpj|rg|password|senha|secret|token|authorization|api[-_]?key|cookie)/i;
 
 /** Chaves cujo nome bate em SENSITIVE_KEY mas NÃO são PII — não redigir. */
 const ALLOWLIST_KEY = /^(phoneNumberId|tenantSlug|messageId)$/;
@@ -27,7 +27,6 @@ const PHONE_FIELD_KEY = /^(from|to)$/i;
 
 const LONG_TEXT_KEY = /^(text|body|message|mensagem|notes?|description|descricao|observac(ao|oes))$/i;
 
-const MAX_CLIENT_TEXT = 60;
 const REDACTED = '[REDACTED]';
 const REDACTED_IP = '0.0.0.0';
 const MAX_DEPTH = 8;
@@ -111,7 +110,9 @@ function scrubDeep(value: unknown, depth: number, seen: WeakSet<object>): unknow
     }
 
     if (typeof current === 'string') {
-      if (LONG_TEXT_KEY.test(key) && current.length > MAX_CLIENT_TEXT) {
+      // Texto de cliente é PII independentemente do tamanho. O limite antigo
+      // deixava mensagens curtas vazarem em request.data/contexts do Sentry.
+      if (LONG_TEXT_KEY.test(key)) {
         record[key] = `[REDACTED:${current.length} chars]`;
       }
       continue;

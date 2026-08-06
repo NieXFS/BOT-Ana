@@ -259,6 +259,11 @@ function buildConfig(arm: BenchmarkArm): TenantBotConfig {
     waApiVersion: 'v21.0',
     phoneNumberId: 'benchmark-phone-number-id',
     isActive: true,
+    // Fixture de compatibilidade: simula o /config anterior à exposição dos
+    // campos da Revisão 3 e, portanto, exercita deliberadamente o bloco C legado.
+    structuredConfig: undefined,
+    bookingMenu: undefined,
+    postBookingInstructions: undefined,
   };
 }
 
