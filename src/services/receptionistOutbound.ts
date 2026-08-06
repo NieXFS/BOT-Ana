@@ -108,7 +108,7 @@ export interface ValidatedReceptionistOutbound {
   sources: ReceptionistOutboundSource[];
 }
 
-const MONEY_RE = /R\$\s*(\d{1,6}(?:[.,]\d{1,2})?)/giu;
+const MONEY_RE = /(?:R\$\s*(?<prefixed>\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)|(?<worded>\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*reais?\b)/giu;
 const TIME_OFFER_RE = /\b(?:temos?|dispon[ií]ve(?:l|is)|hor[aá]rios?)\b[^.!?\n]{0,60}\b([01]?\d|2[0-3])(?:[:h]([0-5]\d))\b/giu;
 const HUMAN_DEADLINE_RE = /\b(?:equipe|atendente|profissional|respons[aá]vel)\b[^.!?\n]{0,80}\b(?:em|dentro de|at[eé])\s+\d+\s*(?:minutos?|horas?|dias?)\b/iu;
 const CPF_RE = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/u;
@@ -164,6 +164,32 @@ function knownPrices(catalog: AuthoritativeOutboundCatalog): Set<number> {
     if (typeof service.price === 'number') prices.add(Math.round(service.price * 100));
   }
   return prices;
+}
+
+function currencyTextToCents(raw: string): number | null {
+  const compact = raw.replace(/\s+/g, '');
+  const lastComma = compact.lastIndexOf(',');
+  const lastDot = compact.lastIndexOf('.');
+  let normalized: string;
+
+  if (lastComma >= 0 && lastDot >= 0) {
+    const decimalSeparator = lastComma > lastDot ? ',' : '.';
+    const groupingSeparator = decimalSeparator === ',' ? /\./g : /,/g;
+    normalized = compact.replace(groupingSeparator, '').replace(decimalSeparator, '.');
+  } else if (lastComma >= 0) {
+    normalized = compact.replace(/\./g, '').replace(',', '.');
+  } else if (lastDot >= 0) {
+    const dotCount = (compact.match(/\./g) ?? []).length;
+    const trailingDigits = compact.length - lastDot - 1;
+    normalized = dotCount > 1 || trailingDigits === 3
+      ? compact.replace(/\./g, '')
+      : compact;
+  } else {
+    normalized = compact;
+  }
+
+  const value = Number(normalized);
+  return Number.isFinite(value) ? Math.round(value * 100) : null;
 }
 
 function offeredSlots(evidence?: ReceptionistOutboundEvidence): Set<string> {
@@ -253,8 +279,9 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   const text = typeof envelope.exactPayload === 'string' ? envelope.exactPayload : '';
   const prices = knownPrices(catalog);
   for (const match of text.matchAll(MONEY_RE)) {
-    const cents = Math.round(Number(match[1]!.replace('.', '').replace(',', '.')) * 100);
-    if (!prices.has(cents)) reasons.add('UNKNOWN_PRICE');
+    const rawValue = match.groups?.prefixed ?? match.groups?.worded;
+    const cents = rawValue ? currencyTextToCents(rawValue) : null;
+    if (cents === null || !prices.has(cents)) reasons.add('UNKNOWN_PRICE');
   }
 
   const normalizedText = normalize(text);
@@ -262,6 +289,7 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   const serviceOffer = text.match(/\b(?:temos|oferecemos|fazemos|realizamos)\s+(?:o\s+servi[cç]o\s+de\s+|a\s+)?([^.!?\n]+)/iu)?.[1];
   if (
     serviceOffer &&
+    mentionedServices.length === 0 &&
     /\p{L}/u.test(serviceOffer) &&
     !/\b(?:hor[aá]rio|vaga|disponibilidade|dispon[ií]ve(?:l|is)|agenda)\b/iu.test(serviceOffer) &&
     !catalog.services.some((service) =>

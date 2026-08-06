@@ -11,6 +11,7 @@
     "benchmark:ana-models:p0": "ts-node scripts/benchmarks/ana-models/runner.ts --providers openai,deepseek",
     "behavioral:clinical-honesty": "ts-node scripts/behavioral-clinical-honesty.ts",
     "behavioral:ana-full": "ts-node scripts/behavioral-clinical-honesty.ts",
+    "behavioral:wave5": "ts-node -T scripts/behavioral-ana-wave5.ts",
     "benchmark:renata-models": "npx tsx scripts/benchmarks/renata-models/runner.ts",
     "harness:onda21:ana": "ts-node -T scripts/harness-onda21-ana.ts",
     "smoke:security": "node scripts/smoke-security.ts",

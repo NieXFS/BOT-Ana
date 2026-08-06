@@ -7,7 +7,10 @@ import {
 } from '../src/services/receptionistOutbound';
 
 const catalog = {
-  services: [{ id: 'svc-1', name: 'Limpeza de Pele', priceCents: 10000, durationMinutes: 60, professionalIds: ['pro-1'] }],
+  services: [
+    { id: 'svc-1', name: 'Limpeza de Pele', priceCents: 10000, durationMinutes: 60, professionalIds: ['pro-1'] },
+    { id: 'svc-2', name: 'Tratamento Completo', priceCents: 123456, durationMinutes: 90, professionalIds: ['pro-1'] },
+  ],
   professionals: [{ id: 'pro-1', name: 'Júlia', active: true }],
 };
 const validate = (blocks: any[], extra: any = {}) => validateReceptionistOutbound(buildReceptionistEnvelope({
@@ -16,6 +19,11 @@ const validate = (blocks: any[], extra: any = {}) => validateReceptionistOutboun
 }));
 
 assert.equal(validate([{ source: 'GENERATED', text: 'A Limpeza de Pele custa R$ 100,00.' }]).originalAccepted, true);
+assert.equal(validate([{ source: 'GENERATED', text: 'Fazemos sim! O serviço de Limpeza de Pele custa R$ 100,00.' }]).originalAccepted, true);
+assert.equal(validate([{ source: 'GENERATED', text: 'O Tratamento Completo custa R$ 1.234,56.' }]).originalAccepted, true);
+assert.equal(validate([{ source: 'GENERATED', text: 'O valor é 1.234,56 reais.' }]).originalAccepted, true);
+assert.equal(validate([{ source: 'GENERATED', text: 'O valor é R$ 1.234,57.' }]).originalAccepted, false);
+assert.equal(validate([{ source: 'GENERATED', text: 'O valor é 1.234,57 reais.' }]).originalAccepted, false);
 assert.equal(validate([{ source: 'GREETING', text: 'Avaliação custa R$ 999,00.' }]).payload, RECEPTIONIST_SAFE_FALLBACK);
 assert.equal(validate([{ source: 'POST_BOOKING', text: 'Cura garantida.' }]).originalAccepted, false);
 assert.equal(validate([{ source: 'GENERATED', text: 'Temos 09:10 disponível.' }]).originalAccepted, false);
