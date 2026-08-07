@@ -538,9 +538,11 @@ async function executeFunction(
 
     // GUARDRAIL B (gate determinístico de serviço): antes de consultar horários
     // ou agendar, se o tenant tem 2+ serviços, o serviço escolhido precisa estar
-    // ancorado numa escolha EXPLÍCITA recente do cliente — não no histórico. Se
-    // não estiver, bloqueia e manda a Ana perguntar qual serviço. Roda AQUI (não
-    // no calendarService) pra não pegar o getAvailableSlots interno do Guardrail A.
+    // ancorado numa escolha EXPLÍCITA recente do cliente — não numa suposição da
+    // Ana. O histórico completo só contextualiza resposta numérica a uma pergunta
+    // de escolha validada contra o catálogo atual. Se não estiver, bloqueia e
+    // manda a Ana perguntar qual serviço. Roda AQUI (não no calendarService) pra
+    // não pegar o getAvailableSlots interno do Guardrail A.
     const isConfirmedRescheduleAfterCancellation =
       functionName === 'bookAppointment' &&
       rescheduleCancellationEvidence.peek(conversationKey) !== null;
@@ -557,7 +559,8 @@ async function executeFunction(
         const gate = serviceSelectionGate(
           String(args.serviceId ?? ''),
           servicesResult.services,
-          userMessages
+          userMessages,
+          conversationHistory
         );
         if (!gate.ok) {
           console.log(
@@ -1428,7 +1431,9 @@ async function getReceptionistReply(
   }
 
   // Mensagens do USUÁRIO (cronológicas, a atual por último) — usadas pelo gate de
-  // serviço (Guardrail B) pra checar se o cliente escolheu o serviço de fato.
+  // serviço (Guardrail B) pra checar se o cliente escolheu o serviço de fato. O
+  // histórico completo só ancora resposta numérica numa pergunta anterior cujos
+  // nomes existam no catálogo atual.
   const userMessages = history
     .filter((message) => message.role === 'user')
     .map((message) => message.content);
@@ -1440,7 +1445,7 @@ async function getReceptionistReply(
     servicesForGate.success &&
     servicesForGate.services &&
     servicesForGate.services.length >= 2 &&
-    shouldAskServiceUpfront(servicesForGate.services, userMessages)
+    shouldAskServiceUpfront(servicesForGate.services, userMessages, history)
   ) {
     const question = validateComposedReceptionistReply({
       baseReply: buildServiceQuestion(servicesForGate.services),

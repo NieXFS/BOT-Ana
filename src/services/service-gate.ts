@@ -11,17 +11,24 @@
  *     getAvailableSlots/bookAppointment): backstop — se o modelo tentar consultar
  *     horários/agendar com um serviço NÃO escolhido pelo cliente, bloqueia.
  *
- * Tudo PURO/determinístico. Janela = msgs do USUÁRIO (nunca do assistant — senão
- * validaria a suposição do modelo), delimitada por max(abridor de intenção, teto
- * de 6). Os matches são avaliados POR MENSAGEM e em ordem: a escolha explícita
- * inequívoca mais recente substitui a anterior; duas escolhas na mesma mensagem
- * continuam ambíguas. Match em 3 camadas (nome completo > token distintivo >
- * anti-ambiguidade).
+ * Tudo PURO/determinístico. Janela = msgs do USUÁRIO, delimitada por
+ * max(abridor de intenção, teto de 6). O texto do assistant nunca vale como
+ * escolha; a única exceção é contexto para uma resposta numérica do próprio
+ * usuário, e ainda assim só quando a pergunta anterior contém 2+ nomes exatos
+ * do catálogo atual. Os matches são avaliados POR MENSAGEM e em ordem: a
+ * escolha explícita inequívoca mais recente substitui a anterior; duas escolhas
+ * na mesma mensagem continuam ambíguas. Match em 3 camadas (nome completo >
+ * token distintivo > anti-ambiguidade).
  */
 
 export interface ServiceLike {
   id: string;
   name: string;
+}
+
+export interface ServiceConversationMessage {
+  role: string;
+  content?: unknown;
 }
 
 export type ServiceGateResult = { ok: true } | { ok: false; hintMessage: string };
@@ -45,14 +52,31 @@ const STOPWORDS = new Set([
   'de', 'da', 'do', 'das', 'dos', 'a', 'o', 'e', 'com', 'em', 'para', 'por',
   'no', 'na', 'ao', 'as', 'os', 'sessao', 'servico', 'atendimento',
 ]);
+const ROMAN_GRADE_VALUES: Record<string, string> = {
+  i: '1',
+  ii: '2',
+  iii: '3',
+  iv: '4',
+  v: '5',
+};
+const SERVICE_CHOICE_QUESTION_RE =
+  /\b(?:qual|prefere|escolh(?:e|a|er|eu)|opcao)\b/;
 
 function normalizeServiceText(value: string): string {
-  return value
+  const normalized = value
     .normalize('NFD')
     .replace(/[̀-ͯ]/g, '')
     .toLowerCase()
     .replace(/\s+/g, ' ')
     .trim();
+
+  // Nomes de catálogo e respostas humanas podem representar o mesmo grau de
+  // formas diferentes ("grau I" x "grau 1"). A equivalência fica limitada ao
+  // contexto explícito de `grau` para não transformar letras soltas do texto.
+  return normalized.replace(
+    /\bgrau\s+(iii|ii|iv|v|i)\b/g,
+    (_match, roman: string) => `grau ${ROMAN_GRADE_VALUES[roman]}`
+  );
 }
 
 /**
@@ -213,6 +237,93 @@ type LatestSelection =
   | { kind: 'chosen'; serviceId: string }
   | { kind: 'ambiguous' };
 
+function parseShortGradeReply(message: string): number | null {
+  const normalized = normalizeServiceText(message);
+  const match = normalized.match(
+    /^(?:(?:opcao|grau)\s+)?([1-9])(?:[º°])?$/
+  );
+  return match?.[1] ? Number(match[1]) : null;
+}
+
+function serviceGradeNumbers(service: ServiceLike): Set<number> {
+  const normalized = normalizeServiceText(service.name);
+  const numbers = new Set<number>();
+  for (const match of normalized.matchAll(
+    /\bgrau\s+([1-9])(?:\s+(?:e|a|-)\s+([1-9]))?/g
+  )) {
+    if (match[1]) numbers.add(Number(match[1]));
+    if (match[2]) numbers.add(Number(match[2]));
+  }
+  return numbers;
+}
+
+/**
+ * Uma resposta curta como "1" só vale como escolha quando a mensagem
+ * imediatamente anterior da Ana contém pelo menos dois nomes EXATOS do
+ * catálogo atual e o número identifica um único serviço por seu `grau`.
+ *
+ * Assim preservamos o caso humano "grau I" → "1" sem transformar qualquer
+ * número solto (dia, horário, quantidade) em serviço e sem confiar numa
+ * afirmação livre da assistente: os candidatos precisam existir no snapshot
+ * autoritativo recebido do Receps.
+ */
+function anchoredGradeSelections(
+  windowMessages: string[],
+  services: ServiceLike[],
+  conversationMessages: ServiceConversationMessage[]
+): Array<string | null> {
+  const selections = windowMessages.map(() => null as string | null);
+  if (windowMessages.length === 0 || conversationMessages.length === 0) {
+    return selections;
+  }
+
+  const userEntries: Array<{ messageIndex: number; content: string }> = [];
+  for (let index = 0; index < conversationMessages.length; index += 1) {
+    const message = conversationMessages[index];
+    if (message?.role === 'user' && typeof message.content === 'string') {
+      userEntries.push({ messageIndex: index, content: message.content });
+    }
+  }
+
+  const scopedEntries = userEntries.slice(-windowMessages.length);
+  const windowOffset = windowMessages.length - scopedEntries.length;
+  for (let scopedIndex = 0; scopedIndex < scopedEntries.length; scopedIndex += 1) {
+    const entry = scopedEntries[scopedIndex]!;
+    const windowIndex = windowOffset + scopedIndex;
+    if (
+      normalizeServiceText(entry.content) !==
+      normalizeServiceText(windowMessages[windowIndex] ?? '')
+    ) {
+      continue;
+    }
+
+    const grade = parseShortGradeReply(entry.content);
+    if (grade === null) continue;
+
+    const previous = conversationMessages[entry.messageIndex - 1];
+    if (previous?.role !== 'assistant' || typeof previous.content !== 'string') {
+      continue;
+    }
+
+    const normalizedAssistant = normalizeServiceText(previous.content);
+    if (!SERVICE_CHOICE_QUESTION_RE.test(normalizedAssistant)) continue;
+    const mentionedServices = services.filter((service) => {
+      const normalizedName = normalizeServiceText(service.name);
+      return normalizedName.length >= 3 && normalizedAssistant.includes(normalizedName);
+    });
+    if (mentionedServices.length < 2) continue;
+
+    const gradeCandidates = mentionedServices.filter((service) =>
+      serviceGradeNumbers(service).has(grade)
+    );
+    if (gradeCandidates.length === 1) {
+      selections[windowIndex] = gradeCandidates[0]!.id;
+    }
+  }
+
+  return selections;
+}
+
 function decisiveChoiceTarget(
   normalizedMessage: string,
   services: ServiceLike[]
@@ -240,8 +351,14 @@ function decisiveChoiceTarget(
  */
 function latestServiceSelection(
   windowMessages: string[],
-  services: ServiceLike[]
+  services: ServiceLike[],
+  conversationMessages: ServiceConversationMessage[] = []
 ): LatestSelection {
+  const anchoredGrades = anchoredGradeSelections(
+    windowMessages,
+    services,
+    conversationMessages
+  );
   for (let index = windowMessages.length - 1; index >= 0; index -= 1) {
     const normalized = normalizeServiceText(windowMessages[index] ?? '');
     const matches = collapseHierarchicalMatches(
@@ -254,7 +371,13 @@ function latestServiceSelection(
         ? { kind: 'chosen', serviceId: decisiveTarget }
         : { kind: 'ambiguous' };
     }
-    if (matches.length === 0) continue;
+    if (matches.length === 0) {
+      const anchoredServiceId = anchoredGrades[index];
+      if (anchoredServiceId) {
+        return { kind: 'chosen', serviceId: anchoredServiceId };
+      }
+      continue;
+    }
 
     const isInformationalQuestion = INFORMATIONAL_SERVICE_QUESTION_RE.test(normalized);
     const isExplicitChoice = EXPLICIT_CHOICE_RE.test(normalized);
@@ -303,11 +426,18 @@ export function buildServiceQuestion(services: ServiceLike[]): string {
  * PROATIVA: novo pedido de agendamento (verbo de marcar/agendar) na janela SEM
  * nenhum serviço citado → o código deve perguntar o serviço antes do modelo rodar.
  */
-export function shouldAskServiceUpfront(services: ServiceLike[], userMessages: string[]): boolean {
+export function shouldAskServiceUpfront(
+  services: ServiceLike[],
+  userMessages: string[],
+  conversationMessages: ServiceConversationMessage[] = []
+): boolean {
   if (!services || services.length < 2) return false;
   const { windowMessages, hasNewBooking } = computeWindow(userMessages);
   if (windowMessages.length === 0 || !hasNewBooking) return false;
-  return latestServiceSelection(windowMessages, services).kind !== 'chosen';
+  return (
+    latestServiceSelection(windowMessages, services, conversationMessages).kind !==
+    'chosen'
+  );
 }
 
 /**
@@ -332,7 +462,8 @@ function resolveChosen(services: ServiceLike[], serviceId: string): ServiceLike 
 export function serviceSelectionGate(
   serviceId: string,
   services: ServiceLike[],
-  userMessages: string[]
+  userMessages: string[],
+  conversationMessages: ServiceConversationMessage[] = []
 ): ServiceGateResult {
   if (!services || services.length < 2) return { ok: true };
   const chosen = resolveChosen(services, serviceId);
@@ -340,7 +471,11 @@ export function serviceSelectionGate(
   const { windowMessages } = computeWindow(userMessages);
   if (windowMessages.length === 0) return { ok: true };
 
-  const latest = latestServiceSelection(windowMessages, services);
+  const latest = latestServiceSelection(
+    windowMessages,
+    services,
+    conversationMessages
+  );
   if (latest.kind === 'chosen' && latest.serviceId === chosen.id) return { ok: true };
   return { ok: false, hintMessage: buildServiceAmbiguationHint(services) };
 }

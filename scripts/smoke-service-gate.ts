@@ -241,6 +241,117 @@ expectAsk('O4.1 upfront: escolha inequívoca recente não repete pergunta', shou
   changedServiceHistory
 ), false);
 
+// ===== Incidente Rose Pacheco Podologia (2026-08-07) =====
+// O catálogo usa algarismo romano (grau I), mas a cliente respondeu "1" e,
+// depois do primeiro loop, escreveu "grau 1". O gate não pode perder nenhuma
+// dessas escolhas quando as mensagens seguintes mudam apenas turno/dia.
+const ROSE_SERVICES = [
+  { id: 'rose-calos', name: 'Calosidades e Fissuras' },
+  { id: 'rose-gel', name: 'Esmaltação em gel' },
+  { id: 'rose-manicure', name: 'Manicure' },
+  { id: 'rose-onico', name: 'Onicomicose - Tratamento inicial' },
+  { id: 'rose-pelling', name: 'Pelling Ungueal' },
+  { id: 'rose-podo', name: 'Podoprofilaxia' },
+  { id: 'rose-grau-23', name: 'Unha encravada grau 2 e 3' },
+  { id: 'rose-grau-1', name: 'Unha encravada grau I' },
+];
+const roseUsers = [
+  'Quero agendar',
+  'Unha encravada',
+  '1',
+  'Tarde',
+  'Terça',
+];
+const roseConversation = [
+  { role: 'user', content: 'Quero agendar' },
+  { role: 'assistant', content: 'Qual serviço você deseja agendar?' },
+  { role: 'user', content: 'Unha encravada' },
+  {
+    role: 'assistant',
+    content:
+      'Temos dois serviços cadastrados para unha encravada: Unha encravada grau I e Unha encravada grau 2 e 3. Qual deles você deseja?',
+  },
+  { role: 'user', content: '1' },
+  {
+    role: 'assistant',
+    content: 'Entendi que você escolheu Unha encravada grau I. Para agendar, qual dia você prefere?',
+  },
+  { role: 'user', content: 'Tarde' },
+  { role: 'assistant', content: 'Qual dia da semana você prefere?' },
+  { role: 'user', content: 'Terça' },
+];
+
+expectAsk(
+  'Rose #1: "1" ancorado no menu de graus + Tarde/Terça não repete serviço',
+  shouldAskServiceUpfront(ROSE_SERVICES, roseUsers, roseConversation),
+  false
+);
+expect(
+  'Rose #2: "1" ancorado libera somente Unha encravada grau I',
+  serviceSelectionGate('rose-grau-1', ROSE_SERVICES, roseUsers, roseConversation).ok,
+  true
+);
+expect(
+  'Rose #3: "1" ancorado não autoriza grau 2 e 3',
+  serviceSelectionGate('rose-grau-23', ROSE_SERVICES, roseUsers, roseConversation).ok,
+  false
+);
+
+const roseArabicChoiceUsers = [...roseUsers, 'Unha encravada grau 1'];
+expectAsk(
+  'Rose #4: nome árabe "grau 1" equivale ao catálogo romano "grau I"',
+  shouldAskServiceUpfront(ROSE_SERVICES, roseArabicChoiceUsers),
+  false
+);
+expect(
+  'Rose #5: nome árabe "grau 1" libera o serviceId de "grau I"',
+  serviceSelectionGate('rose-grau-1', ROSE_SERVICES, roseArabicChoiceUsers).ok,
+  true
+);
+
+const unanchoredNumberUsers = ['Quero agendar', '1', 'Terça'];
+const unanchoredNumberConversation = unanchoredNumberUsers.map((content) => ({
+  role: 'user',
+  content,
+}));
+expectAsk(
+  'Rose #6: número solto sem menu autoritativo continua fail-closed',
+  shouldAskServiceUpfront(
+    ROSE_SERVICES,
+    unanchoredNumberUsers,
+    unanchoredNumberConversation
+  ),
+  true
+);
+expect(
+  'Rose #7: número solto sem menu não licencia tool de grau I',
+  serviceSelectionGate(
+    'rose-grau-1',
+    ROSE_SERVICES,
+    unanchoredNumberUsers,
+    unanchoredNumberConversation
+  ).ok,
+  false
+);
+const nonQuestionConversation = [
+  { role: 'user', content: 'Quero agendar' },
+  {
+    role: 'assistant',
+    content:
+      'Unha encravada grau I e Unha encravada grau 2 e 3 são serviços cadastrados.',
+  },
+  { role: 'user', content: '1' },
+];
+expectAsk(
+  'Rose #8: mera menção da Ana sem pergunta de escolha não ancora o número',
+  shouldAskServiceUpfront(
+    ROSE_SERVICES,
+    ['Quero agendar', '1'],
+    nonQuestionConversation
+  ),
+  true
+);
+
 // buildServiceQuestion lista os serviços de forma neutra
 const q = buildServiceQuestion(TWO);
 checks.push({ name: 'buildServiceQuestion lista os 2 serviços (neutro)', ok: q.includes('Corte de cabelo') && q.includes('Depilação a Laser') && /qual|prefere/i.test(q) });
