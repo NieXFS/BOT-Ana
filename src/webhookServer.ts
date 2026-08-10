@@ -544,13 +544,17 @@ app.post(
 );
 
 /** Estado estritamente técnico da retenção, sem ids ou dados de conversa. */
-app.get('/internal/ana-retention/status', (req: Request, res: Response) => {
+function retentionStatusHandler(req: Request, res: Response): void {
   if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
     res.sendStatus(401);
     return;
   }
   res.status(200).json(getAnaRetentionState());
-});
+}
+
+app.get('/internal/receps-ia/retention/status', retentionStatusHandler);
+// Alias legado durante a janela de compatibilidade do rebrand.
+app.get('/internal/ana-retention/status', retentionStatusHandler);
 
 /** Purge imediato acionado pelo Receps; retorno contém apenas contagens. */
 app.post(
@@ -786,18 +790,18 @@ async function boot(): Promise<void> {
   console.log(`🔊 Renata voice: ${voiceState}`);
 
   app.listen(PORT, () => {
-    console.log(`🚀 Ana — Atendente Virtual rodando na porta ${PORT}`);
+    console.log(`🚀 Receps-IA runtime rodando na porta ${PORT} | personas=Ana,Renata`);
   });
 }
 
 boot().catch((err) => {
-  Sentry.captureException(new Error('ana boot failed'), {
+  Sentry.captureException(new Error('receps-ia boot failed'), {
     tags: {
       service: 'webhook_server',
       operation: 'boot',
       error_kind: runtimeErrorKind(err),
     },
   });
-  console.error(`❌ Falha no boot da Ana | error=${runtimeErrorKind(err)}`);
+  console.error(`❌ Falha no boot do Receps-IA | error=${runtimeErrorKind(err)}`);
   process.exit(1);
 });

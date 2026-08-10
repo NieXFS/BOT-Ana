@@ -1,7 +1,8 @@
-process.env.ANA_DIRECT_DATABASE_URL =
+process.env.RECEPS_IA_DIRECT_DATABASE_URL =
   'postgresql://smoke:smoke@direct.example.invalid:5432/smoke';
 process.env.DATABASE_URL =
   'postgresql://smoke:smoke@direct.example.invalid:5432/smoke';
+process.env.RECEPS_IA_SENTRY_DSN = '';
 process.env.ANA_SENTRY_DSN = '';
 
 export {};
@@ -30,17 +31,32 @@ async function main(): Promise<void> {
   const order = await import('../src/services/conversationOrder');
   try {
     const direct = order.resolveConversationOrderDatabaseUrl({
-      ANA_DIRECT_DATABASE_URL:
+      RECEPS_IA_DIRECT_DATABASE_URL:
         'postgresql://user:pass@direct.example.invalid:5432/app',
+      ANA_DIRECT_DATABASE_URL:
+        'postgresql://user:pass@legacy.example.invalid:5432/app',
     });
     check(
       'URL direta explícita é aceita',
       new URL(direct).hostname === 'direct.example.invalid'
     );
+    check(
+      'nome canônico tem precedência sobre o alias legado',
+      new URL(direct).hostname !== 'legacy.example.invalid'
+    );
+
+    const legacyOnly = order.resolveConversationOrderDatabaseUrl({
+      ANA_DIRECT_DATABASE_URL:
+        'postgresql://user:pass@legacy-only.example.invalid:5432/app',
+    });
+    check(
+      'alias legado permanece aceito quando o nome canônico está ausente',
+      new URL(legacyOnly).hostname === 'legacy-only.example.invalid'
+    );
 
     const poolerError = captureError(() =>
       order.resolveConversationOrderDatabaseUrl({
-        ANA_DIRECT_DATABASE_URL: `postgresql://user:${SECRET}@ep-demo-pooler.example.invalid:5432/app`,
+        RECEPS_IA_DIRECT_DATABASE_URL: `postgresql://user:${SECRET}@ep-demo-pooler.example.invalid:5432/app`,
       })
     );
     check(
@@ -68,7 +84,7 @@ async function main(): Promise<void> {
 
     const invalidError = captureError(() =>
       order.resolveConversationOrderDatabaseUrl({
-        ANA_DIRECT_DATABASE_URL: `not-a-url-${SECRET}`,
+        RECEPS_IA_DIRECT_DATABASE_URL: `not-a-url-${SECRET}`,
       })
     );
     check('URL inválida falha com erro sanitizado', invalidError.includes('URL de banco inválida'));

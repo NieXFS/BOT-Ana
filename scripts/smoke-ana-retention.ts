@@ -1,9 +1,12 @@
 process.env.DATABASE_URL ??= 'postgresql://dummy:dummy@127.0.0.1:1/dummy';
-process.env.ANA_DIRECT_DATABASE_URL ??=
+process.env.RECEPS_IA_DIRECT_DATABASE_URL ??=
   'postgresql://dummy:dummy@127.0.0.1:1/dummy';
+process.env.RECEPS_IA_SENTRY_DSN = '';
 process.env.ANA_SENTRY_DSN = '';
 
 export {};
+
+import { readFileSync } from 'node:fs';
 
 const checks: Array<{ name: string; ok: boolean }> = [];
 function check(name: string, ok: boolean): void {
@@ -44,6 +47,23 @@ function buildClient(calls: QueryCall[], fail = false) {
 }
 
 async function main(): Promise<void> {
+  const webhookSource = readFileSync(
+    'src/webhookServer.ts',
+    'utf8'
+  );
+  check(
+    'rotas canônica e legada compartilham o mesmo handler autenticado',
+    webhookSource.includes(
+      "app.get('/internal/receps-ia/retention/status', retentionStatusHandler)"
+    ) &&
+      webhookSource.includes(
+        "app.get('/internal/ana-retention/status', retentionStatusHandler)"
+      ) &&
+      /function retentionStatusHandler[\s\S]*?isValidBearerToken\([\s\S]*?getAnaRetentionState\(\)/.test(
+        webhookSource
+      )
+  );
+
   const retention = await import('../src/services/anaRetention');
   retention.__resetAnaRetentionRuntimeForTest();
 

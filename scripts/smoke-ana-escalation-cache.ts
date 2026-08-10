@@ -1,6 +1,7 @@
 process.env.DATABASE_URL ??= 'postgresql://dummy:dummy@127.0.0.1:1/dummy';
 process.env.ERP_API_TOKEN ??= 'smoke-erp-token';
 process.env.ANA_ESCALATION_ENABLED = 'false';
+process.env.RECEPS_IA_SENTRY_DSN = '';
 process.env.ANA_SENTRY_DSN = '';
 
 export {};

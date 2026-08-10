@@ -10,7 +10,7 @@ import type OpenAI from "openai";
 
 process.env.NODE_ENV = "test";
 process.env.DATABASE_URL = "postgresql://gseq:gseq@127.0.0.1:1/gseq";
-process.env.ANA_DIRECT_DATABASE_URL = "postgresql://gseq:gseq@127.0.0.1:1/gseq";
+process.env.RECEPS_IA_DIRECT_DATABASE_URL = "postgresql://gseq:gseq@127.0.0.1:1/gseq";
 process.env.ERP_BASE_URL = "http://127.0.0.1:1";
 process.env.RECEPS_INTERNAL_API_URL = "http://127.0.0.1:1";
 process.env.ERP_API_TOKEN = "gseq-no-erp";

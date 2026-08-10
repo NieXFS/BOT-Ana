@@ -1,5 +1,5 @@
 /**
- * Smoke test do Sentry (Ana).
+ * Smoke test do Sentry do Receps-IA.
  *
  * Não depende de rede nem de projeto Sentry real. Testa o `scrubEvent` (o
  * beforeSend) direto e o pipeline real do @sentry/node com transport no-op,
@@ -7,13 +7,17 @@
  * ASSERTANDO que telefone/nome/conteúdo do cliente foram escrubbados e que o
  * `phoneNumberId` (ID Meta da linha do salão) foi PRESERVADO.
  *
- * Rodar: npx ts-node -T scripts/smoke-sentry-ana.ts
+ * Rodar: npm run smoke:sentry
  */
 
 import 'dotenv/config';
 import * as Sentry from '@sentry/node';
 import type { Event } from '@sentry/node';
 import { scrubEvent } from '../src/observability/scrub';
+import {
+  RECEPS_IA_SENTRY_SCOPE,
+  resolveRecepsIaSentryConfig,
+} from '../src/observability/sentryConfig';
 
 let failures = 0;
 
@@ -59,7 +63,7 @@ function testScrubDirect() {
   check('whatsapp.body (>60) virou marcador', String(wa.body).startsWith('[REDACTED:'));
   check('whatsapp.phoneNumberId PRESERVADO (allowlist)', wa.phoneNumberId === '123456789');
   check('whatsapp.tenantSlug preservado', wa.tenantSlug === 'clinica-bella');
-  check('whatsapp.messageId preservado', wa.messageId === 'wamid.ABC');
+  check('whatsapp.messageId cru redigido', wa.messageId === '[REDACTED]');
   check('whatsapp.type preservado', wa.type === 'text');
   check(
     'customerName redigido',
@@ -75,8 +79,47 @@ function testScrubDirect() {
   );
 }
 
+function testRuntimeEnvAliases() {
+  console.log('\n[2] configuração Sentry do runtime');
+  const canonical = resolveRecepsIaSentryConfig({
+    RECEPS_IA_SENTRY_DSN: 'https://canonical.invalid/1',
+    ANA_SENTRY_DSN: 'https://legacy.invalid/1',
+    RECEPS_IA_SENTRY_ENVIRONMENT: 'new-env',
+    ANA_SENTRY_ENVIRONMENT: 'legacy-env',
+    RECEPS_IA_RELEASE: 'new-release',
+    ANA_RELEASE: 'legacy-release',
+  });
+  check(
+    'nomes canônicos vencem os aliases legados',
+    canonical.dsn === 'https://canonical.invalid/1' &&
+      canonical.environment === 'new-env' &&
+      canonical.release === 'new-release'
+  );
+  check(
+    'conflitos são reportados apenas por nome',
+    canonical.conflictingEnvNames.length === 3
+  );
+
+  const legacy = resolveRecepsIaSentryConfig({
+    RECEPS_IA_SENTRY_DSN: '   ',
+    ANA_SENTRY_DSN: 'https://legacy.invalid/1',
+    ANA_SENTRY_ENVIRONMENT: 'legacy-env',
+    ANA_RELEASE: 'legacy-release',
+  });
+  check(
+    'aliases legados permanecem aceitos, inclusive com canônico em branco',
+    legacy.dsn === 'https://legacy.invalid/1' &&
+      legacy.environment === 'legacy-env' &&
+      legacy.release === 'legacy-release'
+  );
+
+  const empty = resolveRecepsIaSentryConfig({ NODE_ENV: 'test' });
+  check('DSN ausente mantém o SDK desabilitável', empty.dsn === undefined);
+  check('NODE_ENV é o fallback do ambiente', empty.environment === 'test');
+}
+
 async function testPipeline() {
-  console.log('\n[2] pipeline real (init + beforeSend)');
+  console.log('\n[3] pipeline real (init + beforeSend)');
 
   const sent: Event[] = [];
   const longText = 'mensagem bem comprida do cliente '.repeat(4);
@@ -85,6 +128,7 @@ async function testPipeline() {
     dsn: 'https://examplePublicKey@o0.ingest.us.sentry.io/0',
     enabled: true,
     environment: 'smoke-test',
+    initialScope: RECEPS_IA_SENTRY_SCOPE,
     sendDefaultPii: false,
     // Desliga ContextLines no teste (anexaria o código-fonte deste script aos
     // stack frames, causando falso positivo na busca por PII no payload).
@@ -127,6 +171,10 @@ async function testPipeline() {
     'tag phoneNumberId preservada no pipeline',
     (piiEvent?.tags as Record<string, unknown> | undefined)?.phoneNumberId === '123456789',
   );
+  check(
+    'tag técnica do runtime preservada no pipeline',
+    (piiEvent?.tags as Record<string, unknown> | undefined)?.runtime === 'receps-ia',
+  );
 
   const serialized = JSON.stringify(sent);
   check('telefone do cliente NÃO vazou no payload', !serialized.includes('5511999998888'));
@@ -134,16 +182,17 @@ async function testPipeline() {
 }
 
 async function main() {
-  console.log('=== smoke-sentry-ana (Ana) ===');
+  console.log('=== smoke-sentry-receps-ia ===');
   testScrubDirect();
+  testRuntimeEnvAliases();
   await testPipeline();
 
   console.log('');
   if (failures > 0) {
-    console.error(`❌ smoke-sentry-ana FALHOU: ${failures} verificação(ões).`);
+    console.error(`❌ smoke-sentry-receps-ia FALHOU: ${failures} verificação(ões).`);
     process.exit(1);
   }
-  console.log('✅ smoke-sentry-ana PASSOU: scrubbing OK.');
+  console.log('✅ smoke-sentry-receps-ia PASSOU: aliases e scrubbing OK.');
   process.exit(0);
 }
 

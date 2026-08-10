@@ -2,10 +2,10 @@ import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 
 /**
- * Hardening do webhook da Ana: verificação de assinatura da Meta
+ * Hardening do webhook do Receps-IA: verificação de assinatura da Meta
  * (X-Hub-Signature-256) + rate limit in-memory por IP.
  *
- * In-memory é suficiente para o deploy single-instance da Ana (prod-only). Ao
+ * In-memory é suficiente para o deploy single-instance do Receps-IA (prod-only). Ao
  * escalar para múltiplas instâncias, troque o store por Redis mantendo as
  * mesmas funções puras.
  */
@@ -50,12 +50,12 @@ export function isValidMetaSignature(
 }
 
 /**
- * Middleware Express: verifica o HMAC do forward Receps→Ana.
+ * Middleware Express: verifica o HMAC do forward Receps→Receps-IA.
  *
- * O webhook da Ana recebe o payload ENCAMINHADO pelo Receps (não direto da
+ * O webhook do Receps-IA recebe o payload ENCAMINHADO pelo Receps (não direto da
  * Meta): Meta → Receps /api/v1/bot/webhook (verifica X-Hub-Signature-256 da
  * Meta) → forward assinado com RECEPS_BOT_WEBHOOK_SECRET (header X-Bot-Signature)
- * → Ana. A assinatura da Meta NÃO sobrevive ao reenvio (corpo re-serializado +
+ * → Receps-IA. A assinatura da Meta NÃO sobrevive ao reenvio (corpo re-serializado +
  * header não repassado), então a defesa real deste hop é o segredo do forward.
  *
  * Fail-CLOSED em produção: sem RECEPS_BOT_WEBHOOK_SECRET → 503 (não processa

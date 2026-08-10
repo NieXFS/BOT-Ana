@@ -36,7 +36,7 @@ import {
 process.env.NODE_ENV = "test";
 process.env.DATABASE_URL =
   "postgresql://behavioral:behavioral@127.0.0.1:1/behavioral";
-process.env.ANA_DIRECT_DATABASE_URL =
+process.env.RECEPS_IA_DIRECT_DATABASE_URL =
   "postgresql://behavioral:behavioral@127.0.0.1:1/behavioral";
 process.env.ERP_API_TOKEN = "behavioral-no-erp-access";
 process.env.ERP_BASE_URL = "http://127.0.0.1:1";

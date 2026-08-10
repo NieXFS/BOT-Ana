@@ -1,6 +1,8 @@
-# AGENTS.md — Ana (bot WhatsApp de agendamento)
+# AGENTS.md — Receps-IA (runtime WhatsApp compartilhado)
 
-Bot de atendimento via WhatsApp Cloud API que conversa com o cliente (OpenAI, function calling) e agenda no ERP **Receps** via HTTP (`/api/v1/agenda/*`). Prod: VPS `root@46.62.134.25` em `~/Ana`, processo pm2 **ana-bot** (porta **3001**). O Receps roda na MESMA VPS em `localhost:3000`. Auth Ana→Receps: `Authorization: Bearer <ERP_API_TOKEN>` (= `AI_BOT_API_KEY` do Receps; ver `src/erpApiToken.ts`).
+Runtime compartilhado via WhatsApp Cloud API que hospeda duas personas: **Ana**, recepcionista das clínicas, e **Renata**, vendas/onboarding da Receps. Prod: VPS `root@46.62.134.25` em `~/Receps-IA`, processo PM2 **receps-ia** (porta **3001**). O Receps roda na MESMA VPS em `localhost:3000`. Auth Receps-IA→Receps: `Authorization: Bearer <ERP_API_TOKEN>` (= `AI_BOT_API_KEY` do Receps; ver `src/erpApiToken.ts`).
+
+**Fronteira de nomes:** Receps-IA é projeto/repo/processo/runtime. Ana e Renata continuam sendo as personagens; não renomeie prompts, tools, `botRole`, modelos/tabelas `Ana*`, flags funcionais `ANA_*` nem assets `RENATA_*` por causa da identidade técnica.
 
 ## Conexão de novos tenants — Embedded Signup público (resolvido 2026-07-30)
 
@@ -10,13 +12,17 @@ Bot de atendimento via WhatsApp Cloud API que conversa com o cliente (OpenAI, fu
 - O Receps mantém `META_EMBEDDED_SIGNUP_ENABLED` somente como kill-switch operacional. Não reintroduzir na documentação nem no produto o fluxo histórico anterior à liberação pública.
 
 ## Deploy (POR GIT — a seção "rsync" antiga está morta)
-O repo é `NieXFS/BOT-Ana`, checkout de `origin/main` em `/root/Ana`. **⚠️ NUNCA editar `/root/Ana` direto na VPS** — em 2026-07-15 um hot-patch de 438 linhas travou o `git pull`.
+O repo é `NieXFS/Receps-IA`, checkout de `origin/main` em `/root/Receps-IA`. **⚠️ NUNCA editar `/root/Receps-IA` direto na VPS** — em 2026-07-15 um hot-patch de 438 linhas no checkout antigo travou o `git pull`.
+
+No **primeiro cutover** a identidade antiga ainda é `ana-bot` em `/root/Ana`: prepare e builde `/root/Receps-IA` sem iniciar uma segunda cópia, então execute `pm2 stop ana-bot` → `pm2 start ecosystem.config.cjs --only receps-ia` → health/listener → `pm2 delete ana-bot` → `pm2 save`. Não use `restart receps-ia` antes desse bootstrap, e não mantenha os dois runtimes ativos porque ambos iniciam pollers.
+
+Nos deploys seguintes, com `receps-ia` já criado pelo ecosystem:
 ```
-ssh root@46.62.134.25 "cd ~/Ana && git pull && npm install --no-audit --no-fund && npm run build && pm2 restart ana-bot --update-env"
+ssh root@46.62.134.25 "cd ~/Receps-IA && git pull && npm install --no-audit --no-fund && npm run build && pm2 startOrReload ecosystem.config.cjs --only receps-ia --update-env"
 ```
 - `npm install` só é dispensável se o `package.json` NÃO mudou (armadilha do `xlsx`/`@anthropic-ai/sdk`).
 - `npm run build` é só `tsc` (saída em `dist/`, `start` roda `dist/webhookServer.js`). **Confira o exit REAL e o `dist/` emitido** antes do restart.
-- **O `pm2 restart` não é opcional**: em 2026-07-20 um deploy fez pull+build sem restart e o processo rodou 1,5 dia com código velho enquanto o prompt (banco, hot-reload) já prometia features novas — a "assimetria fatal". Confira que o processo subiu DEPOIS do build.
+- **O reload/restart do PM2 não é opcional**: em 2026-07-20 um deploy fez pull+build sem restart e o processo rodou 1,5 dia com código velho enquanto o prompt (banco, hot-reload) já prometia features novas — a "assimetria fatal". Confira que o processo subiu DEPOIS do build.
 
 ## Assets binários
 `assets/renata-demo.mp4` (10,7MB) é o vídeo da escada de demonstração da Renata, **commitado de propósito**: o `video/` do repo Receps é gitignored, então o `git pull` é o único caminho que leva o arquivo pra VPS. O `boot()` não lê o asset; ele só é carregado no 1º `sendDemoVideo` (e aí fica ~11MB memoizado no processo). Env opcional `RENATA_DEMO_VIDEO_PATH` sobrepõe o caminho.
@@ -35,7 +41,7 @@ Rodados com `npx tsx`. Padrão pós-ESM: setar `process.env.DATABASE_URL`/`OPENA
 - Smokes: `smoke:receptionist-provider`, `smoke:receptionist-prompt-guards`, `smoke:booking-confirmation-gate`, `smoke:customer-reply-guard`, `smoke:cancel-appointment-guard`, `smoke:service-gate`, `smoke:professional-selection-gate`.
 
 ## PII / scrub
-NUNCA logar PII em claro nem colar telefone/nome/mensagem crus. `messageId`/`wamid` cru também é sensível: pode carregar o telefone do remetente de forma reversível; use apenas `messageIdHash`. O Sentry tem scrub (`src/observability/scrub.ts`) por chave E em strings livres (`event.message`, exceptions, breadcrumbs). Ao acompanhar `pm2 logs ana-bot`, redija telefone/nome ao reportar.
+NUNCA logar PII em claro nem colar telefone/nome/mensagem crus. `messageId`/`wamid` cru também é sensível: pode carregar o telefone do remetente de forma reversível; use apenas `messageIdHash`. O Sentry tem scrub (`src/observability/scrub.ts`) por chave E em strings livres (`event.message`, exceptions, breadcrumbs). Ao acompanhar `pm2 logs receps-ia`, redija telefone/nome ao reportar.
 
 ## Contrato internacional Ana → Receps (W1, 2026-08-10)
 `customerPhone` deve sair da Ana no fio como E.164 explícito (`+<wa_id>`) no outbox de inbound e na escalada. O Receps mantém `+55…` como canônico brasileiro e só-dígitos para DDI estrangeiro; cadastro/login do produto continuam BR-only. Um 4xx do contrato põe o inbound em quarentena terminal: depois de corrigir e publicar Receps + Ana, rearme o item exato pelo endpoint autenticado `/internal/inbound-outbox/reprocess`; o sweep comum não o recupera sozinho. Smokes obrigatórios do contrato: `smoke:ana-outbox`, `smoke:ana-outbox-quarantine`, `smoke:scrub-message` e, no Receps, `smoke:ana-inbound-contract`.
@@ -102,7 +108,7 @@ Dois endpoints GET internos que expõem o `ana_conversation_history` para o pain
 - **`GET /internal/conversation-messages?phoneNumberId=&customerPhone=`** — thread de UMA conversa. Ambos obrigatórios (senão 400); tolerante ao formato do telefone (`customerPhoneVariants`). `200 → { messages: [{ role, content, createdAt (ISO) }] }` em ordem ASC (mais antiga primeiro); conversa inexistente → `{ messages: [] }` (200, não 404). Mensagens `assistant` com prefixo **`[atendente] `** (`HUMAN_ECHO_PREFIX`, echo do humano) VÃO no payload como estão — quem interpreta o marcador é a UI do Receps.
 - **Leitores** (`src/services/contextManager.ts`, exportados): `listConversations`/`getHistoryWithTimestamps` (com query INJETÁVEL p/ o smoke) + puros `parseConversationKey`/`escapeLikePattern`/`truncatePreview`/`clampConversationsLimit`/`clampConversationsOffset`. **Smoke**: `smoke:conversations-endpoint` (puros + shape com pool mockado). NUNCA logam PII.
 
-> Contraparte no Receps: `src/services/ana-conversations-admin.service.ts` consome via `ANA_INTERNAL_API_URL` (padrão do `fetchAnaActivity`) + UI em `/painel-receps/clientes/[tenantId]/conversas`. Ver AGENTS.md do Receps + `docs/features/plataforma.md`.
+> Contraparte no Receps: `src/services/ana-conversations-admin.service.ts` consome via `RECEPS_IA_INTERNAL_API_URL` (com alias legado temporário) + UI em `/painel-receps/clientes/[tenantId]/conversas`. Ver AGENTS.md do Receps + `docs/features/plataforma.md`.
 
 ### FEATURE — Voz da Renata (sales-only, áudio-primeiro) (2026-07-23)
 A Renata (`botRole === "sales"`) pode responder em nota de voz PTT pelo pipeline batch em `src/voice/`. O gate ÚNICO é `isRenataVoiceEnabled(config)`: exige sales + `RENATA_VOICE_ENABLED=true` + chave do provider selecionado + ffmpeg disponível. A flag é **OFF por default**; gate falso mantém o envio de texto anterior. A recepcionista nunca entra no pipeline.

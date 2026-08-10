@@ -10,11 +10,11 @@ function check(name: string, ok: boolean): void {
 async function main(): Promise<void> {
   const skipDatabase = process.env.ANA_SMOKE_SKIP_DB === '1';
   if (
-    !process.env.ANA_DIRECT_DATABASE_URL &&
+    !process.env.RECEPS_IA_DIRECT_DATABASE_URL &&
     !process.env.DATABASE_URL &&
     !skipDatabase
   ) {
-    throw new Error('ANA_DIRECT_DATABASE_URL e DATABASE_URL ausentes no .env local');
+    throw new Error('RECEPS_IA_DIRECT_DATABASE_URL e DATABASE_URL ausentes no .env local');
   }
   process.env.DATABASE_URL ??= 'postgresql://dummy:dummy@127.0.0.1:1/dummy';
   const order = await import('../src/services/conversationOrder');

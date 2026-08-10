@@ -1,7 +1,7 @@
 {
-  "name": "ana-atendente-virtual",
+  "name": "receps-ia-runtime",
   "version": "1.0.0",
-  "description": "Ana — Atendente virtual de agendamento via WhatsApp + ERP interno",
+  "description": "Receps-IA — runtime compartilhado das personas Ana e Renata",
   "main": "dist/webhookServer.js",
   "scripts": {
     "build": "tsc",
@@ -15,6 +15,7 @@
     "benchmark:renata-models": "npx tsx scripts/benchmarks/renata-models/runner.ts",
     "harness:onda21:ana": "ts-node -T scripts/harness-onda21-ana.ts",
     "smoke:security": "node scripts/smoke-security.ts",
+    "smoke:sentry": "npx ts-node -T scripts/smoke-sentry-receps-ia.ts",
     "smoke:booking-reasons": "npx tsx scripts/smoke-booking-reasons.ts",
     "smoke:service-gate": "node scripts/smoke-service-gate.ts",
     "smoke:ana-tool-loop": "ts-node -T scripts/smoke-ana-tool-loop.ts",

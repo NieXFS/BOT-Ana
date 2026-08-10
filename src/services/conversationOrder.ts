@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { Pool, type PoolClient } from 'pg';
 import { Sentry } from '../observability/sentry';
+import { recepsIaEnvValuesConflict } from '../runtimeIdentity';
 
 /**
  * Ordenação distribuída por conversa (Rev. 3 §6.1).
@@ -17,16 +18,20 @@ import { Sentry } from '../observability/sentry';
  */
 
 interface ConversationOrderDatabaseEnv {
+  [name: string]: string | undefined;
+  RECEPS_IA_DIRECT_DATABASE_URL?: string;
   ANA_DIRECT_DATABASE_URL?: string;
   DATABASE_URL?: string;
 }
+
+let warnedDirectDatabaseAliasConflict = false;
 
 function parseDatabaseUrl(connectionString: string): URL {
   try {
     return new URL(connectionString);
   } catch {
     // Não inclua a URL/DSN no erro: ela pode conter credenciais.
-    throw new Error('URL de banco inválida para a ordenação de conversas da Ana.');
+    throw new Error('URL de banco inválida para a ordenação de conversas do Receps-IA.');
   }
 }
 
@@ -49,14 +54,29 @@ export function databaseUrlHasPoolerHostname(
 export function resolveConversationOrderDatabaseUrl(
   env: ConversationOrderDatabaseEnv = process.env
 ): string {
-  const explicitDirectUrl = env.ANA_DIRECT_DATABASE_URL?.trim();
+  if (
+    !warnedDirectDatabaseAliasConflict &&
+    recepsIaEnvValuesConflict(
+      env,
+      'RECEPS_IA_DIRECT_DATABASE_URL',
+      'ANA_DIRECT_DATABASE_URL'
+    )
+  ) {
+    warnedDirectDatabaseAliasConflict = true;
+    console.warn(
+      '[Receps-IA] RECEPS_IA_DIRECT_DATABASE_URL e ANA_DIRECT_DATABASE_URL divergem; o nome canônico será usado.'
+    );
+  }
+  const explicitDirectUrl =
+    env.RECEPS_IA_DIRECT_DATABASE_URL?.trim() ||
+    env.ANA_DIRECT_DATABASE_URL?.trim();
   if (explicitDirectUrl) {
     // Valida sem reescrever: quando o operador define a URL direta, ela é a
     // fonte autoritativa e o guard abaixo acusa eventual endpoint pooled.
     parseDatabaseUrl(explicitDirectUrl);
     if (databaseUrlHasPoolerHostname(explicitDirectUrl)) {
       throw new Error(
-        'Endpoint pooled não é permitido para a ordenação de conversas da Ana.'
+        'Endpoint pooled não é permitido para a ordenação de conversas do Receps-IA.'
       );
     }
     return explicitDirectUrl;
@@ -65,13 +85,13 @@ export function resolveConversationOrderDatabaseUrl(
   const databaseUrl = env.DATABASE_URL?.trim();
   if (!databaseUrl) {
     throw new Error(
-      'ANA_DIRECT_DATABASE_URL ou DATABASE_URL não configurada para ordenar conversas.'
+      'RECEPS_IA_DIRECT_DATABASE_URL, ANA_DIRECT_DATABASE_URL ou DATABASE_URL não configurada para ordenar conversas.'
     );
   }
   const resolved = removePoolerSuffixFromDatabaseUrl(databaseUrl);
   if (databaseUrlHasPoolerHostname(resolved)) {
     throw new Error(
-      'Endpoint pooled não é permitido para a ordenação de conversas da Ana.'
+      'Endpoint pooled não é permitido para a ordenação de conversas do Receps-IA.'
     );
   }
   return resolved;

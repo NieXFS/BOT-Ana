@@ -15,8 +15,8 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 async function main(): Promise<void> {
-  if (!process.env.ANA_DIRECT_DATABASE_URL && !process.env.DATABASE_URL) {
-    throw new Error('ANA_DIRECT_DATABASE_URL e DATABASE_URL ausentes no .env local');
+  if (!process.env.RECEPS_IA_DIRECT_DATABASE_URL && !process.env.DATABASE_URL) {
+    throw new Error('RECEPS_IA_DIRECT_DATABASE_URL e DATABASE_URL ausentes no .env local');
   }
   const order = await import('../src/services/conversationOrder');
   process.env.DATABASE_URL = order.resolveConversationOrderDatabaseUrl();

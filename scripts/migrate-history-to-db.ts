@@ -2,7 +2,24 @@ import 'dotenv/config';
 import fs from 'fs';
 import { Pool } from 'pg';
 
-const HISTORY_FILE = '/root/Ana/historico_conversas.json';
+const canonicalHistoryFile = '/root/Receps-IA/historico_conversas.json';
+const legacyHistoryFile = '/root/Ana/historico_conversas.json';
+
+function resolveHistoryFile(): string {
+  const explicit = process.env.RECEPS_IA_HISTORY_FILE?.trim();
+  if (explicit) return explicit;
+
+  const canonicalExists = fs.existsSync(canonicalHistoryFile);
+  const legacyExists = fs.existsSync(legacyHistoryFile);
+  if (canonicalExists && legacyExists) {
+    throw new Error(
+      'Há dois históricos legados; defina RECEPS_IA_HISTORY_FILE explicitamente.'
+    );
+  }
+  return canonicalExists ? canonicalHistoryFile : legacyHistoryFile;
+}
+
+const HISTORY_FILE = resolveHistoryFile();
 
 if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL não configurada.');

@@ -4,6 +4,7 @@
  */
 
 process.env.DATABASE_URL = 'postgresql://dummy:dummy@127.0.0.1:1/dummy';
+process.env.RECEPS_IA_SENTRY_DSN = '';
 process.env.ANA_SENTRY_DSN = '';
 
 async function main(): Promise<void> {

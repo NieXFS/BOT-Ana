@@ -12,7 +12,7 @@ import type OpenAI from 'openai';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = 'postgresql://wave5:wave5@127.0.0.1:1/wave5';
-process.env.ANA_DIRECT_DATABASE_URL = 'postgresql://wave5:wave5@127.0.0.1:1/wave5';
+process.env.RECEPS_IA_DIRECT_DATABASE_URL = 'postgresql://wave5:wave5@127.0.0.1:1/wave5';
 process.env.ERP_BASE_URL = 'http://127.0.0.1:1';
 process.env.RECEPS_INTERNAL_API_URL = 'http://127.0.0.1:1';
 process.env.ERP_API_TOKEN = 'wave5-no-erp';
