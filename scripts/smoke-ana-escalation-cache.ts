@@ -97,7 +97,8 @@ async function main(): Promise<void> {
         conversationKey: 'pnid:5511999999999',
         text: 'mensagem curta da cliente',
         phoneNumberId: 'pnid-safe',
-        messageId: 'wamid-safe',
+        messageId: 'wamid.HBgONjI4OTU0MjYyNTAzNjcVAgAS.fixture',
+        messageIdHash: '36f35eb6f0a0b0eb',
       },
     },
   } as never) as unknown as {
@@ -113,9 +114,10 @@ async function main(): Promise<void> {
       scrubbed.text === '[REDACTED:25 chars]'
   );
   check(
-    'scrub preserva apenas ids técnicos allowlisted',
+    'scrub preserva apenas ids e hashes técnicos allowlisted',
     scrubbed.phoneNumberId === 'pnid-safe' &&
-      scrubbed.messageId === 'wamid-safe'
+      scrubbed.messageId === '[REDACTED]' &&
+      scrubbed.messageIdHash === '36f35eb6f0a0b0eb'
   );
 
   const failed = checks.filter((entry) => !entry.ok);

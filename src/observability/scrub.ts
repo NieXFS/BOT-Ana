@@ -8,19 +8,20 @@
  * (`text`/`body`/`message`...) para `[REDACTED:N chars]`.
  *
  * Allowlist: `phoneNumberId` (ID Meta da linha do salão, não é número pessoal),
- * `tenantSlug` e `messageId` são contexto útil e ficam preservados.
+ * `tenantSlug` e hashes técnicos ficam preservados. `messageId` cru NÃO é
+ * seguro: o `wamid` pode carregar o telefone do remetente de forma reversível.
  */
 
 import type { Event } from '@sentry/node';
 
 // Obs.: NÃO incluir "whatsapp" aqui — o contexto deliberado `whatsapp_message`
-// (phoneNumberId/tenantSlug/messageId) usa esse nome e seria redigido inteiro.
+// (phoneNumberId/tenantSlug/messageIdHash) usa esse nome e seria redigido inteiro.
 // O número do cliente chega em `from`/`to`/`wa_id`/`phone`/`telefone`.
 const SENSITIVE_KEY =
-  /(e-?mail|phone|telefone|fone|celular|wa_id|conversation.?key|customer.?phone|customer.?name|client.?name|nome.?cliente|cpf|cnpj|rg|password|senha|secret|token|authorization|api[-_]?key|cookie)/i;
+  /(message.?id|e-?mail|phone|telefone|fone|celular|wa_id|conversation.?key|customer.?phone|customer.?name|client.?name|nome.?cliente|cpf|cnpj|rg|password|senha|secret|token|authorization|api[-_]?key|cookie)/i;
 
 /** Chaves cujo nome bate em SENSITIVE_KEY mas NÃO são PII — não redigir. */
-const ALLOWLIST_KEY = /^(phoneNumberId|tenantSlug|messageId)$/;
+const ALLOWLIST_KEY = /^(phoneNumberId|tenantSlug|messageIdHash|providerMessageHash|phoneNumberHash)$/;
 
 /** Telefone do cliente chega como `from`/`to` no payload da Meta. */
 const PHONE_FIELD_KEY = /^(from|to)$/i;

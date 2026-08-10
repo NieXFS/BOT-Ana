@@ -90,6 +90,26 @@ async function main(): Promise<void> {
         createHash('sha256').update(clinicalText, 'utf8').digest('hex') &&
       posted[0]?.contentLength === clinicalText.length
   );
+
+  const internationalPayload = outbox.serializeInboundDeliveryPayload({
+    messageId: 'wamid-international',
+    phoneNumberId: 'pnid-smoke',
+    conversationKey: 'pnid-smoke:6281234567890',
+    receivedAt: new Date(0),
+    messageType: 'text',
+    contentStatus: 'final',
+    content: 'Fixture internacional',
+    contentOriginalLength: 'Fixture internacional'.length,
+    attempts: 0,
+    nextRetryAt: new Date(0),
+    deliveredAt: null,
+    terminalAt: null,
+    failureCode: null,
+  });
+  check(
+    'W1 preserva DDI internacional em E.164 explícito',
+    internationalPayload.customerPhone === '+6281234567890'
+  );
   check(
     'entrega marca delivered_at',
     rows.get('wamid-fast')?.deliveredAt instanceof Date

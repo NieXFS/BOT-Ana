@@ -29,6 +29,9 @@ const CPF = '123.456.789-09';
 const HEX = 'a'.repeat(40); // 40 hex chars (>= 32)
 const BEARER_TOK = 'abcDEF123456_token-value';
 
+const RAW_MESSAGE_ID = 'wamid.HBgONjI4OTU0MjYyNTAzNjcVAgAS.fixture';
+const MESSAGE_ID_HASH = '36f35eb6f0a0b0eb';
+
 const event = {
   message: `Request failed for ${EMAIL} cpf ${CPF}`,
   exception: {
@@ -46,7 +49,11 @@ const event = {
       data: { from: PHONE },
     },
   ],
-  tags: { phoneNumberId: '123456789012345' },
+  tags: {
+    phoneNumberId: '123456789012345',
+    messageId: RAW_MESSAGE_ID,
+    messageIdHash: MESSAGE_ID_HASH,
+  },
 } as unknown as Event;
 
 const out = scrubEvent(event);
@@ -81,6 +88,15 @@ check(
 check(
   'allowlist phoneNumberId (campo estruturado) preservado',
   (out.tags as Record<string, unknown> | undefined)?.phoneNumberId === '123456789012345'
+);
+check(
+  'wamid cru é redigido porque pode carregar telefone reversível',
+  (out.tags as Record<string, unknown> | undefined)?.messageId === '[REDACTED]' &&
+    !blob.includes(RAW_MESSAGE_ID)
+);
+check(
+  'hash técnico do wamid permanece observável',
+  (out.tags as Record<string, unknown> | undefined)?.messageIdHash === MESSAGE_ID_HASH
 );
 
 console.log('[4] scrubText unit');

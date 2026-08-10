@@ -35,7 +35,10 @@ Rodados com `npx tsx`. Padrão pós-ESM: setar `process.env.DATABASE_URL`/`OPENA
 - Smokes: `smoke:receptionist-provider`, `smoke:receptionist-prompt-guards`, `smoke:booking-confirmation-gate`, `smoke:customer-reply-guard`, `smoke:cancel-appointment-guard`, `smoke:service-gate`, `smoke:professional-selection-gate`.
 
 ## PII / scrub
-NUNCA logar PII em claro nem colar telefone/nome/mensagem crus. O Sentry tem scrub (`src/observability/scrub.ts`) por chave E em strings livres (`event.message`, exceptions, breadcrumbs). Ao acompanhar `pm2 logs ana-bot`, redija telefone/nome ao reportar.
+NUNCA logar PII em claro nem colar telefone/nome/mensagem crus. `messageId`/`wamid` cru também é sensível: pode carregar o telefone do remetente de forma reversível; use apenas `messageIdHash`. O Sentry tem scrub (`src/observability/scrub.ts`) por chave E em strings livres (`event.message`, exceptions, breadcrumbs). Ao acompanhar `pm2 logs ana-bot`, redija telefone/nome ao reportar.
+
+## Contrato internacional Ana → Receps (W1, 2026-08-10)
+`customerPhone` deve sair da Ana no fio como E.164 explícito (`+<wa_id>`) no outbox de inbound e na escalada. O Receps mantém `+55…` como canônico brasileiro e só-dígitos para DDI estrangeiro; cadastro/login do produto continuam BR-only. Um 4xx do contrato põe o inbound em quarentena terminal: depois de corrigir e publicar Receps + Ana, rearme o item exato pelo endpoint autenticado `/internal/inbound-outbox/reprocess`; o sweep comum não o recupera sozinho. Smokes obrigatórios do contrato: `smoke:ana-outbox`, `smoke:ana-outbox-quarantine`, `smoke:scrub-message` e, no Receps, `smoke:ana-inbound-contract`.
 
 ## Fixes registrados
 

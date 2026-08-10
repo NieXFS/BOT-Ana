@@ -138,16 +138,16 @@ async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
 
     // Escopo de isolamento por mensagem: tudo que acontecer dentro do
     // processamento desta mensagem fica anexado a este contexto no Sentry.
-    // Só metadados não-PII (phoneNumberId do salão, tenantSlug, messageId) —
-    // o número e o conteúdo do cliente NÃO entram no contexto.
+    // Só metadados não-PII (phoneNumberId do salão, tenantSlug, hash do wamid) —
+    // o wamid cru pode carregar o telefone do remetente de forma reversível.
     Sentry.withIsolationScope((scope) => {
       scope.setTag('phoneNumberId', phoneNumberId);
       scope.setTag('tenantSlug', config.tenantSlug);
-      scope.setTag('messageId', message.id);
+      scope.setTag('messageIdHash', technicalHash(message.id));
       scope.setContext('whatsapp_message', {
         phoneNumberId,
         tenantSlug: config.tenantSlug,
-        messageId: message.id,
+        messageIdHash: technicalHash(message.id),
         type: message.type,
       });
 
@@ -165,12 +165,12 @@ async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
               service: 'webhook_server',
               operation: 'inbound_message',
               phoneNumberId,
-              messageId: message.id,
+              messageIdHash: technicalHash(message.id),
               error_kind: runtimeErrorKind(err),
             },
           });
           console.error(
-            `❌ Erro ao processar inbound | phoneNumberId=${phoneNumberId} | messageId=${message.id} | error=${runtimeErrorKind(err)}`
+            `❌ Erro ao processar inbound | phoneNumberId=${phoneNumberId} | messageIdHash=${technicalHash(message.id)} | error=${runtimeErrorKind(err)}`
           );
         }
       });

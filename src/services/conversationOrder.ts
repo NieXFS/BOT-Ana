@@ -107,6 +107,12 @@ export function canonicalCustomerPhone(customerPhone: string): string {
   return digits || trimmed;
 }
 
+/** Forma explícita no fio para contratos internos: `+<wa_id>` (E.164). */
+export function customerPhoneAsE164(customerPhone: string): string {
+  const canonical = canonicalCustomerPhone(customerPhone);
+  return /^\d+$/.test(canonical) ? `+${canonical}` : canonical;
+}
+
 export function canonicalConversationKey(
   phoneNumberId: string,
   customerPhone: string

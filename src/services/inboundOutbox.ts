@@ -13,7 +13,10 @@ import {
   parseEscalationSnapshot,
   updateEscalationCache,
 } from './escalationCache';
-import { canonicalConversationKey } from './conversationOrder';
+import {
+  canonicalConversationKey,
+  customerPhoneAsE164,
+} from './conversationOrder';
 import type {
   InboundContentStatus,
   InboundMessageType,
@@ -210,12 +213,6 @@ function customerPhoneFromConversationKey(conversationKey: string): string {
   return separator >= 0 ? conversationKey.slice(separator + 1) : '';
 }
 
-function customerPhoneAsE164(conversationKey: string): string {
-  const value = customerPhoneFromConversationKey(conversationKey);
-  const digits = value.replace(/\D/g, '');
-  return digits ? `+${digits}` : value;
-}
-
 /** Serialização W1 única, usada por produção, smoke e harness. */
 export function serializeInboundDeliveryPayload(
   row: InboundOutboxRow
@@ -256,7 +253,9 @@ export function serializeInboundDeliveryPayload(
 
   return {
     phoneNumberId: row.phoneNumberId,
-    customerPhone: customerPhoneAsE164(row.conversationKey),
+    customerPhone: customerPhoneAsE164(
+      customerPhoneFromConversationKey(row.conversationKey)
+    ),
     messageId: row.messageId,
     receivedAt,
     messageType: row.messageType,

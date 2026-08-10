@@ -4,6 +4,7 @@ import {
   parseEscalationSnapshot,
   updateEscalationCache,
 } from './escalationCache';
+import { customerPhoneAsE164 } from './conversationOrder';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -86,7 +87,10 @@ const defaultDeps: EscalationDeps = {
   async post(input) {
     const { data } = await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/questions/escalate`,
-      input,
+      {
+        ...input,
+        customerPhone: customerPhoneAsE164(input.customerPhone),
+      },
       {
         headers: {
           Authorization: `Bearer ${ERP_API_TOKEN}`,
