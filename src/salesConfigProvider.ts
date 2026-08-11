@@ -4,7 +4,7 @@ import { ERP_API_TOKEN } from './erpApiToken';
  * Config de VENDAS da Renata: planos/preços/trials estruturados do Receps
  * (GET /api/v1/bot/sales-config). O modelo NUNCA cita preço de memória — a
  * Renata injeta este bloco no placeholder {{PLANOS}} do system prompt. Cache em
- * memória de 1h (preço muda raramente; o Receps deriva de PLAN_METADATA).
+ * memória de 1h (preço muda raramente; o Receps deriva do catálogo PlanPrice).
  */
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
@@ -27,7 +27,7 @@ export interface SalesConfigPlan {
   /** @deprecated Semântica legada; nunca autoriza oferta anual. */
   annualFreeMonths: number;
   annualSellable?: false;
-  /** Compatibilidade v1: trial da cobrança mensal, hoje chamada Flexível. */
+  /** Compatibilidade v1: trial da cobrança mensal, exibida como Mensal. */
   trialDays: number;
   maxProfessionals: number | null;
   features: string[];
@@ -122,23 +122,23 @@ export function renderPlansBlock(config: SalesConfig): string {
     const planHeader = `- ${plan.name} — slug para o link: "${plan.slug}". ${limite}. Inclui: ${features}.`;
 
     // Compatibilidade com Receps v1: `tracks` não existia. A única oferta
-    // segura é a mensal antiga, agora tratada como Flexível. Os campos anuais
+    // segura é a mensal antiga, exibida como Mensal. Os campos anuais
     // legados são deliberadamente ignorados.
     if (!plan.tracks) {
-      return `${planHeader}\n  - Flexível: ${plan.priceMonthlyFormatted}/mês. Teste grátis de ${plan.trialDays} dias, sem cartão.`;
+      return `${planHeader}\n  - Mensal (track interno flexivel): ${plan.priceMonthlyFormatted}/mês. Teste grátis de ${plan.trialDays} dias, sem cartão.`;
     }
 
     const trackLines: string[] = [];
     if (plan.tracks.flexivel) {
       const flexivel = plan.tracks.flexivel;
       trackLines.push(
-        `  - Flexível: ${flexivel.priceMonthlyFormatted}/mês. Teste grátis de ${flexivel.trialDays} dias, sem cartão.`
+        `  - Mensal (track interno flexivel): ${flexivel.priceMonthlyFormatted}/mês. Teste grátis de ${flexivel.trialDays} dias, sem cartão.`
       );
     }
     if (plan.tracks.fidelidade) {
       const fidelidade = plan.tracks.fidelidade;
       trackLines.push(
-        `  - Fidelidade 12m: ${fidelidade.priceMonthlyFormatted}/mês. Compromisso de ${fidelidade.commitmentMonths} meses. Sem teste grátis — primeira cobrança no ato. Há ${fidelidade.regretDays} dias de arrependimento com reembolso integral; cancelando depois desse prazo, multa de ${fidelidade.penaltyPercent}% sobre as mensalidades que faltam. Depois dos ${fidelidade.commitmentMonths} meses, o preço continua o mesmo mês a mês, sem renovar o compromisso.`
+        `  - Anual (track interno fidelidade): ${fidelidade.priceMonthlyFormatted}/mês, cobrado mensalmente. Sem teste grátis — primeira cobrança no ato. Ao oferecer, diga exatamente: "Arrependimento em até 7 dias após o pagamento". As condições completas aparecem antes do primeiro pagamento e exigem aceite da cliente; não as recite nem improvise no WhatsApp.`
       );
     }
 
@@ -151,16 +151,22 @@ export function renderPlansBlock(config: SalesConfig): string {
   });
 
   const retiredOfferRule = hasStructuredTracks
-    ? '- NUNCA ofereça plano anual nem a oferta aposentada de "2 meses grátis", "2 meses por nossa conta" ou equivalentes.'
+    ? '- NUNCA ofereça o anual legado pago à vista nem a oferta aposentada de "2 meses grátis", "2 meses por nossa conta" ou equivalentes. O Anual atual é cobrado mensalmente.'
     : '- Não mencione nem ofereça condições descontinuadas que não aparecem acima.';
+  const commercialTrackRules = hasStructuredTracks
+    ? `- Fale com a cliente somente em Mensal ou Anual. Mensal usa o track interno flexivel; Anual usa o track interno fidelidade.
+- A recomendação comercial padrão é o Anual, por ter a menor mensalidade. Ofereça o Mensal quando a cliente quiser testar primeiro, começar sem cartão, não assumir compromisso, cancelar quando quiser ou escolher explicitamente o Mensal.
+- Ao chamar sendSignupLink ou sendPrefilledSignup para o Anual, envie SEMPRE o track interno fidelidade. Omitir o track gera tecnicamente o Mensal e não pode ser usado após recomendar o Anual.
+- No Anual, diga exatamente "Arrependimento em até 7 dias após o pagamento" no mesmo turno da oferta. As condições completas aparecem antes do primeiro pagamento; não as recite nem improvise e nunca diga que o Anual pode ser cancelado livremente.
+- "Teste grátis de 14 dias, sem cartão" pertence SOMENTE ao Mensal. O Anual não tem teste grátis e cobra a primeira mensalidade no ato.`
+    : '- Fale com a cliente somente em Mensal. Não mencione nenhuma opção que não apareça acima.';
 
   return `PLANOS E PREÇOS (fonte da verdade — use SOMENTE estes valores, NUNCA cite preço de memória):
 ${lines.join('\n')}
 
 REGRAS DURAS DE OFERTA:
 - Venda somente planos e trilhas explicitamente listados acima; trilha ausente ou nula está indisponível.
-- Na Fidelidade, SEMPRE informe junto o compromisso de 12 meses e a multa de 20% sobre as mensalidades restantes após os 7 dias de arrependimento. Nunca negue nem minimize esse compromisso.
-- "Teste grátis de 14 dias, sem cartão" pertence SOMENTE à Flexível. A Fidelidade não tem teste grátis e cobra a primeira mensalidade no ato.
+${commercialTrackRules}
 ${retiredOfferRule}
 - O Somente Atendente IA não é vendável; ofereça apenas a lista de interesse e apresente Essencial ou Pro.
 - Cite valores absolutos. Não compare preço com concorrentes e não prometa lucro, economia garantida ou retorno financeiro.`;

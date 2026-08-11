@@ -1,7 +1,7 @@
 /**
  * Smoke dos CONTRATOS das ferramentas de venda da Renata (Workstream B).
  * - buildSignupLink: URL builder puro (utm + cid + plano + track; plano/track
- *   indisponível → lista de interesse; payload v1 → só Flexível; ctwaClid >
+ *   indisponível → lista de interesse; payload v1 → só Mensal; ctwaClid >
  *   wa:hash).
  * - registerQualifiedLead / handoffToHuman: contrato HTTP contra um MOCK do
  *   Receps (express local) — sem tocar no Receps real nem no DB (a régua de
@@ -30,7 +30,8 @@ const salesConfig: SalesConfig = {
   currency: 'BRL',
   annualFreeMonths: 2,
   annualSellable: false,
-  deprecationNote: 'Não ofertar anual; use Flexível ou Fidelidade.',
+  deprecationNote:
+    'Não ofertar o anual legado pago à vista; apresente as opções atuais como Mensal ou Anual.',
   signupBaseUrl: 'https://receps.com.br/cadastro',
   plans: [
     {
@@ -184,18 +185,18 @@ async function main() {
     check('essencial: plan=essencial', essencial.url.includes('plan=essencial'));
     check('essencial: utm completo', essencial.url.includes('utm_source=whatsapp&utm_medium=renata&utm_campaign=ctwa'));
     check('essencial: cid=wa:<hash>', essencial.url.includes(`cid=wa%3A${hashPhoneForCid(phone)}`) || essencial.url.includes(`cid=wa:${hashPhoneForCid(phone)}`));
-    check('essencial: default = Flexível', essencial.track === 'flexivel');
-    check('essencial Flexível: URL sem track explícita', !essencial.url.includes('track='));
+    check('essencial: default = Mensal', essencial.track === 'flexivel');
+    check('essencial Mensal: URL sem track explícita', !essencial.url.includes('track='));
     check('links novos nunca emitem interval', !essencial.url.includes('interval='));
   }
   const proFidelity = buildSignupLink('pro', 'fidelidade', phone, salesConfig);
   check(
-    'Pro Fidelidade: track=fidelidade',
+    'Pro Anual: track=fidelidade',
     proFidelity.success === true && proFidelity.url.includes('track=fidelidade')
   );
-  check('Pro Fidelidade: plan=pro', proFidelity.success === true && proFidelity.url.includes('plan=pro'));
+  check('Pro Anual: plan=pro', proFidelity.success === true && proFidelity.url.includes('plan=pro'));
   check(
-    'Pro Fidelidade: nunca emite interval legado',
+    'Pro Anual: nunca emite interval legado',
     proFidelity.success === true && !proFidelity.url.includes('interval=')
   );
 
@@ -222,8 +223,8 @@ async function main() {
 
   const v1Flexible = buildSignupLink('essencial', undefined, phone, v1SalesConfig);
   const v1Fidelity = buildSignupLink('essencial', 'fidelidade', phone, v1SalesConfig);
-  check('payload v1: Flexível implícita continua vendável', v1Flexible.success === true);
-  check('payload v1: Fidelidade falha fechado', v1Fidelity.success === false);
+  check('payload v1: Mensal implícito continua vendável', v1Flexible.success === true);
+  check('payload v1: Anual falha fechado', v1Fidelity.success === false);
 
   const beta = buildSignupLink('atendente-ia', undefined, phone, salesConfig);
   check('plano pausado: recusa (não vende)', beta.success === false);
@@ -270,7 +271,7 @@ async function main() {
   check('prefill: nome e clínica repassados', prefillReq?.body.name === 'Maria' && prefillReq?.body.clinicName === 'Clínica Bella');
   check('prefill: plano normalizado', prefillReq?.body.plan === 'pro');
   check(
-    'prefill Flexível: POST não envia track nem interval legado',
+    'prefill Mensal: POST não envia track nem interval legado',
     prefillReq !== undefined &&
       !('track' in prefillReq.body) &&
       !('interval' in prefillReq.body)

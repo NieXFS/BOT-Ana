@@ -75,7 +75,7 @@ const PLANOS_PLACEHOLDER = '{{PLANOS}}';
 
 /** Bloco seguro quando a sales-config está indisponível — NUNCA inventa preço. */
 const PLANS_UNAVAILABLE_BLOCK =
-  'PLANOS E PREÇOS: não consegui puxar os valores e as trilhas agora. NÃO invente preço, plano, trilha nem trial. NÃO ofereça plano anual nem a oferta aposentada de 2 meses grátis. Se perguntarem valor ou condição, diga que confirma em instantes ou ofereça falar com o Victor.';
+  'PLANOS E PREÇOS: não consegui puxar os valores e as opções agora. NÃO invente preço, plano, condição nem trial. NÃO ofereça o anual legado pago à vista nem a oferta aposentada de 2 meses grátis. Se perguntarem valor ou condição, diga que confirma em instantes ou ofereça falar com o Victor.';
 
 /**
  * Bloco ESTÁVEL do system prompt (persona + manual + {{PLANOS}}) — é o que o
@@ -179,7 +179,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'sendSignupLink',
     description:
-      'Gera o link de cadastro de um plano na trilha escolhida. Flexível é o padrão e tem teste grátis sem cartão; Fidelidade exige compromisso de 12 meses, não tem teste grátis e cobra no ato. Retorna a URL para você enviar ao lead. NÃO gere link de plano ou trilha indisponível (a tool recusa e retorna a lista de interesse).',
+      'Gera o link de cadastro de um plano na opção escolhida. Anual é a recomendação comercial padrão e exige track fidelidade explícito; Mensal usa track flexivel, tem teste grátis sem cartão e é apenas o fallback técnico quando track é omitido. Retorna a URL para você enviar ao lead. NÃO gere link de plano ou opção indisponível (a tool recusa e retorna a lista de interesse).',
     input_schema: {
       type: 'object',
       properties: {
@@ -192,7 +192,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
           type: 'string',
           enum: ['flexivel', 'fidelidade'],
           description:
-            'Trilha Flexível (padrão) ou Fidelidade 12m. Omita somente quando a escolha for Flexível.',
+            'Use fidelidade para a recomendação comercial padrão Anual e flexivel quando a cliente escolher Mensal. Para Anual, envie fidelidade explicitamente; omitir gera tecnicamente o Mensal.',
         },
       },
       required: ['plan'],
@@ -201,7 +201,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'sendPrefilledSignup',
     description:
-      'Na trilha Flexível, gera ou reenvia o MESMO link vigente de cadastro JÁ PREENCHIDO com os dados do lead (e-mail, nome, clínica, plano e, quando descobertos, nicho e número de profissionais); informar o nicho faz o cadastro já chegar com uma agenda pronta. Na Fidelidade, enquanto o prefill do Receps não aceita track, a tool retorna um LINK COMUM com track=fidelidade e avisa para não prometer dados preenchidos. PREFIRA esta tool ao sendSignupLink sempre que você souber o e-mail, inclusive se ela pedir "manda o link de novo" ou disser que perdeu o link. GATE OBRIGATÓRIO EM DOIS TURNOS — CONFIRME O E-MAIL antes de gerar: (1) em uma resposta sua, repita o e-mail exato e pergunte se está correto; (2) encerre essa resposta SEM chamar esta tool; (3) somente depois de uma NOVA mensagem da lead confirmando, chame sendPrefilledSignup. Receber o e-mail e pedir o link no mesmo inbound nunca conta como confirmação. Correção exige repetir o novo e-mail e esperar outra resposta. Se ela não quiser dar o e-mail, use o sendSignupLink e não insista. Retorna a URL pra você enviar.',
+      'No Mensal (track flexivel), gera ou reenvia o MESMO link vigente de cadastro JÁ PREENCHIDO com os dados do lead (e-mail, nome, clínica, plano e, quando descobertos, nicho e número de profissionais); informar o nicho faz o cadastro já chegar com uma agenda pronta. No Anual (track fidelidade), enquanto o prefill do Receps não aceita track, a tool retorna um LINK COMUM com track=fidelidade e avisa para não prometer dados preenchidos. PREFIRA esta tool ao sendSignupLink sempre que você souber o e-mail, inclusive se ela pedir "manda o link de novo" ou disser que perdeu o link. GATE OBRIGATÓRIO EM DOIS TURNOS — CONFIRME O E-MAIL antes de gerar: (1) em uma resposta sua, repita o e-mail exato e pergunte se está correto; (2) encerre essa resposta SEM chamar esta tool; (3) somente depois de uma NOVA mensagem da lead confirmando, chame sendPrefilledSignup. Receber o e-mail e pedir o link no mesmo inbound nunca conta como confirmação. Correção exige repetir o novo e-mail e esperar outra resposta. Se ela não quiser dar o e-mail, use o sendSignupLink e não insista. Retorna a URL pra você enviar.',
     input_schema: {
       type: 'object',
       properties: {
@@ -220,7 +220,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
           type: 'string',
           enum: ['flexivel', 'fidelidade'],
           description:
-            'Trilha Flexível (padrão) ou Fidelidade 12m. Omita somente quando a escolha for Flexível.',
+            'Use fidelidade para a recomendação comercial padrão Anual e flexivel quando a cliente escolher Mensal. Para Anual, envie fidelidade explicitamente; omitir gera tecnicamente o Mensal.',
         },
         niche: {
           type: 'string',

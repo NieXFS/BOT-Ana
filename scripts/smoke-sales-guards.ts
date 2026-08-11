@@ -113,8 +113,8 @@ console.log('  ✓ correção invalida o e-mail anterior e exige nova confirmaç
 
 const persistedConfirmation = [
   ...confirmedHistory,
-  { role: 'assistant', content: 'Você prefere Flexível ou Fidelidade 12m?' },
-  { role: 'user', content: 'Flexível.' },
+  { role: 'assistant', content: 'Você prefere Mensal ou Anual?' },
+  { role: 'user', content: 'Mensal.' },
 ];
 assert.equal(
   hasConfirmedSalesEmail('maria@clinica.com.br', persistedConfirmation),
@@ -518,6 +518,28 @@ assert.deepEqual(
     {
       role: 'user',
       content:
+        'Quero contratar o Essencial no Anual. Meu e-mail é maria@clinica.com.br.',
+    },
+    {
+      role: 'assistant',
+      content: 'Só confirma: maria@clinica.com.br, certo?',
+    },
+    {
+      role: 'user',
+      content: 'Sim, maria@clinica.com.br está certo. Pode mandar.',
+    },
+  ]),
+  {
+    email: 'maria@clinica.com.br',
+    plan: 'essencial',
+    track: 'fidelidade',
+  }
+);
+assert.deepEqual(
+  resolveConfirmedSalesPrefill([
+    {
+      role: 'user',
+      content:
         'Quero contratar o Essencial na Fidelidade. Meu e-mail é maria@clinica.com.br.',
     },
     {
@@ -537,12 +559,48 @@ assert.deepEqual(
 );
 assert.equal(
   resolveConfirmedSalesPrefill([
+    {
+      role: 'user',
+      content:
+        'Estou entre o Essencial Mensal e o Anual. Meu e-mail é maria@clinica.com.br.',
+    },
+    {
+      role: 'assistant',
+      content: 'Só confirma: maria@clinica.com.br, certo?',
+    },
+    {
+      role: 'user',
+      content: 'Sim, maria@clinica.com.br está certo.',
+    },
+  ]),
+  null
+);
+assert.equal(
+  resolveConfirmedSalesPrefill([
+    {
+      role: 'user',
+      content:
+        'Quero o Essencial anual à vista. Meu e-mail é maria@clinica.com.br.',
+    },
+    {
+      role: 'assistant',
+      content: 'Só confirma: maria@clinica.com.br, certo?',
+    },
+    {
+      role: 'user',
+      content: 'Sim, maria@clinica.com.br está certo.',
+    },
+  ]),
+  null
+);
+assert.equal(
+  resolveConfirmedSalesPrefill([
     ...confirmedPurchaseHistory,
     { role: 'user', content: 'Também olhei o Pro.' },
   ]),
   null
 );
-console.log('  ✓ airbag de prefill exige um único e-mail/plano e preserva a trilha');
+console.log('  ✓ airbag de prefill mapeia Mensal/Anual, aceita aliases antigos e falha fechado');
 
 const pausedPlanHistory = [
   { role: 'user', content: 'Quero só a Ana de 99,99. Manda o link.' },

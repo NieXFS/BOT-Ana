@@ -98,7 +98,7 @@ export function buildSignupLink(
   ) {
     return {
       success: false,
-      message: `Trilha "${trackInput}" não existe. Trilhas válidas: flexivel, fidelidade.`,
+      message: `Opção "${trackInput}" não existe. Use o valor interno flexivel (Mensal) ou fidelidade (Anual).`,
     };
   }
 
@@ -112,7 +112,7 @@ export function buildSignupLink(
     const href = plan.waitlist?.href ?? config.anaBeta.waitlistHref;
     return {
       success: false,
-      message: `A trilha ${track === 'fidelidade' ? 'Fidelidade' : 'Flexível'} do plano ${plan.name} não está disponível agora. Não gere link; ofereça a lista de interesse.`,
+      message: `A opção ${track === 'fidelidade' ? 'Anual' : 'Mensal'} do plano ${plan.name} não está disponível agora. Não gere link; ofereça a lista de interesse.`,
       waitlistHref: href,
     };
   }
@@ -211,7 +211,7 @@ export async function createPrefilledSignupLink(
       track: validation.track,
       fallbackReason: 'prefill_nao_suporta_fidelidade',
       warning:
-        'O cadastro pré-preenchido ainda não suporta a trilha Fidelidade. ESTE É O LINK COMUM DA FIDELIDADE (com track=fidelidade). NÃO diga que já vem com os dados nem que só falta a senha; explique que ela preencherá o cadastro normalmente.',
+        'O cadastro pré-preenchido ainda não suporta o Anual. ESTE É O LINK COMUM DO ANUAL (com track=fidelidade). NÃO diga que já vem com os dados nem que só falta a senha; explique que ela preencherá o cadastro normalmente.',
     };
   }
 

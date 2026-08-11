@@ -53,7 +53,8 @@ const salesConfig: SalesConfig = {
   currency: 'BRL',
   annualFreeMonths: 2,
   annualSellable: false,
-  deprecationNote: 'Não ofertar anual; use Flexível ou Fidelidade.',
+  deprecationNote:
+    'Não ofertar o anual legado pago à vista; apresente as opções atuais como Mensal ou Anual.',
   signupBaseUrl: 'https://receps.com.br/cadastro',
   plans: [
     {
@@ -209,7 +210,7 @@ async function main() {
     })()
   );
   check(
-    'tools de signup expõem track Flexível/Fidelidade e removem interval',
+    'tools de signup preservam os tracks internos flexivel/fidelidade e removem interval',
     ['sendSignupLink', 'sendPrefilledSignup'].every((name) => {
       const properties = (
         SALES_TOOLS.find((tool) => tool.name === name)?.input_schema as {
@@ -219,6 +220,21 @@ async function main() {
       return (
         properties?.track?.enum?.join(',') === 'flexivel,fidelidade' &&
         properties?.interval === undefined
+      );
+    })
+  );
+  check(
+    'tools distinguem recomendação Anual do fallback técnico Mensal',
+    ['sendSignupLink', 'sendPrefilledSignup'].every((name) => {
+      const properties = (
+        SALES_TOOLS.find((tool) => tool.name === name)?.input_schema as {
+          properties?: Record<string, { description?: string }>;
+        }
+      )?.properties;
+      const description = properties?.track?.description ?? '';
+      return (
+        description.includes('recomendação comercial padrão Anual') &&
+        description.includes('omitir gera tecnicamente o Mensal')
       );
     })
   );
@@ -332,39 +348,54 @@ async function main() {
   check('sem placeholder → bloco anexado no fim', withoutPlaceholder.includes('R$ 299,99'));
 
   console.log('▶ preços SÓ da sales-config (adversarial: nada de memória)');
-  check('Essencial Flexível presente', plansBlock.includes('R$ 159,99'));
-  check('Pro Flexível presente', plansBlock.includes('R$ 299,99'));
-  check('Essencial Fidelidade presente', plansBlock.includes('R$ 129,99'));
-  check('Pro Fidelidade presente', plansBlock.includes('R$ 249,99'));
+  check('Essencial Mensal presente', plansBlock.includes('R$ 159,99'));
+  check('Pro Mensal presente', plansBlock.includes('R$ 299,99'));
+  check('Essencial Anual presente', plansBlock.includes('R$ 129,99'));
+  check('Pro Anual presente', plansBlock.includes('R$ 249,99'));
+  check(
+    'Anual é a recomendação comercial padrão',
+    plansBlock.includes('A recomendação comercial padrão é o Anual')
+  );
+  check(
+    'link do Anual exige track fidelidade explícito',
+    plansBlock.includes('envie SEMPRE o track interno fidelidade') &&
+      plansBlock.includes('Omitir o track gera tecnicamente o Mensal')
+  );
+  check(
+    'Mensal fica reservado às exceções comerciais documentadas',
+    plansBlock.includes('quiser testar primeiro') &&
+      plansBlock.includes('começar sem cartão') &&
+      plansBlock.includes('cancelar quando quiser')
+  );
   check('header "NUNCA cite preço de memória"', plansBlock.includes('NUNCA cite preço de memória'));
   check('plano pausado NÃO é vendido (sem preço no bloco)', !plansBlock.includes('R$ 99,99'));
   check(
     'plano pausado → lista de interesse com link',
     plansBlock.includes('lista de interesse') && plansBlock.includes('wa.me/5516991113783')
   );
-  const fidelityLines = plansBlock
+  const annualLines = plansBlock
     .split('\n')
-    .filter((line) => line.includes('Fidelidade 12m:'));
+    .filter((line) => line.includes('Anual (track interno fidelidade):'));
   check(
-    'Fidelidade sempre traz compromisso de 12 meses + multa',
-    fidelityLines.length === 2 &&
-      fidelityLines.every(
+    'Anual usa a frase curta de arrependimento e não recita a multa',
+    annualLines.length === 2 &&
+      annualLines.every(
         (line) =>
-          /compromisso de 12 meses/i.test(line) &&
-          /multa de 20%/i.test(line) &&
-          !/sem compromisso/i.test(line)
+          /Arrependimento em até 7 dias após o pagamento/.test(line) &&
+          !/compromisso de 12 meses/i.test(line) &&
+          !/multa de 20%/i.test(line)
       )
   );
   check(
-    'Flexível concentra o teste de 14 dias sem cartão',
+    'Mensal concentra o teste de 14 dias sem cartão',
     plansBlock
       .split('\n')
-      .filter((line) => line.includes('Flexível:'))
+      .filter((line) => line.includes('Mensal (track interno flexivel):'))
       .every((line) => /teste grátis de 14 dias, sem cartão/i.test(line))
   );
   check(
-    'oferta anual aposentada aparece somente como proibição, sem valores legados',
-    /NUNCA ofereça plano anual/i.test(plansBlock) &&
+    'anual pago à vista aposentado aparece só como proibição, sem valores legados',
+    /NUNCA ofereça o anual legado pago à vista/i.test(plansBlock) &&
       /2 meses grátis/i.test(plansBlock) &&
       !plansBlock.includes('R$ 1.599,90') &&
       !plansBlock.includes('R$ 2.999,90') &&
@@ -411,7 +442,7 @@ async function main() {
   check(
     'repricing: preço novo da sales-config é autorizado dinamicamente',
     inspectSalesReplyActionClaims(
-      'O Essencial Flexível custa R$ 161,11.',
+      'O Essencial Mensal custa R$ 161,11.',
       [],
       [],
       { priceAuthorityText: repricedPlansBlock }
@@ -420,7 +451,7 @@ async function main() {
   check(
     'repricing: preço anterior é bloqueado após config nova',
     inspectSalesReplyActionClaims(
-      'O Essencial Flexível custa R$ 159,99.',
+      'O Essencial Mensal custa R$ 159,99.',
       [],
       [],
       { priceAuthorityText: repricedPlansBlock }
@@ -429,7 +460,7 @@ async function main() {
   check(
     'repricing: preço inventado continua bloqueado',
     inspectSalesReplyActionClaims(
-      'O Essencial Flexível custa R$ 111,11.',
+      'O Essencial Mensal custa R$ 111,11.',
       [],
       [],
       { priceAuthorityText: repricedPlansBlock }
@@ -449,9 +480,9 @@ async function main() {
   const v1PlansBlock = renderPlansBlock(v1SalesConfig);
   check('payload v1 renderiza sem crash', v1PlansBlock.includes('PLANOS E PREÇOS'));
   check(
-    'payload v1 oferece somente mensal como Flexível',
-    v1PlansBlock.includes('Flexível: R$ 159,99/mês') &&
-      !v1PlansBlock.includes('  - Fidelidade 12m:')
+    'payload v1 oferece somente a opção Mensal',
+    v1PlansBlock.includes('Mensal (track interno flexivel): R$ 159,99/mês') &&
+      !v1PlansBlock.includes('  - Anual (track interno fidelidade):')
   );
   check(
     'payload v1 omite qualquer menção à oferta anual legada',

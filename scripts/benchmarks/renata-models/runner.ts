@@ -117,7 +117,8 @@ const SALES_CONFIG: SalesConfig = {
   currency: 'BRL',
   annualFreeMonths: 2,
   annualSellable: false,
-  deprecationNote: 'Não ofertar anual; use Flexível ou Fidelidade.',
+  deprecationNote:
+    'Não ofertar o anual legado pago à vista; apresente as opções atuais como Mensal ou Anual.',
   signupBaseUrl: 'https://receps.com.br/cadastro',
   plans: [
     {

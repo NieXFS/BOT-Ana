@@ -513,20 +513,26 @@ export function resolveConfirmedSalesPrefill(
   );
   if (confirmedEmails.length !== 1 || plans.length !== 1) return null;
 
-  // Ausência de escolha explícita preserva o default Flexível. Procura a
-  // mensagem mais recente que nomeia uma trilha; se ela ainda menciona as duas,
-  // falha fechado em vez de escolher uma condição comercial por heurística.
+  // Ausência de escolha explícita preserva o default técnico flexivel (Mensal).
+  // Procura a mensagem mais recente que nomeia uma opção, aceitando também os
+  // nomes antigos; se ela menciona as duas, falha fechado. "Anual à vista"
+  // continua sendo a oferta legada aposentada e nunca autoriza fidelidade.
   let track: 'flexivel' | 'fidelidade' = 'flexivel';
   for (const message of [...userMessages].reverse()) {
     const normalized = normalize(message.text);
-    const mentionsFlexible = /\bflexivel\b/.test(normalized);
-    const mentionsFidelity = /\bfidelidade\b/.test(normalized);
-    if (mentionsFlexible && mentionsFidelity) return null;
-    if (mentionsFidelity) {
+    const mentionsMonthly = /\b(?:mensal|flexivel)\b/.test(normalized);
+    const mentionsAnnual = /\b(?:anual|fidelidade)\b/.test(normalized);
+    const requestsLegacyAnnual =
+      /\banual\b.{0,24}\b(?:a vista|adiantad[oa]|pago (?:de uma vez|integralmente))\b/.test(
+        normalized
+      );
+    if (requestsLegacyAnnual) return null;
+    if (mentionsMonthly && mentionsAnnual) return null;
+    if (mentionsAnnual) {
       track = 'fidelidade';
       break;
     }
-    if (mentionsFlexible) break;
+    if (mentionsMonthly) break;
   }
   return { email: confirmedEmails[0], plan: plans[0], track };
 }
