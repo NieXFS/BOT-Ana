@@ -73,7 +73,7 @@ function voiceConfig(
       apiKey: 'gemini-smoke-key',
       model: 'gemini-3.1-flash-tts-preview',
       voice: 'Achernar',
-      temperature: 1.1,
+      temperature: 1.0,
       stylePrompt: 'Style: Vocal Smile. Pace: Natural.',
       styleMode: 'prefix',
       dailyCharBudget: 100_000,
@@ -211,7 +211,7 @@ async function main(): Promise<void> {
     'default aprovado: Achernar + Vocal Smile + Pace Natural, sem accent',
     defaultGemini.model === 'gemini-3.1-flash-tts-preview' &&
       defaultGemini.voice === 'Achernar' &&
-      defaultGemini.temperature === 1.1 &&
+      defaultGemini.temperature === 1.0 &&
       defaultGemini.stylePrompt === 'Style: Vocal Smile. Pace: Natural.' &&
       !defaultGemini.stylePrompt.toLowerCase().includes('accent') &&
       defaultGemini.styleMode === 'prefix'
@@ -274,7 +274,7 @@ async function main(): Promise<void> {
   check(
     'payload AUDIO/model voice/temp',
     prefixCall.body.generationConfig.responseModalities[0] === 'AUDIO' &&
-      prefixCall.body.generationConfig.temperature === 1.1 &&
+      prefixCall.body.generationConfig.temperature === 1.0 &&
       prefixCall.body.generationConfig.speechConfig.voiceConfig
         .prebuiltVoiceConfig.voiceName === 'Achernar'
   );
