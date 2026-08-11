@@ -74,7 +74,7 @@ function voiceConfig(
       model: 'gemini-3.1-flash-tts-preview',
       voice: 'Achernar',
       temperature: 1.1,
-      stylePrompt: 'Fale com empatia e ritmo rápido',
+      stylePrompt: 'Style: Vocal Smile. Pace: Natural.',
       styleMode: 'prefix',
       dailyCharBudget: 100_000,
     },
@@ -189,6 +189,33 @@ async function main(): Promise<void> {
     voiceFingerprint,
   } = await import('../src/voice/voiceConfig');
   const cost = await import('../src/voice/costMeter');
+
+  const defaultEnvKeys = [
+    'RENATA_GEMINI_TTS_MODEL',
+    'RENATA_GEMINI_TTS_VOICE',
+    'RENATA_GEMINI_TTS_TEMPERATURE',
+    'RENATA_GEMINI_TTS_STYLE_PROMPT',
+    'RENATA_GEMINI_TTS_STYLE_MODE',
+  ] as const;
+  const savedDefaultEnv = new Map(
+    defaultEnvKeys.map((key) => [key, process.env[key]])
+  );
+  for (const key of defaultEnvKeys) delete process.env[key];
+  const defaultGemini = getVoiceEnvConfig().gemini;
+  for (const key of defaultEnvKeys) {
+    const value = savedDefaultEnv.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  check(
+    'default aprovado: Achernar + Vocal Smile + Pace Natural, sem accent',
+    defaultGemini.model === 'gemini-3.1-flash-tts-preview' &&
+      defaultGemini.voice === 'Achernar' &&
+      defaultGemini.temperature === 1.1 &&
+      defaultGemini.stylePrompt === 'Style: Vocal Smile. Pace: Natural.' &&
+      !defaultGemini.stylePrompt.toLowerCase().includes('accent') &&
+      defaultGemini.styleMode === 'prefix'
+  );
 
   console.log('▶ payload Gemini + style steering + parse PCM');
   const prefixCfg = voiceConfig();
@@ -643,6 +670,13 @@ async function main(): Promise<void> {
       gemini: {
         ...prefixCfg.gemini,
         stylePrompt: `${prefixCfg.gemini.stylePrompt}!`,
+      },
+    }),
+    voiceConfig({
+      gemini: {
+        ...prefixCfg.gemini,
+        stylePrompt:
+          'Fale de forma empática, ritmo rápido, sotaque neutro do português brasileiro',
       },
     }),
     systemCfg,

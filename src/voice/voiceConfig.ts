@@ -14,7 +14,7 @@ const DEFAULT_GEMINI_MODEL = 'gemini-3.1-flash-tts-preview';
 const DEFAULT_GEMINI_VOICE = 'Achernar';
 const DEFAULT_GEMINI_TEMPERATURE = 1.1;
 const DEFAULT_GEMINI_STYLE_PROMPT =
-  'Fale de forma empática, ritmo rápido, sotaque neutro do português brasileiro';
+  'Style: Vocal Smile. Pace: Natural.';
 const DEFAULT_GEMINI_DAILY_CHAR_BUDGET = 100_000;
 
 export type VoiceTtsProviderName = 'gemini' | 'elevenlabs';
