@@ -573,10 +573,10 @@ export async function flushBuffer(
         }
         if (salesDelivery !== 'suppressed') {
           notifySalesReplyDelivered(bufferKey, 'novo_inbound');
+          console.log(
+            `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply.length}`
+          );
         }
-        console.log(
-          `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply.length}`
-        );
       } catch (err) {
         flushFailed = true;
         // A proposta só pode autorizar B3 depois de ter sido entregue. Se o
