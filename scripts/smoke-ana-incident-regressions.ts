@@ -15,6 +15,7 @@ async function main() {
   const outbound = await import('../src/services/receptionistOutbound');
   const identity = await import('../src/services/customerIdentitySafety');
   const handler = await import('../src/messageHandler');
+  const grounding = await import('../src/services/receptionistTurnGrounding');
 
   const socialCases = [
     'Oi',
@@ -130,6 +131,7 @@ async function main() {
     'depois das 17',
     'Pode ser 17h',
     'às 18h',
+    'Quero unha com a Luzia amanhã',
   ]) {
     assert.equal(
       socialSafety.classifyReceptionistTurnPermission(
@@ -160,6 +162,128 @@ async function main() {
       informationalText
     );
   }
+  for (const cueText of [
+    'sexta foi top no evento',
+    'hoje foi corrido',
+    'tenho 2 filhos',
+    'sexta às 20 tem festa',
+    'o serviço ficou ótimo',
+    'adorei a profissional',
+  ]) {
+    assert.equal(
+      socialSafety.hasNonTransactionalOperationalCue(cueText),
+      true,
+      cueText
+    );
+  }
+  for (const noCueText of ['sim', 'ok', 'obrigada', 'Tudo bem?']) {
+    assert.equal(
+      socialSafety.hasNonTransactionalOperationalCue(noCueText),
+      false,
+      noCueText
+    );
+  }
+  const groundingCatalog = {
+    success: true as const,
+    services: catalogForPermission.services.map((name, index) => ({
+      id: `svc-${index}`,
+      name,
+      durationMinutes: 30,
+      price: 100,
+      priceFormatted: 'R$ 100,00',
+    })),
+    professionals: catalogForPermission.professionals.map((name, index) => ({
+      id: `pro-${index}`,
+      name,
+    })),
+  };
+  const noIo = {
+    readUpcoming: async () => {
+      throw new Error('turno pessoal/compacto não consulta upcoming neste smoke');
+    },
+    readSlots: async () => {
+      throw new Error('turno pessoal/compacto não consulta slots neste smoke');
+    },
+  };
+  for (const personalText of [
+    'sexta foi top no evento',
+    'hoje foi corrido',
+    'tenho 2 filhos',
+    'sexta às 20 tem festa',
+  ]) {
+    const grounded = await grounding.resolveGroundedReceptionistTurn({
+      userMessage: personalText,
+      userMessages: [personalText],
+      history: [],
+      services: groundingCatalog,
+      now: new Date('2026-08-12T18:00:00.000Z'),
+      timezone: 'America/Sao_Paulo',
+      ...noIo,
+    });
+    assert.equal(grounded.kind, 'short_circuit', personalText);
+    if (grounded.kind === 'short_circuit') {
+      assert.equal(
+        grounded.reply,
+        grounding.NON_OPERATIONAL_TURN_CUSTOMER_MESSAGE
+      );
+      assert.equal(grounded.toolTrace.length, 0);
+    }
+  }
+  for (const feedbackText of ['o serviço ficou ótimo', 'adorei a profissional']) {
+    const grounded = await grounding.resolveGroundedReceptionistTurn({
+      userMessage: feedbackText,
+      userMessages: [feedbackText],
+      history: [],
+      services: groundingCatalog,
+      now: new Date('2026-08-12T18:00:00.000Z'),
+      timezone: 'America/Sao_Paulo',
+      ...noIo,
+    });
+    assert.equal(grounded.kind, 'short_circuit', feedbackText);
+    if (grounded.kind === 'short_circuit') {
+      assert.equal(
+        grounded.reply,
+        grounding.NON_OPERATIONAL_FEEDBACK_CUSTOMER_MESSAGE
+      );
+    }
+  }
+  for (const compactText of [
+    '18h',
+    'Pode ser 17h',
+    'Calosidade',
+    'Drenagem',
+    'unha',
+    'pé',
+    'quero amanhã',
+  ]) {
+    const grounded = await grounding.resolveGroundedReceptionistTurn({
+      userMessage: compactText,
+      userMessages: [compactText],
+      history: [],
+      services: groundingCatalog,
+      now: new Date('2026-08-12T18:00:00.000Z'),
+      timezone: 'America/Sao_Paulo',
+      ...noIo,
+    });
+    assert.equal(grounded.kind, 'continue', compactText);
+  }
+  for (const followUp of ['sim', 'ok', 'obrigada']) {
+    const grounded = await grounding.resolveGroundedReceptionistTurn({
+      userMessage: followUp,
+      userMessages: [
+        'Quero agendar Calosidades e Fissuras amanhã',
+        'Pode ser 17h',
+        followUp,
+      ],
+      history: [],
+      services: groundingCatalog,
+      now: new Date('2026-08-12T18:00:00.000Z'),
+      timezone: 'America/Sao_Paulo',
+      ...noIo,
+    });
+    assert.equal(grounded.kind, 'continue', followUp);
+  }
+
   const compactTimeReply = outbound.validateReceptionistOutbound(
     outbound.buildReceptionistEnvelope({
       purpose: 'REACTIVE',

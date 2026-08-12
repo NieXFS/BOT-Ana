@@ -22,6 +22,11 @@ import {
   uniqueCatalogServiceFromCurrentMessage,
 } from './service-gate';
 import { upcomingAppointmentReadGate } from './upcomingAppointmentGate';
+import {
+  classifyReceptionistTurnPermission,
+  hasCustomerRequestVerb,
+  hasNonTransactionalOperationalCue,
+} from './receptionistSocialSafety';
 
 export const STANDALONE_CANCEL_CUSTOMER_MESSAGE =
   'Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui.';
@@ -34,6 +39,9 @@ export const UNKNOWN_SERVICE_CUSTOMER_MESSAGE =
 
 export const NON_OPERATIONAL_FEEDBACK_CUSTOMER_MESSAGE =
   'Que bom que você gostou. Se precisar de algo, é só chamar.';
+
+export const NON_OPERATIONAL_TURN_CUSTOMER_MESSAGE =
+  'Tudo bem. Se precisar de algo, é só chamar.';
 
 export const HISTORY_PERSON_NAME_PLACEHOLDER = '[NOME]';
 
@@ -576,6 +584,30 @@ export async function resolveGroundedReceptionistTurn(input: {
     return {
       kind: 'short_circuit',
       reply: NON_OPERATIONAL_FEEDBACK_CUSTOMER_MESSAGE,
+      toolTrace: [],
+      identityCanonical: false,
+      modelHistory,
+    };
+  }
+
+  // Conversa pessoal com dia/hora/número/serviço/profissional, sem pedido
+  // transacional: não chama o modelo. A fronteira já continha o drift; o bruto
+  // também precisa nascer social/seguro. Confirmações curtas ("sim", "ok")
+  // continuam ao modelo — não têm esse sinal e não podem ser engolidas.
+  const turnPermission = classifyReceptionistTurnPermission(input.userMessage, {
+    services: (input.services.services ?? []).map((service) => service.name),
+    professionals: (input.services.professionals ?? []).map(
+      (professional) => professional.name
+    ),
+  });
+  if (
+    turnPermission === 'NO_OPERATIONAL_INTENT' &&
+    hasNonTransactionalOperationalCue(input.userMessage) &&
+    !hasCustomerRequestVerb(input.userMessage)
+  ) {
+    return {
+      kind: 'short_circuit',
+      reply: NON_OPERATIONAL_TURN_CUSTOMER_MESSAGE,
       toolTrace: [],
       identityCanonical: false,
       modelHistory,

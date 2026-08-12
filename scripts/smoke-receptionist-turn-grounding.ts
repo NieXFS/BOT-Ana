@@ -12,6 +12,7 @@ import {
   HISTORY_PERSON_NAME_PLACEHOLDER,
   NO_UPCOMING_APPOINTMENT_CUSTOMER_MESSAGE,
   NON_OPERATIONAL_FEEDBACK_CUSTOMER_MESSAGE,
+  NON_OPERATIONAL_TURN_CUSTOMER_MESSAGE,
   STANDALONE_CANCEL_CUSTOMER_MESSAGE,
   UNKNOWN_SERVICE_CUSTOMER_MESSAGE,
   classifyExistingAppointmentIntent,
@@ -46,10 +47,27 @@ const catalog: ServicesResult = {
       priceFormatted: 'R$ 90,00',
       professionalIds: ['pro-luzia-silva', 'pro-luzia-costa'],
     },
+    {
+      id: 'svc-drenagem',
+      name: 'Drenagem Linfática',
+      durationMinutes: 50,
+      price: 160,
+      priceFormatted: 'R$ 160,00',
+      professionalIds: ['pro-marina'],
+    },
+    {
+      id: 'svc-pe',
+      name: 'Spa dos pés',
+      durationMinutes: 50,
+      price: 110,
+      priceFormatted: 'R$ 110,00',
+      professionalIds: ['pro-luzia-silva'],
+    },
   ],
   professionals: [
     { id: 'pro-luzia-silva', name: 'Luzia Silva' },
     { id: 'pro-luzia-costa', name: 'Luzia Costa' },
+    { id: 'pro-marina', name: 'Marina Alves' },
   ],
 };
 
@@ -327,6 +345,135 @@ async function main() {
   );
   assert.equal(isNonOperationalFeedback('serviço ficou ótimo'), true);
   assert.equal(isNonOperationalFeedback('Quero remarcar meu horário'), false);
+
+  const personalTurns = [
+    'sexta foi top no evento',
+    'hoje foi corrido',
+    'tenho 2 filhos',
+    'sexta às 20 tem festa',
+    'hoje às 10 fui ao médico',
+    'amanhã às 8 tenho aula',
+  ];
+  for (const userMessage of personalTurns) {
+    const grounded = await resolveGroundedReceptionistTurn({
+      userMessage,
+      userMessages: [userMessage],
+      history: [],
+      services: catalog,
+      now: NOW,
+      timezone: TZ,
+      readUpcoming: async () => {
+        throw new Error(`turno pessoal não consulta upcoming: ${userMessage}`);
+      },
+      readSlots: async () => {
+        throw new Error(`turno pessoal não consulta slots: ${userMessage}`);
+      },
+    });
+    assert.equal(grounded.kind, 'short_circuit', userMessage);
+    if (grounded.kind === 'short_circuit') {
+      assert.equal(grounded.reply, NON_OPERATIONAL_TURN_CUSTOMER_MESSAGE);
+      assert.equal(grounded.toolTrace.length, 0);
+      assert.doesNotMatch(
+        grounded.reply,
+        /\b(?:horario|dispon|agend|20:00|13:00|17:00|18:00|Luzia)\b/i
+      );
+    }
+  }
+
+  const feedbackTurns = ['o serviço ficou ótimo', 'adorei a profissional'];
+  for (const userMessage of feedbackTurns) {
+    const grounded = await resolveGroundedReceptionistTurn({
+      userMessage,
+      userMessages: [userMessage],
+      history: [],
+      services: catalog,
+      now: NOW,
+      timezone: TZ,
+      readUpcoming: async () => {
+        throw new Error(`feedback não consulta upcoming: ${userMessage}`);
+      },
+      readSlots: async () => {
+        throw new Error(`feedback não consulta slots: ${userMessage}`);
+      },
+    });
+    assert.equal(grounded.kind, 'short_circuit', userMessage);
+    if (grounded.kind === 'short_circuit') {
+      assert.equal(grounded.reply, NON_OPERATIONAL_FEEDBACK_CUSTOMER_MESSAGE);
+    }
+  }
+
+  const compactOperationalTurns = [
+    '18h',
+    'Pode ser 17h',
+    'Calosidade',
+    'Drenagem',
+    'unha',
+    'pé',
+    'quero amanhã',
+  ];
+  for (const userMessage of compactOperationalTurns) {
+    const grounded = await resolveGroundedReceptionistTurn({
+      userMessage,
+      userMessages: [userMessage],
+      history: [],
+      services: catalog,
+      now: NOW,
+      timezone: TZ,
+      readUpcoming: async () => {
+        throw new Error(`compacto operacional não consulta upcoming: ${userMessage}`);
+      },
+      readSlots: async () => {
+        throw new Error(`compacto operacional não consulta slots: ${userMessage}`);
+      },
+    });
+    assert.equal(
+      grounded.kind,
+      'continue',
+      `compacto operacional não pode short-circuit: ${userMessage}`
+    );
+  }
+
+  for (const followUp of ['sim', 'ok', 'obrigada']) {
+    const grounded = await resolveGroundedReceptionistTurn({
+      userMessage: followUp,
+      userMessages: [
+        'Quero agendar Calosidades e Fissuras amanhã',
+        'Pode ser 17h',
+        followUp,
+      ],
+      history: [
+        {
+          role: 'user',
+          content: 'Quero agendar Calosidades e Fissuras amanhã',
+        },
+        {
+          role: 'assistant',
+          content:
+            'Tenho 13:00, 17:00 e 18:00 para Calosidades e Fissuras amanhã.',
+        },
+        { role: 'user', content: 'Pode ser 17h' },
+        {
+          role: 'assistant',
+          content:
+            'Posso marcar Calosidades e Fissuras amanhã às 17:00. Confirma?',
+        },
+      ],
+      services: catalog,
+      now: NOW,
+      timezone: TZ,
+      readUpcoming: async () => {
+        throw new Error(`follow-up curto não consulta upcoming: ${followUp}`);
+      },
+      readSlots: async () => {
+        throw new Error(`follow-up curto não consulta slots: ${followUp}`);
+      },
+    });
+    assert.equal(
+      grounded.kind,
+      'continue',
+      `follow-up curto não pode short-circuit: ${followUp}`
+    );
+  }
 
   const unknown = await resolveGroundedReceptionistTurn({
     userMessage: 'Quero marcar Botox amanhã',

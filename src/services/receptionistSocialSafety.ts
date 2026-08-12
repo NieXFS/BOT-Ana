@@ -182,6 +182,57 @@ export function isSocialOnlyReceptionistMessage(value: string): boolean {
   return consumed && text.length === 0;
 }
 
+const WEEKDAY_OR_RELATIVE_DAY_RE =
+  /\b(?:hoje|amanha|segunda(?: feira)?|terca(?: feira)?|quarta(?: feira)?|quinta(?: feira)?|sexta(?: feira)?|sabado|domingo)\b/u;
+const CLOCK_CUE_RE =
+  /(?:\b(?:as|depois das?|a partir das?|por volta das?)\s+(?:[01]?\d|2[0-3])(?:\s+(?:[0-5]\d|horas?))?\b|\b(?:[01]?\d|2[0-3])h(?:[0-5]\d)?\b|\b(?:[01]?\d|2[0-3])(?:[:\s][0-5]\d)\b)/u;
+const SERVICE_OR_PROFESSIONAL_WORD_RE =
+  /\b(?:servicos?|procedimentos?|tratamentos?|profissiona(?:l|is))\b/u;
+const CUSTOMER_REQUEST_VERB_RE =
+  /\b(?:quero|queria|gostaria|preciso|desejo|prefiro|fazer)\b/u;
+
+function messageMentionsCatalogToken(
+  text: string,
+  catalogNames: readonly string[]
+): boolean {
+  const inputTokens = text.split(' ').filter(Boolean);
+  return catalogNames.some((name) => {
+    const catalogTokens = name
+      .split(' ')
+      .filter((token) => !CATALOG_STOP_WORDS.has(token))
+      .map(catalogTokenKey);
+    return inputTokens.some((token) => {
+      if (CATALOG_STOP_WORDS.has(token)) return false;
+      const key = catalogTokenKey(token);
+      return (
+        catalogTokens.includes(key) &&
+        (key.length >= 4 || ['pe', 'mao', 'unha'].includes(key))
+      );
+    });
+  });
+}
+
+/**
+ * Sinal de dia/data/hora/número/serviço/profissional no turno atual. Sozinho
+ * não autoriza agenda: o classificador ainda exige pedido transacional ou
+ * informacional. Serve para o grounding não mandar conversa pessoal com esses
+ * tokens ao modelo — e para não engolir um "sim"/"ok" de confirmação.
+ */
+export function hasNonTransactionalOperationalCue(value: string): boolean {
+  const text = normalizeSocialMessage(value);
+  if (!text) return false;
+  return (
+    WEEKDAY_OR_RELATIVE_DAY_RE.test(text) ||
+    CLOCK_CUE_RE.test(text) ||
+    /\b\d+\b/u.test(text) ||
+    SERVICE_OR_PROFESSIONAL_WORD_RE.test(text)
+  );
+}
+
+export function hasCustomerRequestVerb(value: string): boolean {
+  return CUSTOMER_REQUEST_VERB_RE.test(normalizeSocialMessage(value));
+}
+
 /**
  * Permissão estrutural do turno atual para a fronteira de saída. Ela é
  * propositalmente separada do atalho de saudação: uma entrada vaga como
@@ -211,21 +262,11 @@ export function classifyReceptionistTurnPermission(
   const compactInputTokens = text.split(' ').filter(Boolean);
   const compactCatalogSelection =
     compactInputTokens.length <= 3 &&
-    normalizedCatalogNames.some((name) => {
-      const catalogTokens = name
-        .split(' ')
-        .filter((token) => !CATALOG_STOP_WORDS.has(token))
-        .map(catalogTokenKey);
-      return compactInputTokens.some((token) => {
-        if (CATALOG_STOP_WORDS.has(token)) return false;
-        const key = catalogTokenKey(token);
-        return (
-          catalogTokens.includes(key) &&
-          (key.length >= 4 || ['pe', 'mao', 'unha'].includes(key))
-        );
-      });
-    });
+    messageMentionsCatalogToken(text, normalizedCatalogNames);
   const mentionsCatalogEntity = exactCatalogEntity || compactCatalogSelection;
+  const catalogTokenWithRequest =
+    CUSTOMER_REQUEST_VERB_RE.test(text) &&
+    messageMentionsCatalogToken(text, normalizedCatalogNames);
 
   // Só uma ação inequívoca do turno atual concede licença transacional. Raízes
   // amplas (qualquer número, dia da semana, "serviço" ou "profissional")
@@ -246,18 +287,8 @@ export function classifyReceptionistTurnPermission(
     /\b(?:quero|queria|gostaria|preciso|desejo|prefiro)\b(?:\s+\w+){0,8}\s+\b(?:agendamento|horario|vaga|retorno|consulta|sessao|procedimento|atendimento)\b/u.test(
       text
     ) ||
-    (mentionsCatalogEntity &&
-      /\b(?:quero|queria|gostaria|preciso|desejo|prefiro|fazer)\b/u.test(text));
-  const temporalWord =
-    /\b(?:hoje|amanha|segunda(?: feira)?|terca(?: feira)?|quarta(?: feira)?|quinta(?: feira)?|sexta(?: feira)?|sabado|domingo)\b/u.test(
-      text
-    );
-  const explicitClock =
-    /\b(?:as|depois das?|a partir das?|por volta das?)\s+(?:[01]?\d|2[0-3])(?:\s+(?:[0-5]\d|horas?))?\b/u.test(
-      text
-    ) ||
-    /\b(?:[01]?\d|2[0-3])h(?:[0-5]\d)?\b/u.test(text) ||
-    /\b(?:[01]?\d|2[0-3])\s+[0-5]\d\b/u.test(text);
+    (mentionsCatalogEntity && CUSTOMER_REQUEST_VERB_RE.test(text));
+  const temporalWord = WEEKDAY_OR_RELATIVE_DAY_RE.test(text);
   const statesScheduleAvailability =
     (temporalWord &&
       /\b(?:livre|folga|disponivel|posso|consigo|saio do (?:servico|trabalho)|depois do (?:servico|trabalho))\b/u.test(
@@ -291,7 +322,8 @@ export function classifyReceptionistTurnPermission(
     statesScheduleAvailability ||
     compactTemporalChoice ||
     compactConfirmation ||
-    compactTimeChoice
+    compactTimeChoice ||
+    catalogTokenWithRequest
   ) {
     return 'TRANSACTION_REQUEST';
   }
