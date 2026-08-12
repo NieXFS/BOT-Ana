@@ -325,6 +325,13 @@ export function maybePrependGreeting(
     return reply;
   }
 
+  // A resposta canônica de identidade ambígua é o único texto público aprovado.
+  // Colar a saudação do 1º contato faria o outbound rejeitar o payload e o
+  // cliente receber silêncio em vez do handoff seguro.
+  if (reply.trim() === CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE) {
+    return reply;
+  }
+
   if (reply.toLowerCase().includes(greeting.toLowerCase())) {
     return reply;
   }
@@ -339,7 +346,7 @@ export function maybePrependGreeting(
   return `${greeting}\n\n${reply}`;
 }
 
-function validateComposedReceptionistReply(input: {
+export function validateComposedReceptionistReply(input: {
   baseReply: string;
   isFirstContact: boolean;
   config: TenantBotConfig;
@@ -355,6 +362,26 @@ function validateComposedReceptionistReply(input: {
     text: string;
   }> = [];
   const authoritativeCatalog = catalogFromServicesResult(input.services);
+  if (toolTraceHasCustomerIdentityAmbiguity(input.toolTrace)) {
+    return validateReceptionistOutbound(
+      buildReceptionistEnvelope({
+        purpose: input.purpose,
+        blocks: [
+          {
+            source: 'GENERATED',
+            text: CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
+          },
+        ],
+        exactPayload: CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
+        authoritativeCatalog,
+        evidence: {
+          toolTrace: input.toolTrace,
+          sourceInboundText: input.sourceInboundText,
+          temporalContext: input.temporalContext,
+        },
+      })
+    );
+  }
   // Uma resposta operacional rejeitada não pode renascer como uma saudação
   // isolada. Payload vazio atravessa a fronteira como EMPTY_PAYLOAD e resulta
   // em silêncio, antes de qualquer composição owner-controlled.
@@ -1668,6 +1695,7 @@ async function getReceptionistReply(
       });
       let customerReplyEvidenceTrace = modelResult.toolTrace;
       if (
+        !customerIdentityAmbiguous &&
         needsAuthoritativeAppointmentRead(
           guardedCandidateReply,
           customerReplyEvidenceTrace,
@@ -1725,9 +1753,11 @@ async function getReceptionistReply(
         });
       }
       const finalReply = validateComposedReceptionistReply({
-        baseReply: inspection.safe
-          ? guardedCandidateReply
-          : safeWriteConfirmation || '',
+        baseReply: customerIdentityAmbiguous
+          ? CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE
+          : inspection.safe
+            ? guardedCandidateReply
+            : safeWriteConfirmation || '',
         isFirstContact,
         config,
         services: servicesForGate,

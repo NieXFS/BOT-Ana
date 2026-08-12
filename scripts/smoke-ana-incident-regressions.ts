@@ -232,6 +232,31 @@ async function main() {
     );
   }
 
+  const identityFirstContact = brain.validateComposedReceptionistReply({
+    baseReply: identity.enforceCustomerIdentitySafeReply(
+      identityTrace,
+      'Parece que há dois cadastros. Qual deles é o seu?'
+    )!,
+    isFirstContact: true,
+    config: {
+      tenantSlug: 'incident-smoke',
+      botName: 'Ana',
+      botRole: 'receptionist',
+      greetingMessage: 'Olá! Sou a Ana. Como posso te ajudar hoje?',
+    } as any,
+    services: { success: true, services: [], professionals: [] },
+    purpose: 'REACTIVE',
+    toolTrace: identityTrace,
+    sourceInboundText: 'Quero remarcar meu horário',
+    appendPostBooking: true,
+  });
+  assert.equal(identityFirstContact.originalAccepted, true);
+  assert.equal(
+    identityFirstContact.payload,
+    identity.CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
+    '1º contato não pode colar saudação nem silenciar o 409 de identidade'
+  );
+
   const modelHistory = human.toReceptionistModelHistory([
     { role: 'user', content: 'pode ser sexta' },
     { role: 'assistant', content: '[atendente] combinado, ficou para 13h' },

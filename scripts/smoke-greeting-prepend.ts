@@ -88,6 +88,18 @@ async function main() {
       'Claro, o Peeling custa R$ 220.'
   );
 
+  const { CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE } = await import(
+    '../src/services/customerIdentitySafety'
+  );
+  record(
+    'maybePrependGreeting não cola saudação na resposta canônica de identidade',
+    maybePrependGreeting(
+      CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
+      true,
+      config
+    ) === CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE
+  );
+
   const failed = checks.filter((c) => !c.ok);
   console.log(
     `\n${failed.length === 0 ? '✅ TODOS OS CHECKS PASSARAM' : `❌ ${failed.length} CHECK(S) FALHARAM`} (${checks.length} no total)`

@@ -31,9 +31,14 @@ async function main(): Promise<void> {
   const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const phoneNumberId = `PN-COMPOSED-${suffix}`;
   const customerPhone = '5511000000000';
+  const identityPhone = '5511000000001';
   const conversationKey = context.buildConversationKey(
     phoneNumberId,
     customerPhone
+  );
+  const identityConversationKey = context.buildConversationKey(
+    phoneNumberId,
+    identityPhone
   );
   const config = {
     tenantSlug: `incident-composed-${suffix}`,
@@ -89,30 +94,35 @@ async function main(): Promise<void> {
   async function ingestAndFlush(
     texts: string[],
     getReply: (...args: any[]) => Promise<any>,
-    transport: string[]
+    transport: string[],
+    target: {
+      config: typeof config | (typeof config & { greetingMessage: string });
+      customerPhone: string;
+      conversationKey: string;
+    } = { config, customerPhone, conversationKey }
   ): Promise<void> {
     handler.__resetFlushStateForTest();
     for (const text of texts) {
       inboundSequence += 1;
       await handler.handleIncomingMessage(
         {
-          from: customerPhone,
+          from: target.customerPhone,
           id: `wamid.inbound.${suffix}.${inboundSequence}`,
           timestamp: String(Math.floor(Date.now() / 1000) + inboundSequence),
           type: 'text',
           text: { body: text },
         },
-        { profile: { name: 'Cliente Smoke' }, wa_id: customerPhone },
-        config as any,
+        { profile: { name: 'Cliente Smoke' }, wa_id: target.customerPhone },
+        target.config as any,
         incomingDeps as any
       );
     }
     assert.equal(
-      handler.__hasBufferForTest(conversationKey),
+      handler.__hasBufferForTest(target.conversationKey),
       true,
       'o handler real deve criar o buffer da conversa'
     );
-    await handler.flushBuffer(conversationKey, {
+    await handler.flushBuffer(target.conversationKey, {
       getReply: getReply as any,
       isPaused: async () => false,
       recordPausedInbound: async () => undefined,
@@ -334,6 +344,56 @@ async function main(): Promise<void> {
       'cinco turnos inseguros geram zero fallback técnico e zero loop'
     );
 
+    // Contrato HTTP 409 do ERP: o reason customer_identity_ambiguous chega no
+    // toolTrace no mesmo shape que calendarService devolve após o 409, e o
+    // caminho composto (1º contato + saudação do tenant + prosa hostil) tem
+    // de transportar SOMENTE a resposta canônica.
+    const identity = await import('../src/services/customerIdentitySafety');
+    const identityConfig = {
+      ...config,
+      greetingMessage:
+        'Olá! Sou a Ana, sua assistente. Como posso te ajudar hoje?',
+    } as const;
+    const identityTrace = [
+      {
+        name: 'getUpcomingAppointments',
+        result: JSON.stringify({
+          success: false,
+          reason: 'customer_identity_ambiguous',
+          message: identity.CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
+        }),
+      },
+    ];
+    const identityTransport: string[] = [];
+    await ingestAndFlush(
+      ['Quero remarcar meu horário'],
+      async () =>
+        brain.validateComposedReceptionistReply({
+          baseReply: identity.enforceCustomerIdentitySafeReply(
+            identityTrace,
+            'Parece que há dois cadastros. Qual deles é o seu?'
+          )!,
+          isFirstContact: true,
+          config: identityConfig as any,
+          services: { success: true, services: [], professionals: [] },
+          purpose: 'REACTIVE',
+          toolTrace: identityTrace,
+          sourceInboundText: 'Quero remarcar meu horário',
+          appendPostBooking: true,
+        }),
+      identityTransport,
+      {
+        config: identityConfig,
+        customerPhone: identityPhone,
+        conversationKey: identityConversationKey,
+      }
+    );
+    assert.deepEqual(
+      identityTransport,
+      [identity.CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE],
+      '409/customer_identity_ambiguous no 1º contato deve virar só a resposta canônica'
+    );
+
     console.log(
       'smoke composto DB: handler→buffer→flush + echo→history→model→outbound→transport OK'
     );
@@ -341,18 +401,19 @@ async function main(): Promise<void> {
     handler.__resetFlushStateForTest();
     try {
       await privacy.purgeConversationData(phoneNumberId, customerPhone);
+      await privacy.purgeConversationData(phoneNumberId, identityPhone);
       const cleanupCounts = await Promise.all([
         context.pool.query<{ count: string }>(
-          'SELECT COUNT(*)::text AS count FROM ana_conversation_history WHERE "conversationKey" = $1',
-          [conversationKey]
+          'SELECT COUNT(*)::text AS count FROM ana_conversation_history WHERE "conversationKey" = ANY($1::text[])',
+          [[conversationKey, identityConversationKey]]
         ),
         context.pool.query<{ count: string }>(
-          'SELECT COUNT(*)::text AS count FROM processed_messages WHERE conversation_key = $1',
-          [conversationKey]
+          'SELECT COUNT(*)::text AS count FROM processed_messages WHERE conversation_key = ANY($1::text[])',
+          [[conversationKey, identityConversationKey]]
         ),
         context.pool.query<{ count: string }>(
-          'SELECT COUNT(*)::text AS count FROM inbound_event_outbox WHERE conversation_key = $1',
-          [conversationKey]
+          'SELECT COUNT(*)::text AS count FROM inbound_event_outbox WHERE conversation_key = ANY($1::text[])',
+          [[conversationKey, identityConversationKey]]
         ),
       ]);
       assert.deepEqual(
