@@ -464,7 +464,7 @@ export const DAILY_SCENARIOS: DailyScenario[] = [
     description: '409 de cadastro ambíguo usa só a frase canônica',
     critical: true,
     fixtureMode: 'identity_ambiguous',
-    turns: ['Qual é o meu horário marcado?'],
+    turns: ['Quero remarcar meu horário'],
     receptionist: {
       identityCanonical: true,
       mustNotWrite: true,

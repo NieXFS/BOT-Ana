@@ -178,6 +178,9 @@ async function main() {
       ) &&
       runtimePrompt.includes(
         'Se a mensagem atual já nomear um serviço cadastrado e pedir horário/disponibilidade, chame getAvailableSlots neste turno'
+      ) &&
+      runtimePrompt.includes(
+        'chame getUpcomingAppointments neste turno ANTES de perguntar serviço, data ou profissional'
       )
   );
 

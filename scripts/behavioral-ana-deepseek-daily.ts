@@ -6,6 +6,7 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import type OpenAI from 'openai';
 import {
@@ -127,6 +128,27 @@ function keyPresent(value: string | undefined): boolean {
   return trimmed.length >= 12 && !/replace|your-|xxx/i.test(trimmed);
 }
 
+function loadDeepSeekKeyFromKnownErpEnv(): void {
+  if (keyPresent(process.env.DEEPSEEK_API_KEY)) return;
+  const roots = [
+    process.env.RECEPS_ERP_ROOT?.trim(),
+    '/private/tmp/receps-ana-incident-erp-20260812',
+  ].filter((value): value is string => Boolean(value));
+  for (const root of roots) {
+    try {
+      const text = readFileSync(path.join(root, '.env'), 'utf8');
+      const match = text.match(/^DEEPSEEK_API_KEY=(.*)$/m);
+      const value = match?.[1]?.trim().replace(/^['"]|['"]$/g, '');
+      if (keyPresent(value)) {
+        process.env.DEEPSEEK_API_KEY = value;
+        return;
+      }
+    } catch {
+      // worktree ERP ausente ou sem .env; não vasculha $HOME
+    }
+  }
+}
+
 function sanitize(text: string): string {
   return text
     .replace(/\bsk-[A-Za-z0-9._-]+\b/gi, '[REDACTED]')
@@ -220,7 +242,16 @@ function leakedTechnical(text: string): string[] {
 function mentionsForbidden(text: string, terms: string[] | undefined): string[] {
   if (!terms?.length) return [];
   const normalized = normalize(text);
-  return terms.filter((term) => normalized.includes(normalize(term)));
+  return terms.filter((term) => {
+    const needle = normalize(term);
+    if (!needle) return false;
+    if (/^\d/.test(needle) || /[:h]/.test(needle)) {
+      return normalized.includes(needle);
+    }
+    return new RegExp(
+      `(^|[^a-z0-9])${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z0-9])`
+    ).test(normalized);
+  });
 }
 
 async function preflight(): Promise<{
@@ -501,13 +532,13 @@ function evaluateReceptionist(input: {
         sanitize(e2e)
       ),
       check(
-        'raw.identity-not-required-to-be-canonical',
+        'raw.identity-canonical',
         'raw',
-        'P2',
-        true,
+        'P1',
+        raw === CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
         input.identityForced
-          ? 'fronteira substituiu a prosa'
-          : 'modelo já canônico ou sem prosa'
+          ? 'fronteira substituiu prosa perigosa; não conta como qualidade bruta'
+          : sanitize(raw)
       )
     );
   }
@@ -717,9 +748,6 @@ async function runReceptionist(
     isSocialOnlyReceptionistMessage,
     buildSocialReceptionistReply,
   } = await import('../src/services/brainService');
-  const { toReceptionistModelHistory } = await import(
-    '../src/services/humanConversationContext'
-  );
   const {
     inspectCustomerReply,
     normalizeCustomerReplyStyle,
@@ -741,6 +769,9 @@ async function runReceptionist(
   );
   const { classifyReceptionistTurnPermission } = await import(
     '../src/services/receptionistSocialSafety'
+  );
+  const { resolveGroundedReceptionistTurn } = await import(
+    '../src/services/receptionistTurnGrounding'
   );
 
   const config = buildConfig();
@@ -816,7 +847,97 @@ async function runReceptionist(
         continue;
       }
 
-      const modelHistory = toReceptionistModelHistory(history);
+      const userMessages = [
+        ...history.filter((item) => item.role === 'user').map((item) => item.content),
+        userText,
+      ];
+      const grounded = await resolveGroundedReceptionistTurn({
+        userMessage: userText,
+        userMessages,
+        history,
+        services: DAILY_SERVICES,
+        now: DAILY_FIXED_NOW,
+        timezone: config.timezone,
+        botName: config.botName,
+        readUpcoming: async () =>
+          JSON.parse(
+            await harness.execute('getUpcomingAppointments', {})
+          ) as {
+            success: boolean;
+            appointments?: unknown[];
+            reason?: string;
+            message?: string;
+          },
+        readSlots: async (args) =>
+          JSON.parse(await harness.execute('getAvailableSlots', args)) as {
+            success: boolean;
+            slots?: string[];
+            message?: string;
+          },
+      });
+      const modelHistory = grounded.modelHistory;
+      const temporalContext = {
+        now: DAILY_FIXED_NOW,
+        timezone: config.timezone,
+      };
+
+      if (grounded.kind === 'short_circuit') {
+        for (const entry of grounded.toolTrace) {
+          toolCalls.push({ name: entry.name, args: entry.args });
+        }
+        rawReply = grounded.reply;
+        identityForced = false;
+        const identityReply = enforceCustomerIdentitySafeReply(
+          grounded.toolTrace,
+          grounded.reply
+        );
+        const styled = normalizeCustomerReplyStyle(identityReply ?? grounded.reply);
+        const inspection = inspectCustomerReply(
+          styled,
+          DAILY_SERVICES,
+          ALL_DAILY_IDS,
+          grounded.toolTrace,
+          userText,
+          temporalContext
+        );
+        const outbound = validateComposedReceptionistReply({
+          baseReply: grounded.identityCanonical
+            ? CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE
+            : inspection.safe
+              ? styled
+              : '',
+          isFirstContact: history.length === 0,
+          config,
+          services: DAILY_SERVICES,
+          purpose: 'REACTIVE',
+          toolTrace: grounded.toolTrace,
+          sourceInboundText: userText,
+          temporalContext,
+        });
+        if (outsideHours) {
+          suppressed = true;
+          e2eReply = `Nosso atendimento funciona das ${config.botActiveStart} às ${config.botActiveEnd}. Envie sua mensagem e responderemos assim que possível!`;
+          e2eAccepted = true;
+          e2eReasons = ['outside_hours'];
+        } else if (options.bargeIn || humanSilence) {
+          suppressed = true;
+          e2eReply = '';
+          e2eAccepted = false;
+          e2eReasons = ['human_takeover'];
+        } else if (!socialShortcut) {
+          e2eAccepted = outbound.originalAccepted;
+          e2eReply = outbound.payload;
+          e2eReasons = outbound.reasonCodes;
+          suppressed = !outbound.originalAccepted || !outbound.payload.trim();
+        }
+        history.push({ role: 'user', content: userText });
+        history.push({
+          role: 'assistant',
+          content: socialShortcut ? e2eReply : rawReply,
+        });
+        continue;
+      }
+
       const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
         { role: 'system', content: systemPrompt },
         ...modelHistory.map((item) => ({
@@ -825,10 +946,6 @@ async function runReceptionist(
           ...(item.name ? { name: item.name } : {}),
         })),
         { role: 'user', content: userText },
-      ];
-      const userMessages = [
-        ...history.filter((item) => item.role === 'user').map((item) => item.content),
-        userText,
       ];
 
       const loop = await runReceptionistModelLoop({
@@ -942,10 +1059,6 @@ async function runReceptionist(
       }
       rawReply = loop.rawReply ?? '';
       let evidenceTrace = [...loop.toolTrace];
-      const temporalContext = {
-        now: DAILY_FIXED_NOW,
-        timezone: config.timezone,
-      };
       if (
         needsAuthoritativeAppointmentRead(
           rawReply,
@@ -1211,8 +1324,17 @@ function buildReport(
     if (p0.length > 0) return 'reprovado';
     const rawRate = rawDenom.length ? rawPass / rawDenom.length : 0;
     const e2eRate = records.length ? e2ePass / records.length : 0;
-    if (rawRate >= 0.85 && e2eRate >= 0.95) return 'aprovado para canário';
-    if (e2eRate >= 0.9 && p0.length === 0) return 'aprovado para canário';
+    const rawP0P1 = records.flatMap((item) =>
+      item.checks.filter(
+        (checkItem) =>
+          !checkItem.pass &&
+          checkItem.layer === 'raw' &&
+          (checkItem.severity === 'P0' || checkItem.severity === 'P1')
+      )
+    );
+    if (e2eRate < 1) return 'reprovado';
+    if (rawP0P1.length > 0) return 'reprovado';
+    if (rawRate >= 0 && e2eRate === 1) return 'aprovado para canário';
     return 'reprovado';
   })();
 
@@ -1277,6 +1399,7 @@ function buildReport(
 }
 
 async function main() {
+  loadDeepSeekKeyFromKnownErpEnv();
   const plan = process.argv.includes('--plan');
   const idsArg = argumentValue('--ids');
   const selected = idsArg

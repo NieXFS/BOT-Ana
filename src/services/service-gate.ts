@@ -466,6 +466,20 @@ export function shouldAskServiceUpfront(
   );
 }
 
+/** Serviço único e inequívoco citado na mensagem ATUAL, mesmo em pergunta. */
+export function uniqueCatalogServiceFromCurrentMessage(
+  message: string,
+  services: ServiceLike[]
+): ServiceLike | undefined {
+  if (!message.trim() || services.length === 0) return undefined;
+  const matches = collapseHierarchicalMatches(
+    matchedServices(normalizeServiceText(message), services),
+    services
+  );
+  if (matches.length !== 1) return undefined;
+  return services.find((service) => service.id === matches[0]!.id);
+}
+
 /**
  * Resolve o serviço escolhido pelo MESMO critério do calendarService
  * (findByExactIdOrUniquePrefix): igualdade exata OU prefixo único. Sem isso, um
