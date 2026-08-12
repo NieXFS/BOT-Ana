@@ -171,6 +171,17 @@ async function main() {
   const preferencesEndIndex = runtimePrompt.indexOf(PREFERENCES_END_DELIMITER);
 
   check(
+    'prompt impede nome/agenda contaminados do histórico neste turno',
+    runtimePrompt.includes('IDENTIDADE DESTE TURNO:') &&
+      runtimePrompt.includes(
+        'Nunca chame a cliente por um nome que ela não disse na mensagem ATUAL'
+      ) &&
+      runtimePrompt.includes(
+        'Se a mensagem atual já nomear um serviço cadastrado e pedir horário/disponibilidade, chame getAvailableSlots neste turno'
+      )
+  );
+
+  check(
     'guarda de serviço ausente precede o tenant, que fica dentro do bloco subordinado',
     unavailableServiceGuardIndex >= 0 &&
       unavailableServiceGuardIndex < servicesBlockIndex &&

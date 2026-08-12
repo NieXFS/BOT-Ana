@@ -13,6 +13,7 @@
     "behavioral:ana-full": "ts-node scripts/behavioral-clinical-honesty.ts",
     "behavioral:wave5": "ts-node -T scripts/behavioral-ana-wave5.ts",
     "behavioral:ana-resume-gate": "npx tsx scripts/behavioral-ana-resume-gate.ts",
+    "behavioral:ana-deepseek-daily": "npx tsx scripts/behavioral-ana-deepseek-daily.ts",
     "benchmark:renata-models": "npx tsx scripts/benchmarks/renata-models/runner.ts",
     "harness:onda21:ana": "ts-node -T scripts/harness-onda21-ana.ts",
     "smoke:security": "node scripts/smoke-security.ts",
