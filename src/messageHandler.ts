@@ -11,11 +11,16 @@ import {
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
 import { shouldAnaResumeForInbound } from './services/anaResumeGate';
-import { markFollowupOptedOut } from './services/salesFollowups';
+import {
+  markFollowupOptedOut,
+  markFollowupPostLink,
+} from './services/salesFollowups';
+import { hasSalesSignupUrl } from './services/salesGuards';
 import { captureReferral, type CtwaReferral } from './services/salesEvents';
 import { transcreverAudioBuffer } from './utils/transcriber';
 import {
   sendFreeformMessage,
+  sendFreeformMessageWithReceipt,
   downloadMedia,
   typingDelay,
 } from './whatsappCloudService';
@@ -138,6 +143,7 @@ export interface FlushDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
+  markPostLink?: typeof markFollowupPostLink;
 }
 
 /**
@@ -162,6 +168,12 @@ export interface ConfiguredReplyDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
+  /** Sales exige o recibo `messages[0].id`; recepção preserva o transporte legado. */
+  sendSalesText?: (
+    from: string,
+    text: string,
+    config: TenantBotConfig
+  ) => Promise<void>;
 }
 
 const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
@@ -169,6 +181,9 @@ const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
   deliverVoice: deliverSalesReply,
   waitTyping: typingDelay,
   sendText: sendFreeformMessage,
+  sendSalesText: async (from, text, config) => {
+    await sendFreeformMessageWithReceipt(from, text, config);
+  },
 };
 
 /** Seam do ponto de entrega: permite provar o caminho byte-idêntico da recepção. */
@@ -203,7 +218,7 @@ export async function sendConfiguredReply(
   if (typingSimEnabled(config)) {
     await deps.waitTyping(salesText);
   }
-  await deps.sendText(from, salesText, config);
+  await (deps.sendSalesText ?? deps.sendText)(from, salesText, config);
 }
 
 const defaultFlushDeps: FlushDeps = {
@@ -228,6 +243,7 @@ const defaultFlushDeps: FlushDeps = {
   },
   isPaused: isConversationPaused,
   recordPausedInbound: recordInboundWhilePaused,
+  markPostLink: markFollowupPostLink,
 };
 
 function safeSalesContext(config: TenantBotConfig, from: string): string {
@@ -468,6 +484,11 @@ export async function flushBuffer(
 
       try {
         await deps.sendReply(from, reply!, config);
+        if (hasSalesSignupUrl(reply) && deps.markPostLink) {
+          await deps
+            .markPostLink(config.phoneNumberId, from)
+            .catch(() => undefined);
+        }
         notifySalesReplyDelivered(bufferKey, 'novo_inbound');
         console.log(
           `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply.length}`

@@ -7,6 +7,8 @@ import type { getSalesConversationReplyFromHistory } from './brainService';
 import type { RecoverableSalesConversationRole } from './brainService';
 import type { handoffToHuman } from './salesTools';
 import type { isConversationPaused } from './pauseService';
+import { hasSalesSignupUrl } from './salesGuards';
+import { markFollowupPostLink } from './salesFollowups';
 
 export const LAST_RESORT_MESSAGE =
   'Oi! Desculpa a demora — já te respondo direitinho aqui 😊';
@@ -54,6 +56,7 @@ export interface SalesRecoveryDeps {
   ) => Promise<void>;
   emitEvent: typeof emitSalesEvent;
   handoff: typeof handoffToHuman;
+  markPostLink: typeof markFollowupPostLink;
 }
 
 interface RecoveryState extends ScheduleSalesRecoveryInput {
@@ -108,6 +111,8 @@ const defaultDeps: SalesRecoveryDeps = {
     const { handoffToHuman: handoff } = await import('./salesTools');
     return handoff(...args);
   },
+  markPostLink: async (...args: Parameters<typeof markFollowupPostLink>) =>
+    markFollowupPostLink(...args),
 };
 
 let deps: SalesRecoveryDeps = defaultDeps;
@@ -293,6 +298,12 @@ async function runRecoveryAttempt(conversationKey: string): Promise<void> {
         state.failure.replyText,
         state.config
       );
+      if (hasSalesSignupUrl(state.failure.replyText)) {
+        await deps.markPostLink(
+          state.config.phoneNumberId,
+          state.phone
+        ).catch(() => undefined);
+      }
     } catch (error) {
       captureRecoveryError('send', state, error);
       await scheduleNextOrExhaust(state);

@@ -32,6 +32,7 @@ export type SalesReplyClaimReason =
   | 'required_simulation_offer_missing'
   | 'handoff_without_success'
   | 'signup_link_without_result'
+  | 'signup_url_missing_from_reply'
   | 'terminal_signup_delivery_failed'
   | 'prefill_claim_without_success'
   | 'demo_video_without_success'
@@ -225,6 +226,71 @@ function parsedResult(result: string): Record<string, unknown> | null {
   }
 }
 
+const SIGNUP_URL_RE =
+  /https:\/\/(?:www\.)?receps\.com\.br\/cadastro[^\s<>()]*/gi;
+
+function trustedSignupUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value);
+    const trustedHost =
+      url.hostname === 'receps.com.br' ||
+      url.hostname.endsWith('.receps.com.br');
+    return url.protocol === 'https:' && trustedHost && url.pathname === '/cadastro'
+      ? url.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** URL autoritativa da última tool de cadastro que realmente concluiu. */
+export function successfulSalesSignupUrl(
+  trace: SalesToolTraceLike[]
+): string | null {
+  for (let index = trace.length - 1; index >= 0; index -= 1) {
+    const entry = trace[index];
+    if (
+      entry.name !== 'sendSignupLink' &&
+      entry.name !== 'sendPrefilledSignup'
+    ) {
+      continue;
+    }
+    const result = parsedResult(entry.result);
+    if (result?.success !== true) continue;
+    const url = trustedSignupUrl(result.url);
+    if (url) return url;
+  }
+  return null;
+}
+
+/**
+ * A tool só gera a URL; quem entrega é o outbound. Coloca a URL autoritativa em
+ * linha própria e remove qualquer URL de cadastro divergente criada pelo modelo.
+ */
+export function ensureSalesSignupUrlInReply(
+  reply: string,
+  trace: SalesToolTraceLike[]
+): string {
+  const url = successfulSalesSignupUrl(trace);
+  const trimmed = reply.trim();
+  if (!url) return trimmed;
+  if (trimmed.includes(url)) return trimmed;
+
+  const withoutModelSignupUrls = trimmed
+    .replace(SIGNUP_URL_RE, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return withoutModelSignupUrls ? `${withoutModelSignupUrls}\n\n${url}` : url;
+}
+
+export function hasSalesSignupUrl(reply: string): boolean {
+  SIGNUP_URL_RE.lastIndex = 0;
+  return SIGNUP_URL_RE.test(reply);
+}
+
 export function salesToolSucceeded(
   trace: SalesToolTraceLike[],
   name: string
@@ -245,22 +311,8 @@ function toolHadAuthorizedAttempt(
   });
 }
 
-function hasDeliveredSignupLink(trace: SalesToolTraceLike[]): boolean {
-  return trace.some((entry) => {
-    if (
-      entry.name !== 'sendSignupLink' &&
-      entry.name !== 'sendPrefilledSignup'
-    ) {
-      return false;
-    }
-    const result = parsedResult(entry.result);
-    return Boolean(
-      result &&
-        (result.success === true ||
-          typeof result.url === 'string' ||
-          typeof result.waitlistHref === 'string')
-    );
-  });
+function hasSuccessfulSignupResult(trace: SalesToolTraceLike[]): boolean {
+  return successfulSalesSignupUrl(trace) !== null;
 }
 
 function hasDeliveredPrefilledSignup(trace: SalesToolTraceLike[]): boolean {
@@ -434,7 +486,7 @@ function requiresTerminalSignupHandoff(
   history: ConversationMessage[]
 ): boolean {
   const noDeliveryOrHandoff =
-    !hasDeliveredSignupLink(trace) &&
+    !hasSuccessfulSignupResult(trace) &&
     !salesToolSucceeded(trace, 'handoffToHuman');
   const failedPrefillAndCommonLink =
     toolAttemptedWithoutSuccess(trace, 'sendPrefilledSignup') &&
@@ -659,8 +711,12 @@ export function inspectSalesReplyActionClaims(
     /\b(?:te mandei (?:aqui )?(?:o )?link|ja enviei (?:aqui )?(?:o )?link|segue (?:aqui )?(?:o )?link|link (?:esta|ta) (?:aqui )?embaixo|aqui esta (?:o )?link)\b/.test(
       normalized
     );
-  if (claimsLinkDelivery && !hasDeliveredSignupLink(trace)) {
+  const signupUrl = successfulSalesSignupUrl(trace);
+  if (claimsLinkDelivery && !signupUrl) {
     reasons.add('signup_link_without_result');
+  }
+  if (signupUrl && !reply.includes(signupUrl)) {
+    reasons.add('signup_url_missing_from_reply');
   }
 
   const mentionsPrefillBenefit =
@@ -670,7 +726,7 @@ export function inspectSalesReplyActionClaims(
   const claimsDeliveredPrefill =
     mentionsPrefillBenefit &&
     (claimsLinkDelivery ||
-      hasDeliveredSignupLink(trace) ||
+      hasSuccessfulSignupResult(trace) ||
       toolAttemptedWithoutSuccess(trace, 'sendPrefilledSignup') ||
       /\b(?:pronto|prontinho|agora sim|confirmado|gerei|enviei|mandei|esta aqui|ta aqui)\b/.test(
         normalized
@@ -774,11 +830,12 @@ export function buildSafeSalesRecoveryReply(
   if (salesToolSucceeded(trace, 'handoffToHuman')) {
     return 'Pronto, já acionei o Victor para continuar com você por aqui.';
   }
-  if (hasDeliveredPrefilledSignup(trace)) {
-    return 'Prontinho! Te mandei o link com seus dados preenchidos — você só cria a senha. Se precisar, fico por aqui com você.';
+  const signupUrl = successfulSalesSignupUrl(trace);
+  if (hasDeliveredPrefilledSignup(trace) && signupUrl) {
+    return `Prontinho! Te mandei o link com seus dados preenchidos — você só cria a senha. Se precisar, fico por aqui com você.\n\n${signupUrl}`;
   }
-  if (hasDeliveredSignupLink(trace)) {
-    return 'Prontinho! Te mandei o link do cadastro. Se precisar, fico por aqui com você.';
+  if (signupUrl) {
+    return `Prontinho! Te mandei o link do cadastro. Se precisar, fico por aqui com você.\n\n${signupUrl}`;
   }
   if (salesToolSucceeded(trace, 'sendDemoVideo')) {
     return 'Prontinho! O vídeo foi enviado. Depois me conta o que você achou.';

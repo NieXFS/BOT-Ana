@@ -368,6 +368,30 @@ async function main() {
   expect('11) buffer sales pausado é limpo', !__hasBufferForTest(key11));
   salesRecovery.__resetSalesRecoveryForTest();
 
+  // --- Caso 12: post_link só começa depois do envio aceito -----------------
+  __resetFlushStateForTest();
+  const deliveryOrder: string[] = [];
+  const signupReply =
+    'Prontinho! Te mandei o link.\n\nhttps://receps.com.br/cadastro?pf=TOKEN';
+  const deliveredLinkDeps: FlushDeps = {
+    getReply: async () => signupReply,
+    sendReply: async () => {
+      deliveryOrder.push('send');
+    },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
+    markPostLink: async () => {
+      deliveryOrder.push('post_link');
+    },
+  };
+  const key12 = __seedFlushBufferForTest(salesConfig, from, ['Sim']);
+  await flushBuffer(key12, deliveredLinkDeps);
+  expect(
+    '12) post_link ocorre somente depois do transporte aceitar a URL',
+    deliveryOrder.join('|') === 'send|post_link'
+  );
+  expect('12) buffer é limpo após link entregue', !__hasBufferForTest(key12));
+
   const failed = checks.filter((c) => !c.ok);
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passaram.`);
   if (failed.length > 0) {

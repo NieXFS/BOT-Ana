@@ -23,7 +23,6 @@ import {
 } from './salesTools';
 import {
   markFollowupDemoStage,
-  markFollowupPostLink,
   scheduleFollowup,
 } from './salesFollowups';
 import {
@@ -53,6 +52,7 @@ import {
   authorizeSalesToolCall,
   buildDeterministicSalesGuardReply,
   buildSafeSalesRecoveryReply,
+  ensureSalesSignupUrlInReply,
   inspectSalesReplyActionClaims,
   isThinkingOnlyResponse,
   normalizeSalesReplyStyle,
@@ -361,7 +361,6 @@ async function executeSalesFunction(
           salesConfig
         );
         if (result.success) {
-          await markFollowupPostLink(config.phoneNumberId, phone);
           void emitSalesEvent(config.phoneNumberId, phone, 'link_enviado', {
             plan: result.plan,
             track: result.track,
@@ -400,7 +399,6 @@ async function executeSalesFunction(
           salesConfig
         );
         if (result.success) {
-          await markFollowupPostLink(config.phoneNumberId, phone);
           // Fidelidade não chama o prefill atual (ele ainda não aceita track),
           // então este link comum precisa registrar o próprio marco. Nos demais
           // casos o endpoint do Receps continua sendo a fonte, evitando dupla.
@@ -718,8 +716,12 @@ async function runSalesReplyFromLoadedHistory(
           continue;
         }
 
-        const inspection = inspectSalesReplyActionClaims(
+        const replyWithSignupUrl = ensureSalesSignupUrlInReply(
           rawReply,
+          toolTrace
+        );
+        const inspection = inspectSalesReplyActionClaims(
+          replyWithSignupUrl,
           toolTrace,
           history,
           {
@@ -750,10 +752,13 @@ async function runSalesReplyFromLoadedHistory(
           continue;
         }
 
-        const reply = normalizeSalesReplyStyle(
-          inspection.safe
-            ? rawReply
-            : await performTerminalResolution(inspection.reasons)
+        const reply = ensureSalesSignupUrlInReply(
+          normalizeSalesReplyStyle(
+            inspection.safe
+              ? replyWithSignupUrl
+              : await performTerminalResolution(inspection.reasons)
+          ),
+          toolTrace
         );
         await deps.addMessage(conversationKey, 'assistant', reply);
         if (isFirstResponse) {

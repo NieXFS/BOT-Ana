@@ -7,7 +7,9 @@ import {
   buildDeterministicSalesGuardReply,
   buildSafeSalesRecoveryReply,
   countActionableSalesQuestions,
+  ensureSalesSignupUrlInReply,
   hasConfirmedSalesEmail,
+  hasSalesSignupUrl,
   inspectSalesReplyActionClaims,
   isThinkingOnlyResponse,
   normalizeSalesReplyStyle,
@@ -421,7 +423,7 @@ assert.equal(
       },
     ]
   ).safe,
-  true
+  false
 );
 assert.equal(
   inspectSalesReplyActionClaims(
@@ -434,7 +436,7 @@ assert.equal(
   inspectSalesReplyActionClaims(
     'O link já vem com seus dados, você só cria a senha.',
     [ok('sendPrefilledSignup', { url: 'https://receps.com.br/cadastro' })]
-  ).safe,
+  ).reasons.includes('signup_url_missing_from_reply'),
   true
 );
 assert.equal(
@@ -450,6 +452,42 @@ assert.equal(
   true
 );
 console.log('  ✓ link comum nunca licencia promessa de prefill');
+
+const incidentTrace = [
+  ok('sendPrefilledSignup', {
+    url: 'https://receps.com.br/cadastro?pf=TOKEN_AUTORITATIVO',
+    prefilled: true,
+  }),
+];
+const incidentReply =
+  'Te mandei o link aqui embaixo. Ele já vem com seus dados — é só criar a senha.';
+assert.equal(
+  inspectSalesReplyActionClaims(incidentReply, incidentTrace).reasons.includes(
+    'signup_url_missing_from_reply'
+  ),
+  true
+);
+const closedIncidentReply = ensureSalesSignupUrlInReply(
+  incidentReply,
+  incidentTrace
+);
+assert.equal(hasSalesSignupUrl(closedIncidentReply), true);
+assert.match(
+  closedIncidentReply,
+  /\n\nhttps:\/\/receps\.com\.br\/cadastro\?pf=TOKEN_AUTORITATIVO$/
+);
+assert.equal(
+  inspectSalesReplyActionClaims(closedIncidentReply, incidentTrace).safe,
+  true
+);
+assert.equal(
+  ensureSalesSignupUrlInReply(
+    'Aqui está: https://receps.com.br/cadastro?pf=TOKEN_ERRADO',
+    incidentTrace
+  ),
+  'Aqui está:\n\nhttps://receps.com.br/cadastro?pf=TOKEN_AUTORITATIVO'
+);
+console.log('  ✓ URL autoritativa fecha o incidente de link anunciado e omitido');
 
 assert.equal(
   inspectSalesReplyActionClaims(
@@ -679,8 +717,11 @@ assert.match(
   /já acionei o Victor/
 );
 assert.match(
-  buildSafeSalesRecoveryReply([ok('sendSignupLink')], 'fallback'),
-  /Te mandei o link/
+  buildSafeSalesRecoveryReply(
+    [ok('sendSignupLink', { url: 'https://receps.com.br/cadastro?plan=pro' })],
+    'fallback'
+  ),
+  /Te mandei o link[\s\S]*https:\/\/receps\.com\.br\/cadastro\?plan=pro/
 );
 assert.equal(
   buildSafeSalesRecoveryReply(
@@ -692,7 +733,7 @@ assert.equal(
     ],
     'fallback'
   ),
-  'Prontinho! Te mandei o link do cadastro. Se precisar, fico por aqui com você.'
+  'Prontinho! Te mandei o link do cadastro. Se precisar, fico por aqui com você.\n\nhttps://receps.com.br/cadastro?track=fidelidade'
 );
 assert.equal(buildSafeSalesRecoveryReply([], 'fallback'), 'fallback');
 console.log(

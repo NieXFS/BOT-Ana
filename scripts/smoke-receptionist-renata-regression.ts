@@ -10,7 +10,10 @@ async function main() {
     voiceEnabled: () => false,
     deliverVoice: async () => { throw new Error('voice should be off'); },
     waitTyping: async () => { throw new Error('sales must not type'); },
-    sendText: async (_to, payload) => { sent.push(payload); },
+    sendText: async () => {
+      throw new Error('sales must require receipt transport');
+    },
+    sendSalesText: async (_to, payload) => { sent.push(payload); },
   });
   assert.deepEqual(sent, [text]);
   console.log('smoke receptionist Renata regression: OK');

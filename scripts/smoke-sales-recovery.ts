@@ -230,6 +230,35 @@ async function main(): Promise<void> {
     recovery.__resetSalesRecoveryForTest();
   }
 
+  // Recovery de envio preserva a URL e só abre post_link após o recibo -------
+  {
+    const scheduler = new FakeScheduler();
+    const order: string[] = [];
+    const linkReply =
+      'Prontinho!\n\nhttps://receps.com.br/cadastro?pf=TOKEN_RECOVERY';
+    recovery.__setSalesRecoveryDepsForTest({
+      scheduler: scheduler.api,
+      isPaused: async () => false,
+      sendReply: async (_phone, text) => {
+        if (text === linkReply) order.push('send');
+      },
+      markPostLink: async () => {
+        order.push('post_link');
+      },
+      emitEvent: async () => undefined,
+    });
+    recovery.scheduleSalesRecovery({
+      ...baseInput,
+      failure: { kind: 'send', replyText: linkReply },
+    });
+    await scheduler.runNext();
+    check(
+      'recovery de link confirma transporte antes de abrir post_link',
+      order.join('|') === 'send|post_link'
+    );
+    recovery.__resetSalesRecoveryForTest();
+  }
+
   // Duas falhas -> texto puro + handoff + estado exhausted -------------------
   {
     const scheduler = new FakeScheduler();

@@ -4,7 +4,7 @@ import { buildConversationKey } from '../services/contextManager';
 import { Sentry } from '../observability/sentry';
 import {
   sendAudioMessage,
-  sendFreeformMessage,
+  sendFreeformMessageWithReceipt,
   uploadMedia,
 } from '../whatsappCloudService';
 import { encodeToOpus, type TtsEncoderInput } from './audioEncoder';
@@ -87,7 +87,9 @@ const defaultDeps: VoiceDeliveryDeps = {
   encode: encodeToOpus,
   upload: uploadMedia,
   sendAudio: sendAudioMessage,
-  sendText: sendFreeformMessage,
+  sendText: async (to, text, config) => {
+    await sendFreeformMessageWithReceipt(to, text, config);
+  },
   recordCacheHit: recordHit,
   recordCacheMiss: recordMiss,
   now: () => new Date(),
