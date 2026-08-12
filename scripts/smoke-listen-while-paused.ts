@@ -152,6 +152,67 @@ async function main() {
     echoRecorded[0]?.content === `${HUMAN_ECHO_PREFIX}enviou uma imagem`
   );
 
+  // === E2) áudio humano → media id, download e transcrição efêmera ==========
+  echoRecorded.length = 0;
+  const audioOrder: string[] = [];
+  const audioEcho = {
+    metadata: { phone_number_id: 'PNID_1' },
+    message_echoes: [
+      {
+        to: '5511CUST4',
+        id: 'wamid.echo-audio',
+        type: 'audio',
+        audio: { id: 'media-owner-1', voice: true },
+      },
+    ],
+  };
+  await handleSmbMessageEchoes(audioEcho, undefined, {
+    ...echoDeps,
+    pauseConversation: async (pnid, phone) => {
+      audioOrder.push('pause');
+      pausedFor.push({ pnid, phone });
+    },
+    loadConfig: async () => config,
+    shouldTranscribeHumanAudio: () => true,
+    downloadAudio: async (mediaId) => {
+      audioOrder.push(`download:${mediaId}`);
+      return Buffer.from('audio-controlado');
+    },
+    transcribeAudio: async () => {
+      audioOrder.push('transcribe');
+      return 'pode deixar marcado para sexta às 13h';
+    },
+  });
+  expect('E2) pausa acontece antes do download', audioOrder[0] === 'pause');
+  expect(
+    'E2) media id do objeto audio é usado no download',
+    audioOrder.includes('download:media-owner-1')
+  );
+  expect('E2) transcrição foi executada', audioOrder.includes('transcribe'));
+  expect(
+    'E2) histórico guarda o transcript prefixado, não o media id',
+    echoRecorded[0]?.content ===
+      `${HUMAN_ECHO_PREFIX}pode deixar marcado para sexta às 13h`
+  );
+
+  echoRecorded.length = 0;
+  const audioWithoutMedia = {
+    metadata: { phone_number_id: 'PNID_1' },
+    message_echoes: [
+      { to: '5511CUST5', id: 'wamid.echo-audio-no-media', type: 'audio' },
+    ],
+  };
+  await handleSmbMessageEchoes(audioWithoutMedia, undefined, {
+    ...echoDeps,
+    loadConfig: async () => config,
+    shouldTranscribeHumanAudio: () => true,
+  });
+  expect(
+    'E2) áudio sem media id persiste estado explícito fail-closed',
+    echoRecorded[0]?.content ===
+      `${HUMAN_ECHO_PREFIX}[áudio do atendente sem transcrição]`
+  );
+
   // === G) gravação falha → marca desfeita → retransmissão recupera =========
   // (à prova de perda: o echo é o contexto do §8.2; um blip de DB na 1ª entrega
   // não pode sumir com ele — a retransmissão da Meta tem que re-gravar.)
@@ -180,6 +241,9 @@ async function main() {
     'F) parse: content prefixado com o corpo',
     parsed[0]?.content === `${HUMAN_ECHO_PREFIX}ok, te espero às 15h`
   );
+  const parsedAudio = parseEchoMessages(audioEcho);
+  expect('F) parse: tipo audio preservado', parsedAudio[0]?.messageType === 'audio');
+  expect('F) parse: media id extraído', parsedAudio[0]?.mediaId === 'media-owner-1');
 
   const noId = {
     metadata: { phone_number_id: 'PNID_1' },

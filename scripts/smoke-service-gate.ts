@@ -352,6 +352,41 @@ expectAsk(
   true
 );
 
+const roseCalosidadeUsers = [
+  'gostaria de agendar um horário',
+  'Calosidade',
+  'podologa',
+];
+expectAsk(
+  'Rose #9: singular "Calosidade" escolhe o catálogo plural e "podologa" não repete o menu',
+  shouldAskServiceUpfront(ROSE_SERVICES, roseCalosidadeUsers),
+  false
+);
+expect(
+  'Rose #10: singular "Calosidade" libera Calosidades e Fissuras',
+  serviceSelectionGate('rose-calo', ROSE_SERVICES, roseCalosidadeUsers).ok,
+  true
+);
+expect(
+  'Rose #11: "podologa" não troca silenciosamente para Podoprofilaxia',
+  serviceSelectionGate('rose-podo', ROSE_SERVICES, roseCalosidadeUsers).ok,
+  false
+);
+
+const SINGULAR_CATALOG = [
+  { id: 'singular-unha', name: 'Manutenção de unha' },
+  { id: 'singular-corte', name: 'Corte de cabelo' },
+];
+expect(
+  'Plural regular também reconhece catálogo no singular',
+  serviceSelectionGate(
+    'singular-unha',
+    SINGULAR_CATALOG,
+    ['quero agendar', 'manutenção de unhas']
+  ).ok,
+  true
+);
+
 // buildServiceQuestion lista os serviços de forma neutra
 const q = buildServiceQuestion(TWO);
 checks.push({ name: 'buildServiceQuestion lista os 2 serviços (neutro)', ok: q.includes('Corte de cabelo') && q.includes('Depilação a Laser') && /qual|prefere/i.test(q) });

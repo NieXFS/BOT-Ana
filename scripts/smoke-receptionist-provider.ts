@@ -7,6 +7,7 @@ import {
 } from '../src/configProvider';
 import {
   buildOpaqueConversationUserId,
+  buildAnaResumeClassifierRequest,
   buildReceptionistClientOptions,
   buildReceptionistCompletionRequest,
   DEEPSEEK_BASE_URL,
@@ -14,6 +15,7 @@ import {
   DEEPSEEK_V4_FLASH_MODEL,
   RECEPTIONIST_AI_TIMEOUT_MS,
   resolveReceptionistAiRuntime,
+  resolveAnaResumeClassifierRuntime,
 } from '../src/services/receptionistLlmProvider';
 import { isRetryableAiError } from '../src/utils/openaiRetry';
 
@@ -181,6 +183,22 @@ assert.throws(
       thinkingMode: 'enabled',
     }),
   /Thinking mode do DeepSeek está bloqueado em produção/
+);
+const resumeRuntime = resolveAnaResumeClassifierRuntime();
+const resumeRequest = buildAnaResumeClassifierRequest(resumeRuntime, {
+  messages,
+});
+assert.equal('tools' in resumeRequest, false);
+assert.equal('tool_choice' in resumeRequest, false);
+assert.equal('temperature' in resumeRequest, false);
+assert.deepEqual(
+  (resumeRequest as unknown as { thinking: unknown }).thinking,
+  { type: 'enabled' },
+  'gate one-shot sem tools pode usar Thinking em produção'
+);
+assert.deepEqual(
+  (resumeRequest as unknown as { response_format: unknown }).response_format,
+  { type: 'json_object' }
 );
 process.env.NODE_ENV = 'test';
 delete process.env[DEEPSEEK_PRODUCTION_APPROVAL_ENV];

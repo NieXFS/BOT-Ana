@@ -122,6 +122,29 @@ function tokensOf(name: string): string[] {
     .filter((token) => token.length >= 3 && !STOPWORDS.has(token) && !/^\d+$/.test(token));
 }
 
+/**
+ * Equivalência conservadora para o plural regular mais comum em nomes de
+ * serviço ("calosidade" x "calosidades", "fissura" x "fissuras").
+ *
+ * A comparação continua sendo por token distintivo do catálogo: isto não cria
+ * sinônimos nem permite que um termo compartilhado escolha um serviço. Limitamos
+ * a remoção do `s` a palavras longas terminadas em vogal + `s`, evitando tratar
+ * invariáveis frequentes como "lápis" e "vírus" como plurais.
+ */
+function simplePluralStem(token: string): string {
+  return token.length >= 5 && /[aeo]s$/.test(token)
+    ? token.slice(0, -1)
+    : token;
+}
+
+function containsEquivalentToken(text: string, catalogToken: string): boolean {
+  const expected = simplePluralStem(catalogToken);
+  return text
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .some((candidate) => simplePluralStem(candidate) === expected);
+}
+
 function buildDistinctiveTokens(services: ServiceLike[]): Map<string, Set<string>> {
   const freq = new Map<string, number>();
   const perService = new Map<string, string[]>();
@@ -192,7 +215,10 @@ function matchedServices(
       continue;
     }
     for (const token of distinctive.get(service.id) ?? []) {
-      if (new RegExp(`\\b${escapeRegex(token)}\\b`).test(windowText)) {
+      if (
+        new RegExp(`\\b${escapeRegex(token)}\\b`).test(windowText) ||
+        containsEquivalentToken(windowText, token)
+      ) {
         out.push({ id: service.id, kind: 'token' });
         break;
       }

@@ -2,6 +2,7 @@ import { pauseConversationByEcho } from './services/pauseService';
 import {
   addMessage,
   buildConversationKey,
+  HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
   HUMAN_ECHO_PREFIX,
 } from './services/contextManager';
 import {
@@ -14,6 +15,10 @@ import {
   canonicalConversationKey,
   withConversationLock,
 } from './services/conversationOrder';
+import { getTenantConfig, type TenantBotConfig } from './configProvider';
+import { downloadMedia } from './whatsappCloudService';
+import { transcreverAudioBuffer } from './utils/transcriber';
+import { isAnaResumeGateEnabled } from './services/anaResumeGate';
 
 export { HUMAN_ECHO_PREFIX };
 
@@ -28,6 +33,9 @@ export interface EchoMessage {
   customerPhone: string;
   /** message id do echo — chave de idempotência (a Meta retransmite). */
   messageId: string;
+  messageType: string;
+  /** ID de mídia do objeto audio/voice; nunca entra em log/telemetria. */
+  mediaId: string | null;
   /** conteúdo JÁ prefixado com HUMAN_ECHO_PREFIX, pronto pra persistir. */
   content: string;
 }
@@ -47,6 +55,10 @@ export interface EchoDeps {
     role: 'user' | 'assistant',
     content: string
   ) => Promise<void>;
+  loadConfig?: (phoneNumberId: string) => Promise<TenantBotConfig | null>;
+  downloadAudio?: typeof downloadMedia;
+  transcribeAudio?: typeof transcreverAudioBuffer;
+  shouldTranscribeHumanAudio?: (config: TenantBotConfig) => boolean;
   /** Mesma serialização PG do intake/envio. Omitida em smokes legados = inline. */
   withConversationLock?: (
     phoneNumberId: string,
@@ -62,6 +74,10 @@ const defaultEchoDeps: EchoDeps = {
   recordMessage: addMessage,
   withConversationLock: (phoneNumberId, customerPhone, work) =>
     withConversationLock(phoneNumberId, customerPhone, async () => work()),
+  loadConfig: getTenantConfig,
+  downloadAudio: downloadMedia,
+  transcribeAudio: transcreverAudioBuffer,
+  shouldTranscribeHumanAudio: isAnaResumeGateEnabled,
 };
 
 /** A Meta envia o campo "smb_message_echoes" em change.field (Coexistence). */
@@ -189,19 +205,72 @@ export function parseEchoMessages(
       id?: unknown;
       type?: unknown;
       text?: { body?: unknown };
+      audio?: { id?: unknown };
+      voice?: { id?: unknown };
     };
     const customerPhone = typeof e.to === 'string' ? e.to.trim() : '';
     const messageId = typeof e.id === 'string' ? e.id.trim() : '';
     if (!customerPhone || !messageId) continue;
+    const messageType = typeof e.type === 'string' ? e.type : '';
+    const rawMediaId =
+      messageType === 'voice' ? e.voice?.id ?? e.audio?.id : e.audio?.id;
+    const mediaId = typeof rawMediaId === 'string' ? rawMediaId.trim() : '';
     messages.push({
       phoneNumberId,
       customerPhone,
       messageId,
+      messageType,
+      mediaId: mediaId || null,
       content: buildEchoContent(e),
     });
   }
 
   return messages;
+}
+
+async function resolveEchoContent(
+  message: EchoMessage,
+  deps: EchoDeps
+): Promise<string> {
+  if (message.messageType !== 'audio' && message.messageType !== 'voice') {
+    return message.content;
+  }
+
+  const loadConfig = deps.loadConfig ?? defaultEchoDeps.loadConfig;
+  const downloadAudio = deps.downloadAudio ?? defaultEchoDeps.downloadAudio;
+  const transcribeAudio = deps.transcribeAudio ?? defaultEchoDeps.transcribeAudio;
+  const shouldTranscribe =
+    deps.shouldTranscribeHumanAudio ?? defaultEchoDeps.shouldTranscribeHumanAudio;
+  try {
+    const config = await loadConfig?.(message.phoneNumberId);
+    if (!config || !shouldTranscribe?.(config)) return message.content;
+    if (!message.mediaId || !downloadAudio || !transcribeAudio) {
+      return `${HUMAN_ECHO_PREFIX}${HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE}`;
+    }
+    const audio = await downloadAudio(message.mediaId, config);
+    const transcription = (await transcribeAudio(
+      audio,
+      config.openaiApiKey
+    )).trim();
+    if (!transcription) {
+      return `${HUMAN_ECHO_PREFIX}${HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE}`;
+    }
+    console.log(
+      `🎙️ Áudio do atendente transcrito | phoneNumberId=${message.phoneNumberId} | chars=${transcription.length}`
+    );
+    return `${HUMAN_ECHO_PREFIX}${transcription}`;
+  } catch (err) {
+    Sentry.captureException(new Error('echo audio transcription failed'), {
+      level: 'warning',
+      tags: {
+        service: 'echo_handler',
+        operation: 'transcribe_human_audio',
+        phoneNumberId: message.phoneNumberId,
+        error_kind: runtimeErrorKind(err),
+      },
+    });
+    return `${HUMAN_ECHO_PREFIX}${HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE}`;
+  }
 }
 
 /**
@@ -266,10 +335,11 @@ export async function handleSmbMessageEchoes(
           if (!fresh) continue;
 
           try {
+            const content = await resolveEchoContent(message, deps);
             await deps.recordMessage(
               buildConversationKey(message.phoneNumberId, message.customerPhone),
               'assistant',
-              message.content
+              content
             );
           } catch (err) {
             Sentry.captureException(new Error('echo history write failed'), {

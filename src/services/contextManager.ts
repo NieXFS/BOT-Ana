@@ -41,6 +41,8 @@ export function currentSourceInboundMessageId(): string | null {
  * brainService (instrui o modelo a tratar como contexto, não como fala dele).
  */
 export const HUMAN_ECHO_PREFIX = '[atendente] ';
+export const HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE =
+  '[áudio do atendente sem transcrição]';
 
 const MAX_MESSAGES = 30;
 

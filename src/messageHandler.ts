@@ -10,6 +10,7 @@ import {
 } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
+import { shouldAnaResumeForInbound } from './services/anaResumeGate';
 import { markFollowupOptedOut } from './services/salesFollowups';
 import { captureReferral, type CtwaReferral } from './services/salesEvents';
 import { transcreverAudioBuffer } from './utils/transcriber';
@@ -770,6 +771,7 @@ export interface IncomingMessageDeps {
   handleOptOut: typeof tryHandleOptOut;
   shouldSuspend: typeof shouldSuspendForPendingInbound;
   isPaused: typeof isConversationPaused;
+  resumeGate?: typeof shouldAnaResumeForInbound;
 }
 
 const defaultIncomingMessageDeps: IncomingMessageDeps = {
@@ -782,6 +784,7 @@ const defaultIncomingMessageDeps: IncomingMessageDeps = {
   handleOptOut: tryHandleOptOut,
   shouldSuspend: shouldSuspendForPendingInbound,
   isPaused: isConversationPaused,
+  resumeGate: shouldAnaResumeForInbound,
 };
 
 export async function handleIncomingMessage(
@@ -959,6 +962,20 @@ export async function handleIncomingMessage(
   ) {
     console.info(
       `⏸️ [escalation] inbound ${message.id} pendente; conversa mantida suspensa.`
+    );
+    return;
+  }
+
+  if (
+    config.botRole !== 'sales' &&
+    !(await (deps.resumeGate ?? shouldAnaResumeForInbound)({
+      config,
+      customerPhone: from,
+      customerName: name,
+    }))
+  ) {
+    console.log(
+      `⏸️ [retomada] Ana permaneceu em silêncio | phoneNumberId=${config.phoneNumberId} | convHash=${convHash}`
     );
     return;
   }

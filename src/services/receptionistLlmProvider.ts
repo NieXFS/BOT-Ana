@@ -37,6 +37,11 @@ export interface ReceptionistCompletionInput {
   thinkingMode?: DeepSeekThinkingMode;
 }
 
+export interface AnaResumeClassifierCompletionInput {
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+  maxTokens?: number;
+}
+
 type DeepSeekChatCompletionParams = Omit<
   OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
   'reasoning_effort'
@@ -126,6 +131,21 @@ export function resolveReceptionistAiRuntime(
   throw new Error(
     `Provider de IA não suportado para a Ana: ${provider || '(vazio)'}.`
   );
+}
+
+/** Provider fixo do gate de retomada, independente do motor principal do tenant. */
+export function resolveAnaResumeClassifierRuntime(): ReceptionistAiRuntime {
+  assertDeepSeekProductionApproved();
+  const apiKey = process.env.DEEPSEEK_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error('DEEPSEEK_API_KEY não configurada para o gate de retomada.');
+  }
+  return {
+    provider: 'deepseek',
+    model: DEEPSEEK_V4_FLASH_MODEL,
+    baseURL: DEEPSEEK_BASE_URL,
+    apiKey,
+  };
 }
 
 function clientCacheKey(runtime: ReceptionistAiRuntime): string {
@@ -219,6 +239,42 @@ export async function createReceptionistChatCompletion(
 ): Promise<OpenAI.Chat.Completions.ChatCompletion> {
   const request = buildReceptionistCompletionRequest(runtime, input);
   return getClient(runtime).chat.completions.create(request);
+}
+
+/**
+ * Request dedicado ao gate de retomada. É deliberadamente one-shot, sem tools,
+ * sem texto para cliente e com JSON obrigatório. Por não existir um segundo
+ * turno/tool-call, `reasoning_content` não precisa ser reenviado nem persistido.
+ */
+export function buildAnaResumeClassifierRequest(
+  runtime: ReceptionistAiRuntime,
+  input: AnaResumeClassifierCompletionInput
+): OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming {
+  if (runtime.provider !== 'deepseek' || runtime.model !== DEEPSEEK_V4_FLASH_MODEL) {
+    throw new Error('O classificador de retomada exige deepseek-v4-flash.');
+  }
+  assertDeepSeekProductionApproved();
+
+  const request = {
+    model: runtime.model,
+    messages: input.messages,
+    // Thinking consome parte do mesmo budget antes do JSON final. 500 e 1.200
+    // tokens ainda produziram respostas reasoning-only no harness; 4.096 é teto,
+    // não consumo obrigatório, e deixa o modelo encerrar com o JSON de 2 chaves.
+    max_tokens: input.maxTokens ?? 4_096,
+    response_format: { type: 'json_object' as const },
+    thinking: { type: 'enabled' as const },
+  };
+  return request as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+}
+
+export async function createAnaResumeClassifierCompletion(
+  runtime: ReceptionistAiRuntime,
+  input: AnaResumeClassifierCompletionInput
+): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+  return getClient(runtime).chat.completions.create(
+    buildAnaResumeClassifierRequest(runtime, input)
+  );
 }
 
 /**
