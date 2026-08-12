@@ -223,16 +223,21 @@ async function main(): Promise<void> {
       recordPausedInbound: async () => undefined,
     });
 
-    await pauseService.pauseConversationByEcho(
-      config.phoneNumberId,
-      secretPhone,
-      {
-        now: () => 1_000,
-        persistPause: async () => {
-          throw new Error(secretError);
-        },
-      }
-    );
+    try {
+      await pauseService.pauseConversationByEcho(
+        config.phoneNumberId,
+        secretPhone,
+        {
+          now: () => 1_000,
+          persistPause: async () => {
+            throw new Error(secretError);
+          },
+        }
+      );
+    } catch {
+      // Esperado: falha durável precisa subir para o webhook pedir replay. Este
+      // smoke verifica apenas que o erro original/PII não aparece nos logs.
+    }
 
     await statusHandler.handleWhatsAppStatuses(
       {

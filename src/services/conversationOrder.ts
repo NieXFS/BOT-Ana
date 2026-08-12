@@ -103,6 +103,9 @@ const conversationOrderPool = new Pool({
   connectionString: conversationOrderDatabaseUrl,
   max: 10,
   idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+  query_timeout: 30_000,
+  statement_timeout: 30_000,
 });
 
 conversationOrderPool.on('error', (error) => {
@@ -123,6 +126,7 @@ conversationOrderPool.on('error', (error) => {
 
 export function canonicalCustomerPhone(customerPhone: string): string {
   const trimmed = customerPhone.trim();
+  if (!/^[+\d\s().-]+$/.test(trimmed)) return trimmed;
   const digits = trimmed.replace(/\D/g, '');
   return digits || trimmed;
 }

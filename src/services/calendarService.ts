@@ -6,6 +6,12 @@ import {
   runtimeErrorKind,
   safeHttpStatus,
 } from '../observability/safeRuntime';
+import {
+  CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
+  CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
+} from './customerIdentitySafety';
+
+export { CUSTOMER_IDENTITY_AMBIGUOUS_HINT } from './customerIdentitySafety';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 
@@ -120,6 +126,14 @@ interface UpcomingAppointmentsResponse {
   appointments?: UpcomingAppointment[];
 }
 
+export type CustomerIdentityFailureReason = 'customer_identity_ambiguous';
+export type UpcomingAppointmentsResult = {
+  success: boolean;
+  appointments?: UpcomingAppointment[];
+  message?: string;
+  reason?: CustomerIdentityFailureReason;
+};
+
 export interface ServiceSummary {
   id: string;
   name: string;
@@ -159,6 +173,7 @@ export type BookFailureReason =
   | 'conflict'
   | 'outside_hours'
   | 'package_exhausted'
+  | CustomerIdentityFailureReason
   | 'other';
 
 export type BookAppointmentResult = {
@@ -213,6 +228,7 @@ export function normalizeBookReason(
     serverReason === 'conflict' ||
     serverReason === 'outside_hours' ||
     serverReason === 'package_exhausted' ||
+    serverReason === 'customer_identity_ambiguous' ||
     serverReason === 'other'
   ) {
     return serverReason;
@@ -237,6 +253,8 @@ export function customerMessageForReason(
       return 'Esse horário está fora do nosso horário de atendimento.';
     case 'package_exhausted':
       return 'O pacote não tem mais sessões disponíveis para esse serviço.';
+    case 'customer_identity_ambiguous':
+      return CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE;
     default:
       return 'Não consegui concluir o agendamento nesse horário.';
   }
@@ -805,7 +823,7 @@ export async function getAvailableSlots(
 export async function getCustomerUpcomingAppointments(
   phone: string,
   config: TenantBotConfig
-): Promise<{ success: boolean; appointments?: UpcomingAppointment[]; message?: string }> {
+): Promise<UpcomingAppointmentsResult> {
   try {
     const response = await erpApi.get<UpcomingAppointmentsResponse>(
       '/api/v1/agenda/customer-upcoming',
@@ -828,6 +846,16 @@ export async function getCustomerUpcomingAppointments(
 
     return { success: true, appointments };
   } catch (err) {
+    const responseReason = axios.isAxiosError(err)
+      ? (err.response?.data as { reason?: unknown } | undefined)?.reason
+      : undefined;
+    if (responseReason === 'customer_identity_ambiguous') {
+      return {
+        success: false,
+        reason: 'customer_identity_ambiguous',
+        message: CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
+      };
+    }
     console.error(
       `❌ Erro ao consultar agendamentos futuros no ERP | error=${runtimeErrorKind(err)} | status=${safeHttpStatus(err) ?? 'n/a'}`
     );
@@ -863,7 +891,11 @@ export async function cancelAppointment(
   config: TenantBotConfig,
   currentUserMessage?: string,
   deps: CancelAppointmentDeps = defaultCancelAppointmentDeps
-): Promise<{ success: boolean; message: string }> {
+): Promise<{
+  success: boolean;
+  message: string;
+  reason?: CustomerIdentityFailureReason;
+}> {
   const requestedAppointmentId = appointmentId?.trim();
 
   if (!requestedAppointmentId) {
@@ -881,7 +913,11 @@ export async function cancelAppointment(
   if (!upcoming.success) {
     return {
       success: false,
-      message: CANCEL_UPCOMING_APPOINTMENTS_LOOKUP_FAILURE_HINT,
+      reason: upcoming.reason,
+      message:
+        upcoming.reason === 'customer_identity_ambiguous'
+          ? CUSTOMER_IDENTITY_AMBIGUOUS_HINT
+          : CANCEL_UPCOMING_APPOINTMENTS_LOOKUP_FAILURE_HINT,
     };
   }
 
@@ -921,6 +957,16 @@ export async function cancelAppointment(
       message: 'Agendamento anterior cancelado com sucesso.',
     };
   } catch (err) {
+    const responseReason = axios.isAxiosError(err)
+      ? (err.response?.data as { reason?: unknown } | undefined)?.reason
+      : undefined;
+    if (responseReason === 'customer_identity_ambiguous') {
+      return {
+        success: false,
+        reason: 'customer_identity_ambiguous',
+        message: CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
+      };
+    }
     const errorMessage =
       axios.isAxiosError(err) && typeof err.response?.data?.error === 'string'
         ? err.response.data.error
@@ -1076,6 +1122,17 @@ export async function bookAppointment(
     if (slotIsFree && !confirmedDuplicate) {
       const upcoming = await getCustomerUpcomingAppointments(phone, config);
 
+      if (
+        !upcoming.success &&
+        upcoming.reason === 'customer_identity_ambiguous'
+      ) {
+        return {
+          success: false,
+          reason: 'customer_identity_ambiguous',
+          message: CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
+        };
+      }
+
       if (upcoming.success && upcoming.appointments && upcoming.appointments.length > 0) {
         const list = upcoming.appointments
           .slice(0, 3)
@@ -1147,6 +1204,13 @@ export async function bookAppointment(
     if (axios.isAxiosError(err) && err.response) {
       const responseData = err.response.data as { reason?: unknown } | undefined;
       const reason = normalizeBookReason(responseData?.reason, err.response.status);
+      if (reason === 'customer_identity_ambiguous') {
+        return {
+          success: false,
+          reason,
+          message: CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
+        };
+      }
       // Falha por horário → entrega alternativas reais já consultadas (Guardrail A).
       if (reason === 'blocked' || reason === 'conflict' || reason === 'outside_hours') {
         return await buildUnavailableResult({

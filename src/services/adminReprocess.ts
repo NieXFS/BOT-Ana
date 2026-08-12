@@ -35,7 +35,7 @@ export interface AdminReprocessDeps {
     phone: string,
     replyText: string,
     config: TenantBotConfig
-  ) => Promise<void>;
+  ) => Promise<unknown>;
   clearRecovery: (conversationKey: string) => void;
 }
 

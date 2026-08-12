@@ -3,10 +3,22 @@ import { AsyncLocalStorage } from 'async_hooks';
 import { customerPhoneVariants } from './conversationActivity';
 import { Sentry } from '../observability/sentry';
 import { runtimeErrorKind } from '../observability/safeRuntime';
+import { canonicalConversationKey } from './conversationOrder';
+export {
+  HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
+  HUMAN_ECHO_PREFIX,
+} from './humanConversationContext';
 
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
+}
+
+export interface HistoryReadDeps {
+  query: <T extends Record<string, unknown>>(
+    sql: string,
+    params: readonly unknown[]
+  ) => Promise<{ rows: T[] }>;
 }
 
 interface PersistedInboundExecutionContext {
@@ -40,10 +52,6 @@ export function currentSourceInboundMessageId(): string | null {
  * respondeu. Fonte ÚNICA — consumido pelo echoHandler (prefixa) e pelo
  * brainService (instrui o modelo a tratar como contexto, não como fala dele).
  */
-export const HUMAN_ECHO_PREFIX = '[atendente] ';
-export const HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE =
-  '[áudio do atendente sem transcrição]';
-
 const MAX_MESSAGES = 30;
 
 if (!process.env.DATABASE_URL) {
@@ -55,6 +63,16 @@ export const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30_000,
 });
+
+const defaultHistoryReadDeps: HistoryReadDeps = {
+  query: async <T extends Record<string, unknown>>(
+    sql: string,
+    params: readonly unknown[]
+  ) => {
+    const result = await pool.query<T>(sql, [...params]);
+    return { rows: result.rows };
+  },
+};
 
 /**
  * O `pg` emite `'error'` no Pool quando um client morre fora de uma query —
@@ -84,7 +102,7 @@ pool.on('error', (err) => {
 });
 
 export function buildConversationKey(phoneNumberId: string, phone: string): string {
-  return `${phoneNumberId}:${phone}`;
+  return canonicalConversationKey(phoneNumberId, phone);
 }
 
 export async function addMessage(
@@ -127,22 +145,54 @@ export async function addMessage(
     );
 }
 
-export async function getHistory(conversationKey: string): Promise<Message[]> {
-  const result = await pool.query<{
-    role: string;
-    content: string;
-    message_id: string | null;
-  }>(
+export async function getHistory(
+  conversationKey: string,
+  deps: HistoryReadDeps = defaultHistoryReadDeps
+): Promise<Message[]> {
+  const snapshotMessageIds = persistedInboundContext.getStore()?.messageIds ?? [];
+  let snapshotMaxId: string | null = null;
+  if (snapshotMessageIds.length > 0) {
+    const snapshot = await deps.query<{
+      max_id: string | null;
+      found_ids: string[] | null;
+    }>(
+      `SELECT max("id")::text AS max_id,
+              array_agg(DISTINCT message_id) FILTER (WHERE message_id IS NOT NULL) AS found_ids
+       FROM ana_conversation_history
+       WHERE "conversationKey" = $1
+         AND message_id = ANY($2::text[])`,
+      [conversationKey, snapshotMessageIds]
+    );
+    snapshotMaxId = snapshot.rows[0]?.max_id ?? null;
+    const foundIds = new Set(snapshot.rows[0]?.found_ids ?? []);
+    const expectedIds = new Set(snapshotMessageIds);
+    if (
+      !snapshotMaxId ||
+      foundIds.size !== expectedIds.size ||
+      [...expectedIds].some((messageId) => !foundIds.has(messageId))
+    ) {
+      throw new Error(
+        'Lote de inbound persistido ficou incompleto ao fixar o snapshot do histórico.'
+      );
+    }
+  }
+
+  const result = await deps.query<{
+      role: string;
+      content: string;
+      message_id: string | null;
+    }>(
     `SELECT "role", "content", message_id
      FROM (
        SELECT "id", "role", "content", "createdAt", message_id
        FROM ana_conversation_history
        WHERE "conversationKey" = $1
+         AND ($3::bigint IS NULL OR "id" <= $3::bigint)
        ORDER BY "createdAt" DESC, "id" DESC
        LIMIT $2
      ) recent
      ORDER BY "createdAt" ASC, "id" ASC`,
-    [conversationKey, MAX_MESSAGES]
+    [conversationKey, MAX_MESSAGES, snapshotMaxId]
   );
 
   // Cada message.id é uma linha física. Para o brain, inbounds atômicas

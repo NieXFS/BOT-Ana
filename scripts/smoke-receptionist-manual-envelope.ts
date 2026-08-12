@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 process.env.DATABASE_URL ||= 'postgresql://smoke:smoke@127.0.0.1:1/smoke';
 
 async function main() {
-  const outbound = await import('../src/services/receptionistOutbound');
   const replies = await import('../src/services/questionReplyService');
   const sent: string[] = [];
   const rows = new Map<string, any>();
@@ -37,12 +36,12 @@ async function main() {
 
   const unsafe = 'Resposta da equipe:\nCura por R$ 999,00.';
   const result2 = await replies.sendQuestionReply({ ...base, idempotencyKey: 'q:2', text: unsafe, blocks: [{ source: 'TEAM_REPLY', text: unsafe }], evidence: { teamReplyAuthorization: { authoredAt: new Date().toISOString(), authoredBy: 'actor', questionId: 'q', clinicalCapability: true } }, authoritativeCatalog: { services: [], professionals: [] } }, {} as any, deps);
-  assert.equal(result2.kind, 'sent');
-  assert.equal(sent[1], outbound.RECEPTIONIST_SAFE_FALLBACK, 'hard block de preço envia fallback com recibo');
+  assert.equal(result2.kind, 'failed_pre_send');
+  assert.equal(sent.length, 1, 'hard block de preço não envia fallback ao cliente');
 
   const result3 = await replies.sendQuestionReply({ ...base, idempotencyKey: 'q:3', text: 'payload adulterado', blocks: [{ source: 'CANONICAL', text: 'outro payload' }] }, {} as any, deps);
-  assert.equal(result3.kind, 'sent');
-  assert.equal(sent[2], outbound.RECEPTIONIST_SAFE_FALLBACK, 'envelope adulterado envia fallback com recibo');
+  assert.equal(result3.kind, 'failed_pre_send');
+  assert.equal(sent.length, 1, 'envelope adulterado é bloqueado antes do transporte');
   console.log('smoke receptionist manual envelope: OK');
 }
 void main();

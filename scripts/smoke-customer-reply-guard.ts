@@ -664,6 +664,11 @@ const successfulUpcomingReadTrace = [
   },
 ];
 
+const appointmentTemporalContext = {
+  now: '2026-08-05T12:00:00-03:00',
+  timezone: 'America/Sao_Paulo',
+};
+
 const stateDescriptions = [
   'Isso, seu agendamento está confirmado para quinta, dia 06/08/2026, às 14h.',
   'Você tem um horário marcado dia 6 às 14h.',
@@ -679,12 +684,16 @@ const stateDescriptions = [
 
 for (const reply of stateDescriptions) {
   assert.equal(
-    hasFalseWriteClaim(reply, successfulUpcomingReadTrace),
+    hasFalseWriteClaim(
+      reply,
+      successfulUpcomingReadTrace,
+      appointmentTemporalContext
+    ),
     false,
     `leitura autoritativa compatível deveria licenciar estado: ${reply}`
   );
   assert.equal(
-    hasFalseWriteClaim(reply, []),
+    hasFalseWriteClaim(reply, [], appointmentTemporalContext),
     true,
     `estado sem nenhuma evidência deveria bloquear: ${reply}`
   );
@@ -946,7 +955,10 @@ assert.deepEqual(
     [],
     failedWriteTrace
   ),
-  { safe: false, reasons: ['false_write_claim'] }
+  {
+    safe: false,
+    reasons: ['false_write_claim', 'unverified_appointment_context'],
+  }
 );
 
 assert.deepEqual(

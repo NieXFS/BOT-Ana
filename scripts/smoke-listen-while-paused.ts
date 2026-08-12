@@ -5,7 +5,7 @@
  *   - recordInboundWhilePaused é à prova de falha (recorder lança → NÃO propaga);
  *   - echo do humano (texto) → grava role `assistant` com prefixo "[atendente] "
  *     + o corpo (echoHandler);
- *   - echo não-texto → placeholder curto prefixado;
+ *   - echo sem texto → marcador interno; áudio sem transcrição nunca vira fala;
  *   - echo retransmitido (mesmo message id) → NÃO grava 2x (dedup por id);
  *   - a PAUSA é disparada por cliente.
  *
@@ -166,21 +166,49 @@ async function main() {
       },
     ],
   };
+  let insideAudioLock = false;
+  let pauseInsideLock = false;
+  let downloadInsideLock = false;
+  let transcribeInsideLock = false;
+  let dedupInsideLock = false;
+  let recordInsideLock = false;
   await handleSmbMessageEchoes(audioEcho, undefined, {
     ...echoDeps,
     pauseConversation: async (pnid, phone) => {
       audioOrder.push('pause');
+      pauseInsideLock = insideAudioLock;
       pausedFor.push({ pnid, phone });
     },
     loadConfig: async () => config,
     shouldTranscribeHumanAudio: () => true,
     downloadAudio: async (mediaId) => {
       audioOrder.push(`download:${mediaId}`);
+      downloadInsideLock = insideAudioLock;
       return Buffer.from('audio-controlado');
     },
     transcribeAudio: async () => {
       audioOrder.push('transcribe');
+      transcribeInsideLock = insideAudioLock;
       return 'pode deixar marcado para sexta às 13h';
+    },
+    markEchoProcessed: async (id) => {
+      dedupInsideLock = insideAudioLock;
+      if (processedIds.has(id)) return false;
+      processedIds.add(id);
+      return true;
+    },
+    recordMessage: async (key, role, content) => {
+      recordInsideLock = insideAudioLock;
+      echoRecorded.push({ key, role, content });
+    },
+    withConversationLock: async (_pnid, _phone, work) => {
+      expect('E2) lock de áudio não é reentrante', insideAudioLock === false);
+      insideAudioLock = true;
+      try {
+        await work();
+      } finally {
+        insideAudioLock = false;
+      }
     },
   });
   expect('E2) pausa acontece antes do download', audioOrder[0] === 'pause');
@@ -189,6 +217,11 @@ async function main() {
     audioOrder.includes('download:media-owner-1')
   );
   expect('E2) transcrição foi executada', audioOrder.includes('transcribe'));
+  expect('E2) pausa acontece fora da lock', pauseInsideLock === false);
+  expect('E2) download acontece fora da lock', downloadInsideLock === false);
+  expect('E2) transcrição acontece fora da lock', transcribeInsideLock === false);
+  expect('E2) dedup acontece dentro da lock curta', dedupInsideLock === true);
+  expect('E2) persistência acontece dentro da lock curta', recordInsideLock === true);
   expect(
     'E2) histórico guarda o transcript prefixado, não o media id',
     echoRecorded[0]?.content ===
@@ -213,6 +246,38 @@ async function main() {
       `${HUMAN_ECHO_PREFIX}[áudio do atendente sem transcrição]`
   );
 
+  echoRecorded.length = 0;
+  let disabledDownloadCalls = 0;
+  await handleSmbMessageEchoes(
+    {
+      metadata: { phone_number_id: 'PNID_1' },
+      message_echoes: [
+        {
+          to: '5511CUST6',
+          id: 'wamid.echo-audio-disabled',
+          type: 'audio',
+          audio: { id: 'media-disabled' },
+        },
+      ],
+    },
+    undefined,
+    {
+      ...echoDeps,
+      loadConfig: async () => config,
+      shouldTranscribeHumanAudio: () => false,
+      downloadAudio: async () => {
+        disabledDownloadCalls += 1;
+        return Buffer.from('nao-deveria-baixar');
+      },
+    }
+  );
+  expect('E2) gate desligado não baixa a mídia', disabledDownloadCalls === 0);
+  expect(
+    'E2) gate desligado não persiste o texto ambíguo "enviou um áudio"',
+    echoRecorded[0]?.content ===
+      `${HUMAN_ECHO_PREFIX}[áudio do atendente sem transcrição]`
+  );
+
   // === G) gravação falha → marca desfeita → retransmissão recupera =========
   // (à prova de perda: o echo é o contexto do §8.2; um blip de DB na 1ª entrega
   // não pode sumir com ele — a retransmissão da Meta tem que re-gravar.)
@@ -224,7 +289,16 @@ async function main() {
     ],
   };
   failRecordOnce = true;
-  await handleSmbMessageEchoes(recoverEcho, undefined, echoDeps); // record lança → unmark
+  let firstDeliveryRejected = false;
+  try {
+    await handleSmbMessageEchoes(recoverEcho, undefined, echoDeps); // record lança → unmark + 5xx
+  } catch {
+    firstDeliveryRejected = true;
+  }
+  expect(
+    'G) falha durável propaga para o webhook solicitar retransmissão',
+    firstDeliveryRejected
+  );
   expect('G) gravação falhou na 1ª entrega (nada gravado ainda)', echoRecorded.length === 0);
   expect('G) id desmarcado (idempotência liberada p/ re-tentar)', processedIds.has('wamid.echo3') === false);
   await handleSmbMessageEchoes(recoverEcho, undefined, echoDeps); // retransmissão → grava
@@ -244,6 +318,27 @@ async function main() {
   const parsedAudio = parseEchoMessages(audioEcho);
   expect('F) parse: tipo audio preservado', parsedAudio[0]?.messageType === 'audio');
   expect('F) parse: media id extraído', parsedAudio[0]?.mediaId === 'media-owner-1');
+  expect(
+    'F) parse: áudio cru já nasce como indisponível, nunca como frase enviável',
+    parsedAudio[0]?.content ===
+      `${HUMAN_ECHO_PREFIX}[áudio do atendente sem transcrição]`
+  );
+
+  const canonicalPhoneEcho = parseEchoMessages({
+    metadata: { phone_number_id: 'PNID_1' },
+    message_echoes: [
+      {
+        to: '+55 (11) 99999-0000',
+        id: 'wamid.echo-canonical',
+        type: 'text',
+        text: { body: 'ok' },
+      },
+    ],
+  });
+  expect(
+    'F) parse: telefone do echo converge para a chave canônica do inbound',
+    canonicalPhoneEcho[0]?.customerPhone === '5511999990000'
+  );
 
   const noId = {
     metadata: { phone_number_id: 'PNID_1' },

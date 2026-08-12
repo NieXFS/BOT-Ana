@@ -29,6 +29,8 @@ import {
   customerMessageForReason,
   getAvailableSlots,
   bookAppointment,
+  cancelAppointment,
+  CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
   type BookFailureReason,
 } from "../src/services/calendarService.ts";
 import type { TenantBotConfig } from "../src/configProvider.ts";
@@ -66,7 +68,14 @@ const FUTURE_DATE = "2099-01-02";
 
 async function main() {
   // ===== Falha 3: mapeamento de reason → mensagem =====
-  const reasons: BookFailureReason[] = ["blocked", "conflict", "outside_hours", "package_exhausted", "other"];
+  const reasons: BookFailureReason[] = [
+    "blocked",
+    "conflict",
+    "outside_hours",
+    "package_exhausted",
+    "customer_identity_ambiguous",
+    "other",
+  ];
   for (const r of reasons) {
     record(`reason "${r}" preservado por normalizeBookReason`, normalizeBookReason(r) === r);
   }
@@ -100,6 +109,40 @@ async function main() {
     'customerMessageForReason("package_exhausted") fala em pacote',
     /pacote/i.test(customerMessageForReason("package_exhausted")),
     customerMessageForReason("package_exhausted")
+  );
+  const identityMessage = customerMessageForReason("customer_identity_ambiguous");
+  record(
+    'customer_identity_ambiguous orienta atendimento humano sem falar em horário',
+    /identificar seu cadastro com segurança/i.test(identityMessage) &&
+      /equipe do estabelecimento/i.test(identityMessage) &&
+      !/horário|vaga|disponibilidade/i.test(identityMessage),
+    identityMessage
+  );
+
+  let ambiguousCancelPostCalls = 0;
+  const ambiguousCancel = await cancelAppointment(
+    "appointment-smoke",
+    "+5511999999999",
+    config,
+    "Quero cancelar meu agendamento",
+    {
+      getUpcomingAppointments: async () => ({
+        success: false,
+        reason: "customer_identity_ambiguous",
+        message: CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
+      }),
+      postCancel: async () => {
+        ambiguousCancelPostCalls += 1;
+      },
+    }
+  );
+  record(
+    "cancelamento com identidade ambígua falha fechado antes do POST",
+    ambiguousCancel.success === false &&
+      ambiguousCancel.reason === "customer_identity_ambiguous" &&
+      ambiguousCancel.message === CUSTOMER_IDENTITY_AMBIGUOUS_HINT &&
+      ambiguousCancelPostCalls === 0,
+    ambiguousCancel.message
   );
 
   // ===== Falha 1: guards de serviceId (pré-rede) =====
@@ -180,6 +223,12 @@ async function main() {
     "package_exhausted/other não viram disponibilidade e preservam hint de fallback",
     calSrc.includes("package_exhausted / other: oferecer horários não resolve") &&
       calSrc.includes("BOOK_ALTERNATIVES_HINT"),
+  );
+  record(
+    "identidade ambígua é tratada antes das alternativas de horário",
+    calSrc.indexOf("if (reason === 'customer_identity_ambiguous')") >= 0 &&
+      calSrc.indexOf("if (reason === 'customer_identity_ambiguous')") <
+        calSrc.indexOf("if (reason === 'blocked' || reason === 'conflict' || reason === 'outside_hours')"),
   );
 
   const failed = checks.filter((c) => !c.ok);

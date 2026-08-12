@@ -82,7 +82,7 @@ interface CloudWebhookValue {
   statuses?: unknown[];
 }
 
-const app = express();
+export const app = express();
 
 // 1) Rate limit ANTES do parser: barra enxurradas sem custo de parsing JSON.
 app.use(webhookRateLimitMiddleware);
@@ -102,6 +102,16 @@ const VERIFY_TOKEN =
   process.env.WA_GLOBAL_VERIFY_TOKEN ?? process.env.WA_VERIFY_TOKEN ?? '';
 const LEGACY_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID ?? '';
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
+
+type WebhookEchoHandler = typeof handleSmbMessageEchoes;
+let webhookEchoHandler: WebhookEchoHandler = handleSmbMessageEchoes;
+
+/** Seam exclusivo de smoke HTTP; `undefined` restaura o handler produtivo. */
+export function __setWebhookEchoHandlerForTest(
+  handler?: WebhookEchoHandler
+): void {
+  webhookEchoHandler = handler ?? handleSmbMessageEchoes;
+}
 
 async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
   const phoneNumberId =
@@ -193,70 +203,73 @@ app.get('/webhook', (req: Request, res: Response) => {
   res.sendStatus(403);
 });
 
-app.post('/webhook', botSignatureMiddleware, (req: Request, res: Response) => {
-  res.sendStatus(200);
+app.post('/webhook', botSignatureMiddleware, async (req: Request, res: Response) => {
+  try {
+    const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
 
-  const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+    for (const entry of entries) {
+      const changes = Array.isArray(entry?.changes) ? entry.changes : [];
 
-  for (const entry of entries) {
-    const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+      for (const change of changes) {
+        const value = change?.value as CloudWebhookValue | undefined;
+        if (!value) {
+          continue;
+        }
 
-    for (const change of changes) {
-      const value = change?.value as CloudWebhookValue | undefined;
-      if (!value) {
-        continue;
-      }
+        // Coexistence: o dono respondeu PELO app do WhatsApp (echo) → pausa a
+        // conversa pra Ana não falar por cima do humano. O 200 só sai DEPOIS
+        // da persistência durável; falha retorna 500 para a Meta retransmitir.
+        if (isEchoChange(change?.field)) {
+          await webhookEchoHandler(value, LEGACY_PHONE_NUMBER_ID);
+          continue;
+        }
 
-      // Coexistence: o dono respondeu PELO app do WhatsApp (echo) → pausa a
-      // conversa pra Ana não falar por cima do humano. NÃO é mensagem de cliente,
-      // então não vai pra handleIncomingMessage.
-      if (isEchoChange(change?.field)) {
-        handleSmbMessageEchoes(value, LEGACY_PHONE_NUMBER_ID).catch((err) => {
-          Sentry.captureException(new Error('webhook echo processing failed'), {
+        // Status Meta (sent/delivered/read/failed) é um fato separado de inbound:
+        // não passa pelo dedup por message.id e não é mais descartado.
+        if (value.statuses?.length) {
+          handleWhatsAppStatuses(value).catch((err) => {
+            Sentry.captureException(new Error('whatsapp status handler failed'), {
+              tags: {
+                service: 'webhook_server',
+                operation: 'whatsapp_statuses',
+                error_kind: err instanceof Error ? err.name : typeof err,
+              },
+            });
+          });
+        }
+
+        if (!value.messages?.length) {
+          continue;
+        }
+
+        processWebhookValue(value).catch((err) => {
+          Sentry.captureException(new Error('webhook payload processing failed'), {
             tags: {
               service: 'webhook_server',
-              operation: 'smb_message_echoes',
+              operation: 'process_payload',
               error_kind: runtimeErrorKind(err),
             },
           });
           console.error(
-            `❌ Erro ao processar smb_message_echoes | error=${runtimeErrorKind(err)}`
+            `❌ Erro ao processar payload do webhook | error=${runtimeErrorKind(err)}`
           );
         });
-        continue;
       }
-
-      // Status Meta (sent/delivered/read/failed) é um fato separado de inbound:
-      // não passa pelo dedup por message.id e não é mais descartado.
-      if (value.statuses?.length) {
-        handleWhatsAppStatuses(value).catch((err) => {
-          Sentry.captureException(new Error('whatsapp status handler failed'), {
-            tags: {
-              service: 'webhook_server',
-              operation: 'whatsapp_statuses',
-              error_kind: err instanceof Error ? err.name : typeof err,
-            },
-          });
-        });
-      }
-
-      if (!value.messages?.length) {
-        continue;
-      }
-
-      processWebhookValue(value).catch((err) => {
-        Sentry.captureException(new Error('webhook payload processing failed'), {
-          tags: {
-            service: 'webhook_server',
-            operation: 'process_payload',
-            error_kind: runtimeErrorKind(err),
-          },
-        });
-        console.error(
-          `❌ Erro ao processar payload do webhook | error=${runtimeErrorKind(err)}`
-        );
-      });
     }
+
+    res.sendStatus(200);
+  } catch (err) {
+    Sentry.captureException(new Error('webhook echo processing failed'), {
+      tags: {
+        service: 'webhook_server',
+        operation: 'smb_message_echoes',
+        error_kind: runtimeErrorKind(err),
+      },
+    });
+    console.error(
+      `❌ Erro ao persistir smb_message_echoes | error=${runtimeErrorKind(err)}`
+    );
+    res.sendStatus(500);
   }
 });
 
@@ -794,14 +807,16 @@ async function boot(): Promise<void> {
   });
 }
 
-boot().catch((err) => {
-  Sentry.captureException(new Error('receps-ia boot failed'), {
-    tags: {
-      service: 'webhook_server',
-      operation: 'boot',
-      error_kind: runtimeErrorKind(err),
-    },
+if (process.env.RECEPS_IA_SKIP_BOOT !== '1') {
+  void boot().catch((err) => {
+    Sentry.captureException(new Error('receps-ia boot failed'), {
+      tags: {
+        service: 'webhook_server',
+        operation: 'boot',
+        error_kind: runtimeErrorKind(err),
+      },
+    });
+    console.error(`❌ Falha no boot do Receps-IA | error=${runtimeErrorKind(err)}`);
+    process.exit(1);
   });
-  console.error(`❌ Falha no boot do Receps-IA | error=${runtimeErrorKind(err)}`);
-  process.exit(1);
-});
+}

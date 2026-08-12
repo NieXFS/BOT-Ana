@@ -2,9 +2,11 @@ import { pauseConversationByEcho } from './services/pauseService';
 import {
   addMessage,
   buildConversationKey,
+} from './services/contextManager';
+import {
   HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
   HUMAN_ECHO_PREFIX,
-} from './services/contextManager';
+} from './services/humanConversationContext';
 import {
   markMessageProcessed,
   unmarkMessageProcessed,
@@ -12,6 +14,7 @@ import {
 import { Sentry } from './observability/sentry';
 import { runtimeErrorKind } from './observability/safeRuntime';
 import {
+  canonicalCustomerPhone,
   canonicalConversationKey,
   withConversationLock,
 } from './services/conversationOrder';
@@ -19,6 +22,7 @@ import { getTenantConfig, type TenantBotConfig } from './configProvider';
 import { downloadMedia } from './whatsappCloudService';
 import { transcreverAudioBuffer } from './utils/transcriber';
 import { isAnaResumeGateEnabled } from './services/anaResumeGate';
+import { persistHumanEchoAtomically } from './services/anaWave2Store';
 
 export { HUMAN_ECHO_PREFIX };
 
@@ -50,6 +54,13 @@ export interface EchoDeps {
   ) => Promise<boolean>;
   /** Desfaz a marca quando a gravação falha → a retransmissão da Meta re-tenta. */
   unmarkEcho: (messageId: string) => Promise<void>;
+  /** Caminho produtivo: dedup + histórico em uma transação crash-safe. */
+  persistEchoAtomically?: (input: {
+    messageId: string;
+    phoneNumberId: string;
+    conversationKey: string;
+    content: string;
+  }) => Promise<boolean>;
   recordMessage: (
     conversationKey: string,
     role: 'user' | 'assistant',
@@ -71,6 +82,7 @@ const defaultEchoDeps: EchoDeps = {
   pauseConversation: pauseConversationByEcho,
   markEchoProcessed: markMessageProcessed,
   unmarkEcho: unmarkMessageProcessed,
+  persistEchoAtomically: persistHumanEchoAtomically,
   recordMessage: addMessage,
   withConversationLock: (phoneNumberId, customerPhone, work) =>
     withConversationLock(phoneNumberId, customerPhone, async () => work()),
@@ -121,7 +133,8 @@ export function parseEchoTargets(
   for (const echo of echoes) {
     if (!echo || typeof echo !== 'object') continue;
     const to = (echo as { to?: unknown }).to;
-    const customerPhone = typeof to === 'string' ? to.trim() : '';
+    const customerPhone =
+      typeof to === 'string' ? canonicalCustomerPhone(to) : '';
     if (!customerPhone) continue;
     if (seen.has(customerPhone)) continue;
     seen.add(customerPhone);
@@ -168,6 +181,9 @@ function buildEchoContent(echo: {
     const body = typeof echo.text?.body === 'string' ? echo.text.body.trim() : '';
     return `${HUMAN_ECHO_PREFIX}${body || 'enviou uma mensagem'}`;
   }
+  if (type === 'audio' || type === 'voice') {
+    return `${HUMAN_ECHO_PREFIX}${HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE}`;
+  }
   return `${HUMAN_ECHO_PREFIX}${placeholderForType(type)}`;
 }
 
@@ -208,7 +224,8 @@ export function parseEchoMessages(
       audio?: { id?: unknown };
       voice?: { id?: unknown };
     };
-    const customerPhone = typeof e.to === 'string' ? e.to.trim() : '';
+    const customerPhone =
+      typeof e.to === 'string' ? canonicalCustomerPhone(e.to) : '';
     const messageId = typeof e.id === 'string' ? e.id.trim() : '';
     if (!customerPhone || !messageId) continue;
     const messageType = typeof e.type === 'string' ? e.type : '';
@@ -243,7 +260,9 @@ async function resolveEchoContent(
     deps.shouldTranscribeHumanAudio ?? defaultEchoDeps.shouldTranscribeHumanAudio;
   try {
     const config = await loadConfig?.(message.phoneNumberId);
-    if (!config || !shouldTranscribe?.(config)) return message.content;
+    if (!config || !shouldTranscribe?.(config)) {
+      return `${HUMAN_ECHO_PREFIX}${HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE}`;
+    }
     if (!message.mediaId || !downloadAudio || !transcribeAudio) {
       return `${HUMAN_ECHO_PREFIX}${HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE}`;
     }
@@ -280,7 +299,9 @@ async function resolveEchoContent(
  *     pra Ana ter contexto ao retomar. Idempotente por message id (a Meta
  *     retransmite) → não grava 2x.
  *
- * NUNCA lança (os erros das chamadas são capturados aqui e no pauseService).
+ * Falha de persistência/serialização é observada e PROPAGADA para o webhook
+ * responder 5xx. Só depois da gravação durável a Meta pode receber 200; assim
+ * uma retransmissão continua possível se o processo ou o PostgreSQL falharem.
  * NUNCA loga o conteúdo do echo (só o fato; o scrub vale — sem console.log do
  * texto). Qualquer tipo de echo conta como ação humana → pausa.
  */
@@ -295,25 +316,74 @@ export async function handleSmbMessageEchoes(
     deps.withConversationLock ??
     (async (_phoneNumberId: string, _customerPhone: string, work: () => Promise<void>) =>
       work());
+  let processingFailure: unknown = null;
 
-  // Pausa + registros do mesmo cliente entram na MESMA advisory lock usada por
-  // intake e resposta manual. Assim o echo não se perde no meio de um envio.
+  // A pausa local é publicada antes de qualquer I/O caro. Download/transcrição
+  // ficam fora da advisory lock para não prender o pool por segundos; somente
+  // dedup + persistência final compartilham a lock de ordenação da conversa.
   for (const target of targets) {
     try {
-      await serialize(target.phoneNumberId, target.customerPhone, async () => {
-        await deps.pauseConversation(target.phoneNumberId, target.customerPhone);
+      await deps.pauseConversation(target.phoneNumberId, target.customerPhone);
+    } catch (err) {
+      // A pausa local já foi publicada pelo pauseService. Ainda assim, sem o
+      // carimbo durável no ERP a entrega não pode ser confirmada à Meta: o erro
+      // agregado no final faz o webhook responder 5xx e habilita retransmissão.
+      processingFailure ??= err;
+      Sentry.captureException(new Error('echo durable pause failed'), {
+        tags: {
+          service: 'echo_handler',
+          operation: 'pause_conversation',
+          phoneNumberId: target.phoneNumberId,
+          error_kind: runtimeErrorKind(err),
+        },
+      });
+    }
 
-        for (const message of messages) {
-          if (
-            message.phoneNumberId !== target.phoneNumberId ||
-            message.customerPhone !== target.customerPhone
-          ) {
-            continue;
-          }
+    try {
+      const resolvedMessages: Array<{
+        message: EchoMessage;
+        content: string;
+      }> = [];
+      for (const message of messages) {
+        if (
+          message.phoneNumberId !== target.phoneNumberId ||
+          message.customerPhone !== target.customerPhone
+        ) {
+          continue;
+        }
+        resolvedMessages.push({
+          message,
+          content: await resolveEchoContent(message, deps),
+        });
+      }
+
+      await serialize(target.phoneNumberId, target.customerPhone, async () => {
+        for (const { message, content } of resolvedMessages) {
           const conversationKey = canonicalConversationKey(
             message.phoneNumberId,
             message.customerPhone
           );
+          if (deps.persistEchoAtomically) {
+            try {
+              await deps.persistEchoAtomically({
+                messageId: message.messageId,
+                phoneNumberId: message.phoneNumberId,
+                conversationKey,
+                content,
+              });
+            } catch (err) {
+              processingFailure ??= err;
+              Sentry.captureException(new Error('echo atomic persistence failed'), {
+                tags: {
+                  service: 'echo_handler',
+                  operation: 'persist_echo_atomically',
+                  phoneNumberId: message.phoneNumberId,
+                  error_kind: runtimeErrorKind(err),
+                },
+              });
+            }
+            continue;
+          }
           let fresh = true;
           try {
             fresh = await deps.markEchoProcessed(
@@ -322,6 +392,7 @@ export async function handleSmbMessageEchoes(
               conversationKey
             );
           } catch (err) {
+            processingFailure ??= err;
             Sentry.captureException(new Error('echo dedup write failed'), {
               tags: {
                 service: 'echo_handler',
@@ -335,13 +406,13 @@ export async function handleSmbMessageEchoes(
           if (!fresh) continue;
 
           try {
-            const content = await resolveEchoContent(message, deps);
             await deps.recordMessage(
               buildConversationKey(message.phoneNumberId, message.customerPhone),
               'assistant',
               content
             );
           } catch (err) {
+            processingFailure ??= err;
             Sentry.captureException(new Error('echo history write failed'), {
               tags: {
                 service: 'echo_handler',
@@ -353,6 +424,7 @@ export async function handleSmbMessageEchoes(
             try {
               await deps.unmarkEcho(message.messageId);
             } catch (unmarkErr) {
+              processingFailure ??= unmarkErr;
               Sentry.captureException(new Error('echo dedup rollback failed'), {
                 tags: {
                   service: 'echo_handler',
@@ -366,6 +438,7 @@ export async function handleSmbMessageEchoes(
         }
       });
     } catch (err) {
+      processingFailure ??= err;
       Sentry.captureException(new Error('echo serialization failed'), {
         tags: {
           service: 'echo_handler',
@@ -375,5 +448,11 @@ export async function handleSmbMessageEchoes(
         },
       });
     }
+  }
+
+  if (processingFailure) {
+    const error = new Error('HumanEchoProcessingFailed');
+    (error as Error & { cause?: unknown }).cause = processingFailure;
+    throw error;
   }
 }

@@ -236,6 +236,58 @@ async function main(): Promise<void> {
     );
   }
 
+  console.log('▶ envio de áudio ambíguo nunca gera texto duplicado');
+  for (const transportCode of ['ETIMEDOUT', 'ECONNRESET']) {
+    for (const includesAxiosRequest of [true, false]) {
+      const ambiguous = Object.assign(new Error('timeout após POST'), {
+        code: transportCode,
+        ...(includesAxiosRequest ? { request: {} } : {}),
+      });
+      const { deps, log } = harness({
+        sendAudio: async () => {
+          log.events.push('audio:POST_POSSIVELMENTE_ACEITO');
+          throw ambiguous;
+        },
+      });
+      await deliverSalesReply('lead', original, config, deps);
+      check(
+        `${transportCode} ${includesAxiosRequest ? 'Axios' : 'Error comum'} não envia fallback textual`,
+        log.events.join('|') === 'audio:POST_POSSIVELMENTE_ACEITO'
+      );
+      check(
+        `${transportCode} ${includesAxiosRequest ? 'Axios' : 'Error comum'} registra warning de send`,
+        log.warnings.includes('send')
+      );
+    }
+  }
+  {
+    const ambiguous = Object.assign(new Error('fallback text timeout'), {
+      code: 'ETIMEDOUT',
+      request: {},
+    });
+    const { deps } = harness({
+      synthesize: async () => {
+        throw new Error('tts indisponível');
+      },
+      sendText: async () => {
+        throw ambiguous;
+      },
+    });
+    let propagated: unknown = null;
+    try {
+      await deliverSalesReply('lead', original, config, deps);
+    } catch (error) {
+      propagated = error;
+    }
+    const { isAmbiguousWhatsAppTransportError } = await import(
+      '../src/whatsappCloudService'
+    );
+    check(
+      'fallback textual ambíguo chega ao caller sem virar retry elegível',
+      isAmbiguousWhatsAppTransportError(propagated)
+    );
+  }
+
   console.log('▶ split voz + link');
   const splitText =
     'Deixei tudo organizado pra você começar com calma por aqui: https://receps.com.br/cadastro?x=1';
@@ -246,6 +298,25 @@ async function main(): Promise<void> {
       'ordem = voz depois texto só-link',
       log.events[0] === 'audio:MEDIA_NEW' &&
         log.events[1] === 'text:https://receps.com.br/cadastro?x=1'
+    );
+  }
+  {
+    const ambiguous = Object.assign(new Error('link timeout'), {
+      isAxiosError: true,
+      code: 'ECONNRESET',
+      request: {},
+    });
+    const { deps, log } = harness({
+      sendText: async (_to, text) => {
+        log.events.push(`text:${text}`);
+        throw ambiguous;
+      },
+    });
+    await deliverSalesReply('lead', splitText, config, deps);
+    check(
+      'link ambíguo não reenvia o ORIGINAL completo',
+      log.events.join('|') ===
+        'audio:MEDIA_NEW|text:https://receps.com.br/cadastro?x=1'
     );
   }
   {

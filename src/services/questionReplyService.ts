@@ -340,7 +340,7 @@ export async function sendQuestionReply(
   const validated = validateReceptionistOutbound(envelope);
   if (!validated.originalAccepted) {
     console.warn(
-      `[receptionist-outbound] fallback purpose=${validated.purpose} reasons=${validated.reasonCodes.join(',')} sources=${validated.sources.join(',')}`
+      `[receptionist-outbound] suppressed purpose=${validated.purpose} reasons=${validated.reasonCodes.join(',')} sources=${validated.sources.join(',')}`
     );
   }
   const transportInput: QuestionReplyInput = {
@@ -369,6 +369,18 @@ export async function sendQuestionReply(
       row.conversationKey === conversationKey;
     if (!samePayload) return { kind: 'conflict' };
     return resultFromExisting(row);
+  }
+
+  if (!validated.originalAccepted) {
+    const row = await deps.store.update(
+      input.idempotencyKey,
+      'failed_pre_send',
+      null,
+      sanitizeFailureCode(
+        `SAFETY_REJECTED_${validated.reasonCodes.join('_') || 'UNKNOWN'}`
+      )
+    );
+    return { kind: 'failed_pre_send', failureCode: row.failureCode };
   }
 
   let transportAttempted = false;

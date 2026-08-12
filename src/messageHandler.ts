@@ -1,5 +1,6 @@
 import type { TenantBotConfig } from './configProvider';
 import {
+  ConversationPausedBeforeDispatch,
   getLastResolvedSalesConversationRole,
   getReply,
 } from './services/brainService';
@@ -23,6 +24,7 @@ import {
   sendFreeformMessageWithReceipt,
   downloadMedia,
   typingDelay,
+  isAmbiguousWhatsAppTransportError,
 } from './whatsappCloudService';
 import { conversationTracker } from './conversationTracker';
 import { Sentry } from './observability/sentry';
@@ -65,8 +67,10 @@ import {
   validateReceptionistOutbound,
   type ValidatedReceptionistOutbound,
 } from './services/receptionistOutbound';
+import { withConversationLock } from './services/conversationOrder';
 
 type OutboundReply = string | ValidatedReceptionistOutbound;
+export type ConfiguredReplyDelivery = 'sent' | 'suppressed';
 
 interface MessageBuffer {
   texts: string[];
@@ -122,6 +126,15 @@ export function shouldSendOutsideHoursNotice(
   return true;
 }
 
+/**
+ * Reverte a reserva quando a mensagem não chegou ao transporte (por exemplo,
+ * takeover humano venceu a revalidação sob lock). A janela representa aviso
+ * efetivamente entregue, não apenas uma tentativa.
+ */
+export function releaseOutsideHoursNotice(bufferKey: string): void {
+  outsideHoursNoticeUntil.delete(bufferKey);
+}
+
 export interface FlushDeps {
   getReply: typeof getReply;
   sendReply: (
@@ -130,13 +143,13 @@ export interface FlushDeps {
     // continua apontando para a fronteira tipada `sendConfiguredReply`.
     text: any,
     config: TenantBotConfig
-  ) => Promise<void>;
+  ) => Promise<void | ConfiguredReplyDelivery>;
   /** Caminho que ignora voz para fallbacks de sistema. */
   sendReplyPlain?: (
     from: string,
     text: string,
     config: TenantBotConfig
-  ) => Promise<void>;
+  ) => Promise<void | ConfiguredReplyDelivery>;
   isPaused?: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
   recordPausedInbound?: (
     conversationKey: string,
@@ -144,6 +157,11 @@ export interface FlushDeps {
     config: TenantBotConfig
   ) => Promise<void>;
   markPostLink?: typeof markFollowupPostLink;
+  withConversationLock?: (
+    phoneNumberId: string,
+    customerPhone: string,
+    work: () => Promise<void>
+  ) => Promise<void>;
 }
 
 /**
@@ -168,22 +186,30 @@ export interface ConfiguredReplyDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
-  /** Sales exige o recibo `messages[0].id`; recepção preserva o transporte legado. */
+  /** Sales exige o recibo `messages[0].id`; recepção usa o mesmo transporte com recibo. */
   sendSalesText?: (
     from: string,
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
+  /** Revalidação imediatamente após a digitação e antes do POST. */
+  isPausedBeforeTransport?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
 }
 
 const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
   voiceEnabled: isRenataVoiceEnabled,
   deliverVoice: deliverSalesReply,
   waitTyping: typingDelay,
-  sendText: sendFreeformMessage,
+  sendText: async (from, text, config) => {
+    await sendFreeformMessageWithReceipt(from, text, config);
+  },
   sendSalesText: async (from, text, config) => {
     await sendFreeformMessageWithReceipt(from, text, config);
   },
+  isPausedBeforeTransport: isConversationPaused,
 };
 
 /** Seam do ponto de entrega: permite provar o caminho byte-idêntico da recepção. */
@@ -192,7 +218,7 @@ export async function sendConfiguredReply(
   text: OutboundReply,
   config: TenantBotConfig,
   deps: ConfiguredReplyDeps = defaultConfiguredReplyDeps
-): Promise<void> {
+): Promise<ConfiguredReplyDelivery> {
   if (config.botRole !== 'sales') {
     const validated = typeof text === 'string'
       ? validateReceptionistOutbound(buildReceptionistEnvelope({
@@ -203,22 +229,41 @@ export async function sendConfiguredReply(
       : text;
     if (!validated.originalAccepted) {
       console.warn(
-        `[receptionist-outbound] fallback purpose=${validated.purpose} reasons=${validated.reasonCodes.join(',')} sources=${validated.sources.join(',')}`
+        `[receptionist-outbound] suppressed purpose=${validated.purpose} reasons=${validated.reasonCodes.join(',')} sources=${validated.sources.join(',')} convHash=${conversationHash(config.phoneNumberId, from)}`
       );
+      Sentry.captureMessage('Saída da recepcionista suprimida antes do WhatsApp', {
+        level: 'warning',
+        tags: {
+          service: 'receptionist_outbound',
+          operation: 'suppress_unsafe_outbound',
+          phoneNumberId: config.phoneNumberId,
+          tenantSlug: config.tenantSlug,
+          purpose: validated.purpose,
+          reason_codes: validated.reasonCodes.join(','),
+        },
+      });
+      return 'suppressed';
     }
     if (typingSimEnabled(config)) await deps.waitTyping(validated.payload);
+    if (
+      deps.isPausedBeforeTransport &&
+      (await deps.isPausedBeforeTransport(config.phoneNumberId, from))
+    ) {
+      return 'suppressed';
+    }
     await deps.sendText(from, validated.payload, config);
-    return;
+    return 'sent';
   }
   const salesText = typeof text === 'string' ? text : text.payload;
   if (deps.voiceEnabled(config)) {
     await deps.deliverVoice(from, salesText, config);
-    return;
+    return 'sent';
   }
   if (typingSimEnabled(config)) {
     await deps.waitTyping(salesText);
   }
   await (deps.sendSalesText ?? deps.sendText)(from, salesText, config);
+  return 'sent';
 }
 
 const defaultFlushDeps: FlushDeps = {
@@ -231,19 +276,27 @@ const defaultFlushDeps: FlushDeps = {
         text,
         config
       );
+      if (!outbound.originalAccepted) return 'suppressed';
       if (typingSimEnabled(config)) await typingDelay(outbound.payload);
-      await deliverValidatedReceptionistText(from, outbound, config);
-      return;
+      if (await isConversationPaused(config.phoneNumberId, from)) {
+        return 'suppressed';
+      }
+      return (await deliverValidatedReceptionistText(from, outbound, config))
+        ? 'sent'
+        : 'suppressed';
     }
     const outbound = text;
     if (typingSimEnabled(config)) {
       await typingDelay(outbound);
     }
     await sendFreeformMessage(from, outbound, config);
+    return 'sent';
   },
   isPaused: isConversationPaused,
   recordPausedInbound: recordInboundWhilePaused,
   markPostLink: markFollowupPostLink,
+  withConversationLock: (phoneNumberId, customerPhone, work) =>
+    withConversationLock(phoneNumberId, customerPhone, async () => work()),
 };
 
 function safeSalesContext(config: TenantBotConfig, from: string): string {
@@ -278,12 +331,37 @@ async function emitFlushFallback(
   }
   flushRecoveryUntil.set(bufferKey, now + FLUSH_RECOVERY_WINDOW_MS);
   try {
-    await (deps.sendReplyPlain ?? deps.sendReply)(
-      from,
-      FLUSH_FALLBACK_MESSAGE,
-      config
-    );
-    console.log(`🆘 [flush] fallback de erro enviado | ${safeSalesContext(config, from)}`);
+    const sendFallback = () =>
+      (deps.sendReplyPlain ?? deps.sendReply)(
+        from,
+        FLUSH_FALLBACK_MESSAGE,
+        config
+      );
+    let sent = true;
+    if (config.botRole !== 'sales') {
+      const serialize = deps.withConversationLock ??
+        (async (
+          _phoneNumberId: string,
+          _customerPhone: string,
+          work: () => Promise<void>
+        ) => work());
+      const isPaused = deps.isPaused ?? isConversationPaused;
+      await serialize(config.phoneNumberId, from, async () => {
+        if (await isPaused(config.phoneNumberId, from)) {
+          sent = false;
+          return;
+        }
+        const result = await sendFallback();
+        if (result === 'suppressed') sent = false;
+      });
+    } else {
+      await sendFallback();
+    }
+    if (sent) {
+      console.log(`🆘 [flush] fallback de erro enviado | ${safeSalesContext(config, from)}`);
+    } else {
+      console.log(`⏸️ [flush] fallback suprimido por pausa/validação | ${safeSalesContext(config, from)}`);
+    }
   } catch (sendErr) {
     Sentry.captureException(new Error('message_handler flush fallback send failed'), {
       tags: {
@@ -301,7 +379,7 @@ async function emitFlushFallback(
 }
 
 function buildBufferKey(config: TenantBotConfig, from: string): string {
-  return `${config.phoneNumberId}:${from}`;
+  return buildConversationKey(config.phoneNumberId, from);
 }
 
 function getCurrentTimeInTimezone(timezone: string): string {
@@ -483,13 +561,19 @@ export async function flushBuffer(
       }
 
       try {
-        await deps.sendReply(from, reply!, config);
-        if (hasSalesSignupUrl(reply) && deps.markPostLink) {
+        const salesDelivery = await deps.sendReply(from, reply!, config);
+        if (
+          salesDelivery !== 'suppressed' &&
+          hasSalesSignupUrl(reply) &&
+          deps.markPostLink
+        ) {
           await deps
             .markPostLink(config.phoneNumberId, from)
             .catch(() => undefined);
         }
-        notifySalesReplyDelivered(bufferKey, 'novo_inbound');
+        if (salesDelivery !== 'suppressed') {
+          notifySalesReplyDelivered(bufferKey, 'novo_inbound');
+        }
         console.log(
           `🤖 ${config.botName} respondeu | ${safeSalesContext(config, from)} | chars=${reply.length}`
         );
@@ -511,6 +595,28 @@ export async function flushBuffer(
         console.error(
           `❌ Erro ao enviar resposta de vendas | ${safeSalesContext(config, from)} | error=${errorKind(err)}`
         );
+
+        if (isAmbiguousWhatsAppTransportError(err)) {
+          console.warn(
+            `🟡 [sales] resultado do transporte desconhecido; sem recovery/retry | ${safeSalesContext(config, from)}`
+          );
+          Sentry.captureMessage('Resultado do transporte de vendas desconhecido', {
+            level: 'warning',
+            tags: {
+              service: 'message_handler',
+              operation: 'sales_transport_outcome_unknown',
+              phoneNumberId: config.phoneNumberId,
+              tenantSlug: config.tenantSlug,
+            },
+          });
+          const current = messageBuffers.get(bufferKey);
+          if (current) {
+            current.pendingTexts = [];
+            current.pendingMessageIds = [];
+          }
+          messageBuffers.delete(bufferKey);
+          return;
+        }
 
         // Um takeover ocorrido durante a tentativa de envio não deve abrir um
         // recovery nem emitir falha_resposta.
@@ -544,23 +650,44 @@ export async function flushBuffer(
         consolidatedText,
         deps
       );
+      const serialize =
+        deps.withConversationLock ??
+        (async (
+          _phoneNumberId: string,
+          _customerPhone: string,
+          work: () => Promise<void>
+        ) => work());
+      let delivery: ConfiguredReplyDelivery = 'sent';
 
-      // A mesma barreira pós-brain vale para a recepcionista.
-      if (
-        await suppressFlushIfPaused({
-          bufferKey,
-          buffer,
-          alreadyProcessedTexts: [],
-          deps,
-        })
-      ) {
-        return;
+      // A pausa e o transporte compartilham a MESMA advisory lock do echo. Se o
+      // humano assumir durante o brain, o echo grava a pausa antes deste bloco e
+      // a resposta é descartada. Não existe mais janela entre o último check e o
+      // POST ao WhatsApp.
+      await serialize(config.phoneNumberId, from, async () => {
+        if (
+          await suppressFlushIfPaused({
+            bufferKey,
+            buffer,
+            alreadyProcessedTexts: [],
+            deps,
+          })
+        ) {
+          delivery = 'suppressed';
+          return;
+        }
+        const result = await deps.sendReply(from, reply, config);
+        if (result === 'suppressed') delivery = 'suppressed';
+      });
+
+      if (delivery === 'sent') {
+        console.log(
+          `🤖 Resposta enviada | ${safeSalesContext(config, from)} | chars=${typeof reply === 'string' ? reply.length : reply.payload.length}`
+        );
+      } else {
+        console.warn(
+          `🛑 Resposta da recepcionista não foi enviada | ${safeSalesContext(config, from)}`
+        );
       }
-
-      await deps.sendReply(from, reply, config);
-      console.log(
-        `🤖 Resposta enviada | ${safeSalesContext(config, from)} | chars=${typeof reply === 'string' ? reply.length : reply.payload.length}`
-      );
     } catch (err) {
       flushFailed = true;
       Sentry.captureException(new Error('message_handler receptionist flush failed'), {
@@ -577,20 +704,47 @@ export async function flushBuffer(
         `❌ Erro no flush | ${safeSalesContext(config, from)} | error=${runtimeErrorKind(err)}`
       );
 
-      // Se o humano assumiu enquanto o brain/envio falhou, não manda M24 por
-      // cima do atendimento e limpa o buffer sem rearmar.
-      if (
-        await suppressFlushIfPaused({
-          bufferKey,
-          buffer,
-          alreadyProcessedTexts: [],
-          deps,
-        })
-      ) {
+      if (err instanceof ConversationPausedBeforeDispatch) {
+        if (
+          !(await suppressFlushIfPaused({
+            bufferKey,
+            buffer,
+            alreadyProcessedTexts: [],
+            deps,
+          }))
+        ) {
+          messageBuffers.delete(bufferKey);
+        }
         return;
       }
 
-      // M24 da recepcionista permanece inalterado: avisa uma vez e pede reenvio.
+      if (isAmbiguousWhatsAppTransportError(err)) {
+        console.warn(
+          `🟡 [flush] resultado do transporte desconhecido; sem retry/fallback | ${safeSalesContext(config, from)}`
+        );
+        Sentry.captureMessage('Resultado do transporte da recepcionista desconhecido', {
+          level: 'warning',
+          tags: {
+            service: 'message_handler',
+            operation: 'receptionist_transport_outcome_unknown',
+            phoneNumberId: config.phoneNumberId,
+            tenantSlug: config.tenantSlug,
+          },
+        });
+        // A Meta pode ter aceitado o primeiro POST. Qualquer segunda mensagem
+        // criaria duplicidade, então este turno termina em silêncio.
+        const current = messageBuffers.get(bufferKey);
+        if (current) {
+          current.pendingTexts = [];
+          current.pendingMessageIds = [];
+        }
+        messageBuffers.delete(bufferKey);
+        return;
+      }
+
+      // `emitFlushFallback` é o único dono de lock+pausa+transporte neste
+      // caminho. Advisory locks PG não são reentrantes entre conexões: adquirir
+      // aqui e novamente dentro do helper causaria deadlock real.
       await emitFlushFallback(bufferKey, from, config, deps);
     }
   }
@@ -793,6 +947,12 @@ export interface IncomingMessageDeps {
   shouldSuspend: typeof shouldSuspendForPendingInbound;
   isPaused: typeof isConversationPaused;
   resumeGate?: typeof shouldAnaResumeForInbound;
+  sendReply?: typeof sendConfiguredReply;
+  withConversationLock?: (
+    phoneNumberId: string,
+    customerPhone: string,
+    work: () => Promise<void>
+  ) => Promise<void>;
 }
 
 const defaultIncomingMessageDeps: IncomingMessageDeps = {
@@ -806,7 +966,39 @@ const defaultIncomingMessageDeps: IncomingMessageDeps = {
   shouldSuspend: shouldSuspendForPendingInbound,
   isPaused: isConversationPaused,
   resumeGate: shouldAnaResumeForInbound,
+  sendReply: sendConfiguredReply,
+  withConversationLock: (phoneNumberId, customerPhone, work) =>
+    withConversationLock(phoneNumberId, customerPhone, async () => work()),
 };
+
+/**
+ * Fronteira única para respostas automáticas diretas da recepcionista que não
+ * passam pelo debounce (por exemplo: áudio ilegível e fora de horário). A
+ * revalidação da pausa e o transporte ficam sob a mesma lock usada pelo echo;
+ * se o humano venceu a ordem, Ana não digita nem envia.
+ */
+export async function sendDirectReceptionistReplyIfUnpaused(
+  from: string,
+  reply: ValidatedReceptionistOutbound,
+  config: TenantBotConfig,
+  deps: Pick<IncomingMessageDeps, 'isPaused' | 'sendReply' | 'withConversationLock'>
+): Promise<ConfiguredReplyDelivery> {
+  const serialize = deps.withConversationLock ??
+    (async (
+      _phoneNumberId: string,
+      _customerPhone: string,
+      work: () => Promise<void>
+    ) => work());
+  const sendReply = deps.sendReply ?? sendConfiguredReply;
+  let delivery: ConfiguredReplyDelivery = 'suppressed';
+
+  await serialize(config.phoneNumberId, from, async () => {
+    if (await deps.isPaused(config.phoneNumberId, from)) return;
+    const result = await sendReply(from, reply, config);
+    delivery = result ?? 'sent';
+  });
+  return delivery;
+}
 
 export async function handleIncomingMessage(
   message: CloudMessage,
@@ -940,7 +1132,27 @@ export async function handleIncomingMessage(
         'Desculpe, não consegui ouvir o áudio. Pode me mandar por escrito?',
         config
       );
-      await sendConfiguredReply(from, transcriptionFallback, config);
+      if (config.botRole !== 'sales') {
+        const resumeAllowed = await (deps.resumeGate ?? shouldAnaResumeForInbound)({
+          config,
+          customerPhone: from,
+          customerName: name,
+        });
+        if (resumeAllowed) {
+          await sendDirectReceptionistReplyIfUnpaused(
+            from,
+            transcriptionFallback,
+            config,
+            deps
+          );
+        }
+      } else {
+        await (deps.sendReply ?? sendConfiguredReply)(
+          from,
+          transcriptionFallback,
+          config
+        );
+      }
       return;
     }
   }
@@ -1038,15 +1250,32 @@ export async function handleIncomingMessage(
     // pra não spammar quem manda várias mensagens seguidas fora do expediente.
     if (shouldSendOutsideHoursNotice(bufferKey)) {
       const outsideHoursMessage = buildOutsideHoursMessage(config);
-      await sendConfiguredReply(
-        from,
-        canonicalReceptionistOutbound(
-          'OUTSIDE_HOURS',
-          outsideHoursMessage,
-          config
-        ),
+      const outbound = canonicalReceptionistOutbound(
+        'OUTSIDE_HOURS',
+        outsideHoursMessage,
         config
       );
+      let delivered = false;
+      try {
+        if (config.botRole !== 'sales') {
+          delivered =
+            (await sendDirectReceptionistReplyIfUnpaused(
+              from,
+              outbound,
+              config,
+              deps
+            )) === 'sent';
+        } else {
+          const result = await (deps.sendReply ?? sendConfiguredReply)(
+            from,
+            outbound,
+            config
+          );
+          delivered = (result ?? 'sent') === 'sent';
+        }
+      } finally {
+        if (!delivered) releaseOutsideHoursNotice(bufferKey);
+      }
     } else {
       console.log(
         `🟡 [fora-de-horário] aviso suprimido | ${safeSalesContext(config, from)}`

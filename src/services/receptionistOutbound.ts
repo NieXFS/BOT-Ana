@@ -2,7 +2,24 @@ import { createHash } from 'crypto';
 import type { TenantBotConfig } from '../configProvider';
 import type { ServicesResult } from './calendarService';
 import { sendFreeformMessage } from '../whatsappCloudService';
+import {
+  HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
+  HUMAN_ECHO_PREFIX,
+  HUMAN_MODEL_CONTEXT_PREFIX,
+} from './humanConversationContext';
+import {
+  hasUnverifiedExistingAppointmentContext,
+  type AppointmentTemporalContext,
+} from './customerReplyGuard';
+import {
+  CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
+  toolTraceHasCustomerIdentityAmbiguity,
+} from './customerIdentitySafety';
+import { classifyReceptionistTurnPermission } from './receptionistSocialSafety';
 
+export { CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE } from './customerIdentitySafety';
+
+/** @deprecated Rejeições da fronteira final agora são silenciosas e nunca enviam fallback. */
 export const RECEPTIONIST_SAFE_FALLBACK =
   'Desculpe, não consegui responder com segurança agora. A equipe do estabelecimento pode ajudar por aqui.';
 
@@ -68,10 +85,16 @@ export interface AuthoritativeOutboundCatalog {
 
 export interface ReceptionistOutboundEvidence {
   toolTrace?: Array<{ name: string; result: string; round?: number }>;
+  /** Falha de identidade detectada pelo ERP; nunca depende de paráfrase do modelo. */
+  customerIdentityAmbiguous?: boolean;
   actionRecorded?: boolean;
   clinicalAuthorization?: ClinicalAuthorization;
   teamReplyAuthorization?: TeamReplyAuthorization;
   sourceInboundMessageId?: string;
+  /** Texto do inbound atual, somente em memória, para impedir fatos adicionados. */
+  sourceInboundText?: string;
+  /** Instante e fuso do turno usados para validar hoje/amanhã deterministicamente. */
+  temporalContext?: AppointmentTemporalContext;
 }
 
 export interface ReceptionistOutboundEnvelope {
@@ -97,7 +120,11 @@ export type OutboundReasonCode =
   | 'EXPLICIT_PII'
   | 'TOO_MANY_EMOJIS'
   | 'UNRECORDED_HANDOFF'
-  | 'UNAUTHORIZED_CLINICAL_PROMISE';
+  | 'UNAUTHORIZED_CLINICAL_PROMISE'
+  | 'INTERNAL_CONVERSATION_MARKER'
+  | 'UNVERIFIED_APPOINTMENT_CONTEXT'
+  | 'SOCIAL_CONTEXT_DRIFT'
+  | 'UNSAFE_CUSTOMER_IDENTITY_RESPONSE';
 
 export interface ValidatedReceptionistOutbound {
   readonly kind: 'validated_receptionist_outbound';
@@ -120,8 +147,79 @@ const HANDOFF_RE = new RegExp(
 );
 const CLINICAL_RE = /\b(?:diagn[oó]stic[oa]|diagnosticamos|cura|curamos|elimina|resolve|garante|garantimos|n[aã]o\s+d[oó]i|sem\s+dor|resultado\s+garantido|adequad[oa]\s+para|indicad[oa]\s+para|seguro\s+para|eficaz)\b/iu;
 
+export function containsInternalConversationMarker(text: string): boolean {
+  const compact = text.trim();
+  const normalizedCompact = normalize(compact).replace(/\s+/g, ' ');
+  const normalizedFormerFallback = normalize(RECEPTIONIST_SAFE_FALLBACK)
+    .replace(/\s+/g, ' ')
+    .replace(/[.!?]+$/g, '');
+  return (
+    normalizedCompact.includes(normalize(HUMAN_ECHO_PREFIX.trim())) ||
+    normalizedCompact.includes(normalize(HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE)) ||
+    normalizedCompact.includes(normalize(HUMAN_MODEL_CONTEXT_PREFIX.trim())) ||
+    normalizedCompact.includes('conteudo serializado:') ||
+    /\b(?:a\s+)?atendente\s+(?:humana\s+)?(?:enviou|mandou)\s+(?:um|uma)\s+(?:audio|mensagem de voz)\b/.test(
+      normalizedCompact
+    ) ||
+    normalizedCompact.replace(/[.!?\p{Extended_Pictographic}\uFE0F\s]+$/gu, '') ===
+      normalizedFormerFallback
+  );
+}
+
 function normalize(value: string): string {
   return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+function traceHasCustomerIdentityAmbiguity(
+  evidence?: ReceptionistOutboundEvidence
+): boolean {
+  if (evidence?.customerIdentityAmbiguous) return true;
+  return toolTraceHasCustomerIdentityAmbiguity(evidence?.toolTrace);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function textWithoutKnownServiceNames(
+  text: string,
+  catalog: AuthoritativeOutboundCatalog
+): string {
+  return [...catalog.services]
+    .sort((left, right) => right.name.length - left.name.length)
+    .reduce(
+      (remaining, service) =>
+        remaining.replace(new RegExp(escapeRegExp(service.name), 'giu'), ' '),
+      text
+    );
+}
+
+function introducesCatalogInformation(
+  normalizedText: string,
+  catalog: AuthoritativeOutboundCatalog
+): boolean {
+  return (
+    catalog.services.some((service) =>
+      normalizedText.includes(normalize(service.name))
+    ) ||
+    catalog.professionals.some((professional) =>
+      normalizedText.includes(normalize(professional.name))
+    )
+  );
+}
+
+function introducesAppointmentStateOrAvailability(normalizedText: string): boolean {
+  return (
+    /\b(?:agend\w*|marc\w*|remarc\w*|reagend\w*|cancel\w*|desmarc\w*|horario|retorno|vaga|disponibilidade|amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|estara a sua espera|ficara a sua espera|te aguarda)\b/u.test(
+      normalizedText
+    ) ||
+    /\b(?:[01]?\d|2[0-3])(?::\d{2}|h(?:\d{2})?)\b/u.test(
+      normalizedText
+    ) ||
+    /\b(?:as|para|pras?)\s+(?:zero|uma|duas|tres|quatro|cinco|seis|sete|oito|nove|dez|onze|doze|treze|quatorze|quinze|vinte)\b/u.test(
+      normalizedText
+    )
+  );
 }
 
 export function outboundBlockHash(text: string): string {
@@ -277,6 +375,12 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   if (joined !== envelope.exactPayload) reasons.add('PAYLOAD_BLOCK_MISMATCH');
 
   const text = typeof envelope.exactPayload === 'string' ? envelope.exactPayload : '';
+  if (
+    traceHasCustomerIdentityAmbiguity(envelope.evidence) &&
+    text.trim() !== CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE
+  ) {
+    reasons.add('UNSAFE_CUSTOMER_IDENTITY_RESPONSE');
+  }
   const prices = knownPrices(catalog);
   for (const match of text.matchAll(MONEY_RE)) {
     const rawValue = match.groups?.prefixed ?? match.groups?.worded;
@@ -285,8 +389,46 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   }
 
   const normalizedText = normalize(text);
+  if (containsInternalConversationMarker(text)) {
+    reasons.add('INTERNAL_CONVERSATION_MARKER');
+  }
+  const generatedSources = blocks.some((block) =>
+    ['GENERATED', 'GREETING', 'POST_BOOKING'].includes(block.source)
+  );
+  const sourceInboundText = envelope.evidence?.sourceInboundText?.trim() ?? '';
+  const turnPermission = sourceInboundText
+    ? classifyReceptionistTurnPermission(sourceInboundText, {
+        services: catalog.services.map((service) => service.name),
+        professionals: catalog.professionals.map(
+          (professional) => professional.name
+        ),
+      })
+    : null;
+  if (
+    generatedSources &&
+    turnPermission !== null &&
+    ((turnPermission === 'SOCIAL_ONLY' ||
+      turnPermission === 'NO_OPERATIONAL_INTENT') &&
+      (introducesCatalogInformation(normalizedText, catalog) ||
+        introducesAppointmentStateOrAvailability(normalizedText)) ||
+      turnPermission === 'INFORMATION_REQUEST' &&
+        introducesAppointmentStateOrAvailability(normalizedText))
+  ) {
+    reasons.add('SOCIAL_CONTEXT_DRIFT');
+  }
+  if (
+    generatedSources &&
+    hasUnverifiedExistingAppointmentContext(
+      text,
+      envelope.evidence?.toolTrace ?? [],
+      envelope.evidence?.sourceInboundText,
+      envelope.evidence?.temporalContext
+    )
+  ) {
+    reasons.add('UNVERIFIED_APPOINTMENT_CONTEXT');
+  }
   const mentionedServices = catalog.services.filter((service) => normalizedText.includes(normalize(service.name)));
-  const serviceOffer = text.match(/\b(?:temos|oferecemos|fazemos|realizamos)\s+(?:o\s+servi[cç]o\s+de\s+|a\s+)?([^.!?\n]+)/iu)?.[1];
+  const serviceOffer = text.match(/\b(?:temos|oferecemos|fazemos|realizamos|trabalhamos\s+com)\s+(?:o\s+servi[cç]o\s+de\s+|a\s+)?([^.!?\n]+)/iu)?.[1];
   if (
     serviceOffer &&
     mentionedServices.length === 0 &&
@@ -294,6 +436,19 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
     !/\b(?:hor[aá]rio|vaga|disponibilidade|dispon[ií]ve(?:l|is)|agenda)\b/iu.test(serviceOffer) &&
     !catalog.services.some((service) =>
       normalize(serviceOffer).includes(normalize(service.name))
+    )
+  ) reasons.add('UNKNOWN_SERVICE');
+  const appointmentServiceClaim = text.match(
+    /\b(?:para|pra)\s+(?:a|o)\s+([\p{L}'-]+(?:\s+[\p{L}'-]+){0,4})(?=[.!?,]|$)/iu
+  )?.[1];
+  if (
+    appointmentServiceClaim &&
+    introducesAppointmentStateOrAvailability(normalizedText) &&
+    !/^(?:equipe|cliente|recepcao|estabelecimento|clinica|sala)$/u.test(
+      normalize(appointmentServiceClaim)
+    ) &&
+    !catalog.services.some((service) =>
+      normalize(appointmentServiceClaim).includes(normalize(service.name))
     )
   ) reasons.add('UNKNOWN_SERVICE');
 
@@ -304,7 +459,18 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   }
 
   const mentionedProfessionals = catalog.professionals.filter((professional) => normalizedText.includes(normalize(professional.name)));
-  if (/\b(?:com|profissional|especialista|dra?\.?|doutor(?:a)?)\s+[A-ZÀ-ÖØ-öø-ÿ][\p{L}'-]+/u.test(text) && mentionedProfessionals.length === 0) reasons.add('UNKNOWN_PROFESSIONAL');
+  const textWithoutServices = textWithoutKnownServiceNames(text, catalog);
+  if (/\b(?:com|pela?|profissional|especialista|dra?\.?|doutor(?:a)?)\s+(?:(?:a|o)\s+)?[A-ZÀ-ÖØ-öø-ÿ][\p{L}'-]+/u.test(textWithoutServices) && mentionedProfessionals.length === 0) reasons.add('UNKNOWN_PROFESSIONAL');
+  const leadingProfessionalClaim = textWithoutServices.match(
+    /\b(?:a|o)\s+([A-ZÀ-ÖØ-öø-ÿ][\p{L}'-]+(?:\s+[A-ZÀ-ÖØ-öø-ÿ][\p{L}'-]+)?)\s+(?:atende|recebe|realiza|estar[aá]|ficar[aá]|vai\s+estar)(?=\s|[.,!?]|$)/iu
+  )?.[1];
+  if (
+    leadingProfessionalClaim &&
+    !catalog.professionals.some(
+      (professional) =>
+        normalize(professional.name) === normalize(leadingProfessionalClaim)
+    )
+  ) reasons.add('UNKNOWN_PROFESSIONAL');
   if (mentionedServices.length === 1 && mentionedProfessionals.length > 0) {
     const eligible = mentionedServices[0]!.professionalIds;
     if (eligible && mentionedProfessionals.some((professional) => !eligible.includes(professional.id))) reasons.add('INELIGIBLE_PROFESSIONAL');
@@ -321,7 +487,7 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   const reasonCodes = [...reasons];
   return {
     kind: 'validated_receptionist_outbound',
-    payload: reasonCodes.length === 0 ? text : RECEPTIONIST_SAFE_FALLBACK,
+    payload: reasonCodes.length === 0 ? text : '',
     originalAccepted: reasonCodes.length === 0,
     reasonCodes,
     purpose: envelope.purpose,
@@ -358,6 +524,8 @@ export async function deliverValidatedReceptionistText(
   outbound: ValidatedReceptionistOutbound,
   config: TenantBotConfig,
   send: typeof sendFreeformMessage = sendFreeformMessage
-): Promise<void> {
+): Promise<boolean> {
+  if (!outbound.originalAccepted || !outbound.payload.trim()) return false;
   await send(to, outbound.payload, config);
+  return true;
 }

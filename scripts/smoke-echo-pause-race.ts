@@ -48,12 +48,21 @@ async function main() {
   );
 
   __resetPauseCacheForTest();
-  await pauseConversationByEcho('PN-FAIL', '5511888880000', {
-    now: () => now,
-    persistPause: async () => {
-      throw new Error('Receps indisponível (simulado)');
-    },
-  });
+  let pauseFailurePropagated = false;
+  try {
+    await pauseConversationByEcho('PN-FAIL', '5511888880000', {
+      now: () => now,
+      persistPause: async () => {
+        throw new Error('Receps indisponível (simulado)');
+      },
+    });
+  } catch {
+    pauseFailurePropagated = true;
+  }
+  check(
+    'falha do POST é propagada para o webhook pedir retransmissão',
+    pauseFailurePropagated
+  );
   check(
     'falha do POST mantém a pausa local otimista',
     await isConversationPaused('PN-FAIL', '5511888880000')

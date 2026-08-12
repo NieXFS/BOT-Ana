@@ -11,6 +11,10 @@ import {
   isEscalationKnownActive,
   updateEscalationFromPauseState,
 } from './escalationCache';
+import {
+  canonicalConversationKey,
+  canonicalCustomerPhone,
+} from './conversationOrder';
 
 // Base + auth no MESMO padrão do optOutService (Bearer ERP_API_TOKEN).
 const RECEPS_INTERNAL_API_URL =
@@ -45,8 +49,7 @@ export interface EchoPauseDeps {
 }
 
 function cacheKey(phoneNumberId: string, customerPhone: string): string {
-  // Mesma forma do conversationKey/bufferKey do resto da Ana.
-  return `${phoneNumberId}:${customerPhone}`;
+  return canonicalConversationKey(phoneNumberId, customerPhone);
 }
 
 function toMs(value: string | null | undefined): number | null {
@@ -164,38 +167,41 @@ const defaultConversationPauseDeps: ConversationPauseDeps = {
  * Echo: o humano respondeu PELO app do WhatsApp → pausa a conversa no Receps
  * (que aplica o echoPauseMinutes do tenant) e no cache local.
  *
- * NUNCA lança. Escreve no cache local IMEDIATAMENTE pra Ana respeitar a pausa já
- * na próxima mensagem (sem esperar o TTL do GET). Se o POST falhar, ainda aplica
- * uma pausa local OTIMISTA pra não falar por cima do humano.
+ * Escreve no cache local IMEDIATAMENTE pra Ana respeitar a pausa já na próxima
+ * mensagem (sem esperar o TTL do GET). Se o POST falhar, a pausa local OTIMISTA
+ * continua ativa, mas o erro é propagado: o webhook responde 5xx e a Meta pode
+ * retransmitir até a pausa ficar durável no Receps.
  */
 export async function pauseConversationByEcho(
   phoneNumberId: string,
   customerPhone: string,
   deps: EchoPauseDeps = defaultEchoPauseDeps
 ): Promise<void> {
+  const canonicalPhone = canonicalCustomerPhone(customerPhone);
   // O write-through precisa acontecer ANTES do primeiro await. A Meta pode entregar
   // a resposta seguinte da cliente enquanto o POST ao Receps ainda está em voo;
   // esperar a rede aqui abriria uma janela de até REQUEST_TIMEOUT_MS pra IA falar.
   const startedAt = deps.now();
   writeConversationPauseToCache(
     phoneNumberId,
-    customerPhone,
+    canonicalPhone,
     startedAt + ECHO_LOCAL_FALLBACK_MS,
     startedAt
   );
 
   try {
-    const pausedUntilMs = toMs(await deps.persistPause(phoneNumberId, customerPhone));
+    const pausedUntilMs = toMs(await deps.persistPause(phoneNumberId, canonicalPhone));
     if (pausedUntilMs !== null) {
       writeConversationPauseToCache(
         phoneNumberId,
-        customerPhone,
+        canonicalPhone,
         pausedUntilMs,
         deps.now()
       );
     }
   } catch (error) {
     capture(error, phoneNumberId, 'pause-conversation');
+    throw error;
   }
 }
 
@@ -212,7 +218,8 @@ export async function isConversationPaused(
   deps: ConversationPauseDeps = defaultConversationPauseDeps
 ): Promise<boolean> {
   const now = deps.now();
-  const key = cacheKey(phoneNumberId, customerPhone);
+  const canonicalPhone = canonicalCustomerPhone(customerPhone);
+  const key = cacheKey(phoneNumberId, canonicalPhone);
   const cached = pauseCache.get(key);
   const escalationWasActive = isEscalationKnownActive(
     phoneNumberId,
@@ -243,7 +250,7 @@ export async function isConversationPaused(
   }
 
   // 3) Busca o estado fresco no Receps.
-  const state = await deps.fetchState(phoneNumberId, customerPhone);
+  const state = await deps.fetchState(phoneNumberId, canonicalPhone);
   if (!state) {
     return escalationWasActive; // só escalada conhecida muda o fail-open legado
   }

@@ -25,10 +25,9 @@ function check(label: string, condition: boolean) {
 }
 
 function readRecepsDefaultPrompt(): string | null {
-  const recepsPath = path.resolve(
-    process.cwd(),
-    '../Receps ERP/src/lib/bot-config.ts'
-  );
+  const recepsPath = process.env.RECEPS_ERP_ROOT?.trim()
+    ? path.resolve(process.env.RECEPS_ERP_ROOT, 'src/lib/bot-config.ts')
+    : path.resolve(process.cwd(), '../Receps ERP/src/lib/bot-config.ts');
   if (!existsSync(recepsPath)) return null;
 
   const source = readFileSync(recepsPath, 'utf8');

@@ -262,6 +262,83 @@ export interface AtomicInboundResult {
   sequence: number | null;
 }
 
+export interface AtomicHumanEchoInput {
+  messageId: string;
+  phoneNumberId: string;
+  conversationKey: string;
+  content: string;
+  receivedAt?: Date;
+}
+
+/**
+ * Dedup e histórico do echo humano compartilham a MESMA transação. Se o
+ * processo morrer entre as duas instruções, o PostgreSQL desfaz ambas; uma
+ * retransmissão nunca encontra "processado" sem a fala correspondente. A linha
+ * do histórico carrega o próprio message_id, reutilizando também o UNIQUE já
+ * exigido para o intake.
+ */
+export async function persistHumanEchoAtomically(
+  input: AtomicHumanEchoInput
+): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const processed = await client.query(
+      `INSERT INTO processed_messages (
+         message_id, phone_number_id, conversation_key
+       ) VALUES ($1, $2, $3)
+       ON CONFLICT (message_id) DO NOTHING
+       RETURNING message_id`,
+      [input.messageId, input.phoneNumberId, input.conversationKey]
+    );
+    if (processed.rowCount !== 1) {
+      await client.query('COMMIT');
+      return false;
+    }
+
+    await client.query(
+      `INSERT INTO ana_conversation_history (
+         "conversationKey", "role", "content", "createdAt", message_id
+       ) VALUES ($1, 'assistant', $2, $3, $4)`,
+      [
+        input.conversationKey,
+        input.content,
+        input.receivedAt ?? new Date(),
+        input.messageId,
+      ]
+    );
+    await client.query(
+      `DELETE FROM ana_conversation_history
+       WHERE "conversationKey" = $1
+         AND (
+           message_id IS NULL OR NOT EXISTS (
+             SELECT 1 FROM inbound_event_outbox pending
+             WHERE pending.message_id = ana_conversation_history.message_id
+               AND pending.delivered_at IS NULL
+           )
+         )
+         AND "id" NOT IN (
+           SELECT "id" FROM ana_conversation_history
+           WHERE "conversationKey" = $1
+           ORDER BY "createdAt" DESC, "id" DESC
+           LIMIT 30
+         )`,
+      [input.conversationKey]
+    );
+    await client.query('COMMIT');
+    return true;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Preserva a falha original; release da conexão encerra a transação.
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function runAtomicInboundTransaction(
   client: PoolClient,
   input: AtomicInboundInput,

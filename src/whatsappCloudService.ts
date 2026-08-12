@@ -10,6 +10,9 @@ function buildApiUrl(waConfig: WhatsAppTenantConfig) {
   return `https://graph.facebook.com/${waConfig.waApiVersion}/${waConfig.phoneNumberId}/messages`;
 }
 
+/** Limite cancelável do POST; evita segurar a lock da conversa indefinidamente. */
+export const WHATSAPP_TEXT_TIMEOUT_MS = 20_000;
+
 const headers = (waConfig: WhatsAppTenantConfig) => ({
   Authorization: `Bearer ${waConfig.waAccessToken}`,
   'Content-Type': 'application/json',
@@ -29,7 +32,7 @@ export async function sendFreeformMessage(
       type: 'text',
       text: { body: text },
     },
-    { headers: headers(waConfig) }
+    { headers: headers(waConfig), timeout: WHATSAPP_TEXT_TIMEOUT_MS }
   );
 }
 
@@ -61,7 +64,7 @@ export async function sendFreeformMessageWithReceipt(
       type: 'text',
       text: { body: text },
     },
-    { headers: headers(waConfig) }
+    { headers: headers(waConfig), timeout: WHATSAPP_TEXT_TIMEOUT_MS }
   );
 
   const providerMessageId = response.data?.messages?.[0]?.id;
@@ -69,6 +72,38 @@ export async function sendFreeformMessageWithReceipt(
     throw new WhatsAppReceiptMissingError();
   }
   return { providerMessageId: providerMessageId.trim() };
+}
+
+/**
+ * Sem resposta HTTP, o POST pode ter sido aceito pela Meta e só o recibo ter se
+ * perdido. Essa condição nunca autoriza retry nem outra mensagem automática.
+ */
+export function isAmbiguousWhatsAppTransportError(error: unknown): boolean {
+  if (error instanceof WhatsAppReceiptMissingError) return true;
+  if (!error || typeof error !== 'object') return false;
+
+  // Axios normalmente preserva `isAxiosError`, mas adapters, interceptors e
+  // wrappers podem devolver um Error estruturalmente equivalente. Depois que o
+  // caller entrou na etapa de POST, timeout/reset sem resposta HTTP continua
+  // sendo resultado DESCONHECIDO: a Meta pode ter aceitado o payload. Exigir a
+  // marca privada do Axios aqui autorizava fallback/retry justamente nos erros
+  // comuns ETIMEDOUT/ECONNRESET.
+  const candidate = error as {
+    code?: unknown;
+    request?: unknown;
+    response?: unknown;
+  };
+  if (candidate.response) return false;
+  const ambiguousCode = [
+    'ECONNABORTED',
+    'ETIMEDOUT',
+    'ECONNRESET',
+    'ERR_NETWORK',
+  ].includes(String(candidate.code ?? '').toUpperCase());
+
+  return axios.isAxiosError(error)
+    ? Boolean(candidate.request) || ambiguousCode
+    : ambiguousCode;
 }
 
 // --- Simulação de digitação --------------------------------------------------

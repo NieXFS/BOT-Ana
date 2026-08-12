@@ -337,6 +337,36 @@ async function main() {
   expect('10) pausa após erro bloqueia fallback M24', sent.length === 0);
   expect('10) buffer é limpo sem rearmar', !__hasBufferForTest(key10));
 
+  // --- Caso 10b: brain aborta por takeover → zero tool/write e zero M24 ------
+  __resetFlushStateForTest();
+  sent.length = 0;
+  let fallbackCalls10b = 0;
+  const { ConversationPausedBeforeDispatch } = await import(
+    '../src/services/brainService'
+  );
+  const pausedDispatchDeps: FlushDeps = {
+    getReply: async () => {
+      throw new ConversationPausedBeforeDispatch();
+    },
+    sendReply: async (f, t) => {
+      sent.push({ from: f, text: t });
+    },
+    sendReplyPlain: async (f, t) => {
+      fallbackCalls10b += 1;
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
+  };
+  const key10b = __seedFlushBufferForTest(config, from, ['quero remarcar']);
+  await flushBuffer(key10b, pausedDispatchDeps);
+  expect(
+    '10b) aborto de takeover no brain não envia resposta',
+    sent.length === 0
+  );
+  expect('10b) aborto de takeover não aciona fallback M24', fallbackCalls10b === 0);
+  expect('10b) buffer é limpo após aborto de takeover', !__hasBufferForTest(key10b));
+
   // --- Caso 11: em sales, pausa vence recovery e falha_resposta --------------
   __resetFlushStateForTest();
   salesRecovery.__resetSalesRecoveryForTest();
@@ -368,7 +398,95 @@ async function main() {
   expect('11) buffer sales pausado é limpo', !__hasBufferForTest(key11));
   salesRecovery.__resetSalesRecoveryForTest();
 
-  // --- Caso 12: post_link só começa depois do envio aceito -----------------
+  // --- Caso 11b: timeout após POST de sales é ambíguo e nunca agenda retry ---
+  __resetFlushStateForTest();
+  salesRecovery.__resetSalesRecoveryForTest();
+  configureRecoveryHarness();
+  const ambiguousSalesError = Object.assign(new Error('timeout after POST'), {
+    isAxiosError: true,
+    code: 'ECONNABORTED',
+    request: {},
+  });
+  const key11b = __seedFlushBufferForTest(salesConfig, from, ['quero conhecer']);
+  await flushBuffer(key11b, {
+    getReply: async () => 'Resposta da Renata possivelmente aceita',
+    sendReply: async () => {
+      throw ambiguousSalesError;
+    },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
+  });
+  expect(
+    '11b) transporte sales ambíguo não agenda recovery/retry',
+    salesRecovery.__getSalesRecoveryStateForTest(key11b) === null
+  );
+  expect('11b) buffer sales é limpo', !__hasBufferForTest(key11b));
+  salesRecovery.__resetSalesRecoveryForTest();
+
+  // --- Caso 12: último check de pausa ocorre dentro da lock do transporte ----
+  __resetFlushStateForTest();
+  sent.length = 0;
+  const dispatchOrder: string[] = [];
+  let insideDispatchLock = false;
+  const lockedDispatchDeps: FlushDeps = {
+    getReply: async () => 'resposta que não pode passar pelo takeover',
+    sendReply: async (f, t) => {
+      dispatchOrder.push('send');
+      sent.push({ from: f, text: t });
+    },
+    isPaused: async () => {
+      dispatchOrder.push(insideDispatchLock ? 'pause:inside' : 'pause:outside');
+      return insideDispatchLock;
+    },
+    recordPausedInbound: async () => {},
+    withConversationLock: async (_pnid, _phone, work) => {
+      dispatchOrder.push('lock:start');
+      insideDispatchLock = true;
+      try {
+        await work();
+      } finally {
+        insideDispatchLock = false;
+        dispatchOrder.push('lock:end');
+      }
+    },
+  };
+  const key12 = __seedFlushBufferForTest(config, from, ['oi']);
+  await flushBuffer(key12, lockedDispatchDeps);
+  expect('12) pausa é revalidada dentro da lock', dispatchOrder.includes('pause:inside'));
+  expect('12) takeover dentro da lock impede transporte', !dispatchOrder.includes('send'));
+  expect('12) buffer é limpo pelo takeover serializado', !__hasBufferForTest(key12));
+
+  // --- Caso 13: rejeição fail-closed não vira fallback nem exceção ------------
+  __resetFlushStateForTest();
+  let fallbackCalls = 0;
+  let boundaryCalls = 0;
+  const suppressedBoundaryDeps: FlushDeps = {
+    getReply: async () => ({
+      kind: 'validated_receptionist_outbound' as const,
+      payload: '',
+      originalAccepted: false,
+      reasonCodes: ['INTERNAL_CONVERSATION_MARKER'],
+      purpose: 'REACTIVE' as const,
+      sources: ['GENERATED'] as const,
+    }),
+    sendReply: async () => {
+      boundaryCalls += 1;
+      return 'suppressed';
+    },
+    sendReplyPlain: async () => {
+      fallbackCalls += 1;
+    },
+    isPaused: async () => false,
+    recordPausedInbound: async () => {},
+    withConversationLock: async (_pnid, _phone, work) => work(),
+  };
+  const key13 = __seedFlushBufferForTest(config, from, ['oi']);
+  await flushBuffer(key13, suppressedBoundaryDeps);
+  expect('13) fronteira é consultada uma vez', boundaryCalls === 1);
+  expect('13) rejeição não aciona fallback M24', fallbackCalls === 0);
+  expect('13) buffer rejeitado é limpo sem loop', !__hasBufferForTest(key13));
+
+  // --- Caso 14: post_link só começa depois do envio aceito -----------------
   __resetFlushStateForTest();
   const deliveryOrder: string[] = [];
   const signupReply =
@@ -384,13 +502,13 @@ async function main() {
       deliveryOrder.push('post_link');
     },
   };
-  const key12 = __seedFlushBufferForTest(salesConfig, from, ['Sim']);
-  await flushBuffer(key12, deliveredLinkDeps);
+  const key14 = __seedFlushBufferForTest(salesConfig, from, ['Sim']);
+  await flushBuffer(key14, deliveredLinkDeps);
   expect(
-    '12) post_link ocorre somente depois do transporte aceitar a URL',
+    '14) post_link ocorre somente depois do transporte aceitar a URL',
     deliveryOrder.join('|') === 'send|post_link'
   );
-  expect('12) buffer é limpo após link entregue', !__hasBufferForTest(key12));
+  expect('14) buffer é limpo após link entregue', !__hasBufferForTest(key14));
 
   const failed = checks.filter((c) => !c.ok);
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passaram.`);

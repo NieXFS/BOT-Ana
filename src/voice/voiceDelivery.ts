@@ -3,6 +3,7 @@ import type { TenantBotConfig } from '../configProvider';
 import { buildConversationKey } from '../services/contextManager';
 import { Sentry } from '../observability/sentry';
 import {
+  isAmbiguousWhatsAppTransportError,
   sendAudioMessage,
   sendFreeformMessageWithReceipt,
   uploadMedia,
@@ -137,15 +138,16 @@ async function sendOriginalFallback(
 ): Promise<void> {
   try {
     await deps.sendText(to, originalText, config);
-  } catch {
+  } catch (error) {
     deps.captureWarning('send');
+    if (isAmbiguousWhatsAppTransportError(error)) throw error;
     throw new Error('renata_voice fallback text send failed');
   }
 }
 
 /**
- * Retorna true quando o áudio foi enviado. Em qualquer falha, tenta o texto
- * ORIGINAL completo e retorna false; no split, isso já preserva o link.
+ * Resultado ambíguo do POST nunca autoriza um segundo payload automático: a
+ * Meta pode ter aceitado o áudio mesmo sem devolver a resposta ao runtime.
  */
 async function speakAndSend(
   to: string,
@@ -154,7 +156,7 @@ async function speakAndSend(
   config: TenantBotConfig,
   voiceConfig: VoiceEnvConfig,
   deps: VoiceDeliveryDeps
-): Promise<boolean> {
+): Promise<'sent' | 'fallback_text_sent' | 'ambiguous'> {
   let step: VoiceDeliveryStep = 'cache';
 
   try {
@@ -186,7 +188,7 @@ async function speakAndSend(
         () => deps.recordCacheHit(usageDay, primaryProvider),
         deps
       );
-      return true;
+      return 'sent';
     }
 
     step = 'tts';
@@ -224,11 +226,14 @@ async function speakAndSend(
     await deps.saveCache(textHash, effectiveFingerprint, ogg, mediaId);
     step = 'send';
     await deps.sendAudio(to, mediaId, config);
-    return true;
-  } catch {
+    return 'sent';
+  } catch (error) {
     deps.captureWarning(step);
+    if (step === 'send' && isAmbiguousWhatsAppTransportError(error)) {
+      return 'ambiguous';
+    }
     await sendOriginalFallback(to, originalText, config, deps);
-    return false;
+    return 'fallback_text_sent';
   }
 }
 
@@ -283,7 +288,7 @@ export async function deliverSalesReply(
     return;
   }
 
-  const audioSent = await speakAndSend(
+  const audioResult = await speakAndSend(
     to,
     plan.voiceText,
     originalText,
@@ -291,17 +296,17 @@ export async function deliverSalesReply(
     voiceConfig,
     deps
   );
-  if (!audioSent) {
+  if (audioResult === 'fallback_text_sent') {
     // O fallback acima já enviou o ORIGINAL, que contém o link.
     return;
   }
 
   try {
     await deps.sendText(to, plan.linkText, config);
-  } catch {
+  } catch (error) {
     deps.captureWarning('send');
-    // A voz saiu, mas o link não. Reenvia o ORIGINAL em texto para garantir a
-    // informação fechada do produto, ainda sem silêncio.
-    await sendOriginalFallback(to, originalText, config, deps);
+    if (isAmbiguousWhatsAppTransportError(error)) return;
+    // A voz já pode ter sido entregue. Mesmo numa rejeição definitiva do link,
+    // não duplicamos todo o conteúdo falado em uma segunda mensagem automática.
   }
 }

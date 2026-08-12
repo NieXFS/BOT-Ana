@@ -7,7 +7,8 @@ export type CustomerReplyLeakReason =
   | 'appointment_id'
   | 'technical_id'
   | 'false_write_claim'
-  | 'unverified_availability';
+  | 'unverified_availability'
+  | 'unverified_appointment_context';
 
 export interface CustomerReplyInspection {
   safe: boolean;
@@ -23,6 +24,11 @@ export type ToolTraceLike = {
    */
   userTurn?: number;
 };
+
+export interface AppointmentTemporalContext {
+  now: Date | string;
+  timezone: string;
+}
 
 type WriteKind = 'book' | 'cancel' | 'reschedule';
 
@@ -277,7 +283,7 @@ function localClaimIsNegatedOrFuture(
   );
 }
 
-function appointmentLocalParts(startTime: string): {
+function appointmentLocalParts(startTime: string, timezone?: string): {
   year: number;
   month: number;
   day: number;
@@ -285,6 +291,44 @@ function appointmentLocalParts(startTime: string): {
   minute: number;
   weekday: string;
 } | null {
+  if (timezone) {
+    const instant = new Date(startTime);
+    if (Number.isNaN(instant.getTime())) return null;
+    const values = Object.fromEntries(
+      new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+        weekday: 'long',
+      })
+        .formatToParts(instant)
+        .map((part) => [part.type, part.value])
+    );
+    const weekdayMap: Record<string, string> = {
+      Sunday: 'domingo',
+      Monday: 'segunda',
+      Tuesday: 'terca',
+      Wednesday: 'quarta',
+      Thursday: 'quinta',
+      Friday: 'sexta',
+      Saturday: 'sabado',
+    };
+    if (!values.year || !values.month || !values.day || !values.hour || !values.minute) {
+      return null;
+    }
+    return {
+      year: Number(values.year),
+      month: Number(values.month),
+      day: Number(values.day),
+      hour: Number(values.hour),
+      minute: Number(values.minute),
+      weekday: weekdayMap[values.weekday ?? ''] ?? '',
+    };
+  }
   const match =
     /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(startTime);
   if (!match) return null;
@@ -312,6 +356,37 @@ function appointmentLocalParts(startTime: string): {
   };
 }
 
+const HOUR_WORD_VALUES: Record<string, number> = {
+  zero: 0,
+  uma: 1,
+  duas: 2,
+  tres: 3,
+  quatro: 4,
+  cinco: 5,
+  seis: 6,
+  sete: 7,
+  oito: 8,
+  nove: 9,
+  dez: 10,
+  onze: 11,
+  doze: 12,
+  treze: 13,
+  quatorze: 14,
+  quinze: 15,
+  dezesseis: 16,
+  dezessete: 17,
+  dezoito: 18,
+  dezenove: 19,
+  vinte: 20,
+  'vinte e uma': 21,
+  'vinte e duas': 22,
+  'vinte e tres': 23,
+};
+
+const WORD_HOUR_PATTERN = Object.keys(HOUR_WORD_VALUES)
+  .sort((left, right) => right.length - left.length)
+  .join('|');
+
 function mentionedTimes(clause: string): string[] {
   const times = new Set<string>();
   for (const match of clause.matchAll(
@@ -321,6 +396,26 @@ function mentionedTimes(clause: string): string[] {
       `${String(Number(match[1])).padStart(2, '0')}:${
         match[2] ?? match[3] ?? '00'
       }`
+    );
+  }
+  for (const match of clause.matchAll(
+    new RegExp(
+      `\\b(?:as|para|pras?)\\s+(${WORD_HOUR_PATTERN})(?:\\s+horas?)?(?:\\s+e\\s+(meia|trinta|quinze|quarenta e cinco))?\\b`,
+      'g'
+    )
+  )) {
+    const hour = HOUR_WORD_VALUES[match[1] ?? ''];
+    if (hour === undefined) continue;
+    const minute =
+      match[2] === 'meia' || match[2] === 'trinta'
+        ? 30
+        : match[2] === 'quinze'
+          ? 15
+          : match[2] === 'quarenta e cinco'
+            ? 45
+            : 0;
+    times.add(
+      `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
     );
   }
   return [...times];
@@ -529,10 +624,46 @@ function mentionedDates(
   return dates;
 }
 
+function expectedRelativeCivilDate(
+  temporalContext: AppointmentTemporalContext,
+  offsetDays: number
+): { year: number; month: number; day: number } | null {
+  const instant =
+    temporalContext.now instanceof Date
+      ? temporalContext.now
+      : new Date(temporalContext.now);
+  if (Number.isNaN(instant.getTime())) return null;
+  const values = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: temporalContext.timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    })
+      .formatToParts(instant)
+      .map((part) => [part.type, part.value])
+  );
+  if (!values.year || !values.month || !values.day) return null;
+  const shifted = new Date(
+    Date.UTC(
+      Number(values.year),
+      Number(values.month) - 1,
+      Number(values.day) + offsetDays,
+      12
+    )
+  );
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+  };
+}
+
 function appointmentMatchesStateClause(
   clause: string,
   appointment: AuthoritativeAppointment,
-  allAppointments: AuthoritativeAppointment[]
+  allAppointments: AuthoritativeAppointment[],
+  temporalContext?: AppointmentTemporalContext
 ): boolean {
   if (
     appointment.status &&
@@ -548,8 +679,29 @@ function appointmentMatchesStateClause(
     return false;
   }
 
-  const parts = appointmentLocalParts(appointment.startTime);
+  const parts = appointmentLocalParts(
+    appointment.startTime,
+    temporalContext?.timezone
+  );
   if (!parts) return false;
+
+  const relativeOffset = /\bamanha\b/.test(clause)
+    ? 1
+    : /\bhoje\b/.test(clause)
+      ? 0
+      : null;
+  if (relativeOffset !== null) {
+    if (!temporalContext) return false;
+    const expected = expectedRelativeCivilDate(temporalContext, relativeOffset);
+    if (
+      !expected ||
+      expected.year !== parts.year ||
+      expected.month !== parts.month ||
+      expected.day !== parts.day
+    ) {
+      return false;
+    }
+  }
 
   const times = mentionedTimes(clause);
   const appointmentTime = `${String(parts.hour).padStart(2, '0')}:${String(
@@ -602,6 +754,9 @@ function appointmentMatchesStateClause(
     )?.[1] ??
     clause.match(
       /\bagendamento\s+de\s+(.{2,80}?)\s+(?:esta|ta|foi|ficou)\s+(?:agendad|marcad|confirmad|reservad)/
+    )?.[1] ??
+    clause.match(
+      /\b(?:retorno|atendimento|agendamento|horario)\s+de\s+(.{2,60}?)(?=\s+(?:com|para|pra|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b|[,?.!]|$)/
     )?.[1];
   let claimedService = rawClaimedService;
   if (claimedService) {
@@ -652,12 +807,37 @@ function appointmentMatchesStateClause(
     return false;
   }
 
+  const groundingFacts = appointmentGroundingFacts(clause);
+  const claimedFactServices = groundingFacts
+    .filter((fact) => fact.startsWith('service:'))
+    .map((fact) => fact.slice('service:'.length));
+  if (
+    claimedFactServices.length > 0 &&
+    (!appointment.serviceName ||
+      !claimedFactServices.includes(normalizeClaimText(appointment.serviceName)))
+  ) {
+    return false;
+  }
+  const claimedFactProfessionals = groundingFacts
+    .filter((fact) => fact.startsWith('professional:'))
+    .map((fact) => fact.slice('professional:'.length));
+  if (
+    claimedFactProfessionals.length > 0 &&
+    (!appointment.professionalName ||
+      !claimedFactProfessionals.includes(
+        normalizeClaimText(appointment.professionalName)
+      ))
+  ) {
+    return false;
+  }
+
   return true;
 }
 
 function hasCompatibleAppointmentRead(
   clause: string,
-  appointments: AuthoritativeAppointment[]
+  appointments: AuthoritativeAppointment[],
+  temporalContext?: AppointmentTemporalContext
 ): boolean {
   const explicitCount = clause.match(
     /\b(?:tem|ha|existem?)\s+(dois|duas|2|tres|3)\s+agendamentos?\b/
@@ -667,13 +847,19 @@ function hasCompatibleAppointmentRead(
     if (appointments.length !== expectedCount) return false;
   }
   return appointments.some((appointment) =>
-    appointmentMatchesStateClause(clause, appointment, appointments)
+    appointmentMatchesStateClause(
+      clause,
+      appointment,
+      appointments,
+      temporalContext
+    )
   );
 }
 
 function inspectCompletedClaims(
   reply: string,
-  toolTrace: ToolTraceLike[]
+  toolTrace: ToolTraceLike[],
+  temporalContext?: AppointmentTemporalContext
 ): { hasUnlicensedClaim: boolean; needsAppointmentRead: boolean } {
   const normalized = normalizeClaimText(reply);
   if (!normalized) {
@@ -701,7 +887,7 @@ function inspectCompletedClaims(
     if (isDirectStateReference) {
       if (
         successfulWrites.has('book') ||
-        hasCompatibleAppointmentRead(clause, appointments)
+        hasCompatibleAppointmentRead(clause, appointments, temporalContext)
       ) {
         // A mesma oração ainda pode conter uma afirmação de ato; ela é
         // analisada abaixo e não herda a licença da leitura.
@@ -737,7 +923,7 @@ function inspectCompletedClaims(
       if (isPresentAppointmentStateClaim(clause, matchIndex, claim)) {
         if (
           successfulWrites.has('book') ||
-          hasCompatibleAppointmentRead(clause, appointments)
+          hasCompatibleAppointmentRead(clause, appointments, temporalContext)
         ) {
           continue;
         }
@@ -771,9 +957,201 @@ function inspectCompletedClaims(
  */
 export function hasFalseWriteClaim(
   reply: string,
+  toolTrace: ToolTraceLike[],
+  temporalContext?: AppointmentTemporalContext
+): boolean {
+  return inspectCompletedClaims(reply, toolTrace, temporalContext).hasUnlicensedClaim;
+}
+
+const EXPLICIT_EXISTING_APPOINTMENT_REFERENCE_RE =
+  /\b(?:seu horario|seu agendamento|seu retorno|seu atendimento|seu procedimento|sua consulta|sua sessao|agendamento anterior|horario anterior|retorno anterior|atendimento anterior|procedimento anterior|consulta anterior|sessao anterior)\b/;
+const EXISTING_APPOINTMENT_ACTION_RE =
+  /\b(?:remarc\w*|reagend\w*|cancel\w*|desmarc\w*|adiar|adiou|antecip\w*)\b/;
+const APPOINTMENT_SHIFT_RE =
+  /\b(?:mud(?:ar|ou|anca|ando)|troc\w*|alter\w*|pass(?:ar|ou|ando)|transfer\w*|mover|moveu|jogar|jogou)\b/;
+const SPECIFIC_APPOINTMENT_DETAIL_RE =
+  /\b(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}(?:\/\d{1,2})?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|(?:[01]?\d|2[0-3])(?::\d{2}|h(?:\d{2})?))\b/;
+const APPOINTMENT_NOUN_RE =
+  /\b(?:agendamento|horario|retorno|reserva|atendimento|procedimento|sessao|consulta)\b/;
+
+function isExistingAppointmentContextClause(clause: string): boolean {
+  if (EXPLICIT_EXISTING_APPOINTMENT_REFERENCE_RE.test(clause)) return true;
+  if (
+    EXISTING_APPOINTMENT_ACTION_RE.test(clause) &&
+    (APPOINTMENT_NOUN_RE.test(clause) || SPECIFIC_APPOINTMENT_DETAIL_RE.test(clause))
+  ) {
+    return true;
+  }
+  if (
+    APPOINTMENT_SHIFT_RE.test(clause) &&
+    (APPOINTMENT_NOUN_RE.test(clause) || SPECIFIC_APPOINTMENT_DETAIL_RE.test(clause))
+  ) {
+    return true;
+  }
+  if (
+    /\b(?:so\s+)?confirm(?:a|ando|ar|acao)\b/.test(clause) &&
+    (APPOINTMENT_NOUN_RE.test(clause) || SPECIFIC_APPOINTMENT_DETAIL_RE.test(clause))
+  ) {
+    return true;
+  }
+  if (
+    APPOINTMENT_NOUN_RE.test(clause) &&
+    /\b(?:sera|vai ser|acontece|ocorre|esta|ta|ficou)\b/.test(clause) &&
+    SPECIFIC_APPOINTMENT_DETAIL_RE.test(clause)
+  ) {
+    return true;
+  }
+  if (
+    /\b(?:te|lhe)\s+(?:recebe|atende)\b/.test(clause) &&
+    (SPECIFIC_APPOINTMENT_DETAIL_RE.test(clause) ||
+      /\b(?:para|pra)\s+(?:a|o)\s+[a-z]/.test(clause))
+  ) {
+    return true;
+  }
+  const hasGroundableStateObject =
+    APPOINTMENT_NOUN_RE.test(clause) ||
+    SPECIFIC_APPOINTMENT_DETAIL_RE.test(clause) ||
+    /\bcom\s+(?:a|o)\s+[a-z][a-z'-]+\b/.test(clause);
+  if (!hasGroundableStateObject) return false;
+
+  if (
+    /\b(?:ficou|esta|ta)\s+(?:para|pra|com|no|na|as|dia|hoje|amanha)\b/.test(
+      clause
+    )
+  ) {
+    return true;
+  }
+
+  // "é" perde o acento na normalização. Só trate como estado quando inicia a
+  // oração e há um objeto operacional concreto; a conjunção cotidiana
+  // "Tudo bem sim, e com você?" não pode virar falso fato de agendamento.
+  return /^(?:(?:sim|entao|certo|perfeito|ok|isso)[,]?\s+)?(?:e|eh)\s+(?:para|pra|com|no|na|as|dia|hoje|amanha)\b/.test(
+    clause
+  );
+}
+
+function appointmentGroundingFacts(value: string): string[] {
+  const normalized = normalizeClaimText(value);
+  const facts = new Set<string>();
+  for (const match of normalized.matchAll(
+    /\b(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}(?:\/\d{1,2})?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b/g
+  )) {
+    facts.add(`date:${match[0]}`);
+  }
+  for (const match of normalized.matchAll(
+    /\b([a-z][a-z'-]+(?:\s+[a-z][a-z'-]+)?)\s+(?:te|lhe)\s+(?:recebe|atende)\b/g
+  )) {
+    const name = match[1]?.trim();
+    if (
+      name &&
+      !/^(?:ela|ele|a equipe|o profissional|a profissional|a gente)$/.test(name)
+    ) {
+      facts.add(`professional:${name}`);
+    }
+  }
+  for (const time of mentionedTimes(normalized)) {
+    facts.add(`time:${time}`);
+  }
+  for (const match of normalized.matchAll(
+    /\bcom\s+(?:a|o)?\s*([a-z][a-z'-]+(?:\s+[a-z][a-z'-]+)?)(?=\s+(?:para|pra|pro|no|na|dia|as)\b|[,?.!]|$)/g
+  )) {
+    const name = match[1]
+      ?.replace(
+        /\s+(?:agendad[oa]|marcad[oa]|confirmad[oa]|reservad[oa])$/,
+        ''
+      )
+      .trim();
+    if (
+      name &&
+      !/^(?:voce|vc|a equipe|o profissional|sucesso|seguranca|certeza)$/.test(
+        name
+      )
+    ) {
+      facts.add(`professional:${name}`);
+    }
+  }
+  for (const match of normalized.matchAll(
+    /\b(?:para|pra)\s+(?:a|o)\s+([a-z][a-z'-]+(?:\s+[a-z][a-z'-]+){0,5})(?=\s+(?:com|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b|[,?.!]|$)/g
+  )) {
+    const service = match[1]?.trim();
+    if (
+      service &&
+      !/^(?:equipe|recepcao|estabelecimento|clinica|sala|data|hora)$/.test(
+        service
+      )
+    ) {
+      facts.add(`service:${service}`);
+    }
+  }
+  for (const match of normalized.matchAll(
+    /\b(?:retorno|atendimento|agendamento|horario)\s+de\s+(.{2,60}?)(?=\s+(?:com|para|pra|pro|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b|[,?.!]|$)/g
+  )) {
+    const service = match[1]?.trim();
+    if (service) facts.add(`service:${service}`);
+  }
+  return [...facts];
+}
+
+function currentInboundGroundsAppointmentContext(
+  clause: string,
+  sourceInboundText?: string
+): boolean {
+  if (!sourceInboundText?.trim()) return false;
+  const source = normalizeClaimText(sourceInboundText);
+  const facts = appointmentGroundingFacts(clause);
+  if (facts.length === 0) return isExistingAppointmentContextClause(source);
+  const sourceFacts = new Set(appointmentGroundingFacts(source));
+  if (!facts.every((fact) => sourceFacts.has(fact))) return false;
+  return isExistingAppointmentContextClause(source);
+}
+
+function successfulWriteLicensesGenericAppointmentContext(
+  clause: string,
   toolTrace: ToolTraceLike[]
 ): boolean {
-  return inspectCompletedClaims(reply, toolTrace).hasUnlicensedClaim;
+  // Uma write só licencia o estado genérico que efetivamente produziu. Data,
+  // hora, profissional ou serviço continuam exigindo fonte compatível; assim,
+  // uma write de outro horário nunca autoriza detalhes inventados pelo modelo.
+  if (appointmentGroundingFacts(clause).length > 0) return false;
+  const writes = successfulWriteKinds(toolTrace);
+  if (/\b(?:remarc\w*|reagend\w*)\b/.test(clause)) {
+    return writes.has('reschedule');
+  }
+  if (/\bcancel\w*\b/.test(clause)) {
+    return writes.has('cancel');
+  }
+  if (/\b(?:agend\w*|marcad\w*|confirmad\w*|reservad\w*)\b/.test(clause)) {
+    return writes.has('book');
+  }
+  return false;
+}
+
+/**
+ * Perguntas também podem vazar estado: "você quer remarcar ... com X amanhã às
+ * Y?" introduz fatos operacionais mesmo terminando em `?`. Só uma leitura
+ * compatível do turno atual (ou uma write concluída) licencia esse contexto.
+ */
+export function hasUnverifiedExistingAppointmentContext(
+  reply: string,
+  toolTrace: ToolTraceLike[],
+  sourceInboundText?: string,
+  temporalContext?: AppointmentTemporalContext
+): boolean {
+  const appointments = parseSuccessfulAppointmentReads(toolTrace);
+  const normalized = normalizeClaimText(reply);
+  const clauses = normalized.match(/[^.!?\n]+[.!?]?/g) ?? [normalized];
+
+  return clauses.some((clauseValue) => {
+    const clause = clauseValue.trim();
+    if (!isExistingAppointmentContextClause(clause)) {
+      return false;
+    }
+    return (
+      !successfulWriteLicensesGenericAppointmentContext(clause, toolTrace) &&
+      !currentInboundGroundsAppointmentContext(clause, sourceInboundText) &&
+      !hasCompatibleAppointmentRead(clause, appointments, temporalContext)
+    );
+  });
 }
 
 /**
@@ -782,9 +1160,19 @@ export function hasFalseWriteClaim(
  */
 export function needsAuthoritativeAppointmentRead(
   reply: string,
-  toolTrace: ToolTraceLike[]
+  toolTrace: ToolTraceLike[],
+  sourceInboundText?: string,
+  temporalContext?: AppointmentTemporalContext
 ): boolean {
-  return inspectCompletedClaims(reply, toolTrace).needsAppointmentRead;
+  return (
+    inspectCompletedClaims(reply, toolTrace, temporalContext).needsAppointmentRead ||
+    hasUnverifiedExistingAppointmentContext(
+      reply,
+      toolTrace,
+      sourceInboundText,
+      temporalContext
+    )
+  );
 }
 
 /**
@@ -796,17 +1184,29 @@ export function inspectCustomerReply(
   reply: string,
   servicesResult: ServicesResult,
   forbiddenAppointmentIds: string[] = [],
-  toolTrace: ToolTraceLike[] = []
+  toolTrace: ToolTraceLike[] = [],
+  sourceInboundText?: string,
+  temporalContext?: AppointmentTemporalContext
 ): CustomerReplyInspection {
   const reasons = new Set<CustomerReplyLeakReason>();
   if (/INTERNAL_HINT/i.test(reply)) {
     reasons.add('internal_hint');
   }
-  if (hasFalseWriteClaim(reply, toolTrace)) {
+  if (hasFalseWriteClaim(reply, toolTrace, temporalContext)) {
     reasons.add('false_write_claim');
   }
   if (hasUnverifiedAvailabilityClaim(reply, toolTrace)) {
     reasons.add('unverified_availability');
+  }
+  if (
+    hasUnverifiedExistingAppointmentContext(
+      reply,
+      toolTrace,
+      sourceInboundText,
+      temporalContext
+    )
+  ) {
+    reasons.add('unverified_appointment_context');
   }
 
   for (const service of servicesResult.services ?? []) {
