@@ -16,6 +16,10 @@ import type {
   StructuredPreferencesConfig,
 } from './services/structuredPreferences';
 import type { AuthoritativeOutboundCatalog } from './services/receptionistOutbound';
+import {
+  observeTechnicalMaintenance,
+  parseTechnicalMaintenanceSnapshot,
+} from './services/technicalMaintenanceCache';
 
 export type {
   BookingMenuItem,
@@ -118,6 +122,13 @@ export interface TenantBotConfig {
   postBookingInstructions?: PostBookingInstruction[];
   authoritativeCatalog?: AuthoritativeOutboundCatalog;
   escalationResponsibleName?: string | null;
+  technicalMaintenance?: {
+    enabled: boolean;
+    paused: boolean;
+    exempt: boolean;
+    exemptTenantId?: string | null;
+    version?: number;
+  };
 }
 
 function parseNumber(
@@ -233,7 +244,15 @@ export async function getTenantConfig(
           typeof raw.escalationResponsibleName === 'string'
             ? raw.escalationResponsibleName
             : null,
+        technicalMaintenance:
+          parseTechnicalMaintenanceSnapshot(raw.technicalMaintenance) ??
+          undefined,
       };
+      observeTechnicalMaintenance({
+        phoneNumberId: data.phoneNumberId,
+        snapshot: data.technicalMaintenance,
+        tenantSlug: data.tenantSlug,
+      });
       configCache.set(cacheKey, {
         data,
         expiresAt: Date.now() + CACHE_TTL_MS,
@@ -297,6 +316,11 @@ export async function getTenantConfig(
   }
 
   return legacyConfig;
+}
+
+export function peekCachedTenantSlug(phoneNumberId: string): string | null {
+  const cacheKey = phoneNumberId || process.env.WA_PHONE_NUMBER_ID || 'legacy';
+  return configCache.get(cacheKey)?.data.tenantSlug ?? null;
 }
 
 export function __resetTenantConfigCacheForTest(): void {

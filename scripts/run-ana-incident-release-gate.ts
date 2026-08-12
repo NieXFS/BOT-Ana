@@ -238,6 +238,9 @@ async function main(): Promise<void> {
   runNpm(erpRoot, 'smoke:bot-customer-identity', erpEnv);
   runNpm(erpRoot, 'smoke:public-booking-auth', erpEnv);
   runNpm(erpRoot, 'smoke:bot-availability', erpEnv);
+  runNpm(erpRoot, 'smoke:ana-technical-maintenance', erpEnv);
+  runNpm(erpRoot, 'smoke:ana-resume-gate', erpEnv);
+  runNpm(erpRoot, 'smoke:pause-state-schedule', erpEnv);
 
   console.log(
     `gate coordenado Ana OK | runtime=${commandOutput(runtimeRoot, 'git', ['rev-parse', '--short=12', 'HEAD'])}:${commandOutput(runtimeRoot, 'git', ['rev-parse', '--short=12', 'HEAD^{tree}'])} | erp=${commandOutput(erpRoot, 'git', ['rev-parse', '--short=12', 'HEAD'])}:${commandOutput(erpRoot, 'git', ['rev-parse', '--short=12', 'HEAD^{tree}'])}`

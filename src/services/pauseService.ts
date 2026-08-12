@@ -11,6 +11,13 @@ import {
   isEscalationKnownActive,
   updateEscalationFromPauseState,
 } from './escalationCache';
+import { peekCachedTenantSlug } from '../configProvider';
+import {
+  observeTechnicalMaintenance,
+  parseTechnicalMaintenanceSnapshot,
+  shouldFailClosedForTechnicalMaintenance,
+  __resetTechnicalMaintenanceCacheForTest,
+} from './technicalMaintenanceCache';
 import {
   canonicalConversationKey,
   canonicalCustomerPhone,
@@ -142,6 +149,9 @@ async function fetchPauseState(
       conversationPausedUntil: data?.conversationPausedUntil ?? null,
       schedulePausedUntil: data?.schedulePausedUntil ?? null,
       escalation: data?.escalation,
+      technicalMaintenance:
+        parseTechnicalMaintenanceSnapshot(data?.technicalMaintenance) ??
+        undefined,
     };
   } catch (error) {
     // FAIL-OPEN: erro/timeout/404 → null → tratado como NÃO pausado pelo caller.
@@ -210,7 +220,8 @@ export async function pauseConversationByEcho(
  * conversa. Usa cache curto por conversa + write-through do echo.
  *
  * FAIL-OPEN legado: erro/timeout/404 continua `false`, EXCETO se o cache já
- * conhecia escalation.active=true; somente esse motivo novo permanece fechado.
+ * conhecia escalation.active=true ou o modo técnico global já tinha sido
+ * observado como ON para um tenant não isento. Esses motivos permanecem fechados.
  */
 export async function isConversationPaused(
   phoneNumberId: string,
@@ -252,8 +263,20 @@ export async function isConversationPaused(
   // 3) Busca o estado fresco no Receps.
   const state = await deps.fetchState(phoneNumberId, canonicalPhone);
   if (!state) {
-    return escalationWasActive; // só escalada conhecida muda o fail-open legado
+    return (
+      escalationWasActive ||
+      shouldFailClosedForTechnicalMaintenance({
+        phoneNumberId,
+        tenantSlug: peekCachedTenantSlug(phoneNumberId),
+      })
+    );
   }
+
+  observeTechnicalMaintenance({
+    phoneNumberId,
+    snapshot: parseTechnicalMaintenanceSnapshot(state.technicalMaintenance),
+    tenantSlug: peekCachedTenantSlug(phoneNumberId),
+  });
 
   const escalation = updateEscalationFromPauseState(
     phoneNumberId,
@@ -274,4 +297,5 @@ export async function isConversationPaused(
 /** Seam de teste: limpa o cache entre casos do smoke. */
 export function __resetPauseCacheForTest(): void {
   pauseCache.clear();
+  __resetTechnicalMaintenanceCacheForTest();
 }

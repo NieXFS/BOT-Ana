@@ -40,6 +40,25 @@ check('todos passado = não pausado', isPausedFromState({ globalPausedUntil: pas
 check('global passado + conversa futuro = pausado', isPausedFromState({ globalPausedUntil: past, conversationPausedUntil: future, schedulePausedUntil: null }, now) === true);
 check('só schedule futuro (resto passado) = pausado', isPausedFromState({ globalPausedUntil: past, conversationPausedUntil: past, schedulePausedUntil: future }, now) === true);
 check('todos futuro = pausado', isPausedFromState({ globalPausedUntil: future, conversationPausedUntil: future, schedulePausedUntil: future }, now) === true);
+check(
+  'technicalMaintenance.paused é autoritativo',
+  isPausedFromState(
+    {
+      globalPausedUntil: null,
+      conversationPausedUntil: null,
+      schedulePausedUntil: null,
+      technicalMaintenance: { enabled: true, paused: true, exempt: false },
+    },
+    now
+  ) === true
+);
+check(
+  'ausência de technicalMaintenance preserva o contrato antigo',
+  isPausedFromState(
+    { globalPausedUntil: null, conversationPausedUntil: null, schedulePausedUntil: null },
+    now
+  ) === false
+);
 
 if (failures > 0) {
   console.error(`\n❌ ${failures} check(s) falharam.`);

@@ -23,6 +23,17 @@ export interface PauseState {
     questionId: string | null;
     version: number;
   };
+  /**
+   * Modo técnico global. Campo aditivo: ERP antigo/ausente = não pausa por
+   * este motivo. `paused` é a decisão autoritativa deste tenant.
+   */
+  technicalMaintenance?: {
+    enabled: boolean;
+    paused: boolean;
+    exempt: boolean;
+    exemptTenantId?: string | null;
+    version?: number;
+  };
 }
 
 /** Um carimbo ISO está "pausado agora"? (futuro = sim; null/passado/inválido = não). */
@@ -39,6 +50,7 @@ export function isActivePause(
 /** A conversa está pausada agora? (salão OU conversa OU auto-pausa programada). */
 export function isPausedFromState(state: PauseState, nowMs: number): boolean {
   return (
+    state.technicalMaintenance?.paused === true ||
     isActivePause(state.globalPausedUntil, nowMs) ||
     isActivePause(state.conversationPausedUntil, nowMs) ||
     isActivePause(state.schedulePausedUntil, nowMs) ||
