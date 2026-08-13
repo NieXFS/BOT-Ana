@@ -812,6 +812,10 @@ async function runReceptionist(
   let providerCalls = 0;
   const outsideHours = expected?.e2eSilence === 'outside_hours';
   const humanSilence = expected?.e2eSilence === 'human_takeover' || options.bargeIn;
+  const humanControl = {
+    disposition: humanSilence ? 'HUMAN_ACTIVE' as const : 'NO_ACTIVE_TAKEOVER' as const,
+    resumeDecision: humanSilence ? 'KEEP_HUMAN' as const : 'NONE' as const,
+  };
 
   try {
     for (const userText of turns) {
@@ -858,6 +862,7 @@ async function runReceptionist(
         inbound: userText,
         history,
         catalog: DAILY_SERVICES,
+        humanControl,
       });
       const grounded = await resolveGroundedReceptionistTurn({
         userMessage: userText,
@@ -867,6 +872,7 @@ async function runReceptionist(
         now: DAILY_FIXED_NOW,
         timezone: config.timezone,
         botName: config.botName,
+        humanControl,
         readUpcoming: async () =>
           JSON.parse(
             await harness.execute('getUpcomingAppointments', {})

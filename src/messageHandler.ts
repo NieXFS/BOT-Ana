@@ -11,7 +11,13 @@ import {
 } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
 import { isConversationPaused } from './services/pauseService';
-import { shouldAnaResumeForInbound } from './services/anaResumeGate';
+import {
+  evaluateAnaResumeForInbound,
+  shouldAnaResumeForInbound,
+  turnControlFromResumeEvaluation,
+  type AnaResumeGateEvaluation,
+} from './services/anaResumeGate';
+import type { ReceptionistTurnControl } from './services/receptionistTurnDecision';
 import {
   markFollowupOptedOut,
   markFollowupPostLink,
@@ -86,6 +92,7 @@ interface MessageBuffer {
   inboundPersisted: boolean;
   messageIds: string[];
   pendingMessageIds: string[];
+  turnControl?: ReceptionistTurnControl;
 }
 
 const messageBuffers = new Map<string, MessageBuffer>();
@@ -442,6 +449,37 @@ async function suppressFlushIfPaused(params: {
   return true;
 }
 
+async function resolveInboundTurnControl(
+  config: TenantBotConfig,
+  customerPhone: string,
+  customerName: string | undefined,
+  deps: IncomingMessageDeps
+): Promise<AnaResumeGateEvaluation> {
+  if (deps.evaluateResume) {
+    return deps.evaluateResume({
+      config,
+      customerPhone,
+      customerName,
+    });
+  }
+  const allowed = await (deps.resumeGate ?? shouldAnaResumeForInbound)({
+    config,
+    customerPhone,
+    customerName,
+  });
+  return allowed
+    ? {
+        allowed: true,
+        disposition: 'NO_ACTIVE_TAKEOVER',
+        resumeDecision: 'PROCEED',
+      }
+    : {
+        allowed: false,
+        disposition: 'HUMAN_ACTIVE',
+        resumeDecision: 'KEEP_SILENT',
+      };
+}
+
 async function getBufferedReply(
   buffer: MessageBuffer,
   bufferedMessageIds: string[],
@@ -449,7 +487,13 @@ async function getBufferedReply(
   deps: FlushDeps
 ): Promise<OutboundReply> {
   const work = () =>
-    deps.getReply(buffer.from, consolidatedText, buffer.name, buffer.config);
+    deps.getReply(
+      buffer.from,
+      consolidatedText,
+      buffer.name,
+      buffer.config,
+      buffer.turnControl
+    );
   if (!buffer.inboundPersisted) return work();
   return withPersistedInboundContext(bufferedMessageIds, work);
 }
@@ -947,6 +991,7 @@ export interface IncomingMessageDeps {
   shouldSuspend: typeof shouldSuspendForPendingInbound;
   isPaused: typeof isConversationPaused;
   resumeGate?: typeof shouldAnaResumeForInbound;
+  evaluateResume?: typeof evaluateAnaResumeForInbound;
   sendReply?: typeof sendConfiguredReply;
   withConversationLock?: (
     phoneNumberId: string,
@@ -966,6 +1011,7 @@ const defaultIncomingMessageDeps: IncomingMessageDeps = {
   shouldSuspend: shouldSuspendForPendingInbound,
   isPaused: isConversationPaused,
   resumeGate: shouldAnaResumeForInbound,
+  evaluateResume: evaluateAnaResumeForInbound,
   sendReply: sendConfiguredReply,
   withConversationLock: (phoneNumberId, customerPhone, work) =>
     withConversationLock(phoneNumberId, customerPhone, async () => work()),
@@ -1133,12 +1179,13 @@ export async function handleIncomingMessage(
         config
       );
       if (config.botRole !== 'sales') {
-        const resumeAllowed = await (deps.resumeGate ?? shouldAnaResumeForInbound)({
+        const resumeEvaluation = await resolveInboundTurnControl(
           config,
-          customerPhone: from,
-          customerName: name,
-        });
-        if (resumeAllowed) {
+          from,
+          name,
+          deps
+        );
+        if (resumeEvaluation.allowed) {
           await sendDirectReceptionistReplyIfUnpaused(
             from,
             transcriptionFallback,
@@ -1199,18 +1246,21 @@ export async function handleIncomingMessage(
     return;
   }
 
-  if (
-    config.botRole !== 'sales' &&
-    !(await (deps.resumeGate ?? shouldAnaResumeForInbound)({
+  let inboundTurnControl: ReceptionistTurnControl | undefined;
+  if (config.botRole !== 'sales') {
+    const resumeEvaluation = await resolveInboundTurnControl(
       config,
-      customerPhone: from,
-      customerName: name,
-    }))
-  ) {
-    console.log(
-      `⏸️ [retomada] Ana permaneceu em silêncio | phoneNumberId=${config.phoneNumberId} | convHash=${convHash}`
+      from,
+      name,
+      deps
     );
-    return;
+    if (!resumeEvaluation.allowed) {
+      console.log(
+        `⏸️ [retomada] Ana permaneceu em silêncio | phoneNumberId=${config.phoneNumberId} | convHash=${convHash}`
+      );
+      return;
+    }
+    inboundTurnControl = turnControlFromResumeEvaluation(resumeEvaluation);
   }
 
   // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada
@@ -1296,6 +1346,7 @@ export async function handleIncomingMessage(
       if (inboundPersisted) existing.pendingMessageIds.push(message.id);
       existing.name = name;
       existing.config = config;
+      if (inboundTurnControl) existing.turnControl = inboundTurnControl;
       console.log(
         `📥 Mensagem adicionada à fila pendente | ${safeSalesContext(config, from)}`
       );
@@ -1305,6 +1356,7 @@ export async function handleIncomingMessage(
       if (inboundPersisted) existing.messageIds.push(message.id);
       existing.name = name;
       existing.config = config;
+      if (inboundTurnControl) existing.turnControl = inboundTurnControl;
       existing.timer = setTimeout(() => {
         flushBuffer(bufferKey).catch((err) => {
           console.error(
@@ -1328,6 +1380,7 @@ export async function handleIncomingMessage(
       inboundPersisted,
       messageIds: inboundPersisted ? [message.id] : [],
       pendingMessageIds: [],
+      turnControl: inboundTurnControl,
     };
 
     newBuffer.timer = setTimeout(() => {
@@ -1359,7 +1412,8 @@ export async function handleIncomingMessage(
 export function __seedFlushBufferForTest(
   config: TenantBotConfig,
   from: string,
-  texts: string[]
+  texts: string[],
+  turnControl?: ReceptionistTurnControl
 ): string {
   const bufferKey = buildBufferKey(config, from);
   messageBuffers.set(bufferKey, {
@@ -1375,6 +1429,7 @@ export function __seedFlushBufferForTest(
     inboundPersisted: false,
     messageIds: [],
     pendingMessageIds: [],
+    turnControl,
   });
   return bufferKey;
 }

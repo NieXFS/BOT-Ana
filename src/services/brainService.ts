@@ -91,7 +91,9 @@ import {
   buildTurnDecisionReceipt,
   emitReceptionistTurnReceipt,
   resolveReceptionistTurnDecision,
+  resolveTurnControl,
   type PendingOperationalQuestion,
+  type ReceptionistTurnControl,
 } from './receptionistTurnDecision';
 import {
   buildSocialReceptionistReply,
@@ -1366,7 +1368,8 @@ export async function getReply(
   phone: string,
   userMessage: string,
   userName: string,
-  config: TenantBotConfig
+  config: TenantBotConfig,
+  turnControl?: ReceptionistTurnControl
 ): Promise<string | ValidatedReceptionistOutbound> {
   const baseRole = resolveBrainRole(config);
   if (baseRole === 'sales') {
@@ -1434,7 +1437,7 @@ export async function getReply(
     rememberResolvedSalesRole(phone, config, 'sales');
     return getSalesReply(phone, userMessage, userName, config);
   }
-  return getReceptionistReply(phone, userMessage, userName, config);
+  return getReceptionistReply(phone, userMessage, userName, config, turnControl);
 }
 
 /**
@@ -1489,7 +1492,8 @@ async function getReceptionistReply(
   phone: string,
   userMessage: string,
   userName: string,
-  config: TenantBotConfig
+  config: TenantBotConfig,
+  turnControlInput?: ReceptionistTurnControl
 ): Promise<ValidatedReceptionistOutbound> {
   const conversationKey = buildConversationKey(config.phoneNumberId, phone);
   const turnStartedAt = new Date();
@@ -1497,8 +1501,32 @@ async function getReceptionistReply(
     now: turnStartedAt,
     timezone: config.timezone,
   };
+  const humanControl = resolveTurnControl(turnControlInput);
 
   if (await isConversationPaused(config.phoneNumberId, phone)) {
+    throw new ConversationPausedBeforeDispatch();
+  }
+  if (humanControl.disposition === 'HUMAN_ACTIVE') {
+    const silentDecision = resolveReceptionistTurnDecision({
+      inbound: userMessage,
+      history: [],
+      catalog: { success: true, services: [], professionals: [] },
+      humanControl,
+    });
+    emitReceptionistTurnReceipt(
+      buildTurnDecisionReceipt({
+        phoneNumberId: config.phoneNumberId,
+        customerPhone: phone,
+        tenantSlug: config.tenantSlug,
+        inboundMessageId: currentSourceInboundMessageId() ?? undefined,
+        decision: silentDecision,
+        modelCalled: false,
+        toolNames: [],
+        outboundAction: 'suppressed',
+        reasonCodes: ['HUMAN_ACTIVE'],
+        latencyMs: Date.now() - turnStartedAt.getTime(),
+      })
+    );
     throw new ConversationPausedBeforeDispatch();
   }
 
@@ -1523,6 +1551,7 @@ async function getReceptionistReply(
       inbound: userMessage,
       history: [],
       catalog: { success: true, services: [], professionals: [] },
+      humanControl,
     });
     emitReceptionistTurnReceipt(
       buildTurnDecisionReceipt({
@@ -1571,6 +1600,7 @@ async function getReceptionistReply(
       inbound: userMessage,
       history,
       catalog: { success: true, services: [], professionals: [] },
+      humanControl,
     });
     emitReceptionistTurnReceipt(
       buildTurnDecisionReceipt({
@@ -1612,6 +1642,7 @@ async function getReceptionistReply(
     inbound: userMessage,
     history,
     catalog: servicesForGate,
+    humanControl,
   });
   const previousAssistantText = immediatePreviousAnaAssistantText(history);
   const groundedTurn = await resolveGroundedReceptionistTurn({
@@ -1622,6 +1653,7 @@ async function getReceptionistReply(
     now: turnStartedAt,
     timezone: config.timezone,
     botName: config.botName,
+    humanControl,
     readUpcoming: () => getCustomerUpcomingAppointments(phone, config),
     readSlots: ({ date, serviceId, professionalId }) =>
       getAvailableSlots(date, serviceId, config, professionalId),

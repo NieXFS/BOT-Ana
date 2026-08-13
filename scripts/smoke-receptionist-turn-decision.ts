@@ -18,8 +18,10 @@ import {
   buildAmbiguousServiceConfirmation,
   buildTurnDecisionReceipt,
   emitReceptionistTurnReceipt,
+  resolveListedServiceOrdinal,
   resolveReceptionistTurnDecision,
   SERVICE_REPEAT_PROMPT,
+  type ReceptionistTurnControl,
 } from '../src/services/receptionistTurnDecision';
 import { resolveGroundedReceptionistTurn } from '../src/services/receptionistTurnGrounding';
 import {
@@ -105,6 +107,7 @@ const cases: Array<{
   replyIncludes?: string;
   replyExcludes?: RegExp;
   grounded?: 'short_circuit' | 'continue';
+  humanControl?: ReceptionistTurnControl;
 }> = [
   {
     name: 'Drenagem Linfática após pergunta de serviço avança',
@@ -215,7 +218,7 @@ const cases: Array<{
     grounded: 'short_circuit',
   },
   {
-    name: 'HUMAN no meio silencia',
+    name: 'HUMAN_ACTIVE no meio silencia',
     inbound: 'Drenagem Linfática',
     assistant: `${HUMAN_ECHO_PREFIX}qual horário fica melhor?`,
     extraHistory: [
@@ -225,13 +228,112 @@ const cases: Array<{
     action: 'silence_human',
     source: 'HUMAN',
     grounded: 'short_circuit',
+    humanControl: {
+      disposition: 'HUMAN_ACTIVE',
+      resumeDecision: 'KEEP_HUMAN',
+    },
   },
   {
-    name: 'pergunta HUMAN não é pending ANA',
+    name: 'pergunta HUMAN com takeover ativo não é pending ANA',
     inbound: 'Drenagem Linfática',
     assistant: `${HUMAN_ECHO_PREFIX}você prefere drenagem ou peeling?`,
     action: 'silence_human',
     source: 'HUMAN',
+    grounded: 'short_circuit',
+    humanControl: {
+      disposition: 'HUMAN_ACTIVE',
+      resumeDecision: 'KEEP_HUMAN',
+    },
+  },
+  {
+    name: 'RESUME_ANA não silencia histórico HUMAN nem reusa slot',
+    inbound: 'Drenagem Linfática',
+    assistant: `${HUMAN_ECHO_PREFIX}qual horário fica melhor?`,
+    extraHistory: [
+      { role: 'user', content: 'Quero agendar' },
+      { role: 'assistant', content: serviceQuestion },
+    ],
+    action: 'continue_model',
+    source: 'HUMAN',
+    grounded: 'continue',
+    humanControl: {
+      disposition: 'RESUME_APPROVED',
+      resumeDecision: 'RESUME_ANA',
+    },
+  },
+  {
+    name: 'pausa expirada sem chefe não silencia histórico HUMAN',
+    inbound: 'Quero agendar',
+    assistant: `${HUMAN_ECHO_PREFIX}te chamo já`,
+    extraHistory: [
+      { role: 'user', content: 'Quero agendar' },
+      { role: 'assistant', content: serviceQuestion },
+    ],
+    action: 'continue_model',
+    source: 'HUMAN',
+    grounded: 'continue',
+    humanControl: {
+      disposition: 'NO_ACTIVE_TAKEOVER',
+      resumeDecision: 'GATE_DISABLED',
+    },
+  },
+  {
+    name: 'a segunda opção escolhe Limpeza',
+    inbound: 'a segunda opção',
+    assistant: serviceQuestion,
+    action: 'follow_up_datetime',
+    slot: 'SERVICE',
+    source: 'ANA',
+    replyIncludes: 'Limpeza de pele profunda',
+    replyExcludes: /Drenagem Linfática|Peeling facial/,
+    grounded: 'short_circuit',
+  },
+  {
+    name: 'primeiro / 1 / última contra a lista pendente',
+    inbound: 'a primeira',
+    assistant: serviceQuestion,
+    action: 'follow_up_datetime',
+    replyIncludes: 'Drenagem Linfática',
+    grounded: 'short_circuit',
+  },
+  {
+    name: '2 escolhe o segundo listado',
+    inbound: '2',
+    assistant: serviceQuestion,
+    action: 'follow_up_datetime',
+    replyIncludes: 'Limpeza de pele profunda',
+    grounded: 'short_circuit',
+  },
+  {
+    name: 'terceiro com acento',
+    inbound: 'a Terceira',
+    assistant: serviceQuestion,
+    action: 'follow_up_datetime',
+    replyIncludes: 'Peeling facial',
+    grounded: 'short_circuit',
+  },
+  {
+    name: 'última quando inequívoco',
+    inbound: 'a última',
+    assistant: serviceQuestion,
+    action: 'follow_up_datetime',
+    replyIncludes: 'Calosidades e Fissuras',
+    grounded: 'short_circuit',
+  },
+  {
+    name: 'índice fora do intervalo pede repetição sem inventar',
+    inbound: 'a 5ª opção',
+    assistant: serviceQuestion,
+    action: 'ask_repeat',
+    replyIncludes: SERVICE_REPEAT_PROMPT,
+    replyExcludes: /Drenagem Linfática|Limpeza de pele profunda/,
+    grounded: 'short_circuit',
+  },
+  {
+    name: 'ordinal fora de pergunta pendente não opera',
+    inbound: 'a segunda opção',
+    action: 'personal_ack',
+    source: 'none',
     grounded: 'short_circuit',
   },
   {
@@ -292,6 +394,7 @@ async function main(): Promise<void> {
       inbound: testCase.inbound,
       history,
       catalog,
+      humanControl: testCase.humanControl,
     });
     assert.equal(decision.action, testCase.action, testCase.name);
     if (testCase.slot) {
@@ -320,6 +423,7 @@ async function main(): Promise<void> {
       services: catalog,
       now: new Date('2026-08-12T18:00:00.000Z'),
       timezone: 'America/Sao_Paulo',
+      humanControl: testCase.humanControl,
       ...noIo,
     });
     if (testCase.grounded) {
@@ -455,6 +559,82 @@ async function main(): Promise<void> {
   assert.equal(socialReceipt.payloadVariant, 'greeting_boa_tarde');
   assert.ok(socialReceipt.payloadHash);
   assert.doesNotMatch(JSON.stringify(socialReceipt), /5511999990000/);
+
+  const listed = [
+    'Drenagem Linfática',
+    'Limpeza de pele profunda',
+    'Peeling facial',
+    'Calosidades e Fissuras',
+  ];
+  assert.equal(resolveListedServiceOrdinal('a segunda opção', listed).kind, 'unequivocal');
+  assert.equal(
+    resolveListedServiceOrdinal('a segunda opção', listed).kind === 'unequivocal'
+      ? resolveListedServiceOrdinal('a segunda opção', listed).serviceName
+      : null,
+    'Limpeza de pele profunda'
+  );
+  assert.equal(resolveListedServiceOrdinal('primeiro', listed).kind, 'unequivocal');
+  assert.equal(resolveListedServiceOrdinal('1', listed).kind, 'unequivocal');
+  assert.equal(resolveListedServiceOrdinal('a última', listed).kind, 'unequivocal');
+  assert.equal(resolveListedServiceOrdinal('5', listed).kind, 'out_of_range');
+  assert.equal(resolveListedServiceOrdinal('a quarta opção', listed).kind, 'unequivocal');
+  assert.equal(resolveListedServiceOrdinal('quarta', listed).kind, 'none');
+  assert.equal(resolveListedServiceOrdinal('segunda feira', listed).kind, 'none');
+  assert.equal(resolveListedServiceOrdinal('a segunda opção', []).kind, 'out_of_range');
+
+  const resumed = resolveReceptionistTurnDecision({
+    inbound: 'Drenagem Linfática',
+    history: historyFor(`${HUMAN_ECHO_PREFIX}já te atendo`, 'Drenagem Linfática', [
+      { role: 'user', content: 'Quero agendar' },
+      { role: 'assistant', content: serviceQuestion },
+    ]),
+    catalog,
+    humanControl: {
+      disposition: 'RESUME_APPROVED',
+      resumeDecision: 'RESUME_ANA',
+    },
+  });
+  assert.equal(resumed.action, 'continue_model');
+  assert.notEqual(resumed.action, 'silence_human');
+  assert.equal(resumed.pending.source, 'HUMAN');
+  assert.equal(resumed.pending.expectedSlot, undefined);
+  assert.equal(resumed.humanControlDisposition, 'RESUME_APPROVED');
+  assert.equal(resumed.resumeDecision, 'RESUME_ANA');
+  const resumeReceipt = buildTurnDecisionReceipt({
+    phoneNumberId: 'PN-SMOKE',
+    customerPhone: '5511999990000',
+    tenantSlug: 'studio-viti',
+    inboundMessageId: 'wamid.resume',
+    decision: resumed,
+    modelCalled: true,
+    toolNames: [],
+    outboundAction: 'sent',
+    payload: 'Qual dia e horário você prefere?',
+  });
+  assert.notEqual(resumeReceipt.decision, 'silence_human');
+  assert.equal(resumeReceipt.humanControlDisposition, 'RESUME_APPROVED');
+  assert.equal(resumeReceipt.resumeDecision, 'RESUME_ANA');
+  assert.equal(resumeReceipt.pendingQuestionSource, 'HUMAN');
+  assert.doesNotMatch(
+    JSON.stringify(resumeReceipt),
+    /5511999990000|Drenagem|wamid\.resume|atendente/
+  );
+
+  const keepHuman = resolveReceptionistTurnDecision({
+    inbound: 'Drenagem Linfática',
+    history: historyFor(`${HUMAN_ECHO_PREFIX}já te atendo`, 'Drenagem Linfática'),
+    catalog,
+    humanControl: {
+      disposition: 'HUMAN_ACTIVE',
+      resumeDecision: 'KEEP_HUMAN',
+    },
+  });
+  assert.equal(keepHuman.action, 'silence_human');
+  assert.equal(keepHuman.humanControlDisposition, 'HUMAN_ACTIVE');
+
+  assert.equal(followUp.humanControlDisposition, 'NO_ACTIVE_TAKEOVER');
+  assert.equal(receipts[0]?.humanControlDisposition, 'NO_ACTIVE_TAKEOVER');
+  assert.equal(receipts[0]?.resumeDecision, 'NONE');
 
   console.log('smoke receptionist turn decision: OK');
 }

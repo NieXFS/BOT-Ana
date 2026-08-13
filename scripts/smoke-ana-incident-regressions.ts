@@ -835,6 +835,29 @@ async function main() {
   );
   pause.__resetPauseCacheForTest();
 
+  const turnDecision = await import('../src/services/receptionistTurnDecision');
+  turnDecision.__resetTurnDecisionReceiptsForTest();
+  await assert.rejects(
+    () =>
+      brain.getReply(
+        '5511999990001',
+        'Quero agendar Drenagem Linfática',
+        'Cliente',
+        config as any,
+        { disposition: 'HUMAN_ACTIVE', resumeDecision: 'KEEP_HUMAN' }
+      ),
+    (error: unknown) =>
+      error instanceof brain.ConversationPausedBeforeDispatch,
+    'HUMAN_ACTIVE chega ao brain e aborta sem outbound'
+  );
+  const keepReceipts = turnDecision
+    .__getTurnDecisionReceiptsForTest()
+    .filter((item) => item.humanControlDisposition === 'HUMAN_ACTIVE');
+  assert.ok(keepReceipts.length >= 1);
+  assert.equal(keepReceipts.at(-1)?.decision, 'silence_human');
+  assert.equal(keepReceipts.at(-1)?.outboundAction, 'suppressed');
+  assert.doesNotMatch(JSON.stringify(keepReceipts.at(-1)), /5511999990001|Drenagem/);
+
   console.log('smoke ana incident regressions: OK');
   process.exit(0);
 }

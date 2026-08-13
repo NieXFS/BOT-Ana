@@ -27,7 +27,12 @@ import {
   hasCustomerRequestVerb,
   hasNonTransactionalOperationalCue,
 } from './receptionistSocialSafety';
-import { resolveReceptionistTurnDecision } from './receptionistTurnDecision';
+import {
+  DEFAULT_TURN_CONTROL,
+  resolveReceptionistTurnDecision,
+  resolveTurnControl,
+  type ReceptionistTurnControl,
+} from './receptionistTurnDecision';
 
 export const STANDALONE_CANCEL_CUSTOMER_MESSAGE =
   'Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui.';
@@ -441,6 +446,7 @@ export async function resolveGroundedReceptionistTurn(input: {
   now: Date;
   timezone: string;
   botName?: string;
+  humanControl?: ReceptionistTurnControl | null;
   readUpcoming: () => Promise<UpcomingAppointmentsResult>;
   readSlots: (args: {
     date: string;
@@ -463,6 +469,20 @@ export async function resolveGroundedReceptionistTurn(input: {
     identityCanonical: false,
     modelHistory,
   });
+  const humanControl = resolveTurnControl(
+    input.humanControl ?? DEFAULT_TURN_CONTROL
+  );
+
+  // Takeover vigente bloqueia antes de qualquer I/O de agenda.
+  if (humanControl.disposition === 'HUMAN_ACTIVE') {
+    return {
+      kind: 'short_circuit',
+      reply: '',
+      toolTrace: [],
+      identityCanonical: false,
+      modelHistory,
+    };
+  }
 
   const intent = classifyExistingAppointmentIntent(input.userMessage);
   if (intent !== 'none') {
@@ -595,6 +615,7 @@ export async function resolveGroundedReceptionistTurn(input: {
     inbound: input.userMessage,
     history: input.history,
     catalog: input.services,
+    humanControl,
   });
   if (turnDecision.action === 'silence_human') {
     return {

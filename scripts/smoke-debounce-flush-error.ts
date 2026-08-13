@@ -456,6 +456,37 @@ async function main() {
   expect('12) takeover dentro da lock impede transporte', !dispatchOrder.includes('send'));
   expect('12) buffer é limpo pelo takeover serializado', !__hasBufferForTest(key12));
 
+  // --- Caso 12-resume: echo após RESUME_APPROVED e antes do send vence -------
+  __resetFlushStateForTest();
+  sent.length = 0;
+  let resumeSendCalls = 0;
+  const key12Resume = __seedFlushBufferForTest(
+    config,
+    from,
+    ['Quero agendar Drenagem Linfática'],
+    { disposition: 'RESUME_APPROVED', resumeDecision: 'RESUME_ANA' }
+  );
+  let pausedAfterBrain = false;
+  await flushBuffer(key12Resume, {
+    getReply: async (_phone, _text, _name, _cfg, turnControl) => {
+      expect(
+        '12-resume) getReply recebe RESUME_APPROVED',
+        turnControl?.disposition === 'RESUME_APPROVED' &&
+          turnControl?.resumeDecision === 'RESUME_ANA'
+      );
+      pausedAfterBrain = true;
+      return 'resposta que não pode sair depois do echo';
+    },
+    sendReply: async () => {
+      resumeSendCalls += 1;
+    },
+    isPaused: async () => pausedAfterBrain,
+    recordPausedInbound: async () => {},
+    withConversationLock: async (_pnid, _phone, work) => work(),
+  });
+  expect('12-resume) zero outbound após echo pós-resume', resumeSendCalls === 0);
+  expect('12-resume) buffer limpo', !__hasBufferForTest(key12Resume));
+
   // --- Caso 13: rejeição fail-closed não vira fallback nem exceção ------------
   __resetFlushStateForTest();
   let fallbackCalls = 0;

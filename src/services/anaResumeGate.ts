@@ -8,6 +8,11 @@ import {
   type AnaResumeClassification,
 } from './anaResumeClassifier';
 import { getHistoryWithTimestamps } from './contextManager';
+import type {
+  HumanControlDisposition,
+  ReceptionistTurnControl,
+  ResumeDecisionCode,
+} from './receptionistTurnDecision';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -138,31 +143,68 @@ function capture(
   });
 }
 
+export interface AnaResumeGateEvaluation {
+  allowed: boolean;
+  disposition: HumanControlDisposition;
+  resumeDecision: ResumeDecisionCode;
+}
+
+export function turnControlFromResumeEvaluation(
+  evaluation: AnaResumeGateEvaluation
+): ReceptionistTurnControl {
+  return {
+    disposition: evaluation.disposition,
+    resumeDecision: evaluation.resumeDecision,
+  };
+}
+
+function silentHuman(
+  resumeDecision: ResumeDecisionCode = 'KEEP_SILENT'
+): AnaResumeGateEvaluation {
+  return {
+    allowed: false,
+    disposition: 'HUMAN_ACTIVE',
+    resumeDecision,
+  };
+}
+
 /**
- * Retorna true SOMENTE quando este inbound pode seguir ao brain normal. Toda
- * falha de estado, histórico, provider, JSON, finalização ou CAS fica em
- * silêncio. O método não envia WhatsApp nem chama tools de agenda.
+ * Avaliação estruturada do chefe de retomada. `allowed` continua sendo o
+ * único sinal que libera buffer/brain; disposition/resumeDecision viajam até
+ * o compositor de turno para não contradizer RESUME_ANA.
  */
-export async function shouldAnaResumeForInbound(
+export async function evaluateAnaResumeForInbound(
   input: {
     config: TenantBotConfig;
     customerPhone: string;
     customerName?: string | null;
   },
   deps: AnaResumeGateDeps = defaultDeps
-): Promise<boolean> {
-  if (!isAnaResumeGateEnabled(input.config)) return true;
+): Promise<AnaResumeGateEvaluation> {
+  if (!isAnaResumeGateEnabled(input.config)) {
+    return {
+      allowed: true,
+      disposition: 'NO_ACTIVE_TAKEOVER',
+      resumeDecision: 'GATE_DISABLED',
+    };
+  }
 
   let begin: AnaResumeGateBeginResponse;
   try {
     begin = await deps.begin(input.config.phoneNumberId, input.customerPhone);
   } catch (error) {
     capture(error, input.config, 'begin');
-    return false;
+    return silentHuman('KEEP_SILENT');
   }
 
-  if (begin.action === 'PROCEED') return true;
-  if (begin.action === 'KEEP_SILENT') return false;
+  if (begin.action === 'PROCEED') {
+    return {
+      allowed: true,
+      disposition: 'NO_ACTIVE_TAKEOVER',
+      resumeDecision: 'PROCEED',
+    };
+  }
+  if (begin.action === 'KEEP_SILENT') return silentHuman('KEEP_SILENT');
 
   let history: Awaited<ReturnType<typeof getHistoryWithTimestamps>> = [];
   try {
@@ -186,7 +228,7 @@ export async function shouldAnaResumeForInbound(
     // catch cobre bugs/erros inesperados do próprio módulo e preserva o
     // contrato mais importante: nenhuma falha pode liberar uma resposta.
     capture(error, input.config, 'classify');
-    return false;
+    return silentHuman('UNCERTAIN');
   }
 
   try {
@@ -196,10 +238,44 @@ export async function shouldAnaResumeForInbound(
       expectedVersion: begin.expectedVersion,
       classification,
     });
-    if (!finalized.applied) return false;
-    return finalized.action === 'PROCEED';
+    if (!finalized.applied) {
+      return silentHuman(
+        classification.decision === 'RESUME_ANA'
+          ? 'KEEP_SILENT'
+          : classification.decision
+      );
+    }
+    if (finalized.action === 'PROCEED') {
+      return {
+        allowed: true,
+        disposition: 'RESUME_APPROVED',
+        resumeDecision:
+          classification.decision === 'RESUME_ANA' ? 'RESUME_ANA' : 'PROCEED',
+      };
+    }
+    return silentHuman(
+      classification.decision === 'RESUME_ANA'
+        ? 'KEEP_SILENT'
+        : classification.decision
+    );
   } catch (error) {
     capture(error, input.config, 'finalize');
-    return false;
+    return silentHuman('KEEP_SILENT');
   }
+}
+
+/**
+ * Retorna true SOMENTE quando este inbound pode seguir ao brain normal. Toda
+ * falha de estado, histórico, provider, JSON, finalização ou CAS fica em
+ * silêncio. O método não envia WhatsApp nem chama tools de agenda.
+ */
+export async function shouldAnaResumeForInbound(
+  input: {
+    config: TenantBotConfig;
+    customerPhone: string;
+    customerName?: string | null;
+  },
+  deps: AnaResumeGateDeps = defaultDeps
+): Promise<boolean> {
+  return (await evaluateAnaResumeForInbound(input, deps)).allowed;
 }

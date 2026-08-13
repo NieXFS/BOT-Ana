@@ -470,6 +470,149 @@ async function main(): Promise<void> {
     assert.equal(lastReceipt?.outboundAction, 'sent');
     assert.equal(lastReceipt?.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'), false);
     assert.doesNotMatch(JSON.stringify(lastReceipt), /5511000000002|Drenagem/);
+    assert.equal(lastReceipt?.humanControlDisposition, 'NO_ACTIVE_TAKEOVER');
+
+    const keepPhone = '5511000000003';
+    const keepKey = context.buildConversationKey(phoneNumberId, keepPhone);
+    handler.__resetFlushStateForTest();
+    inboundSequence += 1;
+    await handler.handleIncomingMessage(
+      {
+        from: keepPhone,
+        id: `wamid.inbound.${suffix}.${inboundSequence}`,
+        timestamp: String(Math.floor(Date.now() / 1000) + inboundSequence),
+        type: 'text',
+        text: { body: 'Quero agendar' },
+      },
+      { profile: { name: 'Cliente Smoke' }, wa_id: keepPhone },
+      config as any,
+      {
+        ...incomingDeps,
+        evaluateResume: async () => ({
+          allowed: false,
+          disposition: 'HUMAN_ACTIVE',
+          resumeDecision: 'KEEP_HUMAN',
+        }),
+      } as any
+    );
+    assert.equal(
+      handler.__hasBufferForTest(keepKey),
+      false,
+      'KEEP_HUMAN não cria buffer nem chama brain'
+    );
+
+    const resumePhone = '5511000000004';
+    const resumeKey = context.buildConversationKey(phoneNumberId, resumePhone);
+    await context.addMessage(
+      resumeKey,
+      'assistant',
+      `${human.HUMAN_ECHO_PREFIX}já te atendo, um instante`
+    );
+    await context.addMessage(resumeKey, 'user', 'ok');
+    await context.addMessage(
+      resumeKey,
+      'assistant',
+      `${human.HUMAN_ECHO_PREFIX}combinado por hoje`
+    );
+    turnDecision.__resetTurnDecisionReceiptsForTest();
+    const resumeTransport: string[] = [];
+    handler.__resetFlushStateForTest();
+    inboundSequence += 1;
+    await handler.handleIncomingMessage(
+      {
+        from: resumePhone,
+        id: `wamid.inbound.${suffix}.${inboundSequence}`,
+        timestamp: String(Math.floor(Date.now() / 1000) + inboundSequence),
+        type: 'text',
+        text: { body: 'Quero agendar' },
+      },
+      { profile: { name: 'Cliente Smoke' }, wa_id: resumePhone },
+      config as any,
+      {
+        ...incomingDeps,
+        evaluateResume: async () => ({
+          allowed: true,
+          disposition: 'RESUME_APPROVED',
+          resumeDecision: 'RESUME_ANA',
+        }),
+      } as any
+    );
+    assert.equal(handler.__hasBufferForTest(resumeKey), true);
+    await handler.flushBuffer(resumeKey, {
+      getReply: brain.getReply,
+      isPaused: async () => false,
+      recordPausedInbound: async () => undefined,
+      withConversationLock: incomingDeps.withConversationLock,
+      sendReply: async (to, reply, tenantConfig) =>
+        handler.sendConfiguredReply(to, reply, tenantConfig, {
+          voiceEnabled: () => false,
+          deliverVoice: async () => undefined,
+          waitTyping: async () => undefined,
+          isPausedBeforeTransport: async () => false,
+          sendText: async (_to, text) => {
+            resumeTransport.push(text);
+          },
+        }),
+    });
+    assert.equal(resumeTransport.length, 1, 'RESUME_ANA responde exatamente uma vez');
+    assert.match(resumeTransport[0]!, /Drenagem Linfática|serviço/i);
+    const resumeReceipts = turnDecision.__getTurnDecisionReceiptsForTest();
+    const resumeLast = resumeReceipts[resumeReceipts.length - 1];
+    assert.notEqual(resumeLast?.decision, 'silence_human');
+    assert.equal(resumeLast?.humanControlDisposition, 'RESUME_APPROVED');
+    assert.equal(resumeLast?.resumeDecision, 'RESUME_ANA');
+    assert.doesNotMatch(JSON.stringify(resumeLast), /5511000000004|atendente/);
+
+    const racePhone = '5511000000005';
+    const raceKey = context.buildConversationKey(phoneNumberId, racePhone);
+    handler.__resetFlushStateForTest();
+    inboundSequence += 1;
+    await handler.handleIncomingMessage(
+      {
+        from: racePhone,
+        id: `wamid.inbound.${suffix}.${inboundSequence}`,
+        timestamp: String(Math.floor(Date.now() / 1000) + inboundSequence),
+        type: 'text',
+        text: { body: 'Oi, quero marcar' },
+      },
+      { profile: { name: 'Cliente Smoke' }, wa_id: racePhone },
+      config as any,
+      {
+        ...incomingDeps,
+        evaluateResume: async () => ({
+          allowed: true,
+          disposition: 'RESUME_APPROVED',
+          resumeDecision: 'RESUME_ANA',
+        }),
+      } as any
+    );
+    const raceTransport: string[] = [];
+    let afterResumeBrain = false;
+    await handler.flushBuffer(raceKey, {
+      getReply: async (...args: any[]) => {
+        const reply = await brain.getReply(...args);
+        afterResumeBrain = true;
+        return reply;
+      },
+      isPaused: async () => afterResumeBrain,
+      recordPausedInbound: async () => undefined,
+      withConversationLock: incomingDeps.withConversationLock,
+      sendReply: async (_to, reply, tenantConfig) =>
+        handler.sendConfiguredReply(_to, reply, tenantConfig, {
+          voiceEnabled: () => false,
+          deliverVoice: async () => undefined,
+          waitTyping: async () => undefined,
+          isPausedBeforeTransport: async () => true,
+          sendText: async (_to, text) => {
+            raceTransport.push(text);
+          },
+        }),
+    });
+    assert.equal(raceTransport.length, 0, 'echo após RESUME_APPROVED impede outbound');
+    assert.equal(
+      handler.__hasBufferForTest(raceKey),
+      false
+    );
 
     console.log(
       'smoke composto DB: handler→buffer→flush + echo→history→model→outbound→transport OK'
@@ -480,22 +623,43 @@ async function main(): Promise<void> {
       await privacy.purgeConversationData(phoneNumberId, customerPhone);
       await privacy.purgeConversationData(phoneNumberId, identityPhone);
       await privacy.purgeConversationData(phoneNumberId, '5511000000002');
+      await privacy.purgeConversationData(phoneNumberId, '5511000000003');
+      await privacy.purgeConversationData(phoneNumberId, '5511000000004');
+      await privacy.purgeConversationData(phoneNumberId, '5511000000005');
       const bookingConversationKey = context.buildConversationKey(
         phoneNumberId,
         '5511000000002'
       );
+      const extraKeys = ['5511000000003', '5511000000004', '5511000000005'].map(
+        (phone) => context.buildConversationKey(phoneNumberId, phone)
+      );
       const cleanupCounts = await Promise.all([
         context.pool.query<{ count: string }>(
           'SELECT COUNT(*)::text AS count FROM ana_conversation_history WHERE "conversationKey" = ANY($1::text[])',
-          [[conversationKey, identityConversationKey, bookingConversationKey]]
+          [[
+            conversationKey,
+            identityConversationKey,
+            bookingConversationKey,
+            ...extraKeys,
+          ]]
         ),
         context.pool.query<{ count: string }>(
           'SELECT COUNT(*)::text AS count FROM processed_messages WHERE conversation_key = ANY($1::text[])',
-          [[conversationKey, identityConversationKey, bookingConversationKey]]
+          [[
+            conversationKey,
+            identityConversationKey,
+            bookingConversationKey,
+            ...extraKeys,
+          ]]
         ),
         context.pool.query<{ count: string }>(
           'SELECT COUNT(*)::text AS count FROM inbound_event_outbox WHERE conversation_key = ANY($1::text[])',
-          [[conversationKey, identityConversationKey, bookingConversationKey]]
+          [[
+            conversationKey,
+            identityConversationKey,
+            bookingConversationKey,
+            ...extraKeys,
+          ]]
         ),
       ]);
       assert.deepEqual(

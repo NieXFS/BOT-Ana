@@ -43,6 +43,60 @@ export type ExpectedSlot =
 
 export type PendingQuestionSource = 'ANA' | 'HUMAN' | 'none';
 
+/**
+ * Precedência de takeover humano. Não é um booleano: o histórico HUMAN sozinho
+ * nunca autoriza silêncio permanente.
+ *
+ * - HUMAN_ACTIVE: pausa/takeover vigente. Bloqueia antes do brain; corrida
+ *   posterior também bloqueia no pause recheck.
+ * - RESUME_APPROVED: o chefe aplicou RESUME_ANA. O brain pode responder.
+ *   Histórico humano NÃO produz silence_human; slots anteriores à fala humana
+ *   ficam invalidados.
+ * - NO_ACTIVE_TAKEOVER: nenhuma pausa humana vigente (expirou ou tenant sem
+ *   chefe). Histórico humano antigo sozinho NÃO silencia; o inbound é turno novo.
+ */
+export const HUMAN_CONTROL_DISPOSITIONS = [
+  'HUMAN_ACTIVE',
+  'RESUME_APPROVED',
+  'NO_ACTIVE_TAKEOVER',
+] as const;
+export type HumanControlDisposition =
+  (typeof HUMAN_CONTROL_DISPOSITIONS)[number];
+
+export const RESUME_DECISION_CODES = [
+  'RESUME_ANA',
+  'KEEP_HUMAN',
+  'UNCERTAIN',
+  'GATE_DISABLED',
+  'PROCEED',
+  'KEEP_SILENT',
+  'NONE',
+] as const;
+export type ResumeDecisionCode = (typeof RESUME_DECISION_CODES)[number];
+
+export interface ReceptionistTurnControl {
+  disposition: HumanControlDisposition;
+  resumeDecision: ResumeDecisionCode;
+}
+
+export const DEFAULT_TURN_CONTROL: ReceptionistTurnControl = {
+  disposition: 'NO_ACTIVE_TAKEOVER',
+  resumeDecision: 'NONE',
+};
+
+export function resolveTurnControl(
+  control?: ReceptionistTurnControl | null
+): ReceptionistTurnControl {
+  if (
+    control &&
+    HUMAN_CONTROL_DISPOSITIONS.includes(control.disposition) &&
+    RESUME_DECISION_CODES.includes(control.resumeDecision)
+  ) {
+    return control;
+  }
+  return DEFAULT_TURN_CONTROL;
+}
+
 export type TurnDecisionAction =
   | 'continue_model'
   | 'follow_up_datetime'
@@ -77,12 +131,19 @@ export interface PendingOperationalQuestion {
   alreadyAskedConfirmation: boolean;
 }
 
-export interface SlotFillResult {
-  kind: 'unequivocal' | 'ambiguous' | 'social' | 'personal' | 'unknown' | 'incompatible';
+export type SlotFillResult = {
+  kind:
+    | 'unequivocal'
+    | 'ambiguous'
+    | 'social'
+    | 'personal'
+    | 'unknown'
+    | 'incompatible'
+    | 'unresolved_ordinal';
   serviceName?: string;
   professionalName?: string;
   candidates?: string[];
-}
+};
 
 export interface ReceptionistTurnDecision {
   permission: ReceptionistTurnPermission;
@@ -90,6 +151,8 @@ export interface ReceptionistTurnDecision {
   fit: SlotFillResult;
   action: TurnDecisionAction;
   disableSocialContextDrift: boolean;
+  humanControlDisposition: HumanControlDisposition;
+  resumeDecision: ResumeDecisionCode;
   reply?: string;
 }
 
@@ -104,6 +167,8 @@ export interface ReceptionistTurnDecisionReceipt {
   reasonCodes: string[];
   pendingQuestionSource: PendingQuestionSource;
   expectedSlot?: ExpectedSlot;
+  humanControlDisposition: HumanControlDisposition;
+  resumeDecision: ResumeDecisionCode;
   modelCalled: boolean;
   toolNames: string[];
   outboundAction: OutboundReceiptAction;
@@ -113,6 +178,11 @@ export interface ReceptionistTurnDecisionReceipt {
   payloadVariant?: string;
   latencyMs?: number;
 }
+
+export type ListedServiceOrdinalMatch =
+  | { kind: 'unequivocal'; serviceName: string; index: number }
+  | { kind: 'out_of_range'; index: number }
+  | { kind: 'none' };
 
 export const SERVICE_CONFIRMATION_PREFIX = 'Só confirmando:';
 export const SERVICE_REPEAT_PROMPT =
@@ -166,10 +236,87 @@ function listedCatalogNames(
   names: readonly string[]
 ): string[] {
   const assistant = normalize(assistantText);
-  return names.filter((name) => {
-    const normalizedName = normalize(name);
-    return normalizedName.length >= 3 && assistant.includes(normalizedName);
-  });
+  return names
+    .map((name) => {
+      const normalizedName = normalize(name);
+      if (normalizedName.length < 3) return null;
+      const index = assistant.indexOf(normalizedName);
+      if (index < 0) return null;
+      return { name, index, length: normalizedName.length };
+    })
+    .filter(
+      (item): item is { name: string; index: number; length: number } =>
+        item !== null
+    )
+    .sort((left, right) =>
+      left.index !== right.index
+        ? left.index - right.index
+        : right.length - left.length
+    )
+    .map((item) => item.name);
+}
+
+/**
+ * Ordinais/números só escolhem serviço contra `listedServiceNames` da pergunta
+ * pendente da Ana. Fora dessa lista, ordinal não é intenção operacional.
+ *
+ * Formas cobertas: primeira/primeiro/1, segunda/segundo/2, terceira/terceiro/3,
+ * último/última quando a lista tem ≥1 item, e dígito/`N opção` para índice.
+ * "quarta" sozinha é dia da semana e NÃO é ordinal; "a quarta opção" é índice 4.
+ * Índice fora do intervalo ou ambíguo nunca inventa escolha.
+ */
+export function resolveListedServiceOrdinal(
+  inbound: string,
+  listedServiceNames: readonly string[]
+): ListedServiceOrdinalMatch {
+  const listed = listedServiceNames.filter((name) => name.trim().length > 0);
+  const text = normalize(inbound)
+    .replace(/[ªº]/g, '')
+    .replace(
+      /^(?:pode ser\s+)?(?:eu\s+)?(?:quero\s+)?(?:prefiro\s+)?(?:escolho\s+)?/u,
+      ''
+    )
+    .replace(/\b(?:por favor|pfv|pf)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return { kind: 'none' };
+
+  let index: number | 'last' | null = null;
+  if (
+    /^(?:a |o )?(?:primeira|primeiro|1(?:[ao]?)?)(?:\s+opca[oa])?$/u.test(text)
+  ) {
+    index = 0;
+  } else if (
+    /^(?:a |o )?(?:segunda|segundo|2(?:[ao]?)?)(?:\s+opca[oa])?$/u.test(text)
+  ) {
+    index = 1;
+  } else if (
+    /^(?:a |o )?(?:terceira|terceiro|3(?:[ao]?)?)(?:\s+opca[oa])?$/u.test(text)
+  ) {
+    index = 2;
+  } else if (/^(?:a |o )?(?:ultima|ultimo)(?:\s+opca[oa])?$/u.test(text)) {
+    index = 'last';
+  } else if (/^(?:a |o )?(?:quarta|quarto)\s+opca[oa]$/u.test(text)) {
+    // "quarta" sozinha é dia da semana; só "quarta opção" é índice 4.
+    index = 3;
+  } else {
+    const numbered = text.match(/^(?:a |o )?(\d{1,2})(?:[ao])?(?:\s+opca[oa])?$/u);
+    if (numbered) {
+      index = Number(numbered[1]) - 1;
+    }
+  }
+
+  if (index === null) return { kind: 'none' };
+  if (listed.length === 0) return { kind: 'out_of_range', index: 0 };
+  const resolved = index === 'last' ? listed.length - 1 : index;
+  if (!Number.isInteger(resolved) || resolved < 0 || resolved >= listed.length) {
+    return { kind: 'out_of_range', index: resolved };
+  }
+  return {
+    kind: 'unequivocal',
+    serviceName: listed[resolved]!,
+    index: resolved,
+  };
 }
 
 function extractConfirmationCandidate(
@@ -429,6 +576,13 @@ export function matchInboundToExpectedSlot(
   }
 
   if (pending.expectedSlot === 'SERVICE') {
+    const ordinal = resolveListedServiceOrdinal(inbound, listed);
+    if (ordinal.kind === 'unequivocal') {
+      return { kind: 'unequivocal', serviceName: ordinal.serviceName };
+    }
+    if (ordinal.kind === 'out_of_range') {
+      return { kind: 'unresolved_ordinal' };
+    }
     const named = uniqueServiceWithSafeTypo(inbound, services);
     if (named && listed.includes(named)) {
       return { kind: 'unequivocal', serviceName: named };
@@ -469,7 +623,9 @@ export function resolveReceptionistTurnDecision(input: {
   inbound: string;
   history: readonly StoredConversationMessage[];
   catalog: ServicesResult;
+  humanControl?: ReceptionistTurnControl | null;
 }): ReceptionistTurnDecision {
+  const humanControl = resolveTurnControl(input.humanControl);
   const pending = resolvePendingOperationalQuestion(input.history, {
     services: input.catalog.services,
     professionals: input.catalog.professionals,
@@ -486,80 +642,103 @@ export function resolveReceptionistTurnDecision(input: {
     fit.kind !== 'social' &&
     fit.kind !== 'personal';
 
-  if (pending.source === 'HUMAN') {
-    return {
+  const withControl = (
+    decision: Omit<
+      ReceptionistTurnDecision,
+      'humanControlDisposition' | 'resumeDecision'
+    >
+  ): ReceptionistTurnDecision => ({
+    ...decision,
+    humanControlDisposition: humanControl.disposition,
+    resumeDecision: humanControl.resumeDecision,
+  });
+
+  // HUMAN_ACTIVE is the only disposition that silences. RESUME_ANA never
+  // produces silence_human. Histórico HUMAN apenas invalida o slot pendente.
+  if (humanControl.disposition === 'HUMAN_ACTIVE') {
+    return withControl({
       permission,
       pending,
       fit,
       action: 'silence_human',
       disableSocialContextDrift: false,
-    };
+    });
   }
 
   // SOCIAL_ONLY continua no template determinístico já aprovado no E2E.
   // kkk/elogio, com ou sem pergunta pendente, segue o caminho atual (modelo).
   // Não ampliar short-circuit social nem regenerar copy via modelo.
   if (permission === 'SOCIAL_ONLY') {
-    return {
+    return withControl({
       permission,
       pending,
       fit,
       action: 'social_reply',
       disableSocialContextDrift: false,
-    };
+    });
   }
 
   if (fit.kind === 'personal') {
-    return {
+    return withControl({
       permission,
       pending,
       fit,
       action: 'personal_ack',
       disableSocialContextDrift: false,
-    };
+    });
   }
 
   if (pending.source === 'ANA' && pending.expectedSlot === 'SERVICE') {
     if (fit.kind === 'unequivocal' && fit.serviceName) {
-      return {
+      return withControl({
         permission,
         pending,
         fit,
         action: 'follow_up_datetime',
         disableSocialContextDrift,
         reply: buildServiceSelectedFollowUp(fit.serviceName),
-      };
+      });
     }
     if (fit.kind === 'unknown') {
-      return {
+      return withControl({
         permission,
         pending,
         fit,
         action: 'unknown_denial',
         disableSocialContextDrift,
-      };
+      });
+    }
+    if (fit.kind === 'unresolved_ordinal') {
+      return withControl({
+        permission,
+        pending,
+        fit,
+        action: 'ask_repeat',
+        disableSocialContextDrift,
+        reply: SERVICE_REPEAT_PROMPT,
+      });
     }
     if (fit.kind === 'ambiguous') {
       const candidate = fit.candidates?.[0] ?? pending.confirmationCandidate;
       if (candidate) {
-        return {
+        return withControl({
           permission,
           pending,
           fit,
           action: 'confirm_once',
           disableSocialContextDrift,
           reply: buildAmbiguousServiceConfirmation(candidate),
-        };
+        });
       }
       if (isAffirmativeCompact(input.inbound)) {
-        return {
+        return withControl({
           permission,
           pending,
           fit,
           action: 'ask_repeat',
           disableSocialContextDrift,
           reply: SERVICE_REPEAT_PROMPT,
-        };
+        });
       }
       // Menção fraca/parcial sem entidade única: o modelo atual já resolve
       // (ex.: "pé"). Não silenciar e não inventar confirmação sem candidato.
@@ -572,32 +751,32 @@ export function resolveReceptionistTurnDecision(input: {
     pending.alreadyAskedConfirmation
   ) {
     if (fit.kind === 'unequivocal' && fit.serviceName) {
-      return {
+      return withControl({
         permission,
         pending,
         fit,
         action: 'follow_up_datetime',
         disableSocialContextDrift,
         reply: buildServiceSelectedFollowUp(fit.serviceName),
-      };
+      });
     }
-    return {
+    return withControl({
       permission,
       pending,
       fit,
       action: 'ask_repeat',
       disableSocialContextDrift,
       reply: SERVICE_REPEAT_PROMPT,
-    };
+    });
   }
 
-  return {
+  return withControl({
     permission,
     pending,
     fit,
     action: 'continue_model',
     disableSocialContextDrift,
-  };
+  });
 }
 
 export function turnDecisionRoute(
@@ -646,7 +825,7 @@ export function emitReceptionistTurnReceipt(
 ): void {
   receiptsForTest.push(receipt);
   console.log(
-    `[receptionist-turn] route=${receipt.route} socialRoute=${receipt.socialRoute} decision=${receipt.decision} pending=${receipt.pendingQuestionSource} slot=${receipt.expectedSlot ?? 'none'} outbound=${receipt.outboundAction} convHash=${receipt.convHash} reasons=${receipt.reasonCodes.join(',') || 'none'}`
+    `[receptionist-turn] route=${receipt.route} socialRoute=${receipt.socialRoute} decision=${receipt.decision} pending=${receipt.pendingQuestionSource} slot=${receipt.expectedSlot ?? 'none'} humanControl=${receipt.humanControlDisposition} resume=${receipt.resumeDecision} outbound=${receipt.outboundAction} convHash=${receipt.convHash} reasons=${receipt.reasonCodes.join(',') || 'none'}`
   );
   const critical =
     receipt.outboundAction !== 'sent' ||
@@ -666,6 +845,8 @@ export function emitReceptionistTurnReceipt(
       social_route: receipt.socialRoute,
       pending_source: receipt.pendingQuestionSource,
       expected_slot: receipt.expectedSlot ?? 'none',
+      human_control: receipt.humanControlDisposition,
+      resume_decision: receipt.resumeDecision,
       outbound_action: receipt.outboundAction,
       model_called: String(receipt.modelCalled),
       reason_codes: receipt.reasonCodes.join(',') || 'none',
@@ -680,6 +861,8 @@ export function emitReceptionistTurnReceipt(
         socialRoute: receipt.socialRoute,
         pendingQuestionSource: receipt.pendingQuestionSource,
         expectedSlot: receipt.expectedSlot ?? null,
+        humanControlDisposition: receipt.humanControlDisposition,
+        resumeDecision: receipt.resumeDecision,
         modelCalled: receipt.modelCalled,
         toolNames: receipt.toolNames,
         outboundAction: receipt.outboundAction,
@@ -719,6 +902,8 @@ export function buildTurnDecisionReceipt(input: {
     reasonCodes: input.reasonCodes ?? [],
     pendingQuestionSource: input.decision.pending.source,
     expectedSlot: input.decision.pending.expectedSlot,
+    humanControlDisposition: input.decision.humanControlDisposition,
+    resumeDecision: input.decision.resumeDecision,
     modelCalled: input.modelCalled,
     toolNames: input.toolNames,
     outboundAction: input.outboundAction,

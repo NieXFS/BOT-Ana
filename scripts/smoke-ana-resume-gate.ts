@@ -255,6 +255,59 @@ async function main() {
   );
   assert.equal(evaluated, true);
   assert.equal(finalizedDecision, 'RESUME_ANA');
+  const structuredResume = await gate.evaluateAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      begin: async () => ({
+        action: 'EVALUATE',
+        expectedVersion: 7,
+        leaseUntil: '2026-08-11T15:01:00.000Z',
+      }),
+      loadHistory: async () => history,
+      classify: async () => ({
+        decision: 'RESUME_ANA',
+        reasonCode: 'NEW_INDEPENDENT_REQUEST',
+        model: 'deepseek-v4-flash',
+        latencyMs: 42,
+        contextHash: 'a'.repeat(64),
+      }),
+      finalize: async () => ({
+        applied: true,
+        action: 'PROCEED',
+        version: 8,
+        pausedUntil: null,
+      }),
+    }
+  );
+  assert.equal(structuredResume.allowed, true);
+  assert.equal(structuredResume.disposition, 'RESUME_APPROVED');
+  assert.equal(structuredResume.resumeDecision, 'RESUME_ANA');
+  assert.deepEqual(gate.turnControlFromResumeEvaluation(structuredResume), {
+    disposition: 'RESUME_APPROVED',
+    resumeDecision: 'RESUME_ANA',
+  });
+
+  const structuredKeep = await gate.evaluateAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      begin: async () => ({
+        action: 'EVALUATE',
+        expectedVersion: 7,
+        leaseUntil: '2026-08-11T15:01:00.000Z',
+      }),
+      loadHistory: async () => history,
+      classify: async () => keep,
+      finalize: async () => ({
+        applied: true,
+        action: 'KEEP_SILENT',
+        version: 8,
+        pausedUntil: null,
+      }),
+    }
+  );
+  assert.equal(structuredKeep.allowed, false);
+  assert.equal(structuredKeep.disposition, 'HUMAN_ACTIVE');
+  assert.equal(structuredKeep.resumeDecision, 'KEEP_HUMAN');
 
   const stale = await gate.shouldAnaResumeForInbound(
     { config, customerPhone: '5511999999999' },
@@ -336,6 +389,54 @@ async function main() {
     messageHandler.__hasBufferForTest('PN-RESUME:5511999999999'),
     false,
     'gate KEEP impede o buffer/brain real'
+  );
+  messageHandler.__resetFlushStateForTest();
+
+  let resumeApprovedCalls = 0;
+  await messageHandler.handleIncomingMessage(
+    {
+      from: '5511999999998',
+      id: 'wamid.resume-approved',
+      timestamp: '1786453201',
+      type: 'text',
+      text: { body: 'Quero agendar' },
+    },
+    { profile: { name: 'Cliente' } },
+    config,
+    {
+      persistInbound: async () => ({
+        fresh: true,
+        conversationKey: 'PN-RESUME:5511999999998',
+        sequence: 1,
+      }),
+      deliverInbound: async () => ({
+        delivered: true,
+        attempts: 1,
+        terminal: false,
+        fastRetryAllowed: false,
+      }),
+      updateInboundContent: async () => {},
+      markTranscriptionFailed: async () => {},
+      downloadAudio: async () => Buffer.alloc(0),
+      transcribeAudio: async () => '',
+      handleOptOut: async () => false,
+      shouldSuspend: async () => false,
+      isPaused: async () => false,
+      evaluateResume: async () => {
+        resumeApprovedCalls += 1;
+        return {
+          allowed: true,
+          disposition: 'RESUME_APPROVED',
+          resumeDecision: 'RESUME_ANA',
+        };
+      },
+    }
+  );
+  assert.equal(resumeApprovedCalls, 1);
+  assert.equal(
+    messageHandler.__hasBufferForTest('PN-RESUME:5511999999998'),
+    true,
+    'RESUME_ANA aplica e o inbound segue ao buffer'
   );
   messageHandler.__resetFlushStateForTest();
 
