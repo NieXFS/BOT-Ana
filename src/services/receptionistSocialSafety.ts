@@ -20,6 +20,17 @@ export interface ReceptionistTurnCatalog {
   professionals?: readonly string[];
 }
 
+export interface ReceptionistTurnPermissionContext {
+  /** Texto imediatamente anterior da Ana; echo humano não deve ser passado. */
+  previousAssistantText?: string;
+}
+
+const SERVICE_CHOICE_QUESTION_RE =
+  /\b(?:qual|prefere|escolh(?:e|a|er|eu)|opcao)\b/u;
+const EXACT_SELECTION_ARTICLE_PREFIX_RE = /^(?:a|o|um|uma|esse|essa|este|esta)\s+/u;
+const EXACT_SELECTION_COURTESY_SUFFIX_RE =
+  /\s+(?:por favor|pfv|pf|please)$/u;
+
 const CATALOG_STOP_WORDS = new Set([
   'a',
   'as',
@@ -191,6 +202,85 @@ const SERVICE_OR_PROFESSIONAL_WORD_RE =
 const CUSTOMER_REQUEST_VERB_RE =
   /\b(?:quero|queria|gostaria|preciso|desejo|prefiro|fazer)\b/u;
 
+/**
+ * Seleção compacta pelo nome completo do catálogo, depois de acento/caixa.
+ * Token parcial ("Drenagem") e substantivo pessoal não passam.
+ */
+export function uniqueExactCatalogServiceSelection(
+  value: string,
+  catalogNames: readonly string[]
+): string | null {
+  if (/[?]/.test(value)) return null;
+  let text = normalizeSocialMessage(value);
+  if (!text) return null;
+  text = text.replace(EXACT_SELECTION_ARTICLE_PREFIX_RE, '').trim();
+  text = text.replace(EXACT_SELECTION_COURTESY_SUFFIX_RE, '').trim();
+  if (!text) return null;
+
+  const matches = catalogNames.filter(
+    (name) => normalizeSocialMessage(name) === text
+  );
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+/**
+ * A fala imediatamente anterior da Ana foi uma pergunta de serviço que listou
+ * o nome completo escolhido e pelo menos outro serviço do snapshot atual.
+ */
+export function assistantAskedImmediateServiceChoice(
+  assistantText: string | undefined,
+  catalogNames: readonly string[],
+  selectedServiceName?: string
+): boolean {
+  const assistant = normalizeSocialMessage(assistantText ?? '');
+  if (!assistant || !SERVICE_CHOICE_QUESTION_RE.test(assistant)) return false;
+
+  const listed = catalogNames.filter((name) => {
+    const normalizedName = normalizeSocialMessage(name);
+    return normalizedName.length >= 3 && assistant.includes(normalizedName);
+  });
+  if (listed.length < 2) return false;
+  if (!selectedServiceName) return true;
+  const selected = normalizeSocialMessage(selectedServiceName);
+  return listed.some((name) => normalizeSocialMessage(name) === selected);
+}
+
+export function looksLikeStandaloneServiceAttempt(value: string): boolean {
+  if (/[?]/.test(value)) return false;
+  const text = normalizeSocialMessage(value);
+  if (!text) return false;
+  if (isSocialOnlyReceptionistMessage(value)) return false;
+  if (WEEKDAY_OR_RELATIVE_DAY_RE.test(text) || CLOCK_CUE_RE.test(text)) {
+    return false;
+  }
+  if (/\b\d+\b/u.test(text)) return false;
+  if (
+    /^(?:sim|nao|ok|certo|obrigad[ao]|por favor|pf|pode ser|fechado|combinado)(?:\s+por favor)?$/u.test(
+      text
+    )
+  ) {
+    return false;
+  }
+  const tokens = text.split(' ').filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 6) return false;
+  return tokens.every(
+    (token) => CATALOG_STOP_WORDS.has(token) || /^[a-z]+$/u.test(token)
+  );
+}
+
+export function currentMessageMentionsCatalogService(
+  value: string,
+  catalogNames: readonly string[]
+): boolean {
+  if (uniqueExactCatalogServiceSelection(value, catalogNames)) return true;
+  const text = normalizeSocialMessage(value);
+  if (!text) return false;
+  return messageMentionsCatalogToken(
+    text,
+    catalogNames.map(normalizeSocialMessage).filter(Boolean)
+  );
+}
+
 function messageMentionsCatalogToken(
   text: string,
   catalogNames: readonly string[]
@@ -233,6 +323,36 @@ export function hasCustomerRequestVerb(value: string): boolean {
   return CUSTOMER_REQUEST_VERB_RE.test(normalizeSocialMessage(value));
 }
 
+const POSITIVE_SOCIAL_TOKEN_RE =
+  /\b(?:kkk+|rs+|haha+|hehe+|obrigad[ao]|valeu|vlw|tchau|ate mais|beijo|beijos|tmj|flw|saudacoes)\b/u;
+
+export function hasPositiveSocialEvidence(value: string): boolean {
+  if (isSocialOnlyReceptionistMessage(value)) return true;
+  const text = normalizeSocialMessage(value);
+  if (POSITIVE_SOCIAL_TOKEN_RE.test(text)) return true;
+  if (
+    !text &&
+    /\p{Extended_Pictographic}/u.test(value) &&
+    !/\bsim\b/i.test(value)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Evidência positiva de conversa social/pessoal. Ausência de verbo operacional
+ * sozinha não conta: precisa de saudação, risada, agradecimento, despedida ou
+ * narrativa pessoal com dia/hora/número.
+ */
+export function hasPositiveSocialOrPersonalEvidence(value: string): boolean {
+  if (hasPositiveSocialEvidence(value)) return true;
+  return (
+    classifyReceptionistTurnPermission(value) === 'NO_OPERATIONAL_INTENT' &&
+    hasNonTransactionalOperationalCue(value)
+  );
+}
+
 /**
  * Permissão estrutural do turno atual para a fronteira de saída. Ela é
  * propositalmente separada do atalho de saudação: uma entrada vaga como
@@ -243,15 +363,17 @@ export function hasCustomerRequestVerb(value: string): boolean {
  */
 export function classifyReceptionistTurnPermission(
   value: string,
-  catalog: ReceptionistTurnCatalog = {}
+  catalog: ReceptionistTurnCatalog = {},
+  _context: ReceptionistTurnPermissionContext = {}
 ): ReceptionistTurnPermission {
   if (isSocialOnlyReceptionistMessage(value)) return 'SOCIAL_ONLY';
 
   const text = normalizeSocialMessage(value);
   if (!text) return 'NO_OPERATIONAL_INTENT';
 
+  const serviceNames = catalog.services ?? [];
   const normalizedCatalogNames = [
-    ...(catalog.services ?? []),
+    ...serviceNames,
     ...(catalog.professionals ?? []),
   ]
     .map(normalizeSocialMessage)

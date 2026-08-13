@@ -433,6 +433,36 @@ async function main() {
     );
   }
 
+  const serviceListHistory = [
+    { role: 'user' as const, content: 'Quero agendar' },
+    {
+      role: 'assistant' as const,
+      content:
+        'Claro! Para qual serviço você gostaria de agendar? Temos Calosidades e Fissuras, Drenagem Linfática e Unha encravada. Qual você prefere?',
+    },
+    { role: 'user' as const, content: 'Calosidade' },
+  ];
+  const compactAfterList = await resolveGroundedReceptionistTurn({
+    userMessage: 'Calosidade',
+    userMessages: ['Quero agendar', 'Calosidade'],
+    history: serviceListHistory,
+    services: catalog,
+    now: NOW,
+    timezone: TZ,
+    readUpcoming: async () => {
+      throw new Error('seleção compacta após lista não consulta upcoming');
+    },
+    readSlots: async () => {
+      throw new Error('seleção compacta após lista não consulta slots');
+    },
+  });
+  assert.equal(compactAfterList.kind, 'short_circuit');
+  if (compactAfterList.kind === 'short_circuit') {
+    assert.match(compactAfterList.reply, /Calosidades e Fissuras/);
+    assert.doesNotMatch(compactAfterList.reply, /Temos |Unha encravada/);
+    assert.equal(compactAfterList.toolTrace.length, 0);
+  }
+
   for (const followUp of ['sim', 'ok', 'obrigada']) {
     const grounded = await resolveGroundedReceptionistTurn({
       userMessage: followUp,

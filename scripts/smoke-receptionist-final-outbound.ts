@@ -184,4 +184,29 @@ assert.equal(
   ).originalAccepted,
   true
 );
+assert.equal(
+  validate(
+    [
+      {
+        source: 'GENERATED',
+        text: 'Perfeito, Limpeza de Pele. Qual dia e horário você prefere?',
+      },
+    ],
+    {
+      evidence: {
+        sourceInboundText: 'Limpeza de Pele',
+        pendingQuestion: {
+          source: 'ANA',
+          expectedSlot: 'SERVICE',
+          listedServiceNames: ['Limpeza de Pele', 'Tratamento Completo', 'Design com Henna'],
+          listedProfessionalNames: [],
+          alreadyAskedConfirmation: false,
+        },
+        disableSocialContextDrift: true,
+      },
+    }
+  ).originalAccepted,
+  true,
+  'pergunta pendente da Ana desliga só SOCIAL_CONTEXT_DRIFT'
+);
 console.log('smoke receptionist final outbound: OK');

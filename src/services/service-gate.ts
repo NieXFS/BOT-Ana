@@ -449,6 +449,15 @@ export function buildServiceQuestion(services: ServiceLike[]): string {
 }
 
 /**
+ * Continuação segura depois de uma escolha inequívoca de serviço: pede o
+ * próximo dado (dia/horário) sem repetir o catálogo e sem inventar agenda.
+ */
+export function buildServiceSelectedFollowUp(serviceName: string): string {
+  const name = serviceName.trim();
+  return `Perfeito, ${name}. Qual dia e horário você prefere?`;
+}
+
+/**
  * PROATIVA: novo pedido de agendamento (verbo de marcar/agendar) na janela SEM
  * nenhum serviço citado → o código deve perguntar o serviço antes do modelo rodar.
  */
@@ -460,10 +469,33 @@ export function shouldAskServiceUpfront(
   if (!services || services.length < 2) return false;
   const { windowMessages, hasNewBooking } = computeWindow(userMessages);
   if (windowMessages.length === 0 || !hasNewBooking) return false;
-  return (
-    latestServiceSelection(windowMessages, services, conversationMessages).kind !==
+  if (
+    latestServiceSelection(windowMessages, services, conversationMessages).kind ===
     'chosen'
-  );
+  ) {
+    return false;
+  }
+  const lastAssistant = [...conversationMessages]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === 'assistant' && typeof message.content === 'string'
+    );
+  if (
+    lastAssistant &&
+    typeof lastAssistant.content === 'string' &&
+    !lastAssistant.content.trimStart().toLowerCase().startsWith('[atendente] ')
+  ) {
+    const normalizedAssistant = normalizeServiceText(lastAssistant.content);
+    if (SERVICE_CHOICE_QUESTION_RE.test(normalizedAssistant)) {
+      const listed = services.filter((service) => {
+        const name = normalizeServiceText(service.name);
+        return name.length >= 3 && normalizedAssistant.includes(name);
+      });
+      if (listed.length >= 2) return false;
+    }
+  }
+  return true;
 }
 
 /** Serviço único e inequívoco citado na mensagem ATUAL, mesmo em pergunta. */

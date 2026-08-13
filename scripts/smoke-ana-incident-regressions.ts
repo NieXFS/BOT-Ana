@@ -335,6 +335,50 @@ async function main() {
     compactServiceReply.reasonCodes.join(',')
   );
 
+  const incidentFollowUp = outbound.validateReceptionistOutbound(
+    outbound.buildReceptionistEnvelope({
+      purpose: 'REACTIVE',
+      blocks: [
+        {
+          source: 'GENERATED',
+          text: 'Perfeito, Drenagem Linfática. Qual dia e horário você prefere?',
+        },
+      ],
+      authoritativeCatalog: {
+        services: [
+          { id: 'svc-drenagem', name: 'Drenagem Linfática' },
+          { id: 'svc-limpeza', name: 'Limpeza de pele profunda' },
+          { id: 'svc-peeling', name: 'Peeling facial' },
+        ],
+        professionals: [],
+      },
+      evidence: {
+        sourceInboundText: 'Drenagem Linfática',
+        pendingQuestion: {
+          source: 'ANA',
+          expectedSlot: 'SERVICE',
+          listedServiceNames: [
+            'Drenagem Linfática',
+            'Limpeza de pele profunda',
+            'Peeling facial',
+          ],
+          listedProfessionalNames: [],
+          alreadyAskedConfirmation: false,
+        },
+        disableSocialContextDrift: true,
+      },
+    })
+  );
+  assert.equal(
+    incidentFollowUp.originalAccepted,
+    true,
+    incidentFollowUp.reasonCodes.join(',')
+  );
+  assert.equal(
+    incidentFollowUp.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'),
+    false
+  );
+
   const identityTrace = [
     {
       name: 'getUpcomingAppointments',
@@ -746,7 +790,16 @@ async function main() {
       })
     );
     assert.equal(result.originalAccepted, false, typo);
-    assert.ok(result.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'), typo);
+    assert.equal(
+      result.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'),
+      false,
+      typo
+    );
+    assert.ok(
+      result.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT') ||
+        result.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+      `${typo}: ${result.reasonCodes.join(',')}`
+    );
   }
 
   const validDelivery = await handler.sendConfiguredReply(

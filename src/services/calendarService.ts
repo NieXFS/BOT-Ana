@@ -315,6 +315,24 @@ export function invalidateServicesCache(tenantSlug?: string): void {
   else servicesCache.clear();
 }
 
+/** Somente smokes: injeta o snapshot autoritativo sem chamar o ERP. */
+export function __seedServicesCacheForTest(
+  tenantSlug: string,
+  data: ServicesResult
+): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('__seedServicesCacheForTest é proibido em produção');
+  }
+  const slug = tenantSlug.trim();
+  if (!slug) {
+    throw new Error('__seedServicesCacheForTest exige tenantSlug');
+  }
+  servicesCache.set(slug, {
+    data,
+    expiresAt: Date.now() + SERVICES_CACHE_TTL_MS,
+  });
+}
+
 function formatDateBR(dateStr: string): string {
   const [year, month, day] = dateStr.split('-');
   return `${day}/${month}/${year}`;

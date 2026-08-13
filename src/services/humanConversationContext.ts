@@ -36,6 +36,23 @@ export function isHumanEchoContent(content: string): boolean {
   return content.trimStart().toLowerCase().startsWith(HUMAN_ECHO_PREFIX);
 }
 
+/**
+ * Última fala da Ana imediatamente anterior. Echo humano não é pulado: se o
+ * atendente falou por último, a pergunta de serviço da Ana ficou stale.
+ */
+export function immediatePreviousAnaAssistantText(
+  history: readonly StoredConversationMessage[]
+): string | undefined {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const message = history[index];
+    if (message?.role !== 'assistant') continue;
+    if (isHumanEchoContent(message.content)) return undefined;
+    const text = message.content.trim();
+    return text || undefined;
+  }
+  return undefined;
+}
+
 export function humanEchoBody(content: string): string | null {
   if (!isHumanEchoContent(content)) return null;
   return content.trimStart().slice(HUMAN_ECHO_PREFIX.length).trim();

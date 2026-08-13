@@ -394,6 +394,83 @@ async function main(): Promise<void> {
       '409/customer_identity_ambiguous no 1º contato deve virar só a resposta canônica'
     );
 
+    const calendar = await import('../src/services/calendarService');
+    const turnDecision = await import('../src/services/receptionistTurnDecision');
+    const bookingPhone = '5511000000002';
+    const bookingConversationKey = context.buildConversationKey(
+      phoneNumberId,
+      bookingPhone
+    );
+    calendar.__seedServicesCacheForTest(config.tenantSlug, {
+      success: true,
+      services: [
+        {
+          id: 'svc-drenagem',
+          name: 'Drenagem Linfática',
+          durationMinutes: 60,
+          price: 160,
+          priceFormatted: 'R$ 160,00',
+        },
+        {
+          id: 'svc-limpeza',
+          name: 'Limpeza de pele profunda',
+          durationMinutes: 50,
+          price: 180,
+          priceFormatted: 'R$ 180,00',
+        },
+        {
+          id: 'svc-peeling',
+          name: 'Peeling facial',
+          durationMinutes: 40,
+          price: 140,
+          priceFormatted: 'R$ 140,00',
+        },
+      ],
+      professionals: [{ id: 'pro-julia', name: 'Júlia' }],
+    });
+    turnDecision.__resetTurnDecisionReceiptsForTest();
+    const bookingListTransport: string[] = [];
+    await ingestAndFlush(
+      ['Quero agendar'],
+      brain.getReply,
+      bookingListTransport,
+      {
+        config,
+        customerPhone: bookingPhone,
+        conversationKey: bookingConversationKey,
+      }
+    );
+    assert.equal(bookingListTransport.length, 1);
+    assert.match(bookingListTransport[0]!, /Drenagem Linfática/);
+    assert.match(bookingListTransport[0]!, /Limpeza de pele profunda/);
+    assert.match(bookingListTransport[0]!, /Peeling facial/);
+
+    const bookingSelectTransport: string[] = [];
+    await ingestAndFlush(
+      ['Drenagem Linfática'],
+      brain.getReply,
+      bookingSelectTransport,
+      {
+        config,
+        customerPhone: bookingPhone,
+        conversationKey: bookingConversationKey,
+      }
+    );
+    assert.equal(bookingSelectTransport.length, 1);
+    assert.match(bookingSelectTransport[0]!, /Drenagem Linfática/);
+    assert.match(bookingSelectTransport[0]!, /dia e horário/i);
+    assert.doesNotMatch(
+      bookingSelectTransport[0]!,
+      /Limpeza de pele profunda|Peeling facial/
+    );
+    const receipts = turnDecision.__getTurnDecisionReceiptsForTest();
+    const lastReceipt = receipts[receipts.length - 1];
+    assert.equal(lastReceipt?.route, 'pending_follow_up');
+    assert.equal(lastReceipt?.socialRoute, 'not_social');
+    assert.equal(lastReceipt?.outboundAction, 'sent');
+    assert.equal(lastReceipt?.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'), false);
+    assert.doesNotMatch(JSON.stringify(lastReceipt), /5511000000002|Drenagem/);
+
     console.log(
       'smoke composto DB: handler→buffer→flush + echo→history→model→outbound→transport OK'
     );
@@ -402,18 +479,23 @@ async function main(): Promise<void> {
     try {
       await privacy.purgeConversationData(phoneNumberId, customerPhone);
       await privacy.purgeConversationData(phoneNumberId, identityPhone);
+      await privacy.purgeConversationData(phoneNumberId, '5511000000002');
+      const bookingConversationKey = context.buildConversationKey(
+        phoneNumberId,
+        '5511000000002'
+      );
       const cleanupCounts = await Promise.all([
         context.pool.query<{ count: string }>(
           'SELECT COUNT(*)::text AS count FROM ana_conversation_history WHERE "conversationKey" = ANY($1::text[])',
-          [[conversationKey, identityConversationKey]]
+          [[conversationKey, identityConversationKey, bookingConversationKey]]
         ),
         context.pool.query<{ count: string }>(
           'SELECT COUNT(*)::text AS count FROM processed_messages WHERE conversation_key = ANY($1::text[])',
-          [[conversationKey, identityConversationKey]]
+          [[conversationKey, identityConversationKey, bookingConversationKey]]
         ),
         context.pool.query<{ count: string }>(
           'SELECT COUNT(*)::text AS count FROM inbound_event_outbox WHERE conversation_key = ANY($1::text[])',
-          [[conversationKey, identityConversationKey]]
+          [[conversationKey, identityConversationKey, bookingConversationKey]]
         ),
       ]);
       assert.deepEqual(

@@ -373,6 +373,24 @@ expect(
   false
 );
 
+const alreadyAskedConversation = [
+  { role: 'user', content: 'Quero agendar' },
+  {
+    role: 'assistant',
+    content: buildServiceQuestion(ROSE_SERVICES),
+  },
+  { role: 'user', content: 'podologa' },
+];
+expectAsk(
+  'Rose #12: pergunta de serviço já feita não relista o catálogo em "podologa"',
+  shouldAskServiceUpfront(
+    ROSE_SERVICES,
+    ['Quero agendar', 'podologa'],
+    alreadyAskedConversation
+  ),
+  false
+);
+
 const SINGULAR_CATALOG = [
   { id: 'singular-unha', name: 'Manutenção de unha' },
   { id: 'singular-corte', name: 'Corte de cabelo' },

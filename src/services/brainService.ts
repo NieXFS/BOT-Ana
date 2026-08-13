@@ -86,6 +86,13 @@ import {
   enforceCustomerIdentitySafeReply,
   toolTraceHasCustomerIdentityAmbiguity,
 } from './customerIdentitySafety';
+import { immediatePreviousAnaAssistantText } from './humanConversationContext';
+import {
+  buildTurnDecisionReceipt,
+  emitReceptionistTurnReceipt,
+  resolveReceptionistTurnDecision,
+  type PendingOperationalQuestion,
+} from './receptionistTurnDecision';
 import {
   buildSocialReceptionistReply,
   isSocialOnlyReceptionistMessage,
@@ -356,6 +363,9 @@ export function validateComposedReceptionistReply(input: {
   purpose: ReceptionistOutboundPurpose;
   toolTrace?: Array<{ name: string; result: string; round?: number }>;
   sourceInboundText?: string;
+  previousAssistantText?: string;
+  pendingQuestion?: PendingOperationalQuestion;
+  disableSocialContextDrift?: boolean;
   temporalContext?: AppointmentTemporalContext;
   appendPostBooking?: boolean;
 }): ValidatedReceptionistOutbound {
@@ -364,6 +374,14 @@ export function validateComposedReceptionistReply(input: {
     text: string;
   }> = [];
   const authoritativeCatalog = catalogFromServicesResult(input.services);
+  const evidence = {
+    toolTrace: input.toolTrace,
+    sourceInboundText: input.sourceInboundText,
+    previousAssistantText: input.previousAssistantText,
+    pendingQuestion: input.pendingQuestion,
+    disableSocialContextDrift: input.disableSocialContextDrift,
+    temporalContext: input.temporalContext,
+  };
   if (toolTraceHasCustomerIdentityAmbiguity(input.toolTrace)) {
     return validateReceptionistOutbound(
       buildReceptionistEnvelope({
@@ -376,11 +394,7 @@ export function validateComposedReceptionistReply(input: {
         ],
         exactPayload: CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
         authoritativeCatalog,
-        evidence: {
-          toolTrace: input.toolTrace,
-          sourceInboundText: input.sourceInboundText,
-          temporalContext: input.temporalContext,
-        },
+        evidence,
       })
     );
   }
@@ -394,11 +408,7 @@ export function validateComposedReceptionistReply(input: {
         blocks: [{ source: 'GENERATED', text: '' }],
         exactPayload: '',
         authoritativeCatalog,
-        evidence: {
-          toolTrace: input.toolTrace,
-          sourceInboundText: input.sourceInboundText,
-          temporalContext: input.temporalContext,
-        },
+        evidence,
       })
     );
   }
@@ -458,11 +468,7 @@ export function validateComposedReceptionistReply(input: {
       blocks,
       exactPayload,
       authoritativeCatalog,
-      evidence: {
-        toolTrace: input.toolTrace,
-        sourceInboundText: input.sourceInboundText,
-        temporalContext: input.temporalContext,
-      },
+      evidence,
     })
   );
 }
@@ -1513,6 +1519,29 @@ async function getReceptionistReply(
       temporalContext,
     });
     await recordAcceptedReceptionistReply(conversationKey, socialReply);
+    const socialDecision = resolveReceptionistTurnDecision({
+      inbound: userMessage,
+      history: [],
+      catalog: { success: true, services: [], professionals: [] },
+    });
+    emitReceptionistTurnReceipt(
+      buildTurnDecisionReceipt({
+        phoneNumberId: config.phoneNumberId,
+        customerPhone: phone,
+        tenantSlug: config.tenantSlug,
+        inboundMessageId: currentSourceInboundMessageId() ?? undefined,
+        decision: socialDecision,
+        modelCalled: false,
+        toolNames: [],
+        outboundAction:
+          socialReply.originalAccepted && socialReply.payload.trim()
+            ? 'sent'
+            : 'suppressed',
+        payload: socialReply.payload,
+        reasonCodes: socialReply.reasonCodes,
+        latencyMs: Date.now() - turnStartedAt.getTime(),
+      })
+    );
     return socialReply;
   }
 
@@ -1538,6 +1567,30 @@ async function getReceptionistReply(
       config
     );
     await recordAcceptedReceptionistReply(conversationKey, validated);
+    const escalationDecision = resolveReceptionistTurnDecision({
+      inbound: userMessage,
+      history,
+      catalog: { success: true, services: [], professionals: [] },
+    });
+    emitReceptionistTurnReceipt(
+      buildTurnDecisionReceipt({
+        phoneNumberId: config.phoneNumberId,
+        customerPhone: phone,
+        tenantSlug: config.tenantSlug,
+        inboundMessageId: currentSourceInboundMessageId() ?? undefined,
+        decision: escalationDecision,
+        modelCalled: false,
+        toolNames: [],
+        outboundAction:
+          validated.originalAccepted && validated.payload.trim()
+            ? 'sent'
+            : 'suppressed',
+        payload: validated.payload,
+        reasonCodes: validated.reasonCodes,
+        latencyMs: Date.now() - turnStartedAt.getTime(),
+        purpose: 'ESCALATION',
+      })
+    );
     return validated;
   }
 
@@ -1555,6 +1608,12 @@ async function getReceptionistReply(
     throw new ConversationPausedBeforeDispatch();
   }
   const servicesForGate = await getServices(config);
+  const turnDecision = resolveReceptionistTurnDecision({
+    inbound: userMessage,
+    history,
+    catalog: servicesForGate,
+  });
+  const previousAssistantText = immediatePreviousAnaAssistantText(history);
   const groundedTurn = await resolveGroundedReceptionistTurn({
     userMessage,
     userMessages,
@@ -1580,9 +1639,30 @@ async function getReceptionistReply(
       purpose: 'REACTIVE',
       toolTrace: groundedTurn.toolTrace,
       sourceInboundText: userMessage,
+      previousAssistantText,
+      pendingQuestion: turnDecision.pending,
+      disableSocialContextDrift: turnDecision.disableSocialContextDrift,
       temporalContext,
     });
     await recordAcceptedReceptionistReply(conversationKey, groundedReply);
+    emitReceptionistTurnReceipt(
+      buildTurnDecisionReceipt({
+        phoneNumberId: config.phoneNumberId,
+        customerPhone: phone,
+        tenantSlug: config.tenantSlug,
+        inboundMessageId: currentSourceInboundMessageId() ?? undefined,
+        decision: turnDecision,
+        modelCalled: false,
+        toolNames: groundedTurn.toolTrace.map((entry) => entry.name),
+        outboundAction:
+          groundedReply.originalAccepted && groundedReply.payload.trim()
+            ? 'sent'
+            : 'suppressed',
+        payload: groundedReply.payload,
+        reasonCodes: groundedReply.reasonCodes,
+        latencyMs: Date.now() - turnStartedAt.getTime(),
+      })
+    );
     return groundedReply;
   }
   if (
@@ -1598,12 +1678,34 @@ async function getReceptionistReply(
       services: servicesForGate,
       purpose: 'SERVICE_QUESTION',
       sourceInboundText: userMessage,
+      previousAssistantText,
+      pendingQuestion: turnDecision.pending,
+      disableSocialContextDrift: turnDecision.disableSocialContextDrift,
       temporalContext,
     });
     console.log(
       `🚦 Receptionist desambiguou o serviço proativamente | phoneNumberId=${config.phoneNumberId}`
     );
     await recordAcceptedReceptionistReply(conversationKey, question);
+    emitReceptionistTurnReceipt(
+      buildTurnDecisionReceipt({
+        phoneNumberId: config.phoneNumberId,
+        customerPhone: phone,
+        tenantSlug: config.tenantSlug,
+        inboundMessageId: currentSourceInboundMessageId() ?? undefined,
+        decision: turnDecision,
+        modelCalled: false,
+        toolNames: [],
+        outboundAction:
+          question.originalAccepted && question.payload.trim()
+            ? 'sent'
+            : 'suppressed',
+        payload: question.payload,
+        reasonCodes: question.reasonCodes,
+        latencyMs: Date.now() - turnStartedAt.getTime(),
+        purpose: 'SERVICE_QUESTION',
+      })
+    );
     return question;
   }
 
@@ -1795,11 +1897,37 @@ async function getReceptionistReply(
         purpose: 'REACTIVE',
         toolTrace: customerReplyEvidenceTrace,
         sourceInboundText: userMessage,
+        previousAssistantText,
+        pendingQuestion: turnDecision.pending,
+        disableSocialContextDrift: turnDecision.disableSocialContextDrift,
         temporalContext,
         appendPostBooking: true,
       });
 
       await recordAcceptedReceptionistReply(conversationKey, finalReply);
+      emitReceptionistTurnReceipt(
+        buildTurnDecisionReceipt({
+          phoneNumberId: config.phoneNumberId,
+          customerPhone: phone,
+          tenantSlug: config.tenantSlug,
+          inboundMessageId: currentSourceInboundMessageId() ?? undefined,
+          decision: turnDecision,
+          modelCalled: true,
+          toolNames: modelResult.toolTrace.map((entry) => entry.name),
+          outboundAction:
+            finalReply.originalAccepted && finalReply.payload.trim()
+              ? inspection.safe
+                ? 'sent'
+                : 'rewritten'
+              : 'suppressed',
+          payload: finalReply.payload,
+          reasonCodes: [
+            ...finalReply.reasonCodes,
+            ...inspection.reasons,
+          ],
+          latencyMs: Date.now() - turnStartedAt.getTime(),
+        })
+      );
       return finalReply;
     }
   } catch (error) {
@@ -1843,9 +1971,30 @@ async function getReceptionistReply(
     purpose: 'RECOVERY',
     toolTrace: completedWriteTrace,
     sourceInboundText: userMessage,
+    previousAssistantText,
+    pendingQuestion: turnDecision.pending,
+    disableSocialContextDrift: turnDecision.disableSocialContextDrift,
     temporalContext,
     appendPostBooking: true,
   });
   await recordAcceptedReceptionistReply(conversationKey, fallbackReply);
+  emitReceptionistTurnReceipt(
+    buildTurnDecisionReceipt({
+      phoneNumberId: config.phoneNumberId,
+      customerPhone: phone,
+      tenantSlug: config.tenantSlug,
+      inboundMessageId: currentSourceInboundMessageId() ?? undefined,
+      decision: turnDecision,
+      modelCalled: true,
+      toolNames: completedWriteTrace.map((entry) => entry.name),
+      outboundAction:
+        fallbackReply.originalAccepted && fallbackReply.payload.trim()
+          ? 'rewritten'
+          : 'suppressed',
+      payload: fallbackReply.payload,
+      reasonCodes: fallbackReply.reasonCodes,
+      latencyMs: Date.now() - turnStartedAt.getTime(),
+    })
+  );
   return fallbackReply;
 }

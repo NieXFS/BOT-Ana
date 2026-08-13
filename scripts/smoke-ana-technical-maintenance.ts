@@ -1,13 +1,11 @@
+process.env.NODE_ENV ||= 'development';
 process.env.RECEPS_IA_SENTRY_DSN = '';
 process.env.ANA_SENTRY_DSN = '';
 process.env.SENTRY_DSN = '';
+process.env.DATABASE_URL ||= 'postgres://smoke:smoke@127.0.0.1:5432/smoke';
 
 import { readFileSync } from 'node:fs';
 import { isPausedFromState } from '../src/services/pauseDecision';
-import {
-  isConversationPaused,
-  __resetPauseCacheForTest,
-} from '../src/services/pauseService';
 import {
   ANA_TECHNICAL_MAINTENANCE_CANARY_SLUG,
   observeTechnicalMaintenance,
@@ -28,6 +26,10 @@ const now = Date.UTC(2026, 7, 12, 18, 0, 0);
 const future = new Date(now + 60_000).toISOString();
 
 async function main() {
+  const {
+    isConversationPaused,
+    __resetPauseCacheForTest,
+  } = await import('../src/services/pauseService');
   __resetPauseCacheForTest();
   __resetTechnicalMaintenanceCacheForTest();
 

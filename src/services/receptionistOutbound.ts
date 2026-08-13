@@ -15,7 +15,8 @@ import {
   CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
   toolTraceHasCustomerIdentityAmbiguity,
 } from './customerIdentitySafety';
-import { classifyReceptionistTurnPermission } from './receptionistSocialSafety';
+import { classifyReceptionistTurnPermission, hasPositiveSocialOrPersonalEvidence } from './receptionistSocialSafety';
+import type { PendingOperationalQuestion } from './receptionistTurnDecision';
 
 export { CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE } from './customerIdentitySafety';
 
@@ -93,6 +94,10 @@ export interface ReceptionistOutboundEvidence {
   sourceInboundMessageId?: string;
   /** Texto do inbound atual, somente em memória, para impedir fatos adicionados. */
   sourceInboundText?: string;
+  /** Fala imediatamente anterior da Ana; não incluir echo humano. */
+  previousAssistantText?: string;
+  pendingQuestion?: PendingOperationalQuestion;
+  disableSocialContextDrift?: boolean;
   /** Instante e fuso do turno usados para validar hoje/amanhã deterministicamente. */
   temporalContext?: AppointmentTemporalContext;
 }
@@ -404,15 +409,21 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
         ),
       })
     : null;
+  const pendingAnaQuestion =
+    envelope.evidence?.pendingQuestion?.source === 'ANA';
+  const disableSocialContextDrift = Boolean(
+    envelope.evidence?.disableSocialContextDrift || pendingAnaQuestion
+  );
+  const positiveSocialOrPersonal = sourceInboundText
+    ? hasPositiveSocialOrPersonalEvidence(sourceInboundText)
+    : false;
   if (
     generatedSources &&
     turnPermission !== null &&
-    ((turnPermission === 'SOCIAL_ONLY' ||
-      turnPermission === 'NO_OPERATIONAL_INTENT') &&
-      (introducesCatalogInformation(normalizedText, catalog) ||
-        introducesAppointmentStateOrAvailability(normalizedText)) ||
-      turnPermission === 'INFORMATION_REQUEST' &&
-        introducesAppointmentStateOrAvailability(normalizedText))
+    !(disableSocialContextDrift && !positiveSocialOrPersonal) &&
+    positiveSocialOrPersonal &&
+    (introducesCatalogInformation(normalizedText, catalog) ||
+      introducesAppointmentStateOrAvailability(normalizedText))
   ) {
     reasons.add('SOCIAL_CONTEXT_DRIFT');
   }

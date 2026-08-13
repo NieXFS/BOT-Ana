@@ -773,6 +773,9 @@ async function runReceptionist(
   const { resolveGroundedReceptionistTurn } = await import(
     '../src/services/receptionistTurnGrounding'
   );
+  const { resolveReceptionistTurnDecision } = await import(
+    '../src/services/receptionistTurnDecision'
+  );
 
   const config = buildConfig();
   const expected = scenario.receptionist;
@@ -851,6 +854,11 @@ async function runReceptionist(
         ...history.filter((item) => item.role === 'user').map((item) => item.content),
         userText,
       ];
+      const turnDecision = resolveReceptionistTurnDecision({
+        inbound: userText,
+        history,
+        catalog: DAILY_SERVICES,
+      });
       const grounded = await resolveGroundedReceptionistTurn({
         userMessage: userText,
         userMessages,
@@ -912,6 +920,8 @@ async function runReceptionist(
           purpose: 'REACTIVE',
           toolTrace: grounded.toolTrace,
           sourceInboundText: userText,
+          pendingQuestion: turnDecision.pending,
+          disableSocialContextDrift: turnDecision.disableSocialContextDrift,
           temporalContext,
         });
         if (outsideHours) {
@@ -1116,6 +1126,8 @@ async function runReceptionist(
         purpose: 'REACTIVE',
         toolTrace: evidenceTrace,
         sourceInboundText: userText,
+        pendingQuestion: turnDecision.pending,
+        disableSocialContextDrift: turnDecision.disableSocialContextDrift,
         temporalContext,
       });
 

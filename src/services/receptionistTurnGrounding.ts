@@ -27,6 +27,7 @@ import {
   hasCustomerRequestVerb,
   hasNonTransactionalOperationalCue,
 } from './receptionistSocialSafety';
+import { resolveReceptionistTurnDecision } from './receptionistTurnDecision';
 
 export const STANDALONE_CANCEL_CUSTOMER_MESSAGE =
   'Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui.';
@@ -584,6 +585,53 @@ export async function resolveGroundedReceptionistTurn(input: {
     return {
       kind: 'short_circuit',
       reply: NON_OPERATIONAL_FEEDBACK_CUSTOMER_MESSAGE,
+      toolTrace: [],
+      identityCanonical: false,
+      modelHistory,
+    };
+  }
+
+  const turnDecision = resolveReceptionistTurnDecision({
+    inbound: input.userMessage,
+    history: input.history,
+    catalog: input.services,
+  });
+  if (turnDecision.action === 'silence_human') {
+    return {
+      kind: 'short_circuit',
+      reply: '',
+      toolTrace: [],
+      identityCanonical: false,
+      modelHistory,
+    };
+  }
+  if (turnDecision.action === 'personal_ack') {
+    return {
+      kind: 'short_circuit',
+      reply: NON_OPERATIONAL_TURN_CUSTOMER_MESSAGE,
+      toolTrace: [],
+      identityCanonical: false,
+      modelHistory,
+    };
+  }
+  if (turnDecision.action === 'unknown_denial') {
+    return {
+      kind: 'short_circuit',
+      reply: UNKNOWN_SERVICE_CUSTOMER_MESSAGE,
+      toolTrace: [],
+      identityCanonical: false,
+      modelHistory,
+    };
+  }
+  if (
+    (turnDecision.action === 'follow_up_datetime' ||
+      turnDecision.action === 'confirm_once' ||
+      turnDecision.action === 'ask_repeat') &&
+    turnDecision.reply
+  ) {
+    return {
+      kind: 'short_circuit',
+      reply: turnDecision.reply,
       toolTrace: [],
       identityCanonical: false,
       modelHistory,
