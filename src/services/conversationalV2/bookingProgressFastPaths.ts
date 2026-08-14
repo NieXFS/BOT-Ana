@@ -1,4 +1,8 @@
 import type { TenantBotConfig } from '../../configProvider';
+import {
+  bookingConfirmationGate,
+  type V2BookingConfirmationContext,
+} from '../bookingConfirmationGate';
 import type {
   ReceptionistModelLoopResult,
   ReceptionistToolTraceEntry,
@@ -29,6 +33,7 @@ import {
   canonicalReadFailureCopyV2,
   type ReadFastPathReasonV2,
 } from './readFastPaths';
+import { validatedBookingDraftForPendingV2 } from './pendingQuestion';
 
 export type BookingProgressFastPathV2 =
   | { kind: 'continue_model'; reason: string; loop?: ReceptionistModelLoopResult }
@@ -95,7 +100,7 @@ function loopForReads(trace: readonly ReceptionistToolTraceEntry[]): Receptionis
 }
 
 async function safeTool(input: {
-  name: 'getAvailableSlots' | 'getUpcomingAppointments';
+  name: 'getAvailableSlots' | 'getUpcomingAppointments' | 'bookAppointment';
   args: Record<string, unknown>;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<{ raw: string; parsed: Record<string, unknown> | null }> {
@@ -106,6 +111,129 @@ async function safeTool(input: {
     const raw = JSON.stringify({ success: false, reason: 'executor_error' });
     return { raw, parsed: parseObject(raw) };
   }
+}
+
+/**
+ * Confirmação v2 server-owned: o modal só licencia os argumentos do draft
+ * validado e executa exatamente um write. O modelo não participa deste turno.
+ */
+export async function resolveBookingConfirmationWriteFastPathV2(input: {
+  frame: TurnFrameV2;
+  inboundText: string;
+  history: readonly { role: string; content?: unknown }[];
+  servicesResult: ServicesResult;
+  lastAcceptedDelivery: V2BookingConfirmationContext['lastAcceptedDelivery'];
+  now: Date;
+  executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
+  onGateDecline?: V2BookingConfirmationContext['onGateDecline'];
+}): Promise<BookingProgressFastPathV2> {
+  const pending = input.frame.pending;
+  if (!pending) {
+    return { kind: 'continue_model', reason: 'confirmation_pending_absent' };
+  }
+  const context: V2BookingConfirmationContext = {
+    pending,
+    flowState: input.frame.flowState,
+    catalog: input.servicesResult,
+    lastAcceptedDelivery: input.lastAcceptedDelivery,
+    now: input.now,
+    ...(input.onGateDecline ? { onGateDecline: input.onGateDecline } : {}),
+  };
+  const draft = validatedBookingDraftForPendingV2({
+    pending,
+    flowState: input.frame.flowState,
+    catalog: input.servicesResult,
+  });
+  if (!draft) {
+    return { kind: 'continue_model', reason: 'confirmation_draft_invalid' };
+  }
+  const service = input.servicesResult.services?.find(
+    (entry) => entry.id === draft.serviceId
+  );
+  const professional = draft.professionalId
+    ? input.servicesResult.professionals?.find(
+        (entry) => entry.id === draft.professionalId
+      )
+    : undefined;
+  if (!service || (draft.professionalId && !professional)) {
+    return { kind: 'continue_model', reason: 'confirmation_catalog_mismatch' };
+  }
+  const decision = bookingConfirmationGate({
+    currentUserMessage: input.inboundText,
+    history: [...input.history],
+    confirmedDuplicate: false,
+    expectedBooking: {
+      date: draft.date,
+      time: draft.time,
+      serviceName: service.name,
+      ...(professional ? { professionalName: professional.name } : {}),
+    },
+    v2ConfirmationContext: context,
+  });
+  if (!decision.ok) {
+    input.onGateDecline?.({
+      gate: 'booking_confirmation',
+      reason: decision.reason,
+    });
+    return { kind: 'continue_model', reason: decision.reason };
+  }
+
+  const args: Record<string, unknown> = {
+    serviceId: draft.serviceId,
+    date: draft.date,
+    time: draft.time,
+    ...(draft.professionalId
+      ? { professionalId: draft.professionalId }
+      : {}),
+  };
+  const write = await safeTool({
+    name: 'bookAppointment',
+    args,
+    executeTool: input.executeTool,
+  });
+  const trace: ReceptionistToolTraceEntry = {
+    round: 0,
+    name: 'bookAppointment',
+    args,
+    argumentsValidJson: true,
+    result: write.raw,
+  };
+  const loop = loopForReads([trace]);
+  const reduced = reduceToolLifecycleV2({
+    frame: input.frame,
+    toolTrace: [trace],
+    services: input.servicesResult,
+    sourceInboundText: input.inboundText,
+  });
+  if (write.parsed?.success === true && reduced?.kind === 'canonical_write') {
+    return {
+      kind: 'resolved',
+      result: reduced.result,
+      loop,
+      proof: null,
+      nextFlowState: reduced.nextFlowState,
+    };
+  }
+
+  // A tentativa falhou sem efeito commitado. Reancora o mesmo resumo e mantém
+  // a CONFIRMATION atual; nenhuma alegação do modelo é necessária ou aceita.
+  return {
+    kind: 'resolved',
+    result: {
+      schemaVersion: 2,
+      reply: buildCanonicalBookingSummaryV2({
+        draft,
+        services: input.servicesResult,
+      }),
+      replyPurpose: 'WRITE_CONFIRMATION',
+      pendingTransitionCandidate: { kind: 'preserve' },
+      resolutionCandidate: null,
+      unknownServiceEvidence: null,
+    },
+    loop,
+    proof: null,
+    nextFlowState: input.frame.flowState,
+  };
 }
 
 function clearTemporalState(flowState: FlowStateV2): FlowStateV2 {

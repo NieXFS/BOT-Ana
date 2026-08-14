@@ -2806,7 +2806,10 @@ async function main(): Promise<void> {
   if (options.mode === 'mock' && selected.length === ANA_V2_ROTEIROS.length) {
     const expectedVariants = new Set<MockUnwrapVariant>(['plain_json']);
     expectedVariants.add('safe_primary_prose_preserve');
-    expectedVariants.add('canonical_write_over_unparsed_prose');
+    // A confirmação inequívoca com CONFIRMATION OPEN é executada pelo
+    // fast-path server-owned. Portanto o turno de write não chama mais o
+    // provider para produzir uma prosa pós-tool; a confirmação canônica é
+    // coberta pelo smoke E2E da rota.
     if (options.repeats >= 2) {
       expectedVariants.add('markdown_fence');
       expectedVariants.add('schema_echo_recovered');

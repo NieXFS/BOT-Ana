@@ -14,6 +14,7 @@ import {
   resolveSelectionFastPathV2,
 } from '../src/services/conversationalV2/fastPaths';
 import {
+  __enforceCanonicalTimeSummaryTransitionForSmokeV2,
   getReceptionistReplyV2,
   __v2RulesPromptForSmoke,
 } from '../src/services/conversationalV2/runtime';
@@ -37,7 +38,9 @@ import {
   MODEL_TURN_RESULT_V2_CONTRACT_BLOCK,
   MODEL_TURN_RESULT_V2_POST_TOOL_REMINDER,
 } from '../src/services/conversationalV2/modelResultContract';
-import { reduceToolLifecycleV2 } from '../src/services/conversationalV2/lifecycleReducer';
+import {
+  reduceToolLifecycleV2,
+} from '../src/services/conversationalV2/lifecycleReducer';
 import {
   buildPendingQuestionV2,
   shouldReanchorPendingQuestionV2,
@@ -1851,6 +1854,167 @@ async function main(): Promise<void> {
     }).ok,
     true,
     'o sim seguinte ao fallback-resumo licencia a escrita e encerra o loop'
+  );
+
+  // Rodada 9d: TIME validado entrega resumo + abre CONFIRMATION; o modal
+  // seguinte executa o write server-owned sem nenhuma completion do modelo.
+  const lexicalBookingStore = new MemoryConversationalV2StateStore();
+  const lexicalBookingPhone = '5511000000027';
+  const lexicalBookingKey = `${config.phoneNumberId}:${lexicalBookingPhone}`;
+  const lexicalTimePending = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '10:00', displayName: '10:00' },
+      { position: 2, entityId: '11:00', displayName: '11:00' },
+    ],
+  });
+  seedPending(lexicalBookingStore, lexicalBookingKey, lexicalTimePending, {
+    flowId: lexicalTimePending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-lexical-slots',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['10:00', '11:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  lexicalBookingStore.setInputSequence(lexicalBookingKey, 1);
+  const lexicalSummary = await getReceptionistReplyV2({
+    phone: lexicalBookingPhone,
+    userMessage: '10h',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: '10h' }),
+    deps: {
+      ...baseDeps(lexicalBookingStore),
+      runModelLoop: async () => {
+        throw new Error('TIME validado não chama modelo');
+      },
+    },
+  });
+  assert.equal(lexicalSummary.planReceipt.route, 'fast_path');
+  assert.equal(lexicalSummary.transition.kind, 'open');
+  if (lexicalSummary.transition.kind !== 'open') {
+    throw new Error('resumo não materializou OPEN');
+  }
+  assert.equal(lexicalSummary.transition.frame.kind, 'CONFIRMATION');
+  assert.deepEqual(
+    lexicalSummary.transition.frame.options.map((option) => option.entityId),
+    [`booking-confirmation:${lexicalTimePending.flowId}`]
+  );
+  assert.equal(lexicalSummary.transition.nextFlowState.bookingDraft?.time, '10:00');
+  assert.deepEqual(
+    __enforceCanonicalTimeSummaryTransitionForSmokeV2({
+      frame: lexicalSummary.frame,
+      flowState: lexicalSummary.transition.nextFlowState,
+      services,
+      payload: lexicalSummary.payload!,
+      candidate: { kind: 'preserve' },
+      writeCommitted: false,
+    }),
+    {
+      kind: 'open',
+      pendingKind: 'CONFIRMATION',
+      flowId: lexicalTimePending.flowId,
+      optionEntityIds: [`booking-confirmation:${lexicalTimePending.flowId}`],
+    },
+    'backstop converte PRESERVE acidental em OPEN CONFIRMATION'
+  );
+  const lexicalSummaryDelivery = await deliverPreparedReceptionistTurnV2(
+    lexicalSummary,
+    {
+      store: lexicalBookingStore,
+      id: nextId,
+      now: () => now,
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 1,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    }
+  );
+  assert.equal(
+    lexicalSummaryDelivery.receipt.pendingCommitOutcome,
+    'opened'
+  );
+  const afterLexicalSummary = await lexicalBookingStore.loadLatestState(
+    lexicalBookingKey,
+    now
+  );
+  assert.equal(afterLexicalSummary.pending?.snapshot.kind, 'CONFIRMATION');
+  assert.equal(afterLexicalSummary.pending?.flowState.bookingDraft?.time, '10:00');
+
+  lexicalBookingStore.setInputSequence(lexicalBookingKey, 2);
+  let lexicalBookCalls = 0;
+  const lexicalBook = await getReceptionistReplyV2({
+    phone: lexicalBookingPhone,
+    userMessage: 'pode',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'pode', sequence: 2 }),
+    deps: {
+      ...baseDeps(lexicalBookingStore),
+      loadHistory: async () => [
+        { role: 'assistant', content: lexicalSummary.payload! },
+        { role: 'user', content: 'pode' },
+      ],
+      executeTool: async (name, args) => {
+        assert.equal(name, 'bookAppointment');
+        assert.deepEqual(args, {
+          serviceId: 'svc-drenagem',
+          date: '2026-08-14',
+          time: '10:00',
+          professionalId: 'prof-julia',
+        });
+        lexicalBookCalls += 1;
+        return JSON.stringify({
+          success: true,
+          message:
+            'Agendado com sucesso para 14/08/2026 às 10:00 com Júlia para Drenagem Linfática.',
+        });
+      },
+      runModelLoop: async () => {
+        throw new Error('modal tipado não chama modelo');
+      },
+    },
+  });
+  assert.equal(lexicalBookCalls, 1, 'léxico executa exatamente um write');
+  assert.equal(lexicalBook.planReceipt.route, 'fast_path');
+  assert.equal(lexicalBook.planReceipt.primaryProviderCalls, 0);
+  assert.equal(lexicalBook.planReceipt.toolEffects[0]?.tool, 'bookAppointment');
+  assert.equal(lexicalBook.planReceipt.toolEffects[0]?.outcome, 'success');
+  assert.equal(lexicalBook.transition.kind, 'resolve');
+  assert.match(lexicalBook.payload ?? '', /confirmado com sucesso|agendado com sucesso/iu);
+  const lexicalBookDelivery = await deliverPreparedReceptionistTurnV2(
+    lexicalBook,
+    {
+      store: lexicalBookingStore,
+      id: nextId,
+      now: () => now,
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 2,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    }
+  );
+  assert.equal(lexicalBookDelivery.receipt.pendingCommitOutcome, 'resolved');
+  assert.equal(
+    (await lexicalBookingStore.loadLatestState(lexicalBookingKey, now)).pending,
+    null,
+    'booking_committed fecha a CONFIRMATION'
   );
 
   // Rodada 9c: um booking nu com progresso velho abre continuar|novo antes do
