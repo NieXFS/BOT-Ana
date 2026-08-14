@@ -7,7 +7,9 @@
  *     + o corpo (echoHandler);
  *   - echo sem texto → marcador interno; áudio sem transcrição nunca vira fala;
  *   - echo retransmitido (mesmo message id) → NÃO grava 2x (dedup por id);
- *   - a PAUSA é disparada por cliente.
+ *   - a PAUSA é disparada por cliente;
+ *   - corrida echo×envio: echo vence ⇒ transporte suprimido; envio vence ⇒
+ *     echo só começa depois do recibo; POST de pausa falho ⇒ latch ECHO bloqueia.
  *
  * Env dummy ANTES dos imports: contextManager exige DATABASE_URL no load (o Pool
  * do pg é lazy — não conecta — e nunca é usado, deps injetadas). NODE_ENV=dev pra
@@ -48,6 +50,47 @@ const checks: { name: string; ok: boolean }[] = [];
 function expect(name: string, cond: boolean) {
   checks.push({ name, ok: cond });
   console.log(`${cond ? '[PASS]' : '[FAIL]'} ${name}`);
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function createSerialLock() {
+  const tails = new Map<string, Promise<void>>();
+  return async (
+    phoneNumberId: string,
+    customerPhone: string,
+    work: () => Promise<void>
+  ) => {
+    const key = `${phoneNumberId}:${customerPhone}`;
+    const prev = tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    tails.set(
+      key,
+      prev.then(
+        () => done,
+        () => done
+      )
+    );
+    try {
+      await prev;
+      await work();
+    } finally {
+      release();
+    }
+  };
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function main() {
@@ -217,7 +260,7 @@ async function main() {
     audioOrder.includes('download:media-owner-1')
   );
   expect('E2) transcrição foi executada', audioOrder.includes('transcribe'));
-  expect('E2) pausa acontece fora da lock', pauseInsideLock === false);
+  expect('E2) pausa acontece dentro da lock', pauseInsideLock === true);
   expect('E2) download acontece fora da lock', downloadInsideLock === false);
   expect('E2) transcrição acontece fora da lock', transcribeInsideLock === false);
   expect('E2) dedup acontece dentro da lock curta', dedupInsideLock === true);
@@ -276,6 +319,211 @@ async function main() {
     'E2) gate desligado não persiste o texto ambíguo "enviou um áudio"',
     echoRecorded[0]?.content ===
       `${HUMAN_ECHO_PREFIX}[áudio do atendente sem transcrição]`
+  );
+
+  // === R) corrida echo×envio (substitui "pausa fora da lock") ===============
+  const pause = await import('../src/services/pauseService');
+  const escalationCache = await import('../src/services/escalationCache');
+  const raceNow = Date.now();
+  const raceUntil = new Date(raceNow + 60 * 60_000).toISOString();
+  const matchingAckState = {
+    globalPausedUntil: null as string | null,
+    conversationPausedUntil: raceUntil,
+    schedulePausedUntil: null as string | null,
+    escalationPause: {
+      active: true as const,
+      questionId: 'question-race-echo',
+      version: 1,
+      until: raceUntil,
+    },
+    humanPause: { active: false as const, source: null, until: null },
+  };
+
+  // R1) echo vence ⇒ transporte suprimido
+  pause.__resetPauseCacheForTest();
+  escalationCache.__resetEscalationCacheForTest();
+  const echoWinPnid = 'PN-RACE-ECHO-WINS';
+  const echoWinPhone = '5511999001111';
+  escalationCache.updateEscalationCache(
+    echoWinPnid,
+    echoWinPhone,
+    { active: true, questionId: 'question-race-echo', version: 1 },
+    raceNow
+  );
+  const echoWinLock = createSerialLock();
+  const echoHold = deferred();
+  const pauseStarted = deferred();
+  let echoWinPauseInsideLock = false;
+  let echoWinInsideLock = false;
+  let sendEnteredWhileEchoHeld = false;
+  let echoWinTransported = false;
+  const echoWinPayload = {
+    metadata: { phone_number_id: echoWinPnid },
+    message_echoes: [
+      {
+        to: echoWinPhone,
+        id: 'wamid.race-echo-wins',
+        type: 'text',
+        text: { body: 'já te atendo' },
+      },
+    ],
+  };
+  const echoWinPromise = handleSmbMessageEchoes(echoWinPayload, undefined, {
+    pauseConversation: async (pnid, phone) => {
+      echoWinPauseInsideLock = echoWinInsideLock;
+      await pause.pauseConversationByEcho(pnid, phone, {
+        now: () => raceNow,
+        persistPause: async () => raceUntil,
+      });
+      pauseStarted.resolve();
+      await echoHold.promise;
+    },
+    markEchoProcessed: async () => true,
+    unmarkEcho: async () => {},
+    recordMessage: async () => {},
+    withConversationLock: async (pnid, phone, work) => {
+      await echoWinLock(pnid, phone, async () => {
+        echoWinInsideLock = true;
+        try {
+          await work();
+        } finally {
+          echoWinInsideLock = false;
+        }
+      });
+    },
+  });
+  await pauseStarted.promise;
+  const sendWhileEchoHeld = echoWinLock(
+    echoWinPnid,
+    echoWinPhone,
+    async () => {
+      sendEnteredWhileEchoHeld = true;
+      const blocked = await pause.isConversationPausedForEscalationAcknowledgement(
+        echoWinPnid,
+        echoWinPhone,
+        'question-race-echo',
+        {
+          now: () => raceNow,
+          fetchState: async () => matchingAckState,
+        }
+      );
+      if (!blocked) echoWinTransported = true;
+    }
+  );
+  await delay(30);
+  expect(
+    'R1) envio espera a lock enquanto o echo pausa',
+    sendEnteredWhileEchoHeld === false
+  );
+  expect('R1) pausa do echo ocorre dentro da lock', echoWinPauseInsideLock === true);
+  expect(
+    'R1) latch local é ECHO',
+    pause.peekLocalEchoLatch(echoWinPnid, echoWinPhone, raceNow)?.source ===
+      'ECHO'
+  );
+  echoHold.resolve();
+  await echoWinPromise;
+  await sendWhileEchoHeld;
+  expect(
+    'R1) echo vence ⇒ transporte suprimido',
+    sendEnteredWhileEchoHeld === true && echoWinTransported === false
+  );
+
+  // R2) envio vence ⇒ echo só começa depois do recibo
+  const sendWinPnid = 'PN-RACE-SEND-WINS';
+  const sendWinPhone = '5511999002222';
+  const sendWinLock = createSerialLock();
+  const sendHold = deferred();
+  const sendRelease = deferred();
+  let echoPauseStartedBeforeReceipt = false;
+  let echoPauseStarted = false;
+  let receiptDone = false;
+  const sending = sendWinLock(sendWinPnid, sendWinPhone, async () => {
+    sendHold.resolve();
+    await sendRelease.promise;
+    receiptDone = true;
+  });
+  await sendHold.promise;
+  const echoAfterSend = handleSmbMessageEchoes(
+    {
+      metadata: { phone_number_id: sendWinPnid },
+      message_echoes: [
+        {
+          to: sendWinPhone,
+          id: 'wamid.race-send-wins',
+          type: 'text',
+          text: { body: 'já te atendo' },
+        },
+      ],
+    },
+    undefined,
+    {
+      pauseConversation: async () => {
+        echoPauseStartedBeforeReceipt = receiptDone === false;
+        echoPauseStarted = true;
+      },
+      markEchoProcessed: async () => true,
+      unmarkEcho: async () => {},
+      recordMessage: async () => {},
+      withConversationLock: sendWinLock,
+    }
+  );
+  await delay(30);
+  expect(
+    'R2) echo não começa enquanto o envio segura a lock',
+    echoPauseStarted === false && receiptDone === false
+  );
+  sendRelease.resolve();
+  await sending;
+  await echoAfterSend;
+  expect(
+    'R2) envio vence ⇒ echo só começa depois do recibo',
+    echoPauseStarted === true &&
+      receiptDone === true &&
+      echoPauseStartedBeforeReceipt === false
+  );
+
+  // R3) POST de pausa falha ⇒ latch ECHO ainda bloqueia o pause-ack
+  pause.__resetPauseCacheForTest();
+  escalationCache.__resetEscalationCacheForTest();
+  const failPnid = 'PN-RACE-POST-FAIL';
+  const failPhone = '5511999003333';
+  escalationCache.updateEscalationCache(
+    failPnid,
+    failPhone,
+    { active: true, questionId: 'question-race-echo', version: 1 },
+    raceNow
+  );
+  let postFailPropagated = false;
+  try {
+    await pause.pauseConversationByEcho(failPnid, failPhone, {
+      now: () => raceNow,
+      persistPause: async () => {
+        throw new Error('Receps indisponível (simulado)');
+      },
+    });
+  } catch {
+    postFailPropagated = true;
+  }
+  const failLatch = pause.peekLocalEchoLatch(failPnid, failPhone, raceNow);
+  const ackBlockedAfterPostFail =
+    await pause.isConversationPausedForEscalationAcknowledgement(
+      failPnid,
+      failPhone,
+      'question-race-echo',
+      {
+        now: () => raceNow,
+        fetchState: async () => matchingAckState,
+      }
+    );
+  expect('R3) falha do POST é propagada', postFailPropagated === true);
+  expect(
+    'R3) latch local permanece tipado ECHO após POST falho',
+    failLatch?.source === 'ECHO'
+  );
+  expect(
+    'R3) POST de pausa falho ⇒ latch ainda bloqueia o pause-ack',
+    ackBlockedAfterPostFail === true
   );
 
   // === G) gravação falha → marca desfeita → retransmissão recupera =========

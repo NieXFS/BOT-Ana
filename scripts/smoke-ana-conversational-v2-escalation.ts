@@ -301,6 +301,32 @@ async function main(): Promise<void> {
   assert.equal(namedDelivered.receipt.transportOutcome, 'accepted_by_provider');
   assert.equal(namedDelivered.receipt.pendingCommitOutcome, 'preserved');
 
+  const idleTypedPauses = {
+    escalationPause: {
+      active: false as const,
+      questionId: null,
+      version: 0,
+      until: null,
+    },
+    humanPause: { active: false as const, source: null, until: null },
+  };
+  const matchingTypedPauses = (
+    questionId: string,
+    until: string,
+    version = 4
+  ) => ({
+    escalationPause: {
+      active: true as const,
+      questionId,
+      version,
+      until,
+    },
+    humanPause: { active: false as const, source: null, until: null },
+  });
+
+  const escalationPauseUntil = new Date(
+    now.getTime() + 24 * 60 * 60_000
+  ).toISOString();
   assert.equal(
     await pause.isConversationPausedForEscalationAcknowledgement(
       config.phoneNumberId,
@@ -310,18 +336,22 @@ async function main(): Promise<void> {
         now: () => now.getTime(),
         fetchState: async () => ({
           globalPausedUntil: null,
-          conversationPausedUntil: null,
+          conversationPausedUntil: escalationPauseUntil,
           schedulePausedUntil: null,
           escalation: {
             active: true,
             questionId: 'question-authoritative-fixture',
             version: 4,
           },
+          ...matchingTypedPauses(
+            'question-authoritative-fixture',
+            escalationPauseUntil
+          ),
         }),
       }
     ),
     false,
-    'somente a confirmação da ação recém-registrada atravessa a pausa criada por ela'
+    'só escalationPause correspondente entrega o ack'
   );
   assert.equal(
     escalationCache.getEscalationSnapshot(
@@ -344,8 +374,8 @@ async function main(): Promise<void> {
         }),
       }
     ),
-    false,
-    'pause-state sem campo escalation não apaga o questionId local nem silencia o ack'
+    true,
+    'wire sem campos tipados suprime o ack (ERP antigo)'
   );
   assert.equal(
     escalationCache.getEscalationSnapshot(
@@ -353,7 +383,7 @@ async function main(): Promise<void> {
       '+5511999000101'
     )?.active,
     true,
-    'campo aditivo ausente preserva o snapshot local'
+    'wire sem campos tipados preserva o snapshot local'
   );
   assert.equal(
     await pause.isConversationPausedForEscalationAcknowledgement(
@@ -373,9 +403,9 @@ async function main(): Promise<void> {
   const ackPhone = '+5511999000999';
   const ackQuestion = 'question-ack-fixture';
   const idlePause = {
-    globalPausedUntil: null,
-    conversationPausedUntil: null,
-    schedulePausedUntil: null,
+    globalPausedUntil: null as string | null,
+    conversationPausedUntil: null as string | null,
+    schedulePausedUntil: null as string | null,
   };
   const seedAckLocal = () =>
     escalationCache.updateEscalationCache(
@@ -386,12 +416,7 @@ async function main(): Promise<void> {
       true
     );
   const ackPaused = (
-    state: {
-      globalPausedUntil: string | null;
-      conversationPausedUntil: string | null;
-      schedulePausedUntil: string | null;
-      escalation?: unknown;
-    } | null
+    state: import('../src/services/pauseDecision').PauseState | null
   ) =>
     pause.isConversationPausedForEscalationAcknowledgement(
       ackPnid,
@@ -399,8 +424,7 @@ async function main(): Promise<void> {
       ackQuestion,
       {
         now: () => now.getTime(),
-        fetchState: async () =>
-          state as import('../src/services/pauseDecision').PauseState | null,
+        fetchState: async () => state,
       }
     );
 
@@ -427,22 +451,26 @@ async function main(): Promise<void> {
   assert.equal(
     await ackPaused({
       ...idlePause,
-      escalation: { active: false },
+      escalation: { active: false, questionId: null, version: 0 },
     }),
     true,
-    '{active:false} incompleto falha fechado'
+    '{active:false} sem campos tipados falha fechado'
   );
   assert.equal(
     escalationCache.getEscalationSnapshot(ackPnid, ackPhone)?.active,
     true,
-    '{active:false} incompleto não grava inactive no snapshot local'
+    'wire sem campos tipados não grava inactive no snapshot local'
   );
 
   seedAckLocal();
   assert.equal(
     await ackPaused({
       ...idlePause,
-      escalation: 'inactive',
+      escalation: 'inactive' as unknown as {
+        active: boolean;
+        questionId: string | null;
+        version: number;
+      },
     }),
     true,
     'escalation primitivo falha fechado'
@@ -452,7 +480,11 @@ async function main(): Promise<void> {
   assert.equal(
     await ackPaused({
       ...idlePause,
-      escalation: [{ active: false, questionId: null, version: 8 }],
+      escalation: [{ active: false, questionId: null, version: 8 }] as unknown as {
+        active: boolean;
+        questionId: string | null;
+        version: number;
+      },
     }),
     true,
     'escalation array falha fechado'
@@ -462,35 +494,63 @@ async function main(): Promise<void> {
   assert.equal(
     await ackPaused({
       ...idlePause,
-      escalation: { active: true, questionId: null, version: 4 },
+      ...idleTypedPauses,
+      escalationPause: {
+        active: true,
+        questionId: null,
+        version: 4,
+        until: escalationPauseUntil,
+      },
     }),
     true,
-    'active:true sem questionId falha fechado'
+    'escalationPause active:true sem questionId falha fechado'
   );
 
   seedAckLocal();
   assert.equal(
     await ackPaused({
       ...idlePause,
-      escalation: { active: true, questionId: 'question-other', version: 9 },
+      conversationPausedUntil: escalationPauseUntil,
+      ...matchingTypedPauses('question-other', escalationPauseUntil, 9),
     }),
     true,
-    'active:true com questionId remoto divergente falha fechado'
+    'escalationPause com questionId remoto divergente falha fechado'
   );
 
   seedAckLocal();
   assert.equal(
     await ackPaused({
       ...idlePause,
-      escalation: { active: false, questionId: null, version: 8 },
+      escalation: { active: false, questionId: null, version: 0 },
+    }),
+    true,
+    'union legado sem campos tipados suprime o ack'
+  );
+  assert.equal(
+    escalationCache.getEscalationSnapshot(ackPnid, ackPhone)?.active,
+    true,
+    'ERP antigo não grava inactive no snapshot local'
+  );
+
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      ...idleTypedPauses,
+      escalationPause: {
+        active: false,
+        questionId: null,
+        version: 8,
+        until: null,
+      },
     }),
     false,
-    'active:false atualiza o cache e aplica a decisão ordinária sem fingir ack'
+    'campos tipados inativos sem outra pausa entregam o ack'
   );
   assert.equal(
     escalationCache.getEscalationSnapshot(ackPnid, ackPhone)?.active,
     false,
-    'active:false grava inactive no snapshot local'
+    'escalationPause inativo grava inactive no snapshot local'
   );
 
   seedAckLocal();
@@ -498,14 +558,171 @@ async function main(): Promise<void> {
     await ackPaused({
       ...idlePause,
       conversationPausedUntil: new Date(now.getTime() + 60_000).toISOString(),
-      escalation: { active: false, questionId: null, version: 8 },
+      ...idleTypedPauses,
+      humanPause: {
+        active: true,
+        source: 'ECHO',
+        until: new Date(now.getTime() + 60_000).toISOString(),
+      },
     }),
     true,
-    'active:false não fura pausa ordinária de conversa'
+    'humanPause.active bloqueia o ack mesmo com escalationPause inativo'
+  );
+
+  pause.__resetPauseCacheForTest();
+  seedAckLocal();
+  let echoPostFailed = false;
+  try {
+    await pause.pauseConversationByEcho(ackPnid, ackPhone, {
+      now: () => now.getTime(),
+      persistPause: async () => {
+        throw new Error('Receps indisponível (simulado)');
+      },
+    });
+  } catch {
+    echoPostFailed = true;
+  }
+  assert.equal(echoPostFailed, true, 'POST de pausa falho propaga');
+  assert.equal(
+    pause.peekLocalEchoLatch(ackPnid, ackPhone, now.getTime())?.source,
+    'ECHO',
+    'POST falho preserva latch local tipado ECHO'
+  );
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      conversationPausedUntil: new Date(now.getTime() + 60_000).toISOString(),
+      ...matchingTypedPauses(
+        ackQuestion,
+        new Date(now.getTime() + 60_000).toISOString()
+      ),
+    }),
+    true,
+    'latch local ECHO bloqueia o ack mesmo com humanPause inativo no ERP'
+  );
+  pause.__resetPauseCacheForTest();
+
+  const selfPauseUntil = new Date(now.getTime() + 24 * 60 * 60_000).toISOString();
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      conversationPausedUntil: selfPauseUntil,
+      escalation: {
+        active: true,
+        questionId: ackQuestion,
+        version: 4,
+      },
+      ...matchingTypedPauses(ackQuestion, selfPauseUntil),
+    }),
+    false,
+    'só escalationPause correspondente ignora conversationPausedUntil agregado'
   );
   assert.equal(
     escalationCache.getEscalationSnapshot(ackPnid, ackPhone)?.active,
-    false
+    true,
+    'ack da própria escalada preserva o snapshot local ativo'
+  );
+
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      conversationPausedUntil: selfPauseUntil,
+      escalation: {
+        active: true,
+        questionId: ackQuestion,
+        version: 4,
+      },
+      escalationPause: {
+        active: true,
+        questionId: ackQuestion,
+        version: 4,
+        until: selfPauseUntil,
+      },
+      humanPause: {
+        active: true,
+        source: 'ECHO',
+        until: selfPauseUntil,
+      },
+    }),
+    true,
+    'escalationPause + humanPause simultâneos suprem o ack'
+  );
+
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      conversationPausedUntil: selfPauseUntil,
+      escalationPause: {
+        active: true,
+        questionId: ackQuestion,
+        version: 4,
+        until: selfPauseUntil,
+      },
+      humanPause: {
+        active: true,
+        source: 'MANUAL',
+        until: selfPauseUntil,
+      },
+    }),
+    true,
+    'humanPause MANUAL simultâneo também bloqueia'
+  );
+
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      globalPausedUntil: selfPauseUntil,
+      conversationPausedUntil: selfPauseUntil,
+      ...matchingTypedPauses(ackQuestion, selfPauseUntil),
+    }),
+    true,
+    'escalationPause casado não fura pausa global do salão'
+  );
+
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      conversationPausedUntil: selfPauseUntil,
+      schedulePausedUntil: selfPauseUntil,
+      ...matchingTypedPauses(ackQuestion, selfPauseUntil),
+    }),
+    true,
+    'escalationPause casado não fura auto-pausa programada'
+  );
+
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      escalationPause: {
+        active: true,
+        questionId: ackQuestion,
+        version: 4,
+        until: selfPauseUntil,
+      },
+    }),
+    true,
+    'escalationPause sem humanPause (contrato parcial) falha fechado'
+  );
+
+  seedAckLocal();
+  assert.equal(
+    await ackPaused({
+      ...idlePause,
+      humanPause: { active: false, source: null, until: null },
+      escalationPause: {
+        active: false,
+        questionId: null,
+        version: 0,
+      } as unknown as import('../src/services/pauseDecision').EscalationPauseReason,
+    }),
+    true,
+    'escalationPause incompleto (sem until) falha fechado'
   );
 
   seedAckLocal();
@@ -544,6 +761,7 @@ async function main(): Promise<void> {
     phoneNumberId: string;
     responsibleName: string;
     escalationPost: () => Promise<unknown>;
+    pauseState: import('../src/services/pauseDecision').PauseState;
   }) => {
     handler.__resetFlushStateForTest();
     escalationCache.__resetEscalationCacheForTest();
@@ -560,11 +778,8 @@ async function main(): Promise<void> {
     );
     let sequence = 0;
     const transported: string[] = [];
-    const pauseStateWithoutEscalation = {
-      globalPausedUntil: null,
-      conversationPausedUntil: null,
-      schedulePausedUntil: null,
-    };
+    let lockDepth = 0;
+    let ackRecheckedUnderSendLock = false;
     const flushDeps = {
       getReply: async (
         from: string,
@@ -620,22 +835,31 @@ async function main(): Promise<void> {
         phoneNumberId: string,
         customerPhone: string,
         questionId: string
-      ) =>
-        pause.isConversationPausedForEscalationAcknowledgement(
+      ) => {
+        if (lockDepth > 0) ackRecheckedUnderSendLock = true;
+        return pause.isConversationPausedForEscalationAcknowledgement(
           phoneNumberId,
           customerPhone,
           questionId,
           {
             now: () => now.getTime(),
-            fetchState: async () => pauseStateWithoutEscalation,
+            fetchState: async () => input.pauseState,
           }
-        ),
+        );
+      },
       recordPausedInbound: async () => {},
       withConversationLock: async (
         _phoneNumberId: string,
         _customerPhone: string,
         work: () => Promise<void>
-      ) => work(),
+      ) => {
+        lockDepth += 1;
+        try {
+          await work();
+        } finally {
+          lockDepth -= 1;
+        }
+      },
       deliverV2: (
         prepared: Awaited<ReturnType<typeof runtime.getReceptionistReplyV2>>,
         checkpoint: () => Promise<{
@@ -668,13 +892,41 @@ async function main(): Promise<void> {
     );
     await handler.flushBuffer(escalateKey, flushDeps);
     const afterState = await store.loadLatestState(conversationKey, now);
-    return { store, conversationKey, transported, before, afterState };
+    return {
+      store,
+      conversationKey,
+      transported,
+      before,
+      afterState,
+      ackRecheckedUnderSendLock,
+    };
+  };
+
+  const liveTypedPauseState = {
+    globalPausedUntil: null as string | null,
+    conversationPausedUntil: new Date(
+      now.getTime() + 24 * 60 * 60_000
+    ).toISOString(),
+    schedulePausedUntil: null as string | null,
+    escalation: {
+      active: true,
+      questionId: 'question-e2e-flush',
+      version: 1,
+    },
+    escalationPause: {
+      active: true,
+      questionId: 'question-e2e-flush',
+      version: 1,
+      until: new Date(now.getTime() + 24 * 60 * 60_000).toISOString(),
+    },
+    humanPause: { active: false as const, source: null, until: null },
   };
 
   const e2e = await runFlushEscalationChain({
     phone: '+5511999000404',
     phoneNumberId: 'PN-ESCALATION-V2-E2E',
     responsibleName: 'Heloísa',
+    pauseState: liveTypedPauseState,
     escalationPost: async () => ({
       questionId: 'question-e2e-flush',
       escalation: {
@@ -701,18 +953,85 @@ async function main(): Promise<void> {
     e2e.before.pending?.snapshot.version
   );
   assert.equal(
+    e2e.ackRecheckedUnderSendLock,
+    true,
+    'pause-ack reconsulta sob a mesma lock de envio'
+  );
+  assert.equal(
     escalationCache.getEscalationSnapshot(
       'PN-ESCALATION-V2-E2E',
       '+5511999000404'
     )?.questionId,
     'question-e2e-flush',
-    'pause-state sem campo aditivo preserva o snapshot local no E2E do flush'
+    'escalationPause correspondente não silencia o ack no E2E'
   );
+
+  const e2eHuman = await runFlushEscalationChain({
+    phone: '+5511999000606',
+    phoneNumberId: 'PN-ESCALATION-V2-E2E-HUMAN',
+    responsibleName: 'Heloísa',
+    pauseState: {
+      ...liveTypedPauseState,
+      humanPause: {
+        active: true,
+        source: 'ECHO',
+        until: liveTypedPauseState.conversationPausedUntil,
+      },
+    },
+    escalationPost: async () => ({
+      questionId: 'question-e2e-flush',
+      escalation: {
+        active: true,
+        questionId: 'question-e2e-flush',
+        version: 4,
+      },
+    }),
+  });
+  assert.equal(e2eHuman.transported.length, 1);
+  assert.doesNotMatch(e2eHuman.transported[0] ?? '', /vou avisar/iu);
+  assert.equal(e2eHuman.afterState.pending?.state, 'OPEN');
+  assert.equal(
+    e2eHuman.ackRecheckedUnderSendLock,
+    true,
+    'humanPause simultâneo também reconsulta sob a lock de envio'
+  );
+
+  const e2eLegacyWire = await runFlushEscalationChain({
+    phone: '+5511999000707',
+    phoneNumberId: 'PN-ESCALATION-V2-E2E-LEGACY',
+    responsibleName: 'Heloísa',
+    pauseState: {
+      globalPausedUntil: null,
+      conversationPausedUntil: liveTypedPauseState.conversationPausedUntil,
+      schedulePausedUntil: null,
+      escalation: {
+        active: true,
+        questionId: 'question-e2e-flush',
+        version: 1,
+      },
+    },
+    escalationPost: async () => ({
+      questionId: 'question-e2e-flush',
+      escalation: {
+        active: true,
+        questionId: 'question-e2e-flush',
+        version: 4,
+      },
+    }),
+  });
+  assert.equal(e2eLegacyWire.transported.length, 1);
+  assert.doesNotMatch(e2eLegacyWire.transported[0] ?? '', /vou avisar/iu);
 
   const e2eFailed = await runFlushEscalationChain({
     phone: '+5511999000505',
     phoneNumberId: 'PN-ESCALATION-V2-E2E-DOWN',
     responsibleName: 'Heloísa',
+    pauseState: {
+      globalPausedUntil: null,
+      conversationPausedUntil: null,
+      schedulePausedUntil: null,
+      ...idleTypedPauses,
+    },
     escalationPost: async () => {
       throw new Error('Receps sinteticamente indisponível');
     },
@@ -730,7 +1049,7 @@ async function main(): Promise<void> {
   );
 
   console.log(
-    'PASS smoke escalada v2: ação autoritativa, validador final, transporte, pause-ack, fail-closed, E2E flushBuffer e pendência preservada.'
+    'PASS smoke escalada v2: ação autoritativa, validador final, transporte, pause-ack tipado, fail-closed, E2E flushBuffer sob a lock e pendência preservada.'
   );
 }
 

@@ -5,7 +5,14 @@
  *
  * Rodar: npx tsx scripts/smoke-pause-decision.ts
  */
-import { isActivePause, isPausedFromState } from '../src/services/pauseDecision';
+import {
+  decideEscalationAcknowledgementPause,
+  isActiveLocalEchoLatch,
+  isActivePause,
+  isPausedFromState,
+  parseStrictEscalationPause,
+  parseStrictHumanPause,
+} from '../src/services/pauseDecision';
 
 let failures = 0;
 function check(label: string, cond: boolean) {
@@ -58,6 +65,178 @@ check(
     { globalPausedUntil: null, conversationPausedUntil: null, schedulePausedUntil: null },
     now
   ) === false
+);
+
+const typedUntil = new Date(now + 60_000).toISOString();
+check(
+  'parser estrito de escalationPause rejeita null/primitivo/incompleto',
+  parseStrictEscalationPause(null) === null &&
+    parseStrictEscalationPause('active') === null &&
+    parseStrictEscalationPause({ active: true, questionId: 'q1', version: 1 }) ===
+      null &&
+    parseStrictEscalationPause({
+      active: true,
+      questionId: null,
+      version: 1,
+      until: typedUntil,
+    }) === null
+);
+check(
+  'parser estrito de escalationPause aceita ativo e inativo completos',
+  parseStrictEscalationPause({
+    active: true,
+    questionId: 'q1',
+    version: 4,
+    until: typedUntil,
+  })?.questionId === 'q1' &&
+    parseStrictEscalationPause({
+      active: false,
+      questionId: null,
+      version: 0,
+      until: null,
+    })?.active === false
+);
+check(
+  'parser estrito de humanPause rejeita source inválida e incompleto',
+  parseStrictHumanPause({
+    active: true,
+    source: 'ESCALATION',
+    until: typedUntil,
+  }) === null &&
+    parseStrictHumanPause({ active: false }) === null &&
+    parseStrictHumanPause({ active: true, source: 'ECHO' }) === null
+);
+check(
+  'parser estrito de humanPause aceita ECHO/MANUAL e inativo',
+  parseStrictHumanPause({
+    active: true,
+    source: 'ECHO',
+    until: typedUntil,
+  })?.source === 'ECHO' &&
+    parseStrictHumanPause({
+      active: true,
+      source: 'MANUAL',
+      until: typedUntil,
+    })?.source === 'MANUAL' &&
+    parseStrictHumanPause({ active: false, source: null, until: null })
+      ?.active === false
+);
+
+const localAck = { active: true, questionId: 'q-ack' };
+const idle = {
+  globalPausedUntil: null as string | null,
+  conversationPausedUntil: null as string | null,
+  schedulePausedUntil: null as string | null,
+};
+check(
+  'pause-ack sem campos tipados falha fechado',
+  decideEscalationAcknowledgementPause({
+    expectedQuestionId: 'q-ack',
+    local: localAck,
+    state: { ...idle, conversationPausedUntil: typedUntil },
+    nowMs: now,
+  }) === true
+);
+check(
+  'pause-ack só escalationPause correspondente libera',
+  decideEscalationAcknowledgementPause({
+    expectedQuestionId: 'q-ack',
+    local: localAck,
+    state: {
+      ...idle,
+      conversationPausedUntil: typedUntil,
+      escalationPause: {
+        active: true,
+        questionId: 'q-ack',
+        version: 1,
+        until: typedUntil,
+      },
+      humanPause: { active: false, source: null, until: null },
+    },
+    nowMs: now,
+  }) === false
+);
+check(
+  'pause-ack com humanPause simultâneo bloqueia',
+  decideEscalationAcknowledgementPause({
+    expectedQuestionId: 'q-ack',
+    local: localAck,
+    state: {
+      ...idle,
+      conversationPausedUntil: typedUntil,
+      escalationPause: {
+        active: true,
+        questionId: 'q-ack',
+        version: 1,
+        until: typedUntil,
+      },
+      humanPause: { active: true, source: 'ECHO', until: typedUntil },
+    },
+    nowMs: now,
+  }) === true
+);
+check(
+  'isPausedFromState trata humanPause.active como pausa ordinária',
+  isPausedFromState(
+    {
+      ...idle,
+      humanPause: { active: true, source: 'MANUAL', until: typedUntil },
+    },
+    now
+  ) === true
+);
+
+const echoLatchUntil = now + 60_000;
+check(
+  'isActiveLocalEchoLatch só aceita source ECHO no futuro',
+  isActiveLocalEchoLatch({ source: 'ECHO', untilMs: echoLatchUntil }, now) ===
+    true &&
+    isActiveLocalEchoLatch({ source: 'ECHO', untilMs: now }, now) === false &&
+    isActiveLocalEchoLatch(
+      { source: 'MANUAL', untilMs: echoLatchUntil },
+      now
+    ) === false &&
+    isActiveLocalEchoLatch(null, now) === false
+);
+check(
+  'pause-ack com latch local ECHO bloqueia mesmo com humanPause inativo',
+  decideEscalationAcknowledgementPause({
+    expectedQuestionId: 'q-ack',
+    local: localAck,
+    state: {
+      ...idle,
+      conversationPausedUntil: typedUntil,
+      escalationPause: {
+        active: true,
+        questionId: 'q-ack',
+        version: 1,
+        until: typedUntil,
+      },
+      humanPause: { active: false, source: null, until: null },
+    },
+    nowMs: now,
+    localEchoLatch: { source: 'ECHO', untilMs: echoLatchUntil },
+  }) === true
+);
+check(
+  'latch ECHO expirado não bloqueia o ack tipado',
+  decideEscalationAcknowledgementPause({
+    expectedQuestionId: 'q-ack',
+    local: localAck,
+    state: {
+      ...idle,
+      conversationPausedUntil: typedUntil,
+      escalationPause: {
+        active: true,
+        questionId: 'q-ack',
+        version: 1,
+        until: typedUntil,
+      },
+      humanPause: { active: false, source: null, until: null },
+    },
+    nowMs: now,
+    localEchoLatch: { source: 'ECHO', untilMs: now - 1 },
+  }) === false
 );
 
 if (failures > 0) {

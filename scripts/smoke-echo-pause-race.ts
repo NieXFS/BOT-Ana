@@ -18,8 +18,11 @@ async function main() {
   const {
     pauseConversationByEcho,
     isConversationPaused,
+    isConversationPausedForEscalationAcknowledgement,
+    peekLocalEchoLatch,
     __resetPauseCacheForTest,
   } = await import('../src/services/pauseService');
+  const escalationCache = await import('../src/services/escalationCache');
 
   // O serviço consulta Date.now() ao ler o cache; alinhar o relógio injetado ao
   // relógio real evita que uma data fixa antiga pareça uma pausa já expirada.
@@ -66,6 +69,42 @@ async function main() {
   check(
     'falha do POST mantém a pausa local otimista',
     await isConversationPaused('PN-FAIL', '5511888880000')
+  );
+  check(
+    'falha do POST preserva latch local tipado ECHO',
+    peekLocalEchoLatch('PN-FAIL', '5511888880000', now)?.source === 'ECHO'
+  );
+
+  const failAckUntil = new Date(now + 60 * 60_000).toISOString();
+  escalationCache.__resetEscalationCacheForTest();
+  escalationCache.updateEscalationCache(
+    'PN-FAIL',
+    '5511888880000',
+    { active: true, questionId: 'question-echo-fail', version: 1 },
+    now
+  );
+  check(
+    'POST de pausa falho ⇒ latch ainda bloqueia o pause-ack',
+    await isConversationPausedForEscalationAcknowledgement(
+      'PN-FAIL',
+      '5511888880000',
+      'question-echo-fail',
+      {
+        now: () => now,
+        fetchState: async () => ({
+          globalPausedUntil: null,
+          conversationPausedUntil: failAckUntil,
+          schedulePausedUntil: null,
+          escalationPause: {
+            active: true,
+            questionId: 'question-echo-fail',
+            version: 1,
+            until: failAckUntil,
+          },
+          humanPause: { active: false, source: null, until: null },
+        }),
+      }
+    )
   );
 
   const failed = checks.filter((item) => !item.ok);

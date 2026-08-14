@@ -38,6 +38,103 @@ async function main(): Promise<void> {
         version: 8,
       })?.active === false
   );
+  const erpInactive = cache.parseStrictEscalationSnapshot({
+    active: false,
+    version: 0,
+  });
+  const erpActive = cache.parseStrictEscalationSnapshot({
+    active: true,
+    questionId: 'question-erp-live',
+    version: 4,
+  });
+  check(
+    'parser estrito aceita union real do ERP (inativo sem questionId; ativo com id)',
+    erpInactive?.active === false &&
+      erpInactive.questionId === null &&
+      erpInactive.version === 0 &&
+      erpActive?.active === true &&
+      erpActive.questionId === 'question-erp-live' &&
+      erpActive.version === 4
+  );
+
+  const decision = await import('../src/services/pauseDecision');
+  const until = new Date(Date.now() + 60_000).toISOString();
+  check(
+    'pause-ack sem campos tipados falha fechado mesmo com escalation legado ativo',
+    decision.decideEscalationAcknowledgementPause({
+      expectedQuestionId: 'question-cache',
+      local: { active: true, questionId: 'question-cache' },
+      state: {
+        globalPausedUntil: null,
+        conversationPausedUntil: until,
+        schedulePausedUntil: null,
+        escalation: {
+          active: true,
+          questionId: 'question-cache',
+          version: 7,
+        },
+      },
+      nowMs: Date.now(),
+    }) === true
+  );
+  check(
+    'pause-ack tipado casa ESCALATION e bloqueia humanPause simultâneo',
+    decision.decideEscalationAcknowledgementPause({
+      expectedQuestionId: 'question-cache',
+      local: { active: true, questionId: 'question-cache' },
+      state: {
+        globalPausedUntil: null,
+        conversationPausedUntil: until,
+        schedulePausedUntil: null,
+        escalationPause: {
+          active: true,
+          questionId: 'question-cache',
+          version: 7,
+          until,
+        },
+        humanPause: { active: true, source: 'ECHO', until },
+      },
+      nowMs: Date.now(),
+    }) === true &&
+      decision.decideEscalationAcknowledgementPause({
+        expectedQuestionId: 'question-cache',
+        local: { active: true, questionId: 'question-cache' },
+        state: {
+          globalPausedUntil: null,
+          conversationPausedUntil: until,
+          schedulePausedUntil: null,
+          escalationPause: {
+            active: true,
+            questionId: 'question-cache',
+            version: 7,
+            until,
+          },
+          humanPause: { active: false, source: null, until: null },
+        },
+        nowMs: Date.now(),
+      }) === false
+  );
+  check(
+    'pause-ack com latch local ECHO bloqueia mesmo com humanPause inativo',
+    decision.decideEscalationAcknowledgementPause({
+      expectedQuestionId: 'question-cache',
+      local: { active: true, questionId: 'question-cache' },
+      state: {
+        globalPausedUntil: null,
+        conversationPausedUntil: until,
+        schedulePausedUntil: null,
+        escalationPause: {
+          active: true,
+          questionId: 'question-cache',
+          version: 7,
+          until,
+        },
+        humanPause: { active: false, source: null, until: null },
+      },
+      nowMs: Date.now(),
+      localEchoLatch: { source: 'ECHO', untilMs: Date.now() + 60_000 },
+    }) === true
+  );
 
   cache.updateEscalationCache(
     'pnid-cache',

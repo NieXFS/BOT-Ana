@@ -800,10 +800,10 @@ export async function flushBuffer(
         ) => work());
       let delivery: ConfiguredReplyDelivery = 'sent';
 
-      // A pausa e o transporte compartilham a MESMA advisory lock do echo. Se o
-      // humano assumir durante o brain, o echo grava a pausa antes deste bloco e
-      // a resposta é descartada. Não existe mais janela entre o último check e o
-      // POST ao WhatsApp.
+      // A pausa (inclusive o pause-ack e o latch local ECHO) e o transporte
+      // compartilham a MESMA advisory lock do echo. pauseConversation do echo
+      // corre sob essa lock antes de liberar o restante do processamento; o
+      // pause-ack consulta o latch ECHO (preservado se o POST ao ERP falhar).
       await serialize(config.phoneNumberId, from, async () => {
         const preparedV2 =
           typeof reply === 'object' &&

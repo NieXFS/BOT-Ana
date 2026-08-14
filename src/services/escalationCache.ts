@@ -41,9 +41,11 @@ export function parseEscalationSnapshot(value: unknown): EscalationSnapshot {
 }
 
 /**
- * Parser fail-closed do pause-ack. `undefined` é ausência (tratada pelo
- * caller). Qualquer valor presente — null, primitivo, array ou objeto com
- * `active`/`questionId`/`version` inválidos ou incompletos — devolve null.
+ * Parser fail-closed do pause-ack. Casa o union real do Receps:
+ * `{ active: true, questionId, version }` | `{ active: false, version }`
+ * (`questionId` omitido no inativo; `null` legado ainda é aceito).
+ * `undefined` é ausência (tratada pelo caller). null, primitivo, array ou
+ * objeto com `active`/`version` inválidos devolve null.
  */
 export function parseStrictEscalationSnapshot(
   value: unknown
@@ -54,7 +56,6 @@ export function parseStrictEscalationSnapshot(
   const raw = value as Record<string, unknown>;
   if (
     !Object.prototype.hasOwnProperty.call(raw, 'active') ||
-    !Object.prototype.hasOwnProperty.call(raw, 'questionId') ||
     !Object.prototype.hasOwnProperty.call(raw, 'version')
   ) {
     return null;
@@ -69,6 +70,7 @@ export function parseStrictEscalationSnapshot(
   ) {
     return null;
   }
+  const version = Math.floor(raw.version);
   if (raw.active === true) {
     if (typeof raw.questionId !== 'string' || !raw.questionId.trim()) {
       return null;
@@ -76,16 +78,19 @@ export function parseStrictEscalationSnapshot(
     return {
       active: true,
       questionId: raw.questionId.trim(),
-      version: Math.floor(raw.version),
+      version,
     };
   }
-  if (raw.questionId !== null) {
+  if (
+    Object.prototype.hasOwnProperty.call(raw, 'questionId') &&
+    raw.questionId !== null
+  ) {
     return null;
   }
   return {
     active: false,
     questionId: null,
-    version: Math.floor(raw.version),
+    version,
   };
 }
 

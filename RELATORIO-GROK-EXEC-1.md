@@ -182,3 +182,213 @@ Conferência GPT 5.6 Sol no retrabalho 1: **aprovou (1) detector nominal e (3) E
 
 Sem deploy. Sem chamadas reais.
 
+## Exec 2 — escalada viva
+
+**Status:** conserto local na Ana; sem deploy; ERP intocado.
+
+### Diagnóstico vivo (somente leitura)
+
+Canário `studio-viti` (`ANA_CONVERSATIONAL_V2_TENANT_SLUGS=studio-viti`, `ANA_ESCALATION_ENABLED=true`). Dois turnos no mesmo `convHash=e283c7c94004e83f` (23 chars = `posso falar com a dona?`):
+
+1. `v2Route=fast_path_escalation` → `⏸️ [pausado] resposta pendente suprimida após intervenção humana.`
+2. repetição horas depois, mesmo par.
+
+O POST **não falhou**. No Postgres do Receps, essa conversa tem duas `ana_questions` `HUMAN_REQUEST` (`has_source_inbound=true`): v2 em 16:51:37 e v4 em 18:45:17, ambas `SUPERSEDED` por inbound posterior. Nenhuma OPEN no tenant agora — a dona nunca recebeu o ack, mas a pergunta existiu.
+
+Contrato real do pause-state (código + GET vivo, Bearer remoto, sem PII):
+
+| Momento | `escalation` | `conversationPausedUntil` |
+|---|---|---|
+| Depois do escalate (OPEN) | `{ active: true, questionId, version }` — **sem** `questionId: null` | ISO futuro (pause `source=ESCALATION`, `inbound.receivedAt + 24h`) |
+| Sem pergunta aberta (GET vivo pós-supersede) | `{ active: false, version: 4 }` — **sem** campo `questionId` | `null` |
+| Nunca escalou | `{ active: false, version: 0 }` — **sem** `questionId` | `null` |
+
+O GET `{active:false, version:N}` observado pelo coordenador é o union **inativo** do ERP (`AnaEscalationState`), não prova que o POST foi recusado. No canário, o POST 200 aconteceu; o ack morreu **depois**.
+
+Causa no último centímetro: `escalateAnaQuestion` (Receps) cria a pergunta e a `ConversationPause` ESCALATION na mesma transação. O pause-ack da Ana zerava só `escalation.active` e ainda consultava `conversationPausedUntil` → `isPausedFromState=true` → `suppressFlushIfPaused` → o log de “intervenção humana”. O parser estrito ainda exigia `questionId: null` no inativo, então o shape vivo `{active:false, version}` falhava fechado se o GET viesse assim.
+
+Não há mudança necessária no ERP para este fecho. O Receps já devolve o union certo e já pausa a conversa para a dona; a Ana é que tratava a pausa da própria ação como silêncio.
+
+### Conserto (somente Receps-IA)
+
+- `parseStrictEscalationSnapshot` casa o union real: ativo exige `questionId` string; inativo aceita `questionId` omitido (ERP) ou `null` (legado). `{active:false}` sem `version`, `null`, primitivo e array continuam inválidos.
+- `isConversationPausedForEscalationAcknowledgement`: com snapshot local ativo + remoto `active:true` e o mesmo `questionId`, ignora `conversationPausedUntil` **só neste ack** (a pausa ESCALATION que o POST acabou de gravar). Global, schedule e modo técnico continuam bloqueando. Inativo real aplica a decisão ordinária (echo/manual não são furados). Fetch nulo e ID divergente seguem fail-closed.
+- Mensagens seguintes continuam pausadas: o cache local de escalada permanece `active:true` após o ack; `isConversationPaused` não usa esta exceção.
+
+### Fixtures
+
+- Vivo ativo: `{ active: true, questionId, version }` + `conversationPausedUntil` +24h → ack **entregue**.
+- Vivo inativo: `{ active: false, version: 0 }` sem `questionId` → ack se não houver outra pausa; com `conversationPausedUntil` → silêncio (echo/manual).
+- E2E `flushBuffer → runtime v2 → escalate fake 200 → pause-state vivo (active:true + conversationPausedUntil) → delivery → "Vou avisar Heloísa…"` no transporte fake.
+- Fail-closed intacto: ID divergente, fetch nulo, `{active:false}` incompleto, pausa global/schedule, ERP fora → copy de indisponibilidade sem promessa.
+
+### Validação (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `npm run build` | 0 | |
+| `git diff --check` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | pause-ack no shape vivo |
+| `smoke:ana-escalation-cache` | 0 | union ERP |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+
+Sem deploy. Sem POST de escalate real. Sem edição na VPS.
+
+### Riscos que permanecem
+
+- O pause-state não publica `source` da pausa de conversa. O ack casa pelo `questionId` e ignora `conversationPausedUntil` nesse único envio; um echo humano no mesmo instante do ack (após o lock) é residual. Global/schedule/técnico não entram nessa licença.
+- GET inativo `{active:false, version}` durante o ack (pergunta já superseded) continua aplicando pausa ordinária e grava inactive no cache — correto se a OPEN já morreu; o canário vivo era OPEN + pause ESCALATION.
+- Recibo `suppressed_pause` para UNRECORDED_HANDOFF permanece o enum existente.
+
+## Exec 3 — contrato tipado de pausas
+
+**Status:** implementado nos dois repos; sem deploy; sem push; VPS intocada.
+
+A conferência reprovou a Exec 2 no ponto (1): ignorar `conversationPausedUntil` no ack era heurística, porque o wire do ERP agregava ECHO/MANUAL/ESCALATION no mesmo carimbo sem origem.
+
+### ERP (Receps) — aditivo
+
+A origem **já existia** em `ConversationPause.source` (`ECHO` | `MANUAL` | `ESCALATION`) com `@@unique([tenantId, customerPhone, source])`. Nenhuma migration: não havia coluna a criar nem backfill a fazer.
+
+`GET /api/v1/bot/pause-state` (via `getConversationPauseState`) passa a publicar, **além** dos campos v1 intactos:
+
+- `escalationPause { active, questionId, version, until }` — da linha `source=ESCALATION` ativa, com `version` da `AnaQuestion` vinculada
+- `humanPause { active, source: "ECHO"|"MANUAL", until }` — das linhas ECHO/MANUAL ativas; se as duas existem, `source=MANUAL` e `until` é o máximo da janela humana
+
+`conversationPausedUntil` continua o agregado (máximo de todas as linhas ativas), para consumidores v1. O campo legado `escalation` (união de `AnaQuestion` OPEN) não foi removido.
+
+Helper puro: `src/lib/bot/conversation-pause-reasons.ts` (`deriveTypedPauseReasons`).
+Smoke focado: `npm run smoke:pause-state-typed-reasons`.
+
+Inbound `/questions` não ganhou os campos novos (`BasePauseState` omite-os). Nenhuma outra rota alterada.
+
+### Ana (Receps-IA)
+
+O pause-ack só ignora a pausa ESCALATION cujo `questionId` corresponde. `humanPause.active` bloqueia em qualquer combinação (incluindo simultânea com a própria escalada). Sem os dois campos tipados no wire (ERP antigo no rollout) ⇒ fail-closed total. Recheck permanece **dentro** da mesma `withConversationLock` do transporte.
+
+Parser puro: `parseStrictEscalationPause` / `parseStrictHumanPause` / `decideEscalationAcknowledgementPause` em `pauseDecision.ts`. Shape malformado, contrato parcial (só um dos dois campos) e `fetchState=null` continuam fechados. Global / schedule / modo técnico não são furados.
+
+### Fixtures
+
+- escalationPause correspondente + `humanPause` inativo + `conversationPausedUntil` agregado ⇒ entrega
+- os dois motivos ativos simultâneos ⇒ suprime
+- wire sem campos tipados (shape vivo da Exec 2) ⇒ suprime; snapshot local preservado
+- shapes malformados (`null`, primitivo, array, `active:true` sem `questionId`, `until` ausente, contrato parcial) ⇒ fail-closed
+- E2E `flushBuffer → runtime v2 → pause-ack real sob a lock de envio → transporte fake`: tipado casa ⇒ `Vou avisar Heloísa…`; humanPause simultâneo ⇒ 🛑; ERP antigo sem tipados ⇒ 🛑; ERP fora ⇒ copy de indisponibilidade sem promessa
+
+### Validação ERP (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `npm run typecheck` | 0 | |
+| `npm run lint` | 0 | 0 erros; 40 warnings pré-existentes (react-hooks/purity etc.) |
+| `npm run smoke:pause-state-typed-reasons` | 0 | puro + round-trip `getConversationPauseState` |
+
+Sem `next build`. Sem deploy.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `npm run build` | 0 | |
+| `git diff --check` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | contrato tipado + E2E na lock |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:pause-decision` | 0 | parsers + decisão pura |
+| `smoke:ana-escalation-cache` | 0 | |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+
+Sem deploy. Sem push. Sem escrita na VPS.
+
+### Riscos que permanecem
+
+- Rollout: Ana nova + ERP antigo suprime o ack (fail-closed, direção segura). O ack só volta quando os dois lados publicam/consomem o contrato tipado.
+- Echo humano **depois** do GET de pause-state mas **ainda dentro** da lock é coberto pelo write-through do echo (mesma lock). Echo que chegar depois do POST ao WhatsApp é o residual de sempre.
+- Recibo `suppressed_pause` para UNRECORDED_HANDOFF permanece o enum existente.
+
+## Exec 4 — lock do echo
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada.
+
+A conferência reprovou a Exec 3 no ponto da ordenação echo×envio: `pauseConversation` corria **fora** da `withConversationLock` (o smoke até aprovava “pausa acontece fora da lock”), enquanto o delivery fazia o último checkpoint e ainda atravessava I/O antes do POST. Um echo podia chegar depois do checkpoint e antes do transporte; o ack saía.
+
+### Conserto
+
+1. `handleSmbMessageEchoes` executa `pauseConversation` sob a **mesma** `withConversationLock` da conversa **antes** de liberar download/transcrição/persistência. O envio (`flushBuffer` / `deliverPreparedReceptionistTurnV2`) já segura essa lock do pause-ack até o recibo. As duas ordens ficam serializadas:
+   - echo vence ⇒ latch ECHO publicado, transporte suprimido;
+   - envio vence ⇒ o echo só começa a pausar depois do recibo.
+2. Latch local **explicitamente tipado** `{ source: "ECHO", untilMs }` (`pauseDecision.isActiveLocalEchoLatch` + mapa em `pauseService`). O GET do ERP **não** o apaga. O pause-ack consulta o latch **além** do `humanPause` tipado no wire. Se o POST de pausa ao ERP falhar, o latch permanece e o ack continua bloqueado.
+3. Fixture “pausa fora da lock” substituída pela corrida de duas ordens + POST falho ⇒ latch ainda bloqueia.
+
+Download/transcrição de áudio humano continuam **fora** da lock (não prender o pool). Dedup + persistência reentram.
+
+### Fixtures
+
+- E2 áudio: pausa **dentro** da lock; download/transcrição fora; persistência na lock curta.
+- R1 echo vence ⇒ envio espera a lock; latch `source=ECHO`; transporte suprimido mesmo com `humanPause` inativo no ERP.
+- R2 envio vence ⇒ echo não chama `pauseConversation` enquanto o envio segura a lock; só começa depois do recibo.
+- R3 POST de pausa falho ⇒ latch ECHO preservado; pause-ack bloqueia.
+- Helper puro: latch ECHO futuro bloqueia; expirado/MANUAL não; contrato tipado sem latch continua liberando o ack da própria escalada.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | latch ECHO no pause-ack |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:pause-decision` | 0 | latch puro |
+| `smoke:ana-escalation-cache` | 0 | |
+| `smoke:echo-handler` | 0 | |
+| `smoke:listen-while-paused` | 0 | corrida R1/R2/R3 |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+
+Extras verdes: `smoke-echo-pause-race` (POST falho ⇒ latch ECHO + pause-ack). Sem deploy. Sem push. Sem escrita na VPS.
+
+### Riscos que permanecem
+
+- O POST de pausa ao ERP agora segura a advisory lock (de propósito: serializa com o envio). Download/transcrição continuam fora. Um ERP lento segura o envio dessa conversa até o timeout do POST (10s) — a alternativa era a janela de corrida.
+- Recibo `suppressed_pause` para UNRECORDED_HANDOFF permanece o enum existente.
+- Rollout Ana nova + ERP antigo continua fail-closed no ack sem campos tipados; o latch ECHO é só local, independente do wire.
+

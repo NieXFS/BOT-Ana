@@ -5,12 +5,19 @@ import {
   safeHttpStatus,
 } from '../observability/safeRuntime';
 import { ERP_API_TOKEN } from '../erpApiToken';
-import { isPausedFromState, type PauseState } from './pauseDecision';
+import {
+  decideEscalationAcknowledgementPause,
+  isActiveLocalEchoLatch,
+  isPausedFromState,
+  parseStrictEscalationPause,
+  type LocalEchoLatch,
+  type PauseState,
+} from './pauseDecision';
 import {
   escalationCacheNeedsRefresh,
   getEscalationSnapshot,
   isEscalationKnownActive,
-  parseStrictEscalationSnapshot,
+  updateEscalationCache,
   updateEscalationFromPauseState,
 } from './escalationCache';
 import { peekCachedTenantSlug } from '../configProvider';
@@ -51,6 +58,9 @@ interface PauseCacheEntry {
 }
 
 const pauseCache = new Map<string, PauseCacheEntry>();
+
+/** Latch local tipado ECHO: o GET do ERP não o apaga; só o untilMs o encerra. */
+const echoLatchByConversation = new Map<string, LocalEchoLatch>();
 
 export interface EchoPauseDeps {
   now: () => number;
@@ -114,6 +124,31 @@ function writeConversationPauseToCache(
   });
 }
 
+function writeEchoLatch(
+  phoneNumberId: string,
+  customerPhone: string,
+  untilMs: number
+): void {
+  echoLatchByConversation.set(cacheKey(phoneNumberId, customerPhone), {
+    source: 'ECHO',
+    untilMs,
+  });
+}
+
+/** Latch local ECHO ainda ativo nesta conversa, se houver. */
+export function peekLocalEchoLatch(
+  phoneNumberId: string,
+  customerPhone: string,
+  nowMs: number = Date.now()
+): LocalEchoLatch | null {
+  const latch = echoLatchByConversation.get(
+    cacheKey(phoneNumberId, canonicalCustomerPhone(customerPhone))
+  );
+  return isActiveLocalEchoLatch(latch, nowMs) && latch
+    ? { source: 'ECHO', untilMs: latch.untilMs }
+    : null;
+}
+
 // NUNCA logar PII: só phoneNumberId (id do salão, allowlistado no scrub). O número
 // e o nome do cliente NÃO entram em tags/log.
 function capture(error: unknown, phoneNumberId: string, operation: string): void {
@@ -151,6 +186,8 @@ async function fetchPauseState(
       conversationPausedUntil: data?.conversationPausedUntil ?? null,
       schedulePausedUntil: data?.schedulePausedUntil ?? null,
       escalation: data?.escalation,
+      escalationPause: data?.escalationPause,
+      humanPause: data?.humanPause,
       technicalMaintenance:
         parseTechnicalMaintenanceSnapshot(data?.technicalMaintenance) ??
         undefined,
@@ -194,12 +231,14 @@ export async function pauseConversationByEcho(
   // a resposta seguinte da cliente enquanto o POST ao Receps ainda está em voo;
   // esperar a rede aqui abriria uma janela de até REQUEST_TIMEOUT_MS pra IA falar.
   const startedAt = deps.now();
+  const localUntilMs = startedAt + ECHO_LOCAL_FALLBACK_MS;
   writeConversationPauseToCache(
     phoneNumberId,
     canonicalPhone,
-    startedAt + ECHO_LOCAL_FALLBACK_MS,
+    localUntilMs,
     startedAt
   );
+  writeEchoLatch(phoneNumberId, canonicalPhone, localUntilMs);
 
   try {
     const pausedUntilMs = toMs(await deps.persistPause(phoneNumberId, canonicalPhone));
@@ -210,6 +249,7 @@ export async function pauseConversationByEcho(
         pausedUntilMs,
         deps.now()
       );
+      writeEchoLatch(phoneNumberId, canonicalPhone, pausedUntilMs);
     }
   } catch (error) {
     capture(error, phoneNumberId, 'pause-conversation');
@@ -233,6 +273,9 @@ export async function isConversationPaused(
   const now = deps.now();
   const canonicalPhone = canonicalCustomerPhone(customerPhone);
   const key = cacheKey(phoneNumberId, canonicalPhone);
+  if (isActiveLocalEchoLatch(echoLatchByConversation.get(key), now)) {
+    return true;
+  }
   const cached = pauseCache.get(key);
   const escalationWasActive = isEscalationKnownActive(
     phoneNumberId,
@@ -297,15 +340,14 @@ export async function isConversationPaused(
 }
 
 /**
- * Exceção fechada de transporte: permite somente a confirmação da ação de
- * escalada que acabou de criar a própria pausa. Campo aditivo ausente
- * (`escalation === undefined`) preserva o snapshot local deste único ack.
- * Qualquer valor presente passa por validação estrita do snapshot: null,
- * primitivo, array ou objeto com active/questionId/version inválidos ou
- * incompletos falha fechado. `active:true` + mesmo questionId atualiza e
- * libera somente a própria escalada; ID ausente/divergente falha fechado;
- * `active:false` completo atualiza o cache e aplica a decisão ordinária das
- * demais pausas. Qualquer outra pausa ou fetch nulo continua fail-closed.
+ * O POST /questions/escalate cria AnaQuestion OPEN e, na mesma transação,
+ * ConversationPause source=ESCALATION. O GET /pause-state agora publica
+ * `escalationPause` e `humanPause` simultâneos. O ack só ignora a pausa
+ * ESCALATION cujo questionId casa; `humanPause.active` bloqueia em qualquer
+ * combinação. Latch local tipado ECHO (write-through do echo, preservado se
+ * o POST ao ERP falhar) também bloqueia — o GET do ERP não o apaga. Sem os
+ * dois campos tipados (ERP antigo no rollout) falha fechado. Fetch nulo,
+ * shape inválido, ID divergente, global/schedule/técnico continuam fechados.
  */
 export async function isConversationPausedForEscalationAcknowledgement(
   phoneNumberId: string,
@@ -320,6 +362,13 @@ export async function isConversationPausedForEscalationAcknowledgement(
 
   const now = deps.now();
   const canonicalPhone = canonicalCustomerPhone(customerPhone);
+  const localEchoLatch = peekLocalEchoLatch(
+    phoneNumberId,
+    canonicalPhone,
+    now
+  );
+  if (isActiveLocalEchoLatch(localEchoLatch, now)) return true;
+
   const state = await deps.fetchState(phoneNumberId, canonicalPhone);
   if (!state) return true;
 
@@ -337,51 +386,35 @@ export async function isConversationPausedForEscalationAcknowledgement(
     return true;
   }
 
-  const rawEscalation: unknown = (state as { escalation?: unknown }).escalation;
-  if (rawEscalation === undefined) {
-    // Campo aditivo ausente no rollout: preserva o snapshot local deste único ack.
-    return isPausedFromState(
+  const paused = decideEscalationAcknowledgementPause({
+    expectedQuestionId,
+    local,
+    state,
+    nowMs: now,
+    localEchoLatch,
+  });
+
+  const typedEscalation = parseStrictEscalationPause(state.escalationPause);
+  if (typedEscalation) {
+    updateEscalationCache(
+      phoneNumberId,
+      canonicalPhone,
       {
-        ...state,
-        escalation: { active: false, questionId: null, version: local.version },
+        active: typedEscalation.active,
+        questionId: typedEscalation.questionId,
+        version: typedEscalation.version,
       },
-      now
+      now,
+      true
     );
   }
 
-  const snapshot = parseStrictEscalationSnapshot(rawEscalation);
-  if (!snapshot) {
-    return true;
-  }
-
-  updateEscalationFromPauseState(
-    phoneNumberId,
-    canonicalPhone,
-    rawEscalation,
-    now
-  );
-  if (snapshot.active) {
-    if (snapshot.questionId !== expectedQuestionId) {
-      return true;
-    }
-    return isPausedFromState(
-      {
-        ...state,
-        escalation: {
-          active: false,
-          questionId: null,
-          version: snapshot.version,
-        },
-      },
-      now
-    );
-  }
-
-  return isPausedFromState({ ...state, escalation: snapshot }, now);
+  return paused;
 }
 
 /** Seam de teste: limpa o cache entre casos do smoke. */
 export function __resetPauseCacheForTest(): void {
   pauseCache.clear();
+  echoLatchByConversation.clear();
   __resetTechnicalMaintenanceCacheForTest();
 }

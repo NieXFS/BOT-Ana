@@ -343,21 +343,36 @@ export async function handleSmbMessageEchoes(
       work());
   let processingFailure: unknown = null;
 
-  // A pausa local é publicada antes de qualquer I/O caro. Download/transcrição
-  // ficam fora da advisory lock para não prender o pool por segundos; somente
-  // dedup + persistência final compartilham a lock de ordenação da conversa.
+  // A pausa (latch ECHO + POST ao ERP) corre sob a mesma advisory lock do
+  // envio, antes de qualquer processamento do echo. Download/transcrição
+  // ficam fora da lock para não prender o pool por segundos; dedup +
+  // persistência final reentram na lock de ordenação da conversa.
   for (const target of targets) {
     try {
-      await deps.pauseConversation(target.phoneNumberId, target.customerPhone);
+      await serialize(target.phoneNumberId, target.customerPhone, async () => {
+        try {
+          await deps.pauseConversation(target.phoneNumberId, target.customerPhone);
+        } catch (err) {
+          // A pausa local (latch ECHO) já foi publicada pelo pauseService.
+          // Sem o carimbo durável no ERP a entrega não pode ser confirmada à
+          // Meta: o erro agregado no final faz o webhook responder 5xx.
+          processingFailure ??= err;
+          Sentry.captureException(new Error('echo durable pause failed'), {
+            tags: {
+              service: 'echo_handler',
+              operation: 'pause_conversation',
+              phoneNumberId: target.phoneNumberId,
+              error_kind: runtimeErrorKind(err),
+            },
+          });
+        }
+      });
     } catch (err) {
-      // A pausa local já foi publicada pelo pauseService. Ainda assim, sem o
-      // carimbo durável no ERP a entrega não pode ser confirmada à Meta: o erro
-      // agregado no final faz o webhook responder 5xx e habilita retransmissão.
       processingFailure ??= err;
-      Sentry.captureException(new Error('echo durable pause failed'), {
+      Sentry.captureException(new Error('echo pause serialization failed'), {
         tags: {
           service: 'echo_handler',
-          operation: 'pause_conversation',
+          operation: 'serialize_echo_pause',
           phoneNumberId: target.phoneNumberId,
           error_kind: runtimeErrorKind(err),
         },
