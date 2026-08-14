@@ -242,7 +242,7 @@ async function main() {
       'NÃO consulte horários antes de o cliente dizer profissional específico ou "tanto faz"'
     ) &&
       runtimePrompt.includes('Depois de um nome, use o ID dele') &&
-      runtimePrompt.includes('depois de "tanto faz", OMITA professionalId')
+      runtimePrompt.includes('depois de "tanto faz", use professionalId=null')
   );
   check(
     'runtime exige nova disponibilidade no mesmo turno após correção',
@@ -336,7 +336,7 @@ async function main() {
   check(
     'marcador de 2+ profissionais reforça disponibilidade local após preferência resolvida',
     runtimePrompt.includes('com 2+ profissionais, NÃO consulte horários antes de o cliente dizer profissional específico ou "tanto faz"') &&
-      runtimePrompt.includes('Depois de um nome, use o ID dele; depois de "tanto faz", OMITA professionalId.') &&
+      runtimePrompt.includes('Depois de um nome, use o ID dele; depois de "tanto faz", use professionalId=null.') &&
       runtimePrompt.includes('Após a preferência estar resolvida, se o cliente MUDAR PARA ESTE SERVIÇO, CHAME getAvailableSlots NO MESMO TURNO')
   );
   check(

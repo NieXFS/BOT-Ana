@@ -160,6 +160,8 @@ function getLegacyConfig(phoneNumberId: string): TenantBotConfig | null {
   const aiModel =
     aiProvider === 'deepseek'
       ? process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash'
+      : aiProvider === 'luna'
+        ? 'gpt-5.6-luna'
       : process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
 
   return {
@@ -219,7 +221,11 @@ export async function getTenantConfig(
         aiProvider,
         aiModel:
           raw.aiModel ??
-          (aiProvider === 'deepseek' ? 'deepseek-v4-flash' : 'gpt-4o-mini'),
+          (aiProvider === 'deepseek'
+            ? 'deepseek-v4-flash'
+            : aiProvider === 'luna'
+              ? 'gpt-5.6-luna'
+              : 'gpt-4o-mini'),
         contractVersion:
           typeof raw.contractVersion === 'number' ? raw.contractVersion : undefined,
         structuredConfig: normalizeStructuredPreferencesPayload(

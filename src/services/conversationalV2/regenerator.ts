@@ -56,11 +56,15 @@ export type RegenerationResultV2 =
       result: ModelTurnResultV2;
       resolutionProof: ResolutionProof | null;
       providerCalls: 1;
+      providerReportedModel?: string | null;
+      systemFingerprint?: string | null;
     }
   | {
       ok: false;
       reasonCode: RegenerationFailureCodeV2;
       providerCalls: 1;
+      providerReportedModel?: string | null;
+      systemFingerprint?: string | null;
       validationIssues?: ModelResultValidationIssueV2[];
       /**
        * Copy final não vazia que falhou apenas no envelope. O coordenador pode
@@ -150,17 +154,33 @@ export async function regenerateReceptionistCopyV2(
     return { ok: false, reasonCode: 'REGEN_PROVIDER_ERROR', providerCalls: 1 };
   }
 
+  const completionMetadata = {
+    providerReportedModel: completion.model || null,
+    systemFingerprint:
+      typeof (completion as { system_fingerprint?: unknown }).system_fingerprint ===
+        'string' &&
+      (completion as { system_fingerprint: string }).system_fingerprint.trim()
+        ? (completion as { system_fingerprint: string }).system_fingerprint.trim()
+        : null,
+  };
+
   const message = completion.choices?.[0]?.message;
   if (completion.choices?.[0]?.finish_reason === 'length') {
     return {
       ok: false,
       reasonCode: 'REGEN_MODEL_RESULT_INVALID',
       providerCalls: 1,
+      ...completionMetadata,
       validationIssues: [{ code: 'TRUNCATED_OUTPUT', path: '$' }],
     };
   }
   if (message?.tool_calls?.length) {
-    return { ok: false, reasonCode: 'REGEN_TOOL_CALLS', providerCalls: 1 };
+    return {
+      ok: false,
+      reasonCode: 'REGEN_TOOL_CALLS',
+      providerCalls: 1,
+      ...completionMetadata,
+    };
   }
   const content = typeof message?.content === 'string' ? message.content.trim() : '';
   const parsed = parseModelTurnResultV2(content, input.validationContext);
@@ -169,6 +189,7 @@ export async function regenerateReceptionistCopyV2(
       ok: false,
       reasonCode: 'REGEN_MODEL_RESULT_INVALID',
       providerCalls: 1,
+      ...completionMetadata,
       validationIssues: parsed.issues,
       ...(content ? { rawReply: content } : {}),
     };
@@ -178,5 +199,6 @@ export async function regenerateReceptionistCopyV2(
     result: parsed.value,
     resolutionProof: parsed.resolutionProof,
     providerCalls: 1,
+    ...completionMetadata,
   };
 }

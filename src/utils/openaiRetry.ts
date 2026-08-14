@@ -7,7 +7,7 @@ type ErrorWithStatus = {
   code?: string | null;
   cause?: { code?: string | null };
 };
-export type AiRetryProvider = 'openai' | 'deepseek';
+export type AiRetryProvider = 'openai' | 'deepseek' | 'luna';
 
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
 
@@ -50,7 +50,12 @@ export async function callAiWithRetry<T>(
   provider: AiRetryProvider
 ): Promise<T> {
   let lastError: unknown;
-  const providerLabel = provider === 'deepseek' ? 'DeepSeek' : 'OpenAI';
+  const providerLabel =
+    provider === 'deepseek'
+      ? 'DeepSeek'
+      : provider === 'luna'
+        ? 'OpenAI Luna'
+        : 'OpenAI';
 
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
     try {

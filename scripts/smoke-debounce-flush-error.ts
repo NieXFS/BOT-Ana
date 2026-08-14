@@ -127,6 +127,54 @@ async function main() {
   expect('4) sucesso responde ao cliente', sent.length === 1 && Boolean(sent[0]?.text.includes('15h')));
   expect('4) buffer limpo após sucesso', !__hasBufferForTest(key4));
 
+  // --- Caso 4b: confirmação da escalada atravessa só a própria pausa --------
+  __resetFlushStateForTest();
+  let escalationAckChecks = 0;
+  let escalationDeliveries = 0;
+  let genericPauseChecks = 0;
+  const escalationDeps: FlushDeps = {
+    getReply: async () =>
+      ({
+        kind: 'ana_conversational_v2_prepared',
+        frame: { inputSequence: 1 },
+        payload: 'Vou avisar a equipe responsável pelo atendimento.',
+        authoritativeEscalationQuestionId: 'question-authoritative-fixture',
+      }) as any,
+    sendReply: async () => {
+      throw new Error('Confirmação v2 não pode usar o transporte v1.');
+    },
+    // Antes do brain ainda não existe a pausa. A ação autoritativa nasce no
+    // getReply; qualquer recheck genérico posterior já a enxergaria como ativa.
+    isPaused: async () => {
+      genericPauseChecks += 1;
+      return genericPauseChecks > 1;
+    },
+    isPausedForEscalationAck: async (_phoneNumberId, _customerPhone, questionId) => {
+      escalationAckChecks += 1;
+      return questionId !== 'question-authoritative-fixture';
+    },
+    recordPausedInbound: async () => {},
+    withConversationLock: async (_phoneNumberId, _customerPhone, work) => work(),
+    deliverV2: async (_prepared, checkpoint) => {
+      const state = await checkpoint();
+      if (state.paused) throw new Error('Ack autoritativo foi suprimido indevidamente.');
+      escalationDeliveries += 1;
+      return { delivery: 'sent', successor: null };
+    },
+  };
+  const escalationKey = __seedFlushBufferForTest(config, from, [
+    'posso falar com a dona?',
+  ]);
+  await flushBuffer(escalationKey, escalationDeps);
+  expect(
+    '4b) pausa criada pela própria escalada usa o check escopado',
+    escalationAckChecks >= 2
+  );
+  expect(
+    '4b) confirmação autoritativa chega ao delivery v2 uma única vez',
+    escalationDeliveries === 1
+  );
+
   const salesConfig: TenantBotConfig = {
     ...config,
     botName: 'Renata',

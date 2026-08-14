@@ -205,7 +205,7 @@ ${professionals
       .map((professional) => `${professional.name} — id: ${professional.id}`)
       .join('; ');
     return `${head}
-    Profissionais habilitados: ${eligibleList} — OBRIGATÓRIO: com 2+ profissionais, NÃO consulte horários antes de o cliente dizer profissional específico ou "tanto faz". Depois de um nome, use o ID dele; depois de "tanto faz", OMITA professionalId. Após a preferência estar resolvida, se o cliente MUDAR PARA ESTE SERVIÇO, CHAME getAvailableSlots NO MESMO TURNO antes de citar QUALQUER horário, mesmo que data e profissional já sejam conhecidos.`;
+    Profissionais habilitados: ${eligibleList} — OBRIGATÓRIO: com 2+ profissionais, NÃO consulte horários antes de o cliente dizer profissional específico ou "tanto faz". Depois de um nome, use o ID dele; depois de "tanto faz", use professionalId=null. Após a preferência estar resolvida, se o cliente MUDAR PARA ESTE SERVIÇO, CHAME getAvailableSlots NO MESMO TURNO antes de citar QUALQUER horário, mesmo que data e profissional já sejam conhecidos.`;
   });
 
   return `${header}
@@ -279,9 +279,9 @@ REGRAS CRÍTICAS DE FERRAMENTAS (não negociáveis, sempre seguir):
 6. INTERNAL_HINT — Se uma ferramenta retornar uma mensagem começando com "INTERNAL_HINT:", siga a instrução dela IMEDIATAMENTE no próximo turno (chamando outras ferramentas se preciso) e refaça a chamada original com os parâmetros corretos. EXCEÇÃO: se o hint disser que o serviço ainda não foi escolhido nesta intenção, NÃO tente getAvailableSlots de novo no mesmo turno; pergunte diretamente qual serviço a pessoa prefere. NÃO responda ao cliente com o conteúdo do hint, NÃO peça confirmação novamente — o cliente já confirmou antes da chamada que falhou. Mensagens INTERNAL_HINT são internas, nunca devem ser repassadas ao cliente nem narradas/parafraseadas em nenhuma forma. NUNCA mencione sistema, regra, ferramenta, serviceId, processo interno, bloqueio, "confirmação neutra" ou "vou perguntar ao cliente".
  7. DETECÇÃO DE AGENDAMENTO EXISTENTE — Quando bookAppointment retornar INTERNAL_HINT informando que o cliente já tem agendamento(s) futuro(s), NÃO crie o novo ainda. Pergunte ao cliente conforme as opções listadas no hint. Aguarde a resposta. Agir conforme:
     - "Manter os dois": chame bookAppointment de novo com confirmedDuplicate=true e os mesmos demais parâmetros.
-    - "Remarcar (cancelar e marcar este novo)": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos. PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior. Só após sucesso chame bookAppointment; confirmedDuplicate pode ser omitido porque o sistema deriva a autorização do cancelamento concluído.
+    - "Remarcar (cancelar e marcar este novo)": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos. PRIMEIRO chame cancelAppointment com o ID técnico exato do agendamento anterior. Só após sucesso chame bookAppointment; use confirmedDuplicate=null porque o sistema deriva a autorização do cancelamento concluído.
    - "Só cancelar o anterior": no novo turno, chame getUpcomingAppointments para recuperar novamente os IDs internos e depois cancelAppointment com o ID técnico exato do agendamento anterior. NÃO chame bookAppointment.
-   - Se o cliente escolher "só cancelar" ou pedir para escolher o novo horário depois e, em outro turno, retomar a remarcação: consulte a disponibilidade do novo horário, apresente um NOVO resumo completo e aguarde confirmação. Depois da confirmação, chame bookAppointment; NUNCA responda que confirmou sem executar a ferramenta. Como o agendamento anterior já foi cancelado, confirmedDuplicate pode ser omitido.
+   - Se o cliente escolher "só cancelar" ou pedir para escolher o novo horário depois e, em outro turno, retomar a remarcação: consulte a disponibilidade do novo horário, apresente um NOVO resumo completo e aguarde confirmação. Depois da confirmação, chame bookAppointment; NUNCA responda que confirmou sem executar a ferramenta. Como o agendamento anterior já foi cancelado, use confirmedDuplicate=null.
    - "Pensar depois": não chame ferramentas. Responda gentilmente e aguarde.
    - Se houver mais de um agendamento anterior e o cliente escolher remarcar/cancelar sem indicar qual, pergunte qual agendamento deve ser cancelado ANTES de chamar cancelAppointment. Nunca invente appointmentId usando data/hora.
 8. CANCELAMENTO RESTRITO — A ferramenta cancelAppointment SÓ pode ser usada no fluxo da regra 7. Para qualquer outro pedido de cancelamento ou remarcação fora desse fluxo, NÃO chame cancelAppointment. Responda SOMENTE: "Esse cancelamento precisa ser tratado diretamente pela equipe. Eu não consigo concluí-lo por aqui." Não prometa nenhuma ação futura sua nem da equipe.
@@ -503,7 +503,9 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
         type: 'object',
         properties: {},
         required: [],
+        additionalProperties: false,
       },
+      strict: true,
     },
   },
   {
@@ -526,13 +528,15 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
               "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
           },
           professionalId: {
-            type: 'string',
+            type: ['string', 'null'],
             description:
-              "ID técnico do profissional (formato cuid) listado para ESTE serviço no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Com 2+ habilitados, só chame depois da preferência: após nome, preencha o ID dele; após 'tanto faz'/'qualquer um', OMITA este campo. Com 1 habilitado, use o ID do profissional único.",
+              "ID técnico do profissional (formato cuid) listado para ESTE serviço no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Com 2+ habilitados, só chame depois da preferência: após nome, preencha o ID dele; após 'tanto faz'/'qualquer um', use null. Com 1 habilitado, use o ID do profissional único.",
           },
         },
-        required: ['date', 'serviceId'],
+        required: ['date', 'serviceId', 'professionalId'],
+        additionalProperties: false,
       },
+      strict: true,
     },
   },
   {
@@ -545,7 +549,9 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
         type: 'object',
         properties: {},
         required: [],
+        additionalProperties: false,
       },
+      strict: true,
     },
   },
   {
@@ -569,18 +575,26 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
               "ID técnico do serviço listado em SERVIÇOS DISPONÍVEIS no system prompt, ou obtido via getServices apenas como fallback. Nunca o nome do serviço, nunca um exemplo, nunca string com 'seed-'.",
           },
           professionalId: {
-            type: 'string',
+            type: ['string', 'null'],
             description:
-              "ID técnico do profissional (formato cuid) listado para ESTE serviço no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Com 2+ habilitados, depois de um nome use o ID dele; depois de 'tanto faz'/'qualquer um', OMITA este campo. Com 1 habilitado, use o ID do profissional único.",
+              "ID técnico do profissional (formato cuid) listado para ESTE serviço no system prompt. Nunca o nome (ex: 'samantha' está ERRADO, use o id que vem da lista). Com 2+ habilitados, depois de um nome use o ID dele; depois de 'tanto faz'/'qualquer um', use null. Com 1 habilitado, use o ID do profissional único.",
           },
           confirmedDuplicate: {
-            type: 'boolean',
+            type: ['boolean', 'null'],
             description:
-              'Marque como true APENAS quando o cliente confirmou explicitamente que quer manter os dois agendamentos. Na remarcação, depois de cancelAppointment concluir com sucesso, omita este campo: o sistema deriva a autorização do cancelamento. NUNCA marque como true em outras situações.',
+              'Use true APENAS quando o cliente confirmou explicitamente que quer manter os dois agendamentos. Em qualquer outro caso use null; na remarcação, depois de cancelAppointment concluir com sucesso, o sistema deriva a autorização do cancelamento. NUNCA marque como true em outras situações.',
           },
         },
-        required: ['date', 'time', 'serviceId'],
+        required: [
+          'date',
+          'time',
+          'serviceId',
+          'professionalId',
+          'confirmedDuplicate',
+        ],
+        additionalProperties: false,
       },
+      strict: true,
     },
   },
   {
@@ -599,7 +613,9 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
           },
         },
         required: ['appointmentId'],
+        additionalProperties: false,
       },
+      strict: true,
     },
   },
 ];
@@ -916,9 +932,12 @@ export interface ReceptionistRequestUsage {
 export interface ReceptionistModelLoopResult {
   rawReply: string | null;
   exhausted: boolean;
-  provider: 'openai' | 'deepseek';
+  provider: 'openai' | 'deepseek' | 'luna';
   model: string;
   providerReportedModels: string[];
+  systemFingerprints?: string[];
+  thinkingMode?: DeepSeekThinkingMode;
+  strictTools?: boolean;
   rounds: number;
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
   toolTrace: ReceptionistToolTraceEntry[];
@@ -1048,6 +1067,9 @@ function validateToolArguments(
   for (const [key, value] of Object.entries(args)) {
     const expectedType = schema.optional[key];
     if (!expectedType) return `campo não permitido: ${key}`;
+    // Schemas strict usam required-all; propriedades semanticamente opcionais
+    // chegam como null e continuam equivalentes à omissão para os gates.
+    if (value === null) continue;
     if (typeof value !== expectedType) {
       return `tipo inválido em ${key}: esperado ${expectedType}`;
     }
@@ -1219,12 +1241,22 @@ export async function runReceptionistModelLoop(
   const toolTrace: ReceptionistToolTraceEntry[] = [];
   const usage: ReceptionistRequestUsage[] = [];
   const providerReportedModels: string[] = [];
+  const systemFingerprints: string[] = [];
   const blockedServiceAttempts = new Set<string>();
   const blockedServiceTools = new Set<string>();
   const tools = input.tools ?? RECEPTIONIST_TOOLS;
   const advertisedToolNames = new Set(
     tools.map((tool) => tool.function.name)
   );
+  const strictTools =
+    runtime.supportsStrictTools &&
+    tools.length > 0 &&
+    tools.every((tool) => tool.function.strict === true);
+  const loopMetadata = {
+    systemFingerprints,
+    thinkingMode,
+    strictTools,
+  } as const;
   let emptyCompletionRetryUsed = false;
   const canonicalServiceQuestion = input.serviceSelectionAntiLoop
     ? buildServiceQuestion(input.serviceSelectionAntiLoop.services)
@@ -1273,6 +1305,14 @@ export async function runReceptionistModelLoop(
             );
       const durationMs = Date.now() - startedAt;
       if (response.model) providerReportedModels.push(response.model);
+      const systemFingerprint = (
+        response as OpenAI.Chat.Completions.ChatCompletion & {
+          system_fingerprint?: unknown;
+        }
+      ).system_fingerprint;
+      if (typeof systemFingerprint === 'string' && systemFingerprint.trim()) {
+        systemFingerprints.push(systemFingerprint.trim());
+      }
       const choice = response.choices[0]!;
       usage.push(
         normalizeUsage(
@@ -1315,6 +1355,7 @@ export async function runReceptionistModelLoop(
         provider: runtime.provider,
         model: runtime.model,
         providerReportedModels,
+        ...loopMetadata,
         rounds: round,
         messages,
         toolTrace,
@@ -1346,6 +1387,7 @@ export async function runReceptionistModelLoop(
         provider: runtime.provider,
         model: runtime.model,
         providerReportedModels,
+        ...loopMetadata,
         rounds: round,
         messages,
         toolTrace,
@@ -1386,6 +1428,7 @@ export async function runReceptionistModelLoop(
           provider: runtime.provider,
           model: runtime.model,
           providerReportedModels,
+          ...loopMetadata,
           rounds: round,
           messages,
           toolTrace,
@@ -1435,6 +1478,7 @@ export async function runReceptionistModelLoop(
     provider: runtime.provider,
     model: runtime.model,
     providerReportedModels,
+    ...loopMetadata,
     rounds: maxToolRounds,
     messages,
     toolTrace,

@@ -8,7 +8,9 @@ import { ERP_API_TOKEN } from '../erpApiToken';
 import { isPausedFromState, type PauseState } from './pauseDecision';
 import {
   escalationCacheNeedsRefresh,
+  getEscalationSnapshot,
   isEscalationKnownActive,
+  parseEscalationSnapshot,
   updateEscalationFromPauseState,
 } from './escalationCache';
 import { peekCachedTenantSlug } from '../configProvider';
@@ -292,6 +294,55 @@ export async function isConversationPaused(
     expiresAt: now + PAUSE_STATE_TTL_MS,
   });
   return isPausedFromState({ ...state, escalation }, now);
+}
+
+/**
+ * Exceção fechada de transporte: permite somente a confirmação da ação de
+ * escalada que acabou de criar a própria pausa. Qualquer outra pausa, snapshot
+ * divergente ou indisponibilidade do Receps continua fail-closed.
+ */
+export async function isConversationPausedForEscalationAcknowledgement(
+  phoneNumberId: string,
+  customerPhone: string,
+  questionId: string,
+  deps: ConversationPauseDeps = defaultConversationPauseDeps
+): Promise<boolean> {
+  const local = getEscalationSnapshot(phoneNumberId, customerPhone);
+  if (!local?.active || local.questionId !== questionId) return true;
+
+  const now = deps.now();
+  const canonicalPhone = canonicalCustomerPhone(customerPhone);
+  const state = await deps.fetchState(phoneNumberId, canonicalPhone);
+  if (!state) return true;
+  const escalation = parseEscalationSnapshot(state.escalation);
+  updateEscalationFromPauseState(
+    phoneNumberId,
+    canonicalPhone,
+    state.escalation,
+    now
+  );
+  if (!escalation.active || escalation.questionId !== questionId) return true;
+
+  observeTechnicalMaintenance({
+    phoneNumberId,
+    snapshot: parseTechnicalMaintenanceSnapshot(state.technicalMaintenance),
+    tenantSlug: peekCachedTenantSlug(phoneNumberId),
+  });
+  if (
+    shouldFailClosedForTechnicalMaintenance({
+      phoneNumberId,
+      tenantSlug: peekCachedTenantSlug(phoneNumberId),
+    })
+  ) {
+    return true;
+  }
+  return isPausedFromState(
+    {
+      ...state,
+      escalation: { active: false, questionId: null, version: escalation.version },
+    },
+    now
+  );
 }
 
 /** Seam de teste: limpa o cache entre casos do smoke. */

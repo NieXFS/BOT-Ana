@@ -164,6 +164,8 @@ export interface SocialCompletionResultV2 {
   ok: boolean;
   candidate: string;
   providerCalls: 1;
+  providerReportedModel?: string | null;
+  systemFingerprint?: string | null;
   failureReason?:
     | 'SOCIAL_PROVIDER_ERROR'
     | 'SOCIAL_TOOL_CALLS'
@@ -239,22 +241,33 @@ export async function composeSocialReplyV2(input: {
       failureReason: 'SOCIAL_PROVIDER_ERROR',
     };
   }
+  const completionMetadata = {
+    providerReportedModel: completion.model || null,
+    systemFingerprint:
+      typeof (completion as { system_fingerprint?: unknown }).system_fingerprint ===
+        'string' &&
+      (completion as { system_fingerprint: string }).system_fingerprint.trim()
+        ? (completion as { system_fingerprint: string }).system_fingerprint.trim()
+        : null,
+  };
   const message = completion.choices?.[0]?.message;
   if (message?.tool_calls?.length) {
     return {
       ok: false,
       candidate: '',
       providerCalls: 1,
+      ...completionMetadata,
       failureReason: 'SOCIAL_TOOL_CALLS',
     };
   }
   const candidate = typeof message?.content === 'string' ? message.content.trim() : '';
   return candidate
-    ? { ok: true, candidate, providerCalls: 1 }
+    ? { ok: true, candidate, providerCalls: 1, ...completionMetadata }
     : {
         ok: false,
         candidate: '',
         providerCalls: 1,
+        ...completionMetadata,
         failureReason: 'SOCIAL_EMPTY_REPLY',
       };
 }
@@ -271,6 +284,8 @@ export type ResolveSocialTurnResultV2 =
       preemption: DeliveryPreemptionV2;
       primaryProviderCalls: number;
       regenProviderCalls: number;
+      providerReportedModels: string[];
+      systemFingerprints: string[];
       boundaryAttempts: SocialBoundaryAttemptV2[];
     }
   | {
@@ -280,6 +295,8 @@ export type ResolveSocialTurnResultV2 =
       recoveryKind: 'none' | 'regen' | 'direct_fallback';
       primaryProviderCalls: number;
       regenProviderCalls: number;
+      providerReportedModels: string[];
+      systemFingerprints: string[];
       boundaryAttempts: SocialBoundaryAttemptV2[];
     };
 
@@ -313,6 +330,7 @@ export async function resolveSocialTurnV2(input: {
   inboundTextsById: Readonly<Record<string, string>>;
   detection: Extract<StrictSocialDetectionV2, { matched: true }>;
   recentAssistantReplies: readonly string[];
+  thinkingMode?: DeepSeekThinkingMode;
   compose?: typeof composeSocialReplyV2;
   afterPrimary?: () => Promise<DeliveryPreemptionV2 | null>;
   beforeRegenerate?: () => Promise<DeliveryPreemptionV2 | null>;
@@ -326,6 +344,16 @@ export async function resolveSocialTurnV2(input: {
 }): Promise<ResolveSocialTurnResultV2> {
   const compose = input.compose ?? composeSocialReplyV2;
   const attempts: SocialBoundaryAttemptV2[] = [];
+  const providerReportedModels: string[] = [];
+  const systemFingerprints: string[] = [];
+  const recordFingerprint = (completion: SocialCompletionResultV2): void => {
+    if (completion.providerReportedModel) {
+      providerReportedModels.push(completion.providerReportedModel);
+    }
+    if (completion.systemFingerprint) {
+      systemFingerprints.push(completion.systemFingerprint);
+    }
+  };
   const evaluate = (candidate: string): BoundaryEvaluation => {
     const evaluation = evaluateBoundaryV2({
       rawCandidate: candidate,
@@ -354,7 +382,9 @@ export async function resolveSocialTurnV2(input: {
   const primary = await compose({
     config: input.config,
     inboundText: input.inboundText,
+    thinkingMode: input.thinkingMode ?? 'disabled',
   });
+  recordFingerprint(primary);
   const primaryEvaluation = evaluate(primary.candidate);
   const afterPrimary = await input.afterPrimary?.();
   if (afterPrimary) {
@@ -363,6 +393,8 @@ export async function resolveSocialTurnV2(input: {
       preemption: afterPrimary,
       primaryProviderCalls: 1,
       regenProviderCalls: 0,
+      providerReportedModels,
+      systemFingerprints,
       boundaryAttempts: attempts,
     };
   }
@@ -381,6 +413,8 @@ export async function resolveSocialTurnV2(input: {
       recoveryKind: 'none',
       primaryProviderCalls: 1,
       regenProviderCalls: 0,
+      providerReportedModels,
+      systemFingerprints,
       boundaryAttempts: attempts,
     };
   }
@@ -397,6 +431,8 @@ export async function resolveSocialTurnV2(input: {
       preemption: before,
       primaryProviderCalls: 1,
       regenProviderCalls: 0,
+      providerReportedModels,
+      systemFingerprints,
       boundaryAttempts: attempts,
     };
   }
@@ -404,7 +440,9 @@ export async function resolveSocialTurnV2(input: {
     config: input.config,
     inboundText: input.inboundText,
     regenerationReasonCodes: primaryEvaluation.reasonCodes,
+    thinkingMode: input.thinkingMode ?? 'disabled',
   });
+  recordFingerprint(regenerated);
   const after = await input.afterRegenerate?.();
   if (after) {
     return {
@@ -412,6 +450,8 @@ export async function resolveSocialTurnV2(input: {
       preemption: after,
       primaryProviderCalls: 1,
       regenProviderCalls: 1,
+      providerReportedModels,
+      systemFingerprints,
       boundaryAttempts: attempts,
     };
   }
@@ -431,6 +471,8 @@ export async function resolveSocialTurnV2(input: {
       recoveryKind: 'regen',
       primaryProviderCalls: 1,
       regenProviderCalls: 1,
+      providerReportedModels,
+      systemFingerprints,
       boundaryAttempts: attempts,
     };
   }
@@ -459,6 +501,8 @@ export async function resolveSocialTurnV2(input: {
       recoveryKind: 'direct_fallback',
       primaryProviderCalls: 1,
       regenProviderCalls: 1,
+      providerReportedModels,
+      systemFingerprints,
       boundaryAttempts: attempts,
     };
   }

@@ -1,25 +1,38 @@
 import { createHash, createHmac } from 'crypto';
 import OpenAI from 'openai';
+import type {
+  FunctionTool as ResponsesFunctionTool,
+  Response as OpenAIResponse,
+  ResponseCreateParamsNonStreaming,
+  ResponseInput,
+} from 'openai/resources/responses/responses';
 import type { TenantBotConfig } from '../configProvider';
 
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+export const DEEPSEEK_BETA_BASE_URL = 'https://api.deepseek.com/beta';
 export const DEEPSEEK_V4_FLASH_MODEL = 'deepseek-v4-flash';
+export const OPENAI_LUNA_MODEL = 'gpt-5.6-luna';
 export const RECEPTIONIST_AI_TIMEOUT_MS = 30_000;
 export const DEEPSEEK_PRODUCTION_APPROVAL_ENV =
   'DEEPSEEK_PRODUCTION_APPROVED';
 const RECEPTIONIST_USER_ID_HMAC_SECRET_ENV =
   'RECEPTIONIST_USER_ID_HMAC_SECRET';
 
-export type ReceptionistAiProvider = 'openai' | 'deepseek';
+export type ReceptionistAiProvider = 'openai' | 'deepseek' | 'luna';
 export type DeepSeekThinkingMode = 'disabled' | 'enabled';
+export type ReceptionistAiTransport = 'chat_completions' | 'responses';
 
 export interface ReceptionistAiRuntime {
   provider: ReceptionistAiProvider;
   model: string;
   baseURL?: string;
   apiKey: string;
+  transport: ReceptionistAiTransport;
   /** Capability explícita; callers de texto puro continuam sem opt-in. */
   supportsJsonObjectResponseFormat: boolean;
+  /** Capability explícita; só o DeepSeek troca para /beta quando há tools strict. */
+  supportsStrictTools: boolean;
+  strictToolsUseBetaEndpoint: boolean;
 }
 
 export interface ReceptionistCompletionInput {
@@ -111,7 +124,35 @@ export function resolveReceptionistAiRuntime(
       provider: 'openai',
       model,
       apiKey,
+      transport: 'chat_completions',
       supportsJsonObjectResponseFormat: true,
+      supportsStrictTools: true,
+      strictToolsUseBetaEndpoint: false,
+    };
+  }
+
+  if (provider === 'luna') {
+    const configuredModel = model || OPENAI_LUNA_MODEL;
+    if (configuredModel !== OPENAI_LUNA_MODEL) {
+      throw new Error(
+        `Configuração incompatível: provider luna exige o modelo ${OPENAI_LUNA_MODEL}.`
+      );
+    }
+    const apiKey =
+      process.env.OPENAI_API_KEY_LUNA?.trim() ||
+      config.openaiApiKey?.trim() ||
+      process.env.OPENAI_API_KEY?.trim();
+    if (!apiKey) {
+      throw new Error('OPENAI_API_KEY_LUNA não configurada para o braço Luna.');
+    }
+    return {
+      provider: 'luna',
+      model: configuredModel,
+      apiKey,
+      transport: 'responses',
+      supportsJsonObjectResponseFormat: true,
+      supportsStrictTools: true,
+      strictToolsUseBetaEndpoint: false,
     };
   }
 
@@ -134,7 +175,10 @@ export function resolveReceptionistAiRuntime(
       model,
       baseURL: DEEPSEEK_BASE_URL,
       apiKey,
+      transport: 'chat_completions',
       supportsJsonObjectResponseFormat: true,
+      supportsStrictTools: true,
+      strictToolsUseBetaEndpoint: true,
     };
   }
 
@@ -155,7 +199,10 @@ export function resolveAnaResumeClassifierRuntime(): ReceptionistAiRuntime {
     model: DEEPSEEK_V4_FLASH_MODEL,
     baseURL: DEEPSEEK_BASE_URL,
     apiKey,
+    transport: 'chat_completions',
     supportsJsonObjectResponseFormat: true,
+    supportsStrictTools: false,
+    strictToolsUseBetaEndpoint: false,
   };
 }
 
@@ -192,6 +239,109 @@ function getClient(runtime: ReceptionistAiRuntime): OpenAI {
   return client;
 }
 
+function strictToolsEnabled(
+  runtime: ReceptionistAiRuntime,
+  tools: readonly OpenAI.Chat.Completions.ChatCompletionTool[]
+): boolean {
+  return (
+    runtime.supportsStrictTools &&
+    tools.length > 0 &&
+    tools.every((tool) => tool.function.strict === true)
+  );
+}
+
+export function runtimeForStrictToolEndpoint(
+  runtime: ReceptionistAiRuntime,
+  tools: readonly OpenAI.Chat.Completions.ChatCompletionTool[]
+): ReceptionistAiRuntime {
+  if (
+    runtime.provider !== 'deepseek' ||
+    !runtime.strictToolsUseBetaEndpoint ||
+    !strictToolsEnabled(runtime, tools)
+  ) {
+    return runtime;
+  }
+  return { ...runtime, baseURL: DEEPSEEK_BETA_BASE_URL };
+}
+
+export class StrictToolSchemaError extends Error {
+  readonly status = 400;
+  readonly code = 'STRICT_TOOL_SCHEMA_INVALID';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'StrictToolSchemaError';
+  }
+}
+
+function schemaTypeIncludesNull(value: unknown): boolean {
+  return Array.isArray(value) && value.includes('null');
+}
+
+/** Validação local equivalente ao fail-fast 400 do endpoint strict. */
+export function assertStrictToolSchemas(
+  tools: readonly OpenAI.Chat.Completions.ChatCompletionTool[]
+): void {
+  for (const tool of tools) {
+    const fn = tool.function;
+    const schema = fn.parameters as {
+      type?: unknown;
+      properties?: unknown;
+      required?: unknown;
+      additionalProperties?: unknown;
+    };
+    if (fn.strict !== true) {
+      throw new StrictToolSchemaError(`${fn.name}: strict deve ser true.`);
+    }
+    if (
+      schema?.type !== 'object' ||
+      !schema.properties ||
+      typeof schema.properties !== 'object' ||
+      Array.isArray(schema.properties) ||
+      schema.additionalProperties !== false ||
+      !Array.isArray(schema.required)
+    ) {
+      throw new StrictToolSchemaError(
+        `${fn.name}: schema strict exige object, required e additionalProperties:false.`
+      );
+    }
+    const required = schema.required as string[];
+    const propertyNames = Object.keys(schema.properties as Record<string, unknown>);
+    if (
+      propertyNames.length !== required.length ||
+      propertyNames.some((name) => !required.includes(name))
+    ) {
+      throw new StrictToolSchemaError(
+        `${fn.name}: required deve conter todas as propriedades.`
+      );
+    }
+    const inspect = (value: unknown, path: string): void => {
+      if (!value || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        if (key === 'minLength' || key === 'maxItems') {
+          throw new StrictToolSchemaError(`${fn.name}: ${path}.${key} não permitido.`);
+        }
+        inspect(child, `${path}.${key}`);
+      }
+    };
+    inspect(schema, '$');
+
+    for (const [name, property] of Object.entries(
+      schema.properties as Record<string, { type?: unknown }>
+    )) {
+      if (
+        required.includes(name) &&
+        (name === 'professionalId' || name === 'confirmedDuplicate') &&
+        !schemaTypeIncludesNull(property.type)
+      ) {
+        throw new StrictToolSchemaError(
+          `${fn.name}.${name}: propriedade opcional required-all deve aceitar null.`
+        );
+      }
+    }
+  }
+}
+
 /**
  * Monta o payload por provider. O DeepSeek V4 liga thinking por default, então
  * o braço principal sempre envia "disabled" explicitamente. tool_choice é
@@ -201,6 +351,12 @@ export function buildReceptionistCompletionRequest(
   runtime: ReceptionistAiRuntime,
   input: ReceptionistCompletionInput
 ): OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming {
+  if (runtime.transport !== 'chat_completions') {
+    throw new Error('Runtime Responses não pode montar payload Chat Completions.');
+  }
+  if (strictToolsEnabled(runtime, input.tools)) {
+    assertStrictToolSchemas(input.tools);
+  }
   const base: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
     model: runtime.model,
     messages: input.messages,
@@ -247,12 +403,204 @@ export function buildReceptionistCompletionRequest(
   return deepSeekRequest;
 }
 
+function chatContentAsText(
+  content: OpenAI.Chat.Completions.ChatCompletionMessageParam['content']
+): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => {
+      if (!part || typeof part !== 'object') return '';
+      const raw = part as { type?: unknown; text?: unknown };
+      return raw.type === 'text' && typeof raw.text === 'string' ? raw.text : '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function convertChatMessagesToResponsesInput(
+  messages: readonly OpenAI.Chat.Completions.ChatCompletionMessageParam[]
+): ResponseInput {
+  const input: ResponseInput = [];
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      input.push({
+        type: 'function_call_output',
+        call_id: message.tool_call_id,
+        output: chatContentAsText(message.content),
+      });
+      continue;
+    }
+    if (message.role === 'function') {
+      throw new Error('Mensagem function legada não é suportada no adapter Luna.');
+    }
+    if (message.role === 'assistant' && message.tool_calls?.length) {
+      const assistantText = chatContentAsText(message.content);
+      if (assistantText.trim()) {
+        input.push({ role: 'assistant', content: assistantText });
+      }
+      for (const call of message.tool_calls) {
+        if (call.type !== 'function') continue;
+        input.push({
+          type: 'function_call',
+          call_id: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments,
+        });
+      }
+      continue;
+    }
+    const role = message.role;
+    if (
+      role !== 'user' &&
+      role !== 'assistant' &&
+      role !== 'system' &&
+      role !== 'developer'
+    ) {
+      throw new Error(`Papel não suportado pelo adapter Luna: ${String(role)}.`);
+    }
+    input.push({ role, content: chatContentAsText(message.content) });
+  }
+  return input;
+}
+
+export function convertChatToolsToResponsesTools(
+  tools: readonly OpenAI.Chat.Completions.ChatCompletionTool[]
+): ResponsesFunctionTool[] {
+  return tools.map((tool) => ({
+    type: 'function',
+    name: tool.function.name,
+    description: tool.function.description ?? null,
+    parameters: (tool.function.parameters ?? {}) as Record<string, unknown>,
+    strict: tool.function.strict === true,
+  }));
+}
+
+export function buildLunaResponsesRequest(
+  runtime: ReceptionistAiRuntime,
+  input: ReceptionistCompletionInput
+): ResponseCreateParamsNonStreaming {
+  if (runtime.provider !== 'luna' || runtime.transport !== 'responses') {
+    throw new Error('Adapter Responses é exclusivo do provider Luna.');
+  }
+  if (strictToolsEnabled(runtime, input.tools)) {
+    assertStrictToolSchemas(input.tools);
+  }
+  const tools = convertChatToolsToResponsesTools(input.tools);
+  return {
+    model: runtime.model,
+    input: convertChatMessagesToResponsesInput(input.messages),
+    ...(tools.length > 0
+      ? {
+          tools,
+          tool_choice: 'auto' as const,
+          parallel_tool_calls: true,
+        }
+      : {}),
+    max_output_tokens: input.maxTokens,
+    store: false,
+    ...(input.userId ? { user: input.userId } : {}),
+    ...(input.responseFormat === 'json_object'
+      ? { text: { format: { type: 'json_object' } } }
+      : {}),
+  };
+}
+
+function responseOutputText(response: OpenAIResponse): string {
+  if (typeof response.output_text === 'string' && response.output_text.length > 0) {
+    return response.output_text;
+  }
+  return response.output
+    .flatMap((item) =>
+      item.type === 'message'
+        ? item.content.flatMap((part) =>
+            part.type === 'output_text' ? [part.text] : []
+          )
+        : []
+    )
+    .join('');
+}
+
+/** Normalização semântica Responses -> contrato único consumido pelo loop v1/v2. */
+export function normalizeLunaResponseToChatCompletion(
+  response: OpenAIResponse
+): OpenAI.Chat.Completions.ChatCompletion {
+  const functionCalls = response.output.filter(
+    (item): item is Extract<OpenAIResponse['output'][number], { type: 'function_call' }> =>
+      item.type === 'function_call'
+  );
+  const text = responseOutputText(response);
+  const finishReason: OpenAI.Chat.Completions.ChatCompletion.Choice['finish_reason'] =
+    response.status === 'incomplete'
+      ? response.incomplete_details?.reason === 'content_filter'
+        ? 'content_filter'
+        : 'length'
+      : functionCalls.length > 0
+        ? 'tool_calls'
+        : 'stop';
+  const usage = response.usage;
+  return {
+    id: response.id,
+    object: 'chat.completion',
+    created: response.created_at,
+    model: String(response.model),
+    choices: [
+      {
+        index: 0,
+        finish_reason: finishReason,
+        logprobs: null,
+        message: {
+          role: 'assistant',
+          content: text,
+          refusal: null,
+          ...(functionCalls.length > 0
+            ? {
+                tool_calls: functionCalls.map((call) => ({
+                  id: call.call_id,
+                  type: 'function' as const,
+                  function: {
+                    name: call.name,
+                    arguments: call.arguments,
+                  },
+                })),
+              }
+            : {}),
+        },
+      },
+    ],
+    usage: usage
+      ? {
+          prompt_tokens: usage.input_tokens,
+          completion_tokens: usage.output_tokens,
+          total_tokens: usage.total_tokens,
+          prompt_tokens_details: {
+            cached_tokens: usage.input_tokens_details.cached_tokens,
+            audio_tokens: 0,
+          },
+          completion_tokens_details: {
+            reasoning_tokens: usage.output_tokens_details.reasoning_tokens,
+            audio_tokens: 0,
+            accepted_prediction_tokens: 0,
+            rejected_prediction_tokens: 0,
+          },
+        }
+      : undefined,
+  };
+}
+
 export async function createReceptionistChatCompletion(
   runtime: ReceptionistAiRuntime,
   input: ReceptionistCompletionInput
 ): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+  if (runtime.transport === 'responses') {
+    const response = await getClient(runtime).responses.create(
+      buildLunaResponsesRequest(runtime, input)
+    );
+    return normalizeLunaResponseToChatCompletion(response);
+  }
   const request = buildReceptionistCompletionRequest(runtime, input);
-  return getClient(runtime).chat.completions.create(request);
+  return getClient(runtimeForStrictToolEndpoint(runtime, input.tools))
+    .chat.completions.create(request);
 }
 
 /**

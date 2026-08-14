@@ -9,6 +9,10 @@ import {
   type ReceptionistModelLoopResult,
 } from '../brainService';
 import {
+  resolveReceptionistAiRuntime,
+  type DeepSeekThinkingMode,
+} from '../receptionistLlmProvider';
+import {
   getCustomerUpcomingAppointmentsV2,
   getServices,
   type ServicesResult,
@@ -20,6 +24,7 @@ import {
 } from '../contextManager';
 import { toReceptionistModelHistory } from '../humanConversationContext';
 import { isConversationPaused } from '../pauseService';
+import { maybeEscalateReceptionistQuestionV2 } from '../questionEscalation';
 import {
   resolveReceptionistTurnDecision,
   resolveTurnControl,
@@ -38,6 +43,9 @@ import {
   type TurnFrameV2,
   type TurnPlanReceiptV2,
 } from './contracts';
+import {
+  evaluateBoundaryV2,
+} from './boundary';
 import {
   resolveInitialServiceQuestionFastPathV2,
   resolvePendingOptionProofV2,
@@ -138,6 +146,8 @@ export interface ReceptionistV2RuntimeDeps {
   loadHistory?: typeof getHistory;
   isPaused?: typeof isConversationPaused;
   runModelLoop?: typeof runReceptionistModelLoop;
+  /** Opt-in explícito do braço experimental; produção omite e fica disabled. */
+  thinkingMode?: DeepSeekThinkingMode;
   executeTool?: (
     name: string,
     args: Record<string, unknown>
@@ -157,6 +167,7 @@ export interface ReceptionistV2RuntimeDeps {
     }
   ) => Promise<RegenerationResultV2>;
   composeSocial?: typeof composeSocialReplyV2;
+  escalate?: typeof maybeEscalateReceptionistQuestionV2;
   /** Somente observabilidade injetada; não é recibo nem log de produção. */
   onRejectedBoundaryCandidate?: (input: {
     stage: 'primary' | 'regen';
@@ -581,6 +592,9 @@ function mergeFastPathLoopsV2(
     providerReportedModels: present.flatMap(
       (entry) => entry.providerReportedModels
     ),
+    systemFingerprints: present.flatMap(
+      (entry) => entry.systemFingerprints ?? []
+    ),
     rounds: present.reduce((sum, entry) => sum + entry.rounds, 0),
     messages: present.flatMap((entry) => entry.messages),
     toolTrace: present.flatMap((entry) => entry.toolTrace),
@@ -598,6 +612,10 @@ function mergeEffectFreeLoopRetryV2(
     providerReportedModels: [
       ...first.providerReportedModels,
       ...retried.providerReportedModels,
+    ],
+    systemFingerprints: [
+      ...(first.systemFingerprints ?? []),
+      ...(retried.systemFingerprints ?? []),
     ],
     rounds: first.rounds + retried.rounds,
     toolTrace: [
@@ -683,6 +701,8 @@ export async function getReceptionistReplyV2(input: {
   turnRuntime?: ConversationalV2TurnRuntime;
   /** Override de experimento; ausente resolve ANA_CONVERSATIONAL_V2_ELICITATION. */
   elicitationVariant?: ElicitationVariantV2;
+  /** Opt-in explícito equivalente ao deps.thinkingMode. */
+  thinkingMode?: DeepSeekThinkingMode;
   deps?: ReceptionistV2RuntimeDeps;
 }): Promise<PreparedReceptionistTurnV2> {
   const deps = input.deps ?? {};
@@ -693,6 +713,7 @@ export async function getReceptionistReplyV2(input: {
   const loadHistory = deps.loadHistory ?? getHistory;
   const paused = deps.isPaused ?? isConversationPaused;
   const runLoop = deps.runModelLoop ?? runReceptionistModelLoop;
+  const thinkingMode = input.thinkingMode ?? deps.thinkingMode ?? 'disabled';
   const elicitationVariant = resolveElicitationVariantV2(
     input.elicitationVariant
   );
@@ -827,13 +848,23 @@ export async function getReceptionistReplyV2(input: {
     primaryModelRounds?: number;
     primaryProviderCalls?: number;
     boundaryAttempts?: TurnPlanReceiptV2['boundaryAttempts'];
-  }): TurnPlanReceiptV2 => ({
+  }): TurnPlanReceiptV2 => {
+    const aiRuntime = resolveReceptionistAiRuntime(input.config);
+    return ({
     schemaVersion: 2,
     planReceiptId: id(),
     turnId,
     frameHash: stableHash(frame),
     inputSequence,
     route: args.route,
+    provider: aiRuntime.provider,
+    requestedModel: aiRuntime.model,
+    response: {
+      model: args.loop.providerReportedModels.at(-1) ?? null,
+      systemFingerprint: args.loop.systemFingerprints?.at(-1) ?? null,
+    },
+    thinkingMode: args.loop.thinkingMode ?? thinkingMode,
+    strictTools: args.loop.strictTools ?? false,
     primaryModelRounds: args.primaryModelRounds ?? args.loop.rounds,
     primaryProviderCalls:
       args.primaryProviderCalls ??
@@ -849,6 +880,7 @@ export async function getReceptionistReplyV2(input: {
     ...(selectedGateDecline ? { gateDecline: selectedGateDecline } : {}),
     result: 'accepted_for_delivery',
   });
+  };
 
   const preparedPreemption = (
     preemption: DeliveryPreemptionV2,
@@ -985,6 +1017,88 @@ export async function getReceptionistReplyV2(input: {
     return writeCommitted ? null : 'SUPERSEDED_BY_NEW_INBOUND';
   };
 
+  const escalate = deps.escalate ?? maybeEscalateReceptionistQuestionV2;
+  const escalation = await escalate({
+    phoneNumberId: input.config.phoneNumberId,
+    customerPhone: input.phone,
+    messageId: inboundId,
+    text: currentInboundBatchText,
+    responsibleName: input.config.escalationResponsibleName ?? undefined,
+  });
+  if (escalation.matched) {
+    const candidate = { kind: 'preserve' } as const;
+    const evaluation = evaluateBoundaryV2({
+      rawCandidate: escalation.reply,
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: frame.flowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER',
+      source: 'CANONICAL',
+      actionRecorded: escalation.actionRecorded,
+      route: 'model',
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    });
+    if (
+      !evaluation.safe ||
+      !evaluation.originalAccepted ||
+      !evaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Copy canônica de escalada v2 rejeitada pela boundary.');
+    }
+    const escalationLoop = emptyLoopResult();
+    escalationLoop.thinkingMode = thinkingMode;
+    const transition = materializeTransition(
+      candidate,
+      frame,
+      frame.flowState,
+      services,
+      startedAt,
+      id
+    );
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'fast_path_escalation',
+    });
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame,
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: evaluation.acceptedPayload,
+      transition,
+      planReceipt: makePlan({
+        route: 'fast_path',
+        loop: escalationLoop,
+        candidate,
+        recoveryKind: 'none',
+        regenCalls: 0,
+        boundaryAttempts: [
+          {
+            index: 0,
+            candidateHash: opaqueReceiptHashV2(escalation.reply),
+            reasonCodes: evaluation.reasonCodes,
+          },
+        ],
+      }),
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: false,
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
+      elicitationVariant,
+      copyVariant,
+      ...(escalation.actionRecorded && escalation.questionId
+        ? { authoritativeEscalationQuestionId: escalation.questionId }
+        : {}),
+    };
+  }
+
   const socialDetection = detectStrictSocialRouteV2({
     inboundId,
     inboundText: currentInboundText,
@@ -998,6 +1112,7 @@ export async function getReceptionistReplyV2(input: {
       inboundText: currentInboundText,
       inboundTextsById,
       detection: socialDetection,
+      thinkingMode,
       recentAssistantReplies: history
         .filter(
           (message) =>
@@ -1014,6 +1129,9 @@ export async function getReceptionistReplyV2(input: {
     });
     if (social.status === 'preempted') {
       const accountingLoop = emptyLoopResult();
+      accountingLoop.thinkingMode = thinkingMode;
+      accountingLoop.providerReportedModels = social.providerReportedModels;
+      accountingLoop.systemFingerprints = social.systemFingerprints;
       accountingLoop.rounds =
         social.primaryProviderCalls + social.regenProviderCalls;
       emitRouteComparisonShadow({
@@ -1028,6 +1146,9 @@ export async function getReceptionistReplyV2(input: {
     }
     const candidate = { kind: 'preserve' } as const;
     const socialLoop = emptyLoopResult();
+    socialLoop.thinkingMode = thinkingMode;
+    socialLoop.providerReportedModels = social.providerReportedModels;
+    socialLoop.systemFingerprints = social.systemFingerprints;
     socialLoop.rounds = social.primaryProviderCalls;
     const route: TurnPlanReceiptV2['route'] =
       social.recoveryKind === 'regen'
@@ -1470,6 +1591,7 @@ export async function getReceptionistReplyV2(input: {
         : {}),
       retryEmptyCompletionOnce:
         elicitation.retryEmptyCompletionInsideLoop,
+      thinkingMode,
     });
     loop = await runPrimaryLoop();
     if (isEmptyFinalModelOutputV2(loop) && loop.toolTrace.length === 0) {
@@ -1550,6 +1672,53 @@ export async function getReceptionistReplyV2(input: {
   const primaryFailedWithEmptyOutput =
     !primary.ok && isEmptyFinalModelOutputV2(loop);
   const rejectedPrimaryRaw = primaryCandidate?.reply ?? loop.rawReply ?? '';
+  let regenerationProviderModel: string | null = null;
+  let regenerationSystemFingerprint: string | null = null;
+  const runRegeneration = async (
+    reasonCodes: readonly BoundaryReasonCodeV2[]
+  ): Promise<RegenerationResultV2> => {
+    const regenerated = deps.regenerate
+      ? await deps.regenerate(reasonCodes, {
+          config: input.config,
+          frame: { ...frame, flowState: nextFlowState },
+          services,
+          messages,
+          rejectedCandidate: rejectedPrimaryRaw,
+          useJsonObjectResponseFormat:
+            elicitation.regenJsonObjectResponseFormat === 'always' ||
+            !primaryFailedWithEmptyOutput,
+          validationContext: {
+            ...validationContext,
+            frame: { ...frame, flowState: nextFlowState },
+            toolTrace: loop.toolTrace,
+          },
+        })
+      : await regenerateReceptionistCopyV2({
+          config: input.config,
+          snapshot: {
+            frame: { ...frame, flowState: nextFlowState },
+            catalogSnapshot: {
+              services: services.services ?? [],
+              professionals: services.professionals ?? [],
+            },
+            messages,
+            rejectedCandidate: rejectedPrimaryRaw,
+          },
+          reasonCodes,
+          thinkingMode,
+          useJsonObjectResponseFormat:
+            elicitation.regenJsonObjectResponseFormat === 'always' ||
+            !primaryFailedWithEmptyOutput,
+          validationContext: {
+            ...validationContext,
+            frame: { ...frame, flowState: nextFlowState },
+            toolTrace: loop.toolTrace,
+          },
+        });
+    regenerationProviderModel = regenerated.providerReportedModel ?? null;
+    regenerationSystemFingerprint = regenerated.systemFingerprint ?? null;
+    return regenerated;
+  };
   const recovery = await coordinateRecoveryV2({
     frame: { ...frame, flowState: nextFlowState },
     primaryResult: primary,
@@ -1579,45 +1748,14 @@ export async function getReceptionistReplyV2(input: {
     beforeRegenerate: () => checkRace('before_regen'),
     afterRegenerate: () => checkRace('during_regen'),
     onRejectedBoundaryCandidate: deps.onRejectedBoundaryCandidate,
-    regenerate: (reasonCodes) =>
-      deps.regenerate
-        ? deps.regenerate(reasonCodes, {
-            config: input.config,
-            frame: { ...frame, flowState: nextFlowState },
-            services,
-            messages,
-            rejectedCandidate: rejectedPrimaryRaw,
-            useJsonObjectResponseFormat:
-              elicitation.regenJsonObjectResponseFormat === 'always' ||
-              !primaryFailedWithEmptyOutput,
-            validationContext: {
-              ...validationContext,
-              frame: { ...frame, flowState: nextFlowState },
-              toolTrace: loop.toolTrace,
-            },
-          })
-        : regenerateReceptionistCopyV2({
-            config: input.config,
-            snapshot: {
-              frame: { ...frame, flowState: nextFlowState },
-              catalogSnapshot: {
-                services: services.services ?? [],
-                professionals: services.professionals ?? [],
-              },
-              messages,
-              rejectedCandidate: rejectedPrimaryRaw,
-            },
-            reasonCodes,
-            useJsonObjectResponseFormat:
-              elicitation.regenJsonObjectResponseFormat === 'always' ||
-              !primaryFailedWithEmptyOutput,
-            validationContext: {
-              ...validationContext,
-              frame: { ...frame, flowState: nextFlowState },
-              toolTrace: loop.toolTrace,
-            },
-          }),
+    regenerate: runRegeneration,
   });
+  if (regenerationProviderModel) {
+    loop.providerReportedModels.push(regenerationProviderModel);
+  }
+  if (regenerationSystemFingerprint) {
+    (loop.systemFingerprints ??= []).push(regenerationSystemFingerprint);
+  }
   if (recovery.status === 'preempted') {
     emitRouteComparisonShadow({
       legacyRoute: legacyShadowRoute,

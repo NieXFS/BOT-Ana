@@ -48,7 +48,13 @@ export function detectEscalationReason(
     /\b(falar|conversar)\s+com\s+(uma?\s+)?(pessoa|humano|atendente|recepcionista|equipe|profissional)\b/.test(
       normalized
     ) ||
-    /\bquero\s+(uma?\s+)?(atendente|humano|pessoa)\b/.test(normalized)
+    /\bquero\s+(uma?\s+)?(atendente|humano|pessoa)\b/.test(normalized) ||
+    /\b(?:posso|quero)\s+falar\s+com\s+(?:a\s+)?(?:dona|responsavel|gerente)\b/.test(
+      normalized
+    ) ||
+    /\b(?:chama|chame|pode\s+chamar)\s+(?:a\s+)?(?:dona|responsavel|gerente|uma\s+pessoa)\b/.test(
+      normalized
+    )
   ) {
     return 'HUMAN_REQUEST';
   }
@@ -160,6 +166,61 @@ export function buildEscalationReply(
       : 'Sua pergunta foi registrada para a equipe responsável pelo atendimento.';
   }
   return 'Não consigo responder isso com segurança por aqui. Você pode falar diretamente com a equipe do estabelecimento.';
+}
+
+/** Copy v2: a promessa só é usada depois de questionId autoritativo. */
+export function buildEscalationReplyV2(
+  outcome: EscalationOutcome,
+  responsibleName?: string
+): string {
+  if (outcome.kind !== 'created') {
+    return buildEscalationReply(outcome, responsibleName);
+  }
+  const responsible = responsibleName?.trim();
+  return responsible
+    ? `Vou avisar ${responsible}, responsável por este atendimento.`
+    : 'Vou avisar a equipe responsável pelo atendimento.';
+}
+
+export type ReceptionistEscalationV2Decision =
+  | { matched: false }
+  | {
+      matched: true;
+      reply: string;
+      actionRecorded: boolean;
+      questionId: string | null;
+      outcome: EscalationOutcome['kind'];
+    };
+
+export async function maybeEscalateReceptionistQuestionV2(
+  input: {
+    phoneNumberId: string;
+    customerPhone: string;
+    messageId: string | null;
+    text: string;
+    responsibleName?: string;
+  },
+  deps: EscalationDeps = defaultDeps
+): Promise<ReceptionistEscalationV2Decision> {
+  if (!isAnaEscalationEnabled() || !input.messageId) return { matched: false };
+  const reasonCode = detectEscalationReason(input.text);
+  if (!reasonCode) return { matched: false };
+  const outcome = await escalateQuestion(
+    {
+      phoneNumberId: input.phoneNumberId,
+      customerPhone: input.customerPhone,
+      reasonCode,
+      messageId: input.messageId,
+    },
+    deps
+  );
+  return {
+    matched: true,
+    reply: buildEscalationReplyV2(outcome, input.responsibleName),
+    actionRecorded: outcome.kind === 'created',
+    questionId: outcome.kind === 'created' ? outcome.questionId : null,
+    outcome: outcome.kind,
+  };
 }
 
 /**

@@ -53,6 +53,8 @@ export interface PreparedReceptionistTurnV2 {
   canonicalPendingQuestion: string | null;
   elicitationVariant: ElicitationVariantV2;
   copyVariant?: CopyVariantIdV2;
+  /** Única entrega que pode atravessar a pausa recém-criada pela própria escalada. */
+  authoritativeEscalationQuestionId?: string;
 }
 
 export function isPreparedReceptionistTurnV2(

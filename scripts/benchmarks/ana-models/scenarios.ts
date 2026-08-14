@@ -534,7 +534,7 @@ export const P0_SCENARIOS: BenchmarkScenario[] = [
   defineScenario({
     id: 'P0-ANY-PRO',
     priority: 'P0',
-    description: 'Tanto faz deve omitir professionalId.',
+    description: 'Tanto faz deve representar ausência semântica de professionalId.',
     turns: ['Quero marcar Peeling amanhã.', 'Tanto faz.'],
     evaluate: (run) => {
       const firstTurnAvailability = calls(run, 'getAvailableSlots', 1);
@@ -556,12 +556,8 @@ export const P0_SCENARIOS: BenchmarkScenario[] = [
         ),
         assertion(
           'any-pro-omits-professional-id',
-          Boolean(availability) &&
-            !Object.prototype.hasOwnProperty.call(
-              availability.args,
-              'professionalId'
-            ),
-          'professionalId ausente',
+          Boolean(availability) && availability.args.professionalId == null,
+          'professionalId ausente ou null',
           availability?.args
         ),
         assertion(

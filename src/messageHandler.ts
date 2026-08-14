@@ -11,7 +11,10 @@ import {
   withPersistedInboundContext,
 } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
-import { isConversationPaused } from './services/pauseService';
+import {
+  isConversationPaused,
+  isConversationPausedForEscalationAcknowledgement,
+} from './services/pauseService';
 import {
   evaluateAnaResumeForInbound,
   shouldAnaResumeForInbound,
@@ -173,6 +176,11 @@ export interface FlushDeps {
     config: TenantBotConfig
   ) => Promise<void | ConfiguredReplyDelivery>;
   isPaused?: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
+  isPausedForEscalationAck?: (
+    phoneNumberId: string,
+    customerPhone: string,
+    questionId: string
+  ) => Promise<boolean>;
   recordPausedInbound?: (
     conversationKey: string,
     text: string,
@@ -322,6 +330,8 @@ const defaultFlushDeps: FlushDeps = {
     return 'sent';
   },
   isPaused: isConversationPaused,
+  isPausedForEscalationAck:
+    isConversationPausedForEscalationAcknowledgement,
   recordPausedInbound: recordInboundWhilePaused,
   markPostLink: markFollowupPostLink,
   withConversationLock: (phoneNumberId, customerPhone, work) =>
@@ -795,12 +805,34 @@ export async function flushBuffer(
       // a resposta é descartada. Não existe mais janela entre o último check e o
       // POST ao WhatsApp.
       await serialize(config.phoneNumberId, from, async () => {
+        const preparedV2 =
+          typeof reply === 'object' &&
+          reply !== null &&
+          (reply as { kind?: unknown }).kind === 'ana_conversational_v2_prepared'
+            ? (reply as PreparedReceptionistTurnV2)
+            : null;
+        const pauseCheck = preparedV2?.authoritativeEscalationQuestionId
+          ? () =>
+              deps.isPausedForEscalationAck
+                ? deps.isPausedForEscalationAck(
+                    config.phoneNumberId,
+                    from,
+                    preparedV2.authoritativeEscalationQuestionId!
+                  )
+                : deps.isPaused
+                  ? deps.isPaused(config.phoneNumberId, from)
+                  : isConversationPausedForEscalationAcknowledgement(
+                      config.phoneNumberId,
+                      from,
+                      preparedV2.authoritativeEscalationQuestionId!
+                    )
+          : () => (deps.isPaused ?? isConversationPaused)(config.phoneNumberId, from);
         if (
           await suppressFlushIfPaused({
             bufferKey,
             buffer,
             alreadyProcessedTexts: [],
-            deps,
+            deps: { ...deps, isPaused: (_phoneNumberId, _customerPhone) => pauseCheck() },
           })
         ) {
           delivery = 'suppressed';
@@ -811,7 +843,7 @@ export async function flushBuffer(
           reply !== null &&
           (reply as { kind?: unknown }).kind === 'ana_conversational_v2_prepared'
         ) {
-          const prepared = reply as PreparedReceptionistTurnV2;
+          const prepared = preparedV2!;
           const deliverV2 = deps.deliverV2 ??
             (async (
               value: PreparedReceptionistTurnV2,
@@ -831,10 +863,7 @@ export async function flushBuffer(
               ? Math.max(...buffer.pendingInputSequences)
               : null;
             return {
-              paused: await (deps.isPaused ?? isConversationPaused)(
-                config.phoneNumberId,
-                from
-              ),
+              paused: await pauseCheck(),
               latestInputSequence: Math.max(
                 prepared.frame.inputSequence,
                 pendingSequence ?? prepared.frame.inputSequence

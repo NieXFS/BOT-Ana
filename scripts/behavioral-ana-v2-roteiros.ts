@@ -50,7 +50,7 @@ import {
 } from './benchmarks/ana-v2-roteiros/scenarios';
 
 type ProviderMode = 'mock' | 'real';
-type HarnessProvider = 'deepseek' | 'openai';
+type HarnessProvider = 'deepseek' | 'openai' | 'luna';
 type CheckStatus = 'PASS' | 'FAIL' | 'REVIEW';
 
 interface CliOptions {
@@ -243,6 +243,11 @@ const PRICE_PER_MILLION = {
     promptCacheMiss: 0.15,
     completion: 0.6,
   },
+  luna: {
+    promptCacheHit: Number(process.env.OPENAI_LUNA_CACHED_INPUT_USD_PER_MILLION ?? 0),
+    promptCacheMiss: Number(process.env.OPENAI_LUNA_INPUT_USD_PER_MILLION ?? 0),
+    completion: Number(process.env.OPENAI_LUNA_OUTPUT_USD_PER_MILLION ?? 0),
+  },
 } as const;
 
 const OLD_DRY_DENIAL =
@@ -314,13 +319,13 @@ function parseArgs(argv: string[]): CliOptions {
     } else if (arg === '--provider') {
       const value = (argv[++index] ?? '').toLowerCase();
       if (value === 'gpt-4o-mini') provider = 'openai';
-      else if (value === 'deepseek' || value === 'openai') provider = value;
-      else throw new Error('--provider deve ser deepseek, openai ou gpt-4o-mini.');
+      else if (value === 'deepseek' || value === 'openai' || value === 'luna') provider = value;
+      else throw new Error('--provider deve ser deepseek, openai, gpt-4o-mini ou luna.');
     } else if (arg.startsWith('--provider=')) {
       const value = arg.slice('--provider='.length).toLowerCase();
       if (value === 'gpt-4o-mini') provider = 'openai';
-      else if (value === 'deepseek' || value === 'openai') provider = value;
-      else throw new Error('--provider deve ser deepseek, openai ou gpt-4o-mini.');
+      else if (value === 'deepseek' || value === 'openai' || value === 'luna') provider = value;
+      else throw new Error('--provider deve ser deepseek, openai, gpt-4o-mini ou luna.');
     } else if (arg === '--elicitation') {
       const value = (argv[++index] ?? '').toLowerCase();
       if (!['v1', 'v2', 'v3', 'v4'].includes(value)) {
@@ -335,7 +340,7 @@ function parseArgs(argv: string[]): CliOptions {
       elicitation = value as ElicitationVariantV2;
     } else if (arg === '--help' || arg === '-h') {
       console.log(
-        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--provider deepseek|openai|gpt-4o-mini] [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
+        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--provider deepseek|openai|gpt-4o-mini|luna] [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
       );
       process.exit(0);
     } else {
@@ -345,7 +350,7 @@ function parseArgs(argv: string[]): CliOptions {
   if (!mode) {
     throw new Error('Informe obrigatoriamente --mock-provider ou --real.');
   }
-  if (provider === 'openai' && thinking) {
+  if (provider !== 'deepseek' && thinking) {
     throw new Error('--thinking é exclusivo do braço DeepSeek.');
   }
   if (!Number.isInteger(repeats) || repeats < 1 || repeats > 20) {
@@ -389,11 +394,22 @@ function neutralizeEnvironment(options: CliOptions): void {
   process.env.ANA_CONVERSATIONAL_V2_ELICITATION = options.elicitation;
   if (options.mode === 'mock') {
     process.env.OPENAI_API_KEY = 'sk-mock-provider-no-network';
+    process.env.OPENAI_API_KEY_LUNA = 'sk-mock-luna-no-network';
     process.env.DEEPSEEK_API_KEY = 'mock-provider-no-network';
   } else if (options.provider === 'deepseek') {
     process.env.OPENAI_API_KEY ||= 'sk-fixture-no-openai-network';
     if (!process.env.DEEPSEEK_API_KEY?.trim()) {
       throw new Error('--real --provider deepseek exige DEEPSEEK_API_KEY.');
+    }
+  } else if (options.provider === 'luna') {
+    if (!process.env.OPENAI_API_KEY_LUNA?.trim()) {
+      throw new Error('--real --provider luna exige OPENAI_API_KEY_LUNA.');
+    }
+    process.env.OPENAI_API_KEY ||= 'sk-fixture-no-openai-network';
+    const includesR10 =
+      !options.scenarioIds || options.scenarioIds.has('R10');
+    if (includesR10 && !process.env.DEEPSEEK_API_KEY?.trim()) {
+      throw new Error('R10 real mantém o chefe Thinking e exige DEEPSEEK_API_KEY.');
     }
   } else {
     if (!process.env.OPENAI_API_KEY?.trim()) {
@@ -539,6 +555,7 @@ function syntheticCompletion(input: {
     object: 'chat.completion',
     created: 0,
     model: input.model ?? 'deepseek-v4-flash-mock',
+    system_fingerprint: 'fp_ana_v2_mock',
     choices: [
       {
         index: 0,
@@ -1277,6 +1294,11 @@ function buildArmConfig(options: CliOptions) {
   if (options.provider === 'openai') {
     config.aiProvider = 'openai';
     config.aiModel = 'gpt-4o-mini';
+    config.openaiApiKey = null;
+  }
+  if (options.provider === 'luna') {
+    config.aiProvider = 'luna';
+    config.aiModel = 'gpt-5.6-luna';
     config.openaiApiKey = null;
   }
   if (options.thinking) config.aiMaxTokens = 8_192;
@@ -2027,6 +2049,19 @@ async function runCustomerTurn(
           (completionAttemptsByRound.get(round) ?? 0) + 1;
         completionAttemptsByRound.set(round, completionAttempt);
         if (ctx.options.mode === 'mock') {
+          if (
+            ctx.options.thinking &&
+            round > 1 &&
+            messages.some((message) => message.role === 'tool') &&
+            !messages.some(
+              (message) =>
+                message.role === 'assistant' &&
+                (message as unknown as { reasoning_content?: unknown })
+                  .reasoning_content === MOCK_REASONING_SENTINEL
+            )
+          ) {
+            throw new Error('reasoning_content não foi preservado no replay pós-tool.');
+          }
           const started = Date.now();
           const completion = mockCompletionForBehavior(
             step.mockBehavior,
@@ -2040,6 +2075,12 @@ async function runCustomerTurn(
             ctx.options.elicitation,
             ctx.mockUnwrapVariants
           );
+          completion.model =
+            ctx.options.provider === 'luna'
+              ? 'gpt-5.6-luna-mock'
+              : ctx.options.provider === 'openai'
+                ? 'gpt-4o-mini-mock'
+                : 'deepseek-v4-flash-mock';
           ctx.calls.push(
             metricFromCompletion(
               completion,
@@ -2123,6 +2164,12 @@ async function runCustomerTurn(
               ? { reasoningContent: MOCK_REASONING_SENTINEL }
               : {}),
           });
+          completion.model =
+            ctx.options.provider === 'luna'
+              ? 'gpt-5.6-luna-mock'
+              : ctx.options.provider === 'openai'
+                ? 'gpt-4o-mini-mock'
+                : 'deepseek-v4-flash-mock';
           ctx.calls.push(
             metricFromCompletion(
               completion,
@@ -2248,6 +2295,12 @@ async function runCustomerTurn(
               ? { reasoningContent: MOCK_REASONING_SENTINEL }
               : {}),
           });
+          completion.model =
+            ctx.options.provider === 'luna'
+              ? 'gpt-5.6-luna-mock'
+              : ctx.options.provider === 'openai'
+                ? 'gpt-4o-mini-mock'
+                : 'deepseek-v4-flash-mock';
           ctx.calls.push(
             metricFromCompletion(
               completion,
@@ -2306,6 +2359,7 @@ async function runCustomerTurn(
     userName: 'Cliente sintética',
     config,
     elicitationVariant: ctx.options.elicitation,
+    thinkingMode: ctx.options.thinking ? 'enabled' : 'disabled',
     turnControl: turnControl.control,
     turnRuntime: {
       turnId: nextId(session, 'turn'),
@@ -2585,7 +2639,15 @@ function markdownReport(input: {
 - Início: ${input.startedAt}
 - Fim: ${input.finishedAt}
 - Provider: ${input.options.mode === 'mock' ? `mock offline (${input.options.provider})` : `${input.options.provider} real`}
-- Braço: ${input.options.provider === 'openai' ? 'gpt-4o-mini' : input.options.thinking ? 'Thinking enabled' : 'Flash non-thinking'}
+- Braço: ${
+    input.options.provider === 'openai'
+      ? 'gpt-4o-mini'
+      : input.options.provider === 'luna'
+        ? 'Luna Responses'
+        : input.options.thinking
+          ? 'Thinking enabled'
+          : 'Flash non-thinking'
+  }
 - Elicitação: ${input.options.elicitation}
 - Repetições: ${input.options.repeats}
 - Chamadas: ${input.calls.length}
@@ -2763,13 +2825,15 @@ async function main(): Promise<void> {
   if (!runtime.isAnaConversationalV2Enabled(ROTEIROS_TENANT_SLUG)) {
     throw new Error('Flag v2 não ficou ligada para o tenant fixture.');
   }
-  if (options.mode === 'real') {
-    runtime.resolveReceptionistAiRuntime(buildArmConfig(options));
-    runtime.resolveAnaResumeClassifierRuntime();
-  }
   const selected = ANA_V2_ROTEIROS.filter(
     (scenario) => !options.scenarioIds || options.scenarioIds.has(scenario.id)
   );
+  if (options.mode === 'real') {
+    runtime.resolveReceptionistAiRuntime(buildArmConfig(options));
+    if (selected.some((scenario) => scenario.id === 'R10')) {
+      runtime.resolveAnaResumeClassifierRuntime();
+    }
+  }
   const startedAt = new Date().toISOString();
   const ctx: RunContext = {
     options,
@@ -2875,7 +2939,9 @@ async function main(): Promise<void> {
   const timestamp = startedAt.replace(/[:.]/g, '-');
   const arm = options.provider === 'openai'
     ? 'gpt-4o-mini'
-    : options.thinking
+    : options.provider === 'luna'
+      ? 'luna'
+      : options.thinking
       ? 'thinking'
       : 'flash';
   const outputParent = path.resolve(
