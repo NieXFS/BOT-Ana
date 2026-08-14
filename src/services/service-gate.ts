@@ -175,15 +175,213 @@ function editDistanceAtMostOne(left: string, right: string): boolean {
   return true;
 }
 
+/**
+ * Regra canônica aprovada para typo de distância 2. Ela vive no matcher
+ * compartilhado para que proof/gate/offer/denial/profissionais não mantenham
+ * dialetos fuzzy diferentes. Callers que precisam provar a entidade-base sem
+ * esse último degrau (C* do offer-check) fazem opt-out explícito.
+ */
+export const ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH = true;
+
+function editDistanceAtMostTwo(left: string, right: string): boolean {
+  if (Math.abs(left.length - right.length) > 2) return false;
+  const rows = Array.from({ length: left.length + 1 }, () =>
+    Array<number>(right.length + 1).fill(0)
+  );
+  for (let row = 0; row <= left.length; row += 1) rows[row]![0] = row;
+  for (let column = 0; column <= right.length; column += 1) {
+    rows[0]![column] = column;
+  }
+  for (let row = 1; row <= left.length; row += 1) {
+    let rowMinimum = Number.POSITIVE_INFINITY;
+    for (let column = 1; column <= right.length; column += 1) {
+      const substitution = left[row - 1] === right[column - 1] ? 0 : 1;
+      let distance = Math.min(
+        rows[row - 1]![column]! + 1,
+        rows[row]![column - 1]! + 1,
+        rows[row - 1]![column - 1]! + substitution
+      );
+      if (
+        row > 1 &&
+        column > 1 &&
+        left[row - 1] === right[column - 2] &&
+        left[row - 2] === right[column - 1]
+      ) {
+        distance = Math.min(distance, rows[row - 2]![column - 2]! + 1);
+      }
+      rows[row]![column] = distance;
+      rowMinimum = Math.min(rowMinimum, distance);
+    }
+    if (rowMinimum > 2) return false;
+  }
+  return rows[left.length]![right.length]! <= 2;
+}
+
+/**
+ * Distância EXATAMENTE 2 com uma forma aprovada pelo consenso: duas operações
+ * de inserção/remoção, ou uma inserção/remoção mais uma substituição. Duas
+ * substituições são deliberadamente proibidas ("mensagem" não vira
+ * "Massagem"). Transposição adjacente pura continua sendo o typo de distância
+ * 1 já aceito pela casa.
+ */
+function hasAllowedTwoEditShape(left: string, right: string): boolean {
+  if (editDistanceAtMostOne(left, right)) return false;
+  if (Math.abs(left.length - right.length) > 2) return false;
+
+  const seen = new Set<string>();
+  const visit = (
+    leftIndex: number,
+    rightIndex: number,
+    insertions: number,
+    deletions: number,
+    substitutions: number
+  ): boolean => {
+    const edits = insertions + deletions + substitutions;
+    if (edits > 2) return false;
+    const key = `${leftIndex}:${rightIndex}:${insertions}:${deletions}:${substitutions}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+
+    if (leftIndex === left.length && rightIndex === right.length) {
+      const indels = insertions + deletions;
+      return (
+        edits === 2 &&
+        ((indels === 2 && substitutions === 0) ||
+          (indels === 1 && substitutions === 1))
+      );
+    }
+    if (
+      leftIndex < left.length &&
+      rightIndex < right.length &&
+      left[leftIndex] === right[rightIndex] &&
+      visit(
+        leftIndex + 1,
+        rightIndex + 1,
+        insertions,
+        deletions,
+        substitutions
+      )
+    ) {
+      return true;
+    }
+    if (
+      leftIndex < left.length &&
+      rightIndex < right.length &&
+      left[leftIndex] !== right[rightIndex] &&
+      visit(
+        leftIndex + 1,
+        rightIndex + 1,
+        insertions,
+        deletions,
+        substitutions + 1
+      )
+    ) {
+      return true;
+    }
+    if (
+      leftIndex < left.length &&
+      visit(
+        leftIndex + 1,
+        rightIndex,
+        insertions,
+        deletions + 1,
+        substitutions
+      )
+    ) {
+      return true;
+    }
+    return (
+      rightIndex < right.length &&
+      visit(
+        leftIndex,
+        rightIndex + 1,
+        insertions + 1,
+        deletions,
+        substitutions
+      )
+    );
+  };
+
+  return visit(0, 0, 0, 0, 0);
+}
+
+export interface CatalogEntityMatchOptions {
+  /** Opt-out local usado apenas para provar a entidade-base do predicado C*. */
+  allowRestrictedDistanceTwo?: boolean;
+}
+
+type TokenMatchKind = 'token' | 'typo1' | 'typo2';
+
 function tokenMatchKind(
   candidate: string,
-  catalogToken: string
-): 'token' | 'typo' | null {
+  catalogToken: string,
+  options: CatalogEntityMatchOptions = {}
+): TokenMatchKind | null {
   const left = simplePluralStem(candidate);
   const right = simplePluralStem(catalogToken);
   if (left === right) return 'token';
   if (left.length < 5 || right.length < 5) return null;
-  return editDistanceAtMostOne(left, right) ? 'typo' : null;
+  if (editDistanceAtMostOne(left, right)) return 'typo1';
+  return (
+    ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH &&
+    options.allowRestrictedDistanceTwo !== false &&
+    candidate.length >= 6 &&
+    catalogToken.length >= 8 &&
+    hasAllowedTwoEditShape(left, right)
+  )
+    ? 'typo2'
+    : null;
+}
+
+function entityIdsWithinRawDistanceTwo(
+  candidate: string,
+  entities: ServiceLike[]
+): Set<string> {
+  const normalizedCandidate = simplePluralStem(normalizeServiceText(candidate));
+  const ids = new Set<string>();
+  if (!normalizedCandidate) return ids;
+  for (const entity of entities) {
+    if (
+      tokensOf(entity.name).some((catalogToken) =>
+        editDistanceAtMostTwo(
+          normalizedCandidate,
+          simplePluralStem(catalogToken)
+        )
+      )
+    ) {
+      ids.add(entity.id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * C*: perdão local de UM token residual depois que o mesmo segmento já provou
+ * a entidade-base sem distância 2. A bola fechada considera qualquer token de
+ * outra entidade a distância <=2, inclusive formas que seriam proibidas como
+ * match (por exemplo, duas substituições).
+ */
+export function isClosedCatalogResidualForEntity(
+  residualToken: string,
+  entityId: string,
+  entities: ServiceLike[]
+): boolean {
+  const candidate = normalizeServiceText(residualToken);
+  if (!candidate || /[^a-z0-9]/u.test(candidate)) return false;
+  const entity = entities.find((entry) => entry.id === entityId);
+  if (!entity) return false;
+  const left = simplePluralStem(candidate);
+  const matchesTarget = tokensOf(entity.name).some((catalogToken) => {
+    if (catalogToken.length < 8) return false;
+    const right = simplePluralStem(catalogToken);
+    return (
+      editDistanceAtMostOne(left, right) ||
+      hasAllowedTwoEditShape(left, right)
+    );
+  });
+  if (!matchesTarget) return false;
+  const nearbyEntityIds = entityIdsWithinRawDistanceTwo(candidate, entities);
+  return nearbyEntityIds.size === 1 && nearbyEntityIds.has(entityId);
 }
 
 /** Janela de intenção sobre as msgs do usuário + se contém abridor de NOVO agendamento. */
@@ -225,12 +423,14 @@ type MatchKind = 'full' | 'token' | 'typo';
 /** Serviços citados na janela, com o tipo de match (nome completo vs token distintivo). */
 function matchedServices(
   windowText: string,
-  services: ServiceLike[]
+  services: ServiceLike[],
+  options: CatalogEntityMatchOptions = {}
 ): Array<{ id: string; kind: MatchKind }> {
   const inboundTokens = windowText
     .split(/[^a-z0-9]+/)
     .filter((token) => token.length >= 3 && !STOPWORDS.has(token));
   const out: Array<{ id: string; kind: MatchKind }> = [];
+  const forcedDistanceTwoAmbiguity = new Set<string>();
   for (const service of services) {
     const name = normalizeServiceText(service.name);
     if (name.length >= 3 && windowText.includes(name)) {
@@ -240,16 +440,30 @@ function matchedServices(
     let best: Exclude<MatchKind, 'full'> | null = null;
     for (const catalogToken of tokensOf(service.name)) {
       for (const candidate of inboundTokens) {
-        const kind = tokenMatchKind(candidate, catalogToken);
+        const kind = tokenMatchKind(candidate, catalogToken, options);
         if (kind === 'token') {
           best = 'token';
           break;
         }
-        if (kind === 'typo') best ??= 'typo';
+        if (kind === 'typo1') best ??= 'typo';
+        if (kind === 'typo2') {
+          best ??= 'typo';
+          const nearby = entityIdsWithinRawDistanceTwo(candidate, services);
+          if (nearby.size > 1) {
+            for (const entityId of nearby) {
+              forcedDistanceTwoAmbiguity.add(entityId);
+            }
+          }
+        }
       }
       if (best === 'token') break;
     }
     if (best) out.push({ id: service.id, kind: best });
+  }
+  for (const entityId of forcedDistanceTwoAmbiguity) {
+    if (!out.some((match) => match.id === entityId)) {
+      out.push({ id: entityId, kind: 'typo' });
+    }
   }
   return out;
 }
@@ -265,7 +479,10 @@ function collapseHierarchicalMatches(
 ): Array<{ id: string; kind: MatchKind }> {
   const full = matches.filter((match) => match.kind === 'full');
   if (full.length === 1) return full;
-  if (full.length === 0) return matches;
+  if (full.length === 0) {
+    const token = matches.filter((match) => match.kind === 'token');
+    return token.length > 0 ? token : matches;
+  }
 
   return matches.filter((candidate) => {
     const candidateService = services.find((service) => service.id === candidate.id);
@@ -292,7 +509,8 @@ export type CatalogEntityResolution =
  */
 export function resolveUniqueCatalogEntityFromCurrentMessage(
   message: string,
-  entities: ServiceLike[]
+  entities: ServiceLike[],
+  options: CatalogEntityMatchOptions = {}
 ): CatalogEntityResolution {
   const normalized = normalizeServiceText(message);
   if (!normalized || entities.length === 0) {
@@ -302,7 +520,7 @@ export function resolveUniqueCatalogEntityFromCurrentMessage(
     return { kind: 'no_match', reason: 'naked_weekday' };
   }
   const matches = collapseHierarchicalMatches(
-    matchedServices(normalized, entities),
+    matchedServices(normalized, entities, options),
     entities
   );
   if (matches.length === 0) return { kind: 'no_match', reason: 'none' };

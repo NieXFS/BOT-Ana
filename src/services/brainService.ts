@@ -905,6 +905,8 @@ export interface RunReceptionistModelLoopInput {
   config: TenantBotConfig;
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
   executeTool: ReceptionistToolExecutor;
+  /** Override fechado de arsenal; ausente preserva exatamente as tools v1. */
+  tools?: OpenAI.Chat.Completions.ChatCompletionTool[];
   userId?: string;
   thinkingMode?: DeepSeekThinkingMode;
   maxToolRounds?: number;
@@ -1188,6 +1190,10 @@ export async function runReceptionistModelLoop(
   const providerReportedModels: string[] = [];
   const blockedServiceAttempts = new Set<string>();
   const blockedServiceTools = new Set<string>();
+  const tools = input.tools ?? RECEPTIONIST_TOOLS;
+  const advertisedToolNames = new Set(
+    tools.map((tool) => tool.function.name)
+  );
   let emptyCompletionRetryUsed = false;
   const canonicalServiceQuestion = input.serviceSelectionAntiLoop
     ? buildServiceQuestion(input.serviceSelectionAntiLoop.services)
@@ -1203,11 +1209,11 @@ export async function runReceptionistModelLoop(
             ...(input.responseFormat && runtime.supportsJsonObjectResponseFormat
               ? { responseFormat: input.responseFormat }
               : {}),
-            tools: RECEPTIONIST_TOOLS,
+            tools,
           })
         : await createReceptionistChatCompletion(runtime, {
             messages,
-            tools: RECEPTIONIST_TOOLS,
+            tools,
             temperature: sanitizeTemperature(input.config.aiTemperature),
             maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
             userId: input.userId,
@@ -1321,9 +1327,11 @@ export async function runReceptionistModelLoop(
       const parsed = parseFunctionArgsWithStatus(
         toolCall.function.arguments || '{}'
       );
-      const schemaIssue = parsed.valid
-        ? validateToolArguments(functionName, parsed.args)
-        : 'argumentos não são um objeto JSON válido';
+      const schemaIssue = !advertisedToolNames.has(functionName)
+        ? `ferramenta não disponível nesta rota: ${functionName}`
+        : parsed.valid
+          ? validateToolArguments(functionName, parsed.args)
+          : 'argumentos não são um objeto JSON válido';
       const serviceAttemptKey = input.serviceSelectionAntiLoop
         ? JSON.stringify([
             functionName,

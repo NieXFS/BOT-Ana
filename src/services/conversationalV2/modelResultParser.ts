@@ -1,5 +1,6 @@
 import type { ToolTraceLike } from '../customerReplyGuard';
 import {
+  ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
   resolveUniqueCatalogEntityFromCurrentMessage,
   type CatalogEntityResolution,
 } from '../service-gate';
@@ -388,7 +389,10 @@ function resolveV2CatalogText(
   if (properPrefixIds.length > 1 && entities.some((entry) => normalizedName(entry.displayName) === normalized)) {
     return { kind: 'ambiguous', entityIds: [...new Set(properPrefixIds)] };
   }
-  return resolveUniqueCatalogEntityFromCurrentMessage(text, [...entities]);
+  return resolveUniqueCatalogEntityFromCurrentMessage(text, [...entities], {
+    allowRestrictedDistanceTwo:
+      ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+  });
 }
 
 function earliestEntityMentionIndex(

@@ -4,6 +4,7 @@ import type { TenantBotConfig } from '../../configProvider';
 import {
   buildSystemPromptFromServices,
   executeReceptionistFunction,
+  RECEPTIONIST_TOOLS,
   runReceptionistModelLoop,
   type ReceptionistModelLoopResult,
 } from '../brainService';
@@ -33,6 +34,7 @@ import {
   type TurnPlanReceiptV2,
 } from './contracts';
 import {
+  resolveInitialServiceQuestionFastPathV2,
   resolvePendingOptionProofV2,
   resolveSelectionFastPathV2,
 } from './fastPaths';
@@ -82,6 +84,11 @@ import {
   type MaterializedPendingTransitionV2,
   type PendingFrameRecordV2,
 } from './stateStore';
+
+/** Arsenal fechado da rota v2: o catálogo já está congelado no TurnFrame. */
+export const RECEPTIONIST_V2_TOOLS = RECEPTIONIST_TOOLS.filter(
+  (tool) => tool.function.name !== 'getServices'
+);
 
 export interface ReceptionistV2RuntimeDeps {
   store?: ConversationalV2StateStore;
@@ -140,6 +147,23 @@ function v2RulesPrompt(
   if (rewritten.includes('Esse tipo de atendimento não está disponível neste estabelecimento.')) {
     throw new Error('Prompt v2 reteve a frase canônica proibida da regra E v1.');
   }
+  const closedCatalogPrompt = rewritten
+    .replace(', getServices,', ',')
+    .replace(
+      /SERVIÇOS DISPONÍVEIS \(use estes IDs diretamente nas ferramentas — você NÃO precisa chamar getServices\):/u,
+      'SERVIÇOS DISPONÍVEIS (snapshot imutável; use estes IDs diretamente nas ferramentas):'
+    )
+    .replace(
+      /1\. Use os IDs de serviço e profissional[\s\S]*?(?=\n2\. serviceId)/u,
+      '1. Use diretamente os IDs de serviço e profissional do snapshot "SERVIÇOS DISPONÍVEIS". O catálogo já está completo e imutável neste turno; não existe ferramenta para relê-lo ou atualizá-lo.'
+    )
+    .replace(
+      /4\. Se a ferramenta retornar erro de "Serviço não encontrado"[^\n]*/u,
+      '4. Se uma ferramenta retornar erro de "Serviço não encontrado", não invente nem troque IDs: responda apenas com o snapshot imutável ou peça uma nova escolha de serviço.'
+    );
+  if (/\bgetServices\b/u.test(closedCatalogPrompt)) {
+    throw new Error('Prompt v2 reteve referência à tool de catálogo removida.');
+  }
   const data = {
     turnFrame: frame,
     catalogSnapshot: {
@@ -151,6 +175,18 @@ function v2RulesPrompt(
       inboundId,
       text: inboundTextsById[inboundId] ?? '',
     })),
+    tenantFacts: {
+      name: config.authoritativeCatalog?.tenant?.name ?? null,
+      address: config.authoritativeCatalog?.tenant?.address ?? null,
+      city: config.authoritativeCatalog?.tenant?.city ?? null,
+      state: config.authoritativeCatalog?.tenant?.state ?? null,
+      businessHours: {
+        alwaysActive: config.botIsAlwaysActive,
+        start: config.botActiveStart,
+        end: config.botActiveEnd,
+        timezone: config.timezone,
+      },
+    },
   };
   const primaryOutputContract = elicitation.primaryRequiresFlatEnvelope
     ? MODEL_TURN_RESULT_V2_CONTRACT_BLOCK
@@ -158,7 +194,7 @@ function v2RulesPrompt(
 - Responda diretamente à cliente em texto natural, sem JSON, cercas ou metadados.
 - Tools continuam nativas. Quando precisar consultar ou escrever, chame a tool; depois responda em prosa.
 - O servidor deriva lifecycle de tools/fast-paths. Se uma transição ainda depender de declaração, ele pedirá uma regeneração estruturada separada.`;
-  return `${rewritten}
+  return `${closedCatalogPrompt}
 
 ${primaryOutputContract}
 
@@ -873,8 +909,18 @@ export async function getReceptionistReplyV2(input: {
     forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
     executeTool,
   });
-  const selectionFastPath =
+  const initialServiceQuestionFastPath =
     readFastPath.kind === 'continue_model'
+      ? resolveInitialServiceQuestionFastPathV2({
+          frame,
+          inboundText: currentInboundText,
+          catalog: services,
+          now: startedAt,
+        })
+      : null;
+  const selectionFastPath =
+    readFastPath.kind === 'continue_model' &&
+    initialServiceQuestionFastPath?.kind !== 'resolved'
       ? resolveSelectionFastPathV2({
           frame,
           inboundId,
@@ -894,6 +940,16 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: readFastPath.proof,
       resolutionProofRejections: [],
     };
+  } else if (initialServiceQuestionFastPath?.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    proof = null;
+    selectionNextFlowState = initialServiceQuestionFastPath.nextFlowState;
+    primary = {
+      ok: true,
+      value: initialServiceQuestionFastPath.result,
+      resolutionProof: null,
+      resolutionProofRejections: [],
+    };
   } else if (selectionFastPath?.kind === 'resolved') {
     nominalRoute = 'fast_path';
     proof = selectionFastPath.proof;
@@ -909,6 +965,7 @@ export async function getReceptionistReplyV2(input: {
       config: input.config,
       messages,
       executeTool,
+      tools: RECEPTIONIST_V2_TOOLS,
       captureTruncationAsResult: true,
       postToolResultReminder: elicitation.primaryRequiresFlatEnvelope
         ? MODEL_TURN_RESULT_V2_POST_TOOL_REMINDER

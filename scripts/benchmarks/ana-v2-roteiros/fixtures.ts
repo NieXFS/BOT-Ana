@@ -226,5 +226,29 @@ export function buildRoteirosConfig(): TenantBotConfig {
     waApiVersion: 'v21.0',
     phoneNumberId: 'fixture-ana-v2-phone',
     isActive: true,
+    authoritativeCatalog: {
+      tenant: {
+        name: 'Clínica Ana V2 Fixture',
+        address: 'Avenida Fixture, 123',
+        city: 'São Paulo',
+        state: 'SP',
+      },
+      services: (ROTEIROS_SERVICES.services ?? []).map((service) => ({
+        id: service.id,
+        name: service.name,
+        priceCents: Math.round(service.price * 100),
+        durationMinutes: service.durationMinutes,
+        ...(service.professionalIds !== undefined
+          ? { professionalIds: service.professionalIds }
+          : {}),
+      })),
+      professionals: (ROTEIROS_SERVICES.professionals ?? []).map(
+        (professional) => ({
+          id: professional.id,
+          name: professional.name,
+          active: true,
+        })
+      ),
+    },
   };
 }

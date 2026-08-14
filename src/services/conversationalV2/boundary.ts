@@ -22,6 +22,8 @@ import {
   type ReceptionistTurnPermission,
 } from '../receptionistSocialSafety';
 import {
+  ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+  isClosedCatalogResidualForEntity,
   resolveUniqueCatalogEntityFromCurrentMessage,
   uniqueCatalogServiceFromCurrentMessage,
 } from '../service-gate';
@@ -138,6 +140,16 @@ function normalize(value: string): string {
     .toLowerCase()
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function resolveCatalogEntityV2(
+  message: string,
+  entities: Array<{ id: string; name: string }>
+) {
+  return resolveUniqueCatalogEntityFromCurrentMessage(message, entities, {
+    allowRestrictedDistanceTwo:
+      ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+  });
 }
 
 function escapeRegExp(value: string): string {
@@ -436,7 +448,10 @@ function hasUnknownServiceOffer(
     ) {
       return false;
     }
-    return !isCatalogOnlyServiceOfferSpanV2(offered, catalog);
+    return !isCatalogOnlyServiceOfferSpanV2(
+      offered,
+      catalog
+    );
   });
 }
 
@@ -549,7 +564,7 @@ export function isCatalogOnlyServiceOfferSpanV2(
   remainder = remainder.replace(
     /\b(?:e\s+)?(?:e\s+)?com\s+(?:a|o)?\s*([a-z][a-z' -]{1,80})$/gu,
     (whole, claim: string) => {
-      const professional = resolveUniqueCatalogEntityFromCurrentMessage(
+      const professional = resolveCatalogEntityV2(
         claim.trim(),
         catalog.professionals
       );
@@ -557,102 +572,86 @@ export function isCatalogOnlyServiceOfferSpanV2(
     }
   );
   remainder = remainder.replace(/\s+/gu, ' ').trim();
-  const canonical = resolveUniqueCatalogEntityFromCurrentMessage(
-    remainder,
-    catalogEntities
-  );
-  if (canonical.kind === 'resolved') {
+  const allowed = new Set([
+    'a', 'o', 'as', 'os', 'de', 'da', 'do', 'das', 'dos', 'e', 'ou',
+    'servico', 'servicos', 'procedimento', 'procedimentos', 'sim', 'claro',
+    'tambem', 'certamente', 'por', 'favor',
+  ]);
+  const isKnownSegment = (segment: string): boolean => {
+    const tokens = segment.split(/[^a-z0-9]+/gu).filter(Boolean);
+    const substantiveTokens = tokens.filter((token) => !allowed.has(token));
+    if (substantiveTokens.length === 0) return false;
+
+    const canonical = resolveCatalogEntityV2(segment, catalogEntities);
+    if (canonical.kind !== 'resolved') return false;
+    const baseResolution = resolveUniqueCatalogEntityFromCurrentMessage(
+      segment,
+      catalogEntities,
+      { allowRestrictedDistanceTwo: false }
+    );
     const canonicalTokens = new Set(
       normalize(canonical.entity.name)
         .split(/[^a-z0-9]+/gu)
         .filter(Boolean)
     );
-    const allowed = new Set([
-      'a', 'o', 'as', 'os', 'de', 'da', 'do', 'das', 'dos', 'e', 'ou',
-      'servico', 'servicos', 'procedimento', 'procedimentos', 'sim', 'claro',
-      'tambem', 'certamente', 'por',
-    ]);
-    const onlyCanonicalServiceLexemes = remainder
-      .split(/[^a-z0-9]+/gu)
-      .filter(Boolean)
-      .every((token) => {
-        if (allowed.has(token) || canonicalTokens.has(token)) return true;
-        const tokenResolution = resolveUniqueCatalogEntityFromCurrentMessage(
+
+    return tokens.every((token) => {
+      if (allowed.has(token) || canonicalTokens.has(token)) return true;
+      const baseToken = resolveUniqueCatalogEntityFromCurrentMessage(
+        token,
+        catalogEntities,
+        { allowRestrictedDistanceTwo: false }
+      );
+      if (
+        baseToken.kind === 'resolved' &&
+        baseToken.entity.id === canonical.entity.id
+      ) {
+        return true;
+      }
+      const restrictedToken = resolveCatalogEntityV2(token, catalogEntities);
+      if (
+        restrictedToken.kind !== 'resolved' ||
+        restrictedToken.entity.id !== canonical.entity.id
+      ) {
+        return false;
+      }
+
+      // D direto: o único token substantivo estabelece a entidade pelo
+      // matcher canônico restrito (caso real "denajem" -> Drenagem).
+      if (substantiveTokens.length === 1) return true;
+
+      // C*: o resíduo só é perdoado quando ESTE segmento já resolvia E sem
+      // distância 2 e nenhuma outra entidade toca a bola fechada do token.
+      return (
+        baseResolution.kind === 'resolved' &&
+        baseResolution.entity.id === canonical.entity.id &&
+        isClosedCatalogResidualForEntity(
           token,
+          canonical.entity.id,
           catalogEntities
-        );
-        return (
-          tokenResolution.kind === 'resolved' &&
-          tokenResolution.entity.id === canonical.entity.id
-        );
-      });
-    if (onlyCanonicalServiceLexemes) return true;
-  }
+        )
+      );
+    });
+  };
+
+  if (isKnownSegment(remainder)) return true;
 
   // Uma enumeração é validada item a item. Ambiguidade do conjunto inteiro é
   // esperada, mas cada segmento entre vírgula/"e"/"ou" precisa resolver para
   // exatamente um serviço e não pode deixar modificador substantivo de fora
   // desse serviço ("drenagem a vapor" continua fail-closed).
-  const segmentFillers = new Set([
-    'a', 'o', 'as', 'os', 'de', 'da', 'do', 'das', 'dos', 'e', 'ou',
-    'servico', 'servicos', 'procedimento', 'procedimentos', 'sim', 'claro',
-    'tambem', 'certamente', 'por',
-  ]);
   const segments = remainder
     .split(/\s*(?:,|\be\b|\bou\b)\s*/u)
     .map((segment) => segment.replace(/[^a-z0-9' -]+/gu, ' ').trim())
     .filter(Boolean);
   const everySegmentIsKnown =
     segments.length > 1 &&
-    segments.every((segment) => {
-      const resolution = resolveUniqueCatalogEntityFromCurrentMessage(
-        segment,
-        catalogEntities
-      );
-      if (resolution.kind !== 'resolved') return false;
-      const canonicalTokens = new Set(
-        normalize(resolution.entity.name)
-          .split(/[^a-z0-9]+/gu)
-          .filter(Boolean)
-      );
-      return segment
-        .split(/[^a-z0-9]+/gu)
-        .filter(Boolean)
-        .every((token) => {
-          if (segmentFillers.has(token) || canonicalTokens.has(token)) {
-            return true;
-          }
-          const tokenResolution = resolveUniqueCatalogEntityFromCurrentMessage(
-            token,
-            catalogEntities
-          );
-          return (
-            tokenResolution.kind === 'resolved' &&
-            tokenResolution.entity.id === resolution.entity.id
-          );
-        });
-    });
+    segments.every(isKnownSegment);
   if (everySegmentIsKnown) {
     return true;
   }
 
-  let matchedCatalogService = false;
-  for (const service of [...catalog.services].sort(
-    (left, right) => right.name.length - left.name.length
-  )) {
-    const name = normalize(service.name);
-    const matcher = new RegExp(`\\b${escapeRegExp(name)}\\b`, 'gu');
-    if (matcher.test(remainder)) matchedCatalogService = true;
-    remainder = remainder.replace(matcher, ' ');
-  }
-  remainder = remainder
-    .replace(
-      /\b(?:e|ou|a|o|as|os|servicos?|procedimentos?)\b/gu,
-      ' '
-    )
-    .replace(/[^a-z0-9]+/gu, ' ')
-    .trim();
-  return matchedCatalogService && remainder === '';
+  return false;
 }
 
 function shouldDiscardTemporalOnlyUnknownServiceOfferV2(
@@ -742,7 +741,7 @@ export function isLicensedPreBookingSummaryV2(
 
   const fixedServiceId = input.flowState?.fixedServiceId;
   if (!fixedServiceId) return false;
-  const serviceResolution = resolveUniqueCatalogEntityFromCurrentMessage(
+  const serviceResolution = resolveCatalogEntityV2(
     candidate,
     catalog.services
   );
@@ -898,7 +897,7 @@ function professionalClaimsV2(
   const resolvedIds: string[] = [];
   let allUniquelyResolved = claims.size > 0;
   for (const claim of claims.values()) {
-    const resolution = resolveUniqueCatalogEntityFromCurrentMessage(
+    const resolution = resolveCatalogEntityV2(
       claim,
       catalog.professionals
     );
@@ -934,7 +933,7 @@ function inboundPositivelyResolvesProfessionalV2(
   catalog: AuthoritativeOutboundCatalog
 ): boolean {
   for (const clause of splitClausesV2(inbound)) {
-    const resolution = resolveUniqueCatalogEntityFromCurrentMessage(
+    const resolution = resolveCatalogEntityV2(
       clause,
       catalog.professionals
     );
@@ -943,7 +942,7 @@ function inboundPositivelyResolvesProfessionalV2(
     let index = clause.indexOf(name);
     if (index < 0) {
       for (const match of clause.matchAll(/\b[a-z0-9]+\b/gu)) {
-        const tokenResolution = resolveUniqueCatalogEntityFromCurrentMessage(
+        const tokenResolution = resolveCatalogEntityV2(
           match[0],
           catalog.professionals
         );
@@ -1156,7 +1155,11 @@ function v2FactReasons(
   const denialClaim = UNAVAILABLE_DENIAL_RE.test(normalize(normalizedCandidate));
   const denialLicensed = denialClaim && unknownServiceDenialLicensedV2(input, catalog);
   if (
-    hasUnknownServiceOffer(normalizedCandidate, catalog, toolTrace) ||
+    hasUnknownServiceOffer(
+      normalizedCandidate,
+      catalog,
+      toolTrace
+    ) ||
     hasUnknownAppointmentServiceClaimV2(normalizedCandidate, catalog)
   ) {
     reasons.add('UNKNOWN_SERVICE_OFFER');
@@ -1312,7 +1315,11 @@ export function evaluateBoundaryV2(
       catalog,
       toolTrace
     ) &&
-    !hasUnknownServiceOffer(normalizedCandidate, catalog, toolTrace);
+    !hasUnknownServiceOffer(
+      normalizedCandidate,
+      catalog,
+      toolTrace
+    );
   const positiveCapacityOffers = findServiceOfferMatchesV2(
     normalizedCandidate
   ).filter((match) => match.positive);
@@ -1327,7 +1334,10 @@ export function evaluateBoundaryV2(
     mappedOutboundReasons.includes('UNKNOWN_SERVICE_OFFER') &&
     positiveCapacityOffers.length > 0 &&
     positiveCapacityOffers.every((match) =>
-      isCatalogOnlyServiceOfferSpanV2(match.groups[0] ?? '', catalog)
+      isCatalogOnlyServiceOfferSpanV2(
+        match.groups[0] ?? '',
+        catalog
+      )
     ) &&
     !hasUnknownAppointmentServiceClaimV2(normalizedCandidate, catalog);
   const temporalFilteredReasons =

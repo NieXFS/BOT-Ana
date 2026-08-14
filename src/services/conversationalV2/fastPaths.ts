@@ -1,4 +1,9 @@
 import type { ServicesResult } from '../calendarService';
+import {
+  ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+  buildServiceQuestion,
+  resolveUniqueCatalogEntityFromCurrentMessage,
+} from '../service-gate';
 import type {
   BookingDraftV2,
   FlowStateV2,
@@ -98,6 +103,36 @@ function temporalPendingPosition(
   return matches.length === 1 ? matches[0]!.position : null;
 }
 
+type BarePendingHourResolution =
+  | { kind: 'no_match' }
+  | { kind: 'ambiguous' }
+  | { kind: 'resolved'; position: number };
+
+/**
+ * Hora sem sufixo só existe dentro de TIME OPEN. O número é projetado contra
+ * optionEntityIds autoritativos; nunca entra no normalizador global nem vira
+ * fato temporal fora dessa pendência.
+ */
+function barePendingHourPosition(
+  inboundText: string,
+  frame: TurnFrameV2
+): BarePendingHourResolution {
+  if (frame.pending?.kind !== 'TIME') return { kind: 'no_match' };
+  const match = /^(?:(?:pode ser|prefiro|quero)\s+)?(?:as\s+)?([01]?\d|2[0-3])(?:\s+(?:por favor|mesmo))?$/u.exec(
+    normalize(inboundText)
+  );
+  if (!match?.[1]) return { kind: 'no_match' };
+  const hour = Number(match[1]);
+  const matches = frame.pending.options.filter((option) => {
+    const optionMatch = /^([01]\d|2[0-3]):([0-5]\d)$/u.exec(option.entityId);
+    return optionMatch !== null && Number(optionMatch[1]) === hour;
+  });
+  if (matches.length === 1) {
+    return { kind: 'resolved', position: matches[0]!.position };
+  }
+  return matches.length > 1 ? { kind: 'ambiguous' } : { kind: 'no_match' };
+}
+
 /**
  * Produz proof apenas para uma opção OPEN/fresca evidenciada no inbound atual.
  * É reutilizado pelo fast-path de reads da duplicidade; flowId e versão vêm do
@@ -112,10 +147,13 @@ export function resolvePendingOptionProofV2(input: {
 }): ResolutionProof | null {
   const { frame, inboundId, inboundText, now } = input;
   if (!frame.pending || !pendingFresh(frame, now)) return null;
+  const bareHour = barePendingHourPosition(inboundText, frame);
+  if (bareHour.kind === 'ambiguous') return null;
   const position =
+    temporalPendingPosition(inboundText, frame) ??
+    (bareHour.kind === 'resolved' ? bareHour.position : null) ??
     strictOrdinal(inboundText) ??
     exactPendingNamePosition(inboundText, frame) ??
-    temporalPendingPosition(inboundText, frame) ??
     (frame.pending.options.length === 1 && compactAffirmative(inboundText)
       ? frame.pending.options[0]!.position
       : null);
@@ -133,6 +171,85 @@ export function resolvePendingOptionProofV2(input: {
     position,
     entityId: option.entityId,
     inboundId,
+  };
+}
+
+export type InitialServiceQuestionFastPathV2 =
+  | { kind: 'continue_model'; reason: string }
+  | {
+      kind: 'resolved';
+      result: ModelTurnResultV2;
+      nextFlowState: FlowStateV2;
+    };
+
+function hasPositiveExplicitBookingVerbV2(inboundText: string): boolean {
+  const text = normalize(inboundText);
+  const matcher = /\b(?:agendar|marcar)\b/gu;
+  for (const match of text.matchAll(matcher)) {
+    const prefix = text.slice(Math.max(0, (match.index ?? 0) - 40), match.index);
+    if (/\b(?:nao|nunca)\b(?:\s+[a-z0-9]+){0,3}\s*$/u.test(prefix)) {
+      continue;
+    }
+    if (
+      /\b(?:quero|queria|gostaria de|preciso|desejo|posso|podemos|pode|vamos|vou)\s*$/u.test(
+        prefix
+      ) ||
+      /^(?:agendar|marcar)\b/u.test(text.slice(match.index ?? 0))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Abertura determinística de um novo agendamento sem serviço. É allow-only:
+ * verbo explícito positivo + 2+ serviços + nenhuma resolução unívoca atual.
+ * Pendência fresca continua soberana; pendência velha pode ser supersedida.
+ */
+export function resolveInitialServiceQuestionFastPathV2(input: {
+  frame: TurnFrameV2;
+  inboundText: string;
+  catalog: ServicesResult;
+  now: Date;
+}): InitialServiceQuestionFastPathV2 {
+  const services = input.catalog.services ?? [];
+  if (!input.catalog.success || services.length < 2) {
+    return { kind: 'continue_model', reason: 'catalog_without_multiple_services' };
+  }
+  if (input.frame.pending && pendingFresh(input.frame, input.now)) {
+    return { kind: 'continue_model', reason: 'fresh_pending_is_authoritative' };
+  }
+  if (!hasPositiveExplicitBookingVerbV2(input.inboundText)) {
+    return { kind: 'continue_model', reason: 'no_positive_booking_verb' };
+  }
+  const resolution = resolveUniqueCatalogEntityFromCurrentMessage(
+    input.inboundText,
+    services,
+    {
+      allowRestrictedDistanceTwo:
+        ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+    }
+  );
+  if (resolution.kind === 'resolved') {
+    return { kind: 'continue_model', reason: 'service_already_resolved' };
+  }
+  return {
+    kind: 'resolved',
+    nextFlowState: input.frame.flowState,
+    result: {
+      schemaVersion: 2,
+      reply: buildServiceQuestion(services),
+      replyPurpose: 'SERVICE_QUESTION',
+      pendingTransitionCandidate: {
+        kind: 'open',
+        pendingKind: 'SERVICE',
+        flowId: input.frame.flowState.flowId,
+        optionEntityIds: services.map((service) => service.id),
+      },
+      resolutionCandidate: null,
+      unknownServiceEvidence: null,
+    },
   };
 }
 
@@ -441,3 +558,4 @@ export function resolveSelectionFastPathV2(input: {
 }
 
 export const __strictOrdinalForSmokeV2 = strictOrdinal;
+export const __barePendingHourPositionForSmokeV2 = barePendingHourPosition;

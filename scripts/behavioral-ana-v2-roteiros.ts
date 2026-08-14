@@ -983,7 +983,7 @@ function mockCompletionForBehavior(
       return syntheticCompletion({
         content: ' \n ',
         ...(thinking ? { reasoningContent: MOCK_REASONING_SENTINEL } : {}),
-        tool: { name: 'getServices', args: {} },
+        tool: { name: 'getUpcomingAppointments', args: {} },
       });
     }
     if (completionAttempt === 1) {
@@ -1890,7 +1890,7 @@ async function runCustomerTurn(
     const result = await ctx.runtime.runReceptionistModelLoop({
       ...input,
       retryOnFailure: false,
-      completionFactory: async ({ round, messages, responseFormat }) => {
+      completionFactory: async ({ round, messages, responseFormat, tools }) => {
         const expectedResponseFormat =
           ctx.options.elicitation === 'v1' ? 'json_object' : undefined;
         if (responseFormat !== expectedResponseFormat) {
@@ -1940,7 +1940,7 @@ async function runCustomerTurn(
             ctx.runtime.resolveReceptionistAiRuntime(config),
             {
               messages,
-              tools: ctx.runtime.RECEPTIONIST_TOOLS,
+              tools,
               temperature: config.aiTemperature,
               maxTokens: config.aiMaxTokens,
               userId: input.userId,

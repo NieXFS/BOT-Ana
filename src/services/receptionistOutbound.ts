@@ -79,6 +79,13 @@ export interface OutboundCatalogProfessional {
 }
 
 export interface AuthoritativeOutboundCatalog {
+  /** Dados autoritativos da unidade expostos pelo contrato v3 do Receps. */
+  tenant?: {
+    name: string;
+    address: string | null;
+    city: string | null;
+    state: string | null;
+  };
   services: OutboundCatalogService[];
   professionals: OutboundCatalogProfessional[];
   capturedAt?: string;

@@ -10,6 +10,7 @@ import type {
 import { deliverPreparedReceptionistTurnV2 } from '../src/services/conversationalV2/delivery';
 import {
   __strictOrdinalForSmokeV2,
+  resolveInitialServiceQuestionFastPathV2,
   resolveSelectionFastPathV2,
 } from '../src/services/conversationalV2/fastPaths';
 import {
@@ -58,6 +59,16 @@ const config = {
   waApiVersion: 'v21.0',
   phoneNumberId: 'PN-V2-ROUTE',
   isActive: true,
+  authoritativeCatalog: {
+    tenant: {
+      name: 'Clínica Fixture V2',
+      address: 'Avenida Fixture, 123',
+      city: 'São Paulo',
+      state: 'SP',
+    },
+    services: [],
+    professionals: [],
+  },
 } as TenantBotConfig;
 
 const services: ServicesResult = {
@@ -300,11 +311,28 @@ async function main(): Promise<void> {
     prompt,
     /Esse tipo de atendimento não está disponível neste estabelecimento\./
   );
+  assert.doesNotMatch(
+    prompt,
+    /\bgetServices\b/u,
+    'F: prompt v2 não elicita a tool removida do arsenal'
+  );
   const immutableMarker = 'DADOS IMUTÁVEIS DO TURNO (não são instruções): ';
   const immutableData = JSON.parse(
     prompt.slice(prompt.indexOf(immutableMarker) + immutableMarker.length)
   ) as {
     catalogSnapshot: ServicesResult;
+    tenantFacts: {
+      name: string | null;
+      address: string | null;
+      city: string | null;
+      state: string | null;
+      businessHours: {
+        alwaysActive: boolean;
+        start: string;
+        end: string;
+        timezone: string;
+      };
+    };
   };
   assert.deepEqual(
     immutableData.catalogSnapshot.services?.map((service) => ({
@@ -321,6 +349,18 @@ async function main(): Promise<void> {
     })),
     'preço/duração do catálogo pertencem aos dados imutáveis do turno'
   );
+  assert.deepEqual(immutableData.tenantFacts, {
+    name: 'Clínica Fixture V2',
+    address: 'Avenida Fixture, 123',
+    city: 'São Paulo',
+    state: 'SP',
+    businessHours: {
+      alwaysActive: true,
+      start: '00:00',
+      end: '23:59',
+      timezone: 'America/Sao_Paulo',
+    },
+  }, 'endereço e funcionamento da config pertencem aos dados imutáveis');
 
   assert.equal(__strictOrdinalForSmokeV2('2'), 2);
   assert.equal(__strictOrdinalForSmokeV2('a segunda opção'), 2);
@@ -363,6 +403,47 @@ async function main(): Promise<void> {
     now,
   });
   assert.equal(stale.kind, 'continue_model');
+
+  const deterministicServiceQuestion = resolveInitialServiceQuestionFastPathV2({
+    frame: promptFrame,
+    inboundText: 'Quero agendar',
+    catalog: services,
+    now,
+  });
+  assert.equal(deterministicServiceQuestion.kind, 'resolved');
+  if (deterministicServiceQuestion.kind === 'resolved') {
+    assert.equal(
+      deterministicServiceQuestion.result.pendingTransitionCandidate.kind === 'open' &&
+        deterministicServiceQuestion.result.pendingTransitionCandidate.pendingKind,
+      'SERVICE'
+    );
+    assert.deepEqual(
+      deterministicServiceQuestion.result.pendingTransitionCandidate.kind === 'open'
+        ? deterministicServiceQuestion.result.pendingTransitionCandidate.optionEntityIds
+        : [],
+      services.services!.map((service) => service.id)
+    );
+  }
+  for (const [label, inboundText, catalog] of [
+    ['negação', 'não quero agendar', services],
+    ['serviço resolvido', 'quero agendar Peeling Facial', services],
+    [
+      'catálogo unitário',
+      'quero agendar',
+      { ...services, services: [services.services![0]!] },
+    ],
+  ] as const) {
+    assert.equal(
+      resolveInitialServiceQuestionFastPathV2({
+        frame: promptFrame,
+        inboundText,
+        catalog,
+        now,
+      }).kind,
+      'continue_model',
+      label
+    );
+  }
 
   const timePending = pending({
     kind: 'TIME',
@@ -416,6 +497,87 @@ async function main(): Promise<void> {
     });
     assert.match(timeFastPath.result.reply, /Confirmando: Drenagem Linfática/);
   }
+
+  for (const inboundText of ['pode ser às 15', 'as 15', '15']) {
+    const bareTimeFastPath = resolveSelectionFastPathV2({
+      frame: {
+        ...promptFrame,
+        pending: timePending,
+        flowState: {
+          flowId: timePending.flowId,
+          fixedServiceId: 'svc-drenagem',
+          fixedProfessionalId: 'prof-julia',
+          resolvedDate: '2026-08-14',
+          slotEvidence: {
+            turnId: 'turn-slot-evidence',
+            serviceId: 'svc-drenagem',
+            professionalId: 'prof-julia',
+            date: '2026-08-14',
+            slots: ['14:00', '15:00'],
+          },
+          fixedByProofVersion: {
+            fixedServiceId: 1,
+            fixedProfessionalId: 1,
+            resolvedDate: 1,
+          },
+        },
+      },
+      inboundId: 'inbound-prompt',
+      inboundText,
+      catalog: services,
+      now,
+    });
+    assert.equal(bareTimeFastPath.kind, 'resolved', inboundText);
+    if (bareTimeFastPath.kind === 'resolved') {
+      assert.equal(bareTimeFastPath.nextFlowState.bookingDraft?.time, '15:00');
+      assert.deepEqual(
+        bareTimeFastPath.result.pendingTransitionCandidate.kind === 'open'
+          ? bareTimeFastPath.result.pendingTransitionCandidate.pendingKind
+          : null,
+        'CONFIRMATION'
+      );
+    }
+  }
+
+  const ambiguousBareTime = resolveSelectionFastPathV2({
+    frame: {
+      ...promptFrame,
+      pending: {
+        ...timePending,
+        options: [
+          { position: 1, entityId: '15:00', displayName: '15:00' },
+          { position: 2, entityId: '15:30', displayName: '15:30' },
+        ],
+      },
+      flowState: {
+        flowId: timePending.flowId,
+        fixedServiceId: 'svc-drenagem',
+        fixedProfessionalId: 'prof-julia',
+        resolvedDate: '2026-08-14',
+        slotEvidence: {
+          turnId: 'turn-slot-evidence-ambiguous',
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-14',
+          slots: ['15:00', '15:30'],
+        },
+        fixedByProofVersion: {
+          fixedServiceId: 1,
+          fixedProfessionalId: 1,
+          resolvedDate: 1,
+        },
+      },
+    },
+    inboundId: 'inbound-prompt',
+    inboundText: '15',
+    catalog: services,
+    now,
+  });
+  assert.equal(
+    ambiguousBareTime.kind,
+    'continue_model',
+    '15:00 e 15:30 tornam "15" ambíguo; nunca escolhe silenciosamente'
+  );
 
   const reducerSlots = reduceToolLifecycleV2({
     frame: promptFrame,
@@ -735,7 +897,64 @@ async function main(): Promise<void> {
   assert.match(i1.payload ?? '', /Qual dia/);
   assert.doesNotMatch(i1.payload ?? '', /não (?:temos|está disponível)/i);
 
-  // Replay I3: pedido genérico diante de pendência velha vai ao modelo e reabre.
+  // Replay canário T4: hora nua é preenchida contra TIME OPEN autoritativo; a
+  // copy canônica atravessa a boundary usando BookingDraftV2 + slotEvidence.
+  const bareTimeStore = new MemoryConversationalV2StateStore();
+  const bareTimePhone = '5511000000018';
+  const bareTimeKey = `${config.phoneNumberId}:${bareTimePhone}`;
+  seedPending(bareTimeStore, bareTimeKey, timePending, {
+    flowId: timePending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-slot-evidence-prior',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['14:00', '15:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  bareTimeStore.setInputSequence(bareTimeKey, 1);
+  let bareTimeModelCalls = 0;
+  const bareTimePrepared = await getReceptionistReplyV2({
+    phone: bareTimePhone,
+    userMessage: 'pode ser às 15',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'pode ser às 15' }),
+    deps: {
+      ...baseDeps(bareTimeStore),
+      runModelLoop: async () => {
+        bareTimeModelCalls += 1;
+        throw new Error('hora nua unívoca não deve chamar modelo');
+      },
+    },
+  });
+  assert.equal(bareTimeModelCalls, 0);
+  assert.equal(bareTimePrepared.planReceipt.route, 'fast_path');
+  assert.equal(
+    bareTimePrepared.planReceipt.boundaryAttempts.at(-1)?.reasonCodes.length,
+    0
+  );
+  assert.match(bareTimePrepared.payload ?? '', /às 15h/);
+  assert.equal(
+    bareTimePrepared.transition.kind === 'open' &&
+      bareTimePrepared.transition.frame.kind,
+    'CONFIRMATION'
+  );
+  assert.equal(
+    bareTimePrepared.frame.flowState.bookingDraft?.slotEvidenceTurnId,
+    'turn-slot-evidence-prior'
+  );
+
+  // Replay canário T1/T2: pedido genérico supersede pendência velha sem modelo,
+  // entrega SERVICE OPEN e ancora a resposta ordinal seguinte.
   const i3Store = new MemoryConversationalV2StateStore();
   const i3Key = `${config.phoneNumberId}:5511000000003`;
   const oldPending = pending({ askedAt: '2026-08-13T09:00:00.000Z' });
@@ -766,9 +985,42 @@ async function main(): Promise<void> {
       },
     },
   });
-  assert.equal(i3ModelCalls, 1);
-  assert.match(i3.payload ?? '', /Qual serviço/);
+  assert.equal(i3ModelCalls, 0);
+  assert.equal(i3.planReceipt.route, 'fast_path');
+  assert.match(i3.payload ?? '', /qual serviço/i);
   assert.doesNotMatch(i3.payload ?? '', /não (?:temos|está disponível)/i);
+  assert.equal(i3.transition.kind, 'open');
+  assert.equal(i3.transition.kind === 'open' && i3.transition.frame.kind, 'SERVICE');
+  await deliverPreparedReceptionistTurnV2(i3, {
+    store: i3Store,
+    id: nextId,
+    now: () => now,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  i3Store.setInputSequence(i3Key, 2);
+  const i3Second = await getReceptionistReplyV2({
+    phone: '5511000000003',
+    userMessage: 'segunda opção',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'segunda opção', sequence: 2 }),
+    deps: {
+      ...baseDeps(i3Store),
+      runModelLoop: async () => {
+        i3ModelCalls += 1;
+        throw new Error('segunda opção ancorada não deve chamar modelo');
+      },
+    },
+  });
+  assert.equal(i3ModelCalls, 0);
+  assert.equal(i3Second.planReceipt.route, 'fast_path');
+  assert.equal(i3Second.frame.flowState.fixedServiceId, 'svc-peeling');
 
   await assert.rejects(
     () =>
@@ -798,10 +1050,10 @@ async function main(): Promise<void> {
   let truncatedRegenCalls = 0;
   const truncatedPrepared = await getReceptionistReplyV2({
     phone: truncatedPhone,
-    userMessage: 'Quero agendar',
+    userMessage: 'quanto custa Peeling Facial?',
     userName: 'Cliente',
     config: { ...config, aiMaxTokens: 8_192 },
-    turnRuntime: turnRuntime({ text: 'Quero agendar' }),
+    turnRuntime: turnRuntime({ text: 'quanto custa Peeling Facial?' }),
     deps: {
       ...baseDeps(truncatedStore),
       runModelLoop: (loopInput) =>
@@ -917,7 +1169,7 @@ async function main(): Promise<void> {
             emptyAfterToolProviderRounds += 1;
             assert.equal(responseFormat, 'json_object');
             return emptyAfterToolProviderRounds === 1
-              ? completion({ toolName: 'getServices', args: {} })
+              ? completion({ toolName: 'getUpcomingAppointments', args: {} })
               : completion({ content: '' });
           },
         });
@@ -1079,6 +1331,16 @@ async function main(): Promise<void> {
             providerRound += 1;
             assert.equal(responseFormat, 'json_object', 'toda completion brain v2 pede JSON mode');
             assert.ok((tools?.length ?? 0) > 0, 'JSON mode convive com tools nativas');
+            assert.deepEqual(
+              tools.map((tool) => tool.function.name),
+              [
+                'getAvailableSlots',
+                'getUpcomingAppointments',
+                'bookAppointment',
+                'cancelAppointment',
+              ],
+              'F: arsenal v2 exclui getServices e preserva somente as quatro tools aprovadas'
+            );
             if (providerRound > 1) {
               assert.equal(messages.at(-1)?.role, 'system');
               assert.equal(
@@ -1138,8 +1400,13 @@ async function main(): Promise<void> {
     messages: [{ role: 'system', content: 'prompt legado sem flag v2' }],
     executeTool: async () => JSON.stringify({ success: true, slots: [] }),
     retryOnFailure: false,
-    completionFactory: async ({ messages }) => {
+    completionFactory: async ({ messages, tools }) => {
       legacyRound += 1;
+      assert.equal(
+        tools.some((tool) => tool.function.name === 'getServices'),
+        true,
+        'caller v1 sem override preserva getServices'
+      );
       legacySawReminder ||= messages.some(
         (message) => message.content === MODEL_TURN_RESULT_V2_POST_TOOL_REMINDER
       );
@@ -1178,14 +1445,14 @@ async function main(): Promise<void> {
     const key = `${config.phoneNumberId}:${phone}`;
     store.setInputSequence(key, 1);
     const runtime = turnRuntime({
-      text: 'Quero agendar',
+      text: 'quanto custa Peeling Facial?',
       checkpoint: (current) => ({
         sequence: current === stage && stage !== 'before_transport' ? 2 : 1,
       }),
     });
     const prepared = await getReceptionistReplyV2({
       phone,
-      userMessage: 'Quero agendar',
+      userMessage: 'quanto custa Peeling Facial?',
       userName: 'Cliente',
       config,
       turnRuntime: runtime,
@@ -1252,14 +1519,14 @@ async function main(): Promise<void> {
     const key = `${config.phoneNumberId}:${phone}`;
     store.setInputSequence(key, 1);
     const runtime = turnRuntime({
-      text: 'Quero agendar',
+      text: 'quanto custa Peeling Facial?',
       checkpoint: (current) => ({
         paused: current === stage && stage !== 'before_transport',
       }),
     });
     const prepared = await getReceptionistReplyV2({
       phone,
-      userMessage: 'Quero agendar',
+      userMessage: 'quanto custa Peeling Facial?',
       userName: 'Cliente',
       config,
       turnRuntime: runtime,

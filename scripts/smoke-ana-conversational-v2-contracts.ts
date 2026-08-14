@@ -7,6 +7,10 @@ import type {
 } from '../src/services/conversationalV2/contracts';
 import { isAnaConversationalV2Enabled } from '../src/services/conversationalV2/featureFlag';
 import {
+  ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+  resolveUniqueCatalogEntityFromCurrentMessage,
+} from '../src/services/service-gate';
+import {
   __parseFlatModelTurnV2ForSmoke,
   codePointSliceV2,
   coerceEquivalentOpenTransitionV2,
@@ -126,6 +130,78 @@ for (const [label, inbound, chosen, entityId] of [
   });
   assert.equal(result.ok, true, label);
   if (result.ok) assert.equal(result.resolutionProof?.entityId, entityId, label);
+}
+
+const uniqueDistanceTwo = parsed({
+  inbounds: { current: 'quero drenajemm' },
+  result: { chosenOptionText: 'drenajemm' },
+});
+assert.equal(ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH, true);
+assert.equal(
+  resolveUniqueCatalogEntityFromCurrentMessage('drenajemm', [
+    { id: 'svc-drenagem', name: 'Drenagem' },
+  ]).kind,
+  'resolved',
+  'D compartilhado aceita 1 indel + 1 substituição com os pisos canônicos'
+);
+assert.equal(uniqueDistanceTwo.ok, true);
+if (uniqueDistanceTwo.ok) {
+  assert.equal(
+    uniqueDistanceTwo.resolutionProof?.entityId,
+    'svc-drenagem',
+    'D: token >=8 a distância 2 resolve quando a entidade é única'
+  );
+}
+const canaryDistanceTwo = resolveUniqueCatalogEntityFromCurrentMessage(
+  'denajem',
+  [{ id: 'svc-drenagem', name: 'Drenagem' }]
+);
+assert.equal(canaryDistanceTwo.kind, 'resolved');
+if (canaryDistanceTwo.kind === 'resolved') {
+  assert.equal(canaryDistanceTwo.entity.id, 'svc-drenagem');
+}
+assert.equal(
+  resolveUniqueCatalogEntityFromCurrentMessage('mensagem', [
+    { id: 'svc-massagem', name: 'Massagem' },
+  ]).kind,
+  'no_match',
+  'D-1: duas substituições não transformam mensagem em Massagem'
+);
+const professionalExactWins = resolveUniqueCatalogEntityFromCurrentMessage(
+  'Fernanda',
+  [
+    { id: 'prof-fernanda', name: 'Fernanda Lopes' },
+    { id: 'prof-neighbor', name: 'Fexrnandb Souza' },
+  ]
+);
+assert.equal(
+  professionalExactWins.kind === 'resolved'
+    ? professionalExactWins.entity.id
+    : professionalExactWins.kind,
+  'prof-fernanda',
+  'K8: full profissional nunca é vencido pelo typo dist-2 de outra pessoa'
+);
+const ambiguousDistanceTwo = parsed({
+  inbounds: { current: 'quero drenajemm' },
+  result: { chosenOptionText: 'drenajemm' },
+  context: {
+    services: [
+      { id: 'svc-drenagem', displayName: 'Drenagem' },
+      { id: 'svc-drenajemx', displayName: 'Drenajemx' },
+    ],
+  },
+});
+assert.equal(ambiguousDistanceTwo.ok, true);
+if (ambiguousDistanceTwo.ok) {
+  assert.equal(
+    ambiguousDistanceTwo.resolutionProof,
+    null,
+    'D: duas entidades dentro da distância 2 permanecem fail-closed'
+  );
+  assert.equal(
+    ambiguousDistanceTwo.resolutionProofRejections[0]?.code,
+    'CATALOG_ENTITY_AMBIGUOUS'
+  );
 }
 
 // K1: polaridade é por oração; menção negada não governa a escolha.
@@ -281,6 +357,18 @@ const validUnknown = parsed({
 assert.equal(validUnknown.ok, true);
 if (validUnknown.ok) {
   assert.equal(validUnknown.value.unknownServiceEvidence?.inboundId, 'current');
+}
+const canaryTypoCannotLicenseDenial = parsed({
+  inbounds: { current: 'vocês fazem denajem?' },
+  result: { unknownServiceText: 'denajem' },
+});
+assert.equal(canaryTypoCannotLicenseDenial.ok, true);
+if (canaryTypoCannotLicenseDenial.ok) {
+  assert.equal(
+    canaryTypoCannotLicenseDenial.value.unknownServiceEvidence,
+    null,
+    'denajem resolve Drenagem e nunca vira prova de serviço ausente'
+  );
 }
 
 // Tabela de precondições: TIME só nasce de slots autoritativos tipados.

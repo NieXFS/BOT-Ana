@@ -4,6 +4,7 @@ import {
   UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2,
   classifyReceptionistTurnPermissionV2,
   evaluateBoundaryV2,
+  isCatalogOnlyServiceOfferSpanV2,
   isV2BusinessHoursInformationRequest,
   isLicensedPreBookingSummaryV2,
   isTemporalOnlyServiceOfferSpanV2,
@@ -240,6 +241,20 @@ assert.equal(
   noSpan.reasonCodes.includes('UNLICENSED_SERVICE_UNAVAILABLE_DENIAL'),
   true
 );
+const denajemInbound = 'Vocês fazem denajem?';
+const denajemDenial = boundary(UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2, {
+  sourceInboundText: denajemInbound,
+  inboundTextsById: { 'in-current': denajemInbound },
+  unknownServiceEvidence: {
+    inboundId: 'in-current',
+    ...spanFor(denajemInbound, 'denajem'),
+  },
+});
+assert.equal(
+  denajemDenial.reasonCodes.includes('UNLICENSED_SERVICE_UNAVAILABLE_DENIAL'),
+  true,
+  'D: denajem resolve Drenagem e não licencia denial de serviço ausente'
+);
 
 for (const generic of ['retorno', 'unidade']) {
   const inbound = `Quero ${generic}`;
@@ -332,6 +347,68 @@ assert.equal(
   typoEchoOffer.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
   false,
   'eco de typo resolvido univocamente pelo matcher canônico não vira oferta desconhecida'
+);
+const canaryDistanceTwoEchoInbound = 'Vocês fazem denajem?';
+const canaryDistanceTwoEcho = boundary('Sim, fazemos denajem.', {
+  sourceInboundText: canaryDistanceTwoEchoInbound,
+  inboundTextsById: { 'in-current': canaryDistanceTwoEchoInbound },
+});
+assert.equal(
+  canaryDistanceTwoEcho.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  false,
+  'D: denajem resolve Drenagem pelo matcher compartilhado restrito'
+);
+const canaryEchoWithUnknownRemainder = boundary(
+  'Sim, fazemos denajem a vapor.',
+  {
+    sourceInboundText: canaryDistanceTwoEchoInbound,
+    inboundTextsById: { 'in-current': canaryDistanceTwoEchoInbound },
+  }
+);
+assert.equal(
+  canaryEchoWithUnknownRemainder.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  true,
+  'D: modificador substantivo fora do catálogo continua bloqueado'
+);
+for (const [label, inbound] of [
+  ['C-1 afirmação ecoada', 'Eu faço botox em casa.'],
+  ['C-3 pergunta ecoada', 'Vocês fazem botox?'],
+] as const) {
+  const echoedUnknown = boundary('Sim, fazemos botox.', {
+    sourceInboundText: inbound,
+    inboundTextsById: { 'in-current': inbound },
+  });
+  assert.equal(
+    echoedUnknown.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+    true,
+    `${label}: inbound não entra no perdão C*`
+  );
+}
+const closedResidualCatalog = {
+  services: [
+    { id: 'svc-drenagem-cstar', name: 'Drenagem' },
+    { id: 'svc-denajem-other', name: 'Denajem Terapia' },
+  ],
+  professionals: [],
+};
+assert.equal(
+  isCatalogOnlyServiceOfferSpanV2(
+    'Drenagem denajem',
+    closedResidualCatalog
+  ),
+  false,
+  'C-2: canônico de Drenagem não lava token canônico de outra entidade'
+);
+assert.equal(
+  isCatalogOnlyServiceOfferSpanV2(
+    'Drenagem denajem',
+    {
+      services: [{ id: 'svc-drenagem-cstar', name: 'Drenagem' }],
+      professionals: [],
+    }
+  ),
+  true,
+  'C*: E prévio e bola fechada permitem somente o resíduo restrito'
 );
 const enumerationServices: ServicesResult = {
   ...servicesResult,
