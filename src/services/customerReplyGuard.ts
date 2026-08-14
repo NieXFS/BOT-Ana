@@ -591,12 +591,16 @@ function offeredAvailabilitySlots(reply: string): string[] {
  */
 export function hasUnverifiedAvailabilityClaim(
   reply: string,
-  toolTrace: ToolTraceLike[]
+  toolTrace: ToolTraceLike[],
+  additionalVerifiedSlots: readonly string[] = []
 ): boolean {
   const offered = offeredAvailabilitySlots(reply);
   if (offered.length === 0) return false;
 
   const verified = currentTurnAuthoritativeAvailabilitySlots(toolTrace);
+  for (const slot of additionalVerifiedSlots) {
+    if (/^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(slot)) verified.add(slot);
+  }
   return offered.some((slot) => !verified.has(slot));
 }
 
@@ -1186,7 +1190,8 @@ export function inspectCustomerReply(
   forbiddenAppointmentIds: string[] = [],
   toolTrace: ToolTraceLike[] = [],
   sourceInboundText?: string,
-  temporalContext?: AppointmentTemporalContext
+  temporalContext?: AppointmentTemporalContext,
+  additionalVerifiedSlots: readonly string[] = []
 ): CustomerReplyInspection {
   const reasons = new Set<CustomerReplyLeakReason>();
   if (/INTERNAL_HINT/i.test(reply)) {
@@ -1195,7 +1200,13 @@ export function inspectCustomerReply(
   if (hasFalseWriteClaim(reply, toolTrace, temporalContext)) {
     reasons.add('false_write_claim');
   }
-  if (hasUnverifiedAvailabilityClaim(reply, toolTrace)) {
+  if (
+    hasUnverifiedAvailabilityClaim(
+      reply,
+      toolTrace,
+      additionalVerifiedSlots
+    )
+  ) {
     reasons.add('unverified_availability');
   }
   if (

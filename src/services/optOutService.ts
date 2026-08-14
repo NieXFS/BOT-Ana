@@ -17,12 +17,18 @@ const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
 
 const STRONG_STOP_KEYWORDS = new Set<string>([
-  'pare', 'parar', 'parem', 'para',
+  'pare', 'parar', 'parem',
+  'descadastrar', 'descadastra', 'descadastre', 'descadastrem', 'descadastro',
+  'stop',
+]);
+
+// Estes verbos também pertencem ao domínio operacional da recepção. Mesmo em
+// mensagens curtas, só significam opt-out quando a cliente explicita que está
+// falando das comunicações — nunca apenas de um agendamento/horário.
+const AMBIGUOUS_DOMAIN_STOP_KEYWORDS = new Set<string>([
   'cancelar', 'cancele', 'cancela', 'cancelem',
   'remover', 'remova', 'remove', 'removam',
-  'descadastrar', 'descadastra', 'descadastre', 'descadastrem', 'descadastro',
   'sair', 'saia', 'saiam',
-  'stop',
 ]);
 
 const COMMS_CONTEXT_KEYWORDS = new Set<string>([
@@ -89,12 +95,21 @@ export function isOptOutMessage(text: string): boolean {
     }
   }
 
+  // Compatibilidade com o comando unitário consagrado "PARA", sem recolocar
+  // a preposição mais comum do português no léxico forte.
+  if (normalized === 'para') return true;
+
+  // Perguntar sobre parar/cancelar/remover nunca executa uma mutação de
+  // compliance por keyword. Frases explícitas acima permanecem soberanas.
+  if (text.trim().endsWith('?')) return false;
+
   const hasStrong = hasAny(words, STRONG_STOP_KEYWORDS);
-  if (!hasStrong) return false;
+  if (hasStrong) {
+    if (wordCount <= VERY_SHORT_MSG_WORDS) return true;
+    return hasContext;
+  }
 
-  if (wordCount <= VERY_SHORT_MSG_WORDS) return true;
-
-  return hasContext;
+  return hasAny(words, AMBIGUOUS_DOMAIN_STOP_KEYWORDS) && hasContext;
 }
 
 interface OptOutResponse {

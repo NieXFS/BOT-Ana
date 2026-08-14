@@ -8,6 +8,8 @@ import type {
   BookingDraftV2,
   FlowStateV2,
   ModelTurnResultV2,
+  PendingKindV2,
+  PendingOptionV2,
   ResolutionProof,
   TurnFrameV2,
 } from './contracts';
@@ -22,7 +24,7 @@ export type FastPathResultV2 =
   | {
       kind: 'resolved';
       result: ModelTurnResultV2;
-      proof: ResolutionProof;
+      proof: ResolutionProof | null;
       nextFlowState: FlowStateV2;
     };
 
@@ -57,6 +59,17 @@ function strictOrdinal(value: string): number | null {
   const token = match?.[1] ?? match?.[2];
   if (!token) return null;
   return /^\d+$/.test(token) ? Number(token) : words[token] ?? null;
+}
+
+function pendingOrdinalPosition(
+  value: string,
+  pendingKind: PendingKindV2
+): number | null {
+  const text = normalize(value);
+  // Em TIME, um inteiro nu sempre representa uma hora candidata. A posição
+  // ordinal só existe quando a cliente diz explicitamente "opção N".
+  if (pendingKind === 'TIME' && /^[1-9]\d*$/u.test(text)) return null;
+  return strictOrdinal(value);
 }
 
 function compactAffirmative(value: string): boolean {
@@ -162,7 +175,7 @@ function temporalPendingPosition(
 
 type BarePendingHourResolution =
   | { kind: 'no_match' }
-  | { kind: 'ambiguous' }
+  | { kind: 'ambiguous'; options: readonly PendingOptionV2[] }
   | { kind: 'resolved'; position: number };
 
 /**
@@ -175,7 +188,7 @@ function barePendingHourPosition(
   frame: TurnFrameV2
 ): BarePendingHourResolution {
   if (frame.pending?.kind !== 'TIME') return { kind: 'no_match' };
-  const match = /^(?:(?:pode ser|prefiro|quero)\s+)?(?:as\s+)?([01]?\d|2[0-3])(?:\s+(?:por favor|mesmo))?$/u.exec(
+  const match = /^(?:(?:pode ser|prefiro|quero)\s+)?(?:as\s+)?([01]?\d|2[0-3])(?:\s*h)?(?:\s+(?:por favor|mesmo))?$/u.exec(
     normalize(inboundText)
   );
   if (!match?.[1]) return { kind: 'no_match' };
@@ -187,7 +200,25 @@ function barePendingHourPosition(
   if (matches.length === 1) {
     return { kind: 'resolved', position: matches[0]!.position };
   }
-  return matches.length > 1 ? { kind: 'ambiguous' } : { kind: 'no_match' };
+  return matches.length > 1
+    ? { kind: 'ambiguous', options: matches }
+    : { kind: 'no_match' };
+}
+
+function displayPendingTime(value: string): string {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/u.exec(value);
+  if (!match) return value;
+  return match[2] === '00'
+    ? `${Number(match[1])}h`
+    : `${Number(match[1])}h${match[2]}`;
+}
+
+function buildBareHourDisambiguationV2(
+  options: readonly PendingOptionV2[]
+): string {
+  const displayed = options.map((option) => displayPendingTime(option.entityId));
+  if (displayed.length <= 1) return `${displayed[0] ?? 'Qual horário'}?`;
+  return `${displayed.slice(0, -1).join(', ')} ou ${displayed.at(-1)}?`;
 }
 
 /**
@@ -210,7 +241,7 @@ export function resolvePendingOptionProofV2(input: {
   const position =
     temporalPendingPosition(inboundText, frame) ??
     (bareHour.kind === 'resolved' ? bareHour.position : null) ??
-    strictOrdinal(inboundText) ??
+    pendingOrdinalPosition(inboundText, frame.pending.kind) ??
     exactPendingNamePosition(inboundText, frame) ??
     canonicalPendingEntityPosition(inboundText, frame, input.catalog) ??
     (frame.pending.options.length === 1 && compactAffirmative(inboundText)
@@ -406,10 +437,13 @@ export function buildTimeSelectionFollowUpV2(
   const serviceId = frame.flowState.fixedServiceId;
   if (
     frame.pending?.kind !== 'TIME' ||
+    frame.pending.flowId !== frame.flowState.flowId ||
     !evidence ||
     !serviceId ||
+    !evidence.turnId.trim() ||
     evidence.serviceId !== serviceId ||
     evidence.date !== frame.flowState.resolvedDate ||
+    !frame.pending.options.some((option) => option.entityId === time) ||
     !evidence.slots.includes(time)
   ) {
     return null;
@@ -527,6 +561,22 @@ export function resolveSelectionFastPathV2(input: {
       return {
         kind: 'continue_model',
         reason: 'current_date_correction_preempts_time_selection',
+      };
+    }
+    const bareHour = barePendingHourPosition(inboundText, frame);
+    if (bareHour.kind === 'ambiguous') {
+      return {
+        kind: 'resolved',
+        proof: null,
+        nextFlowState: frame.flowState,
+        result: {
+          schemaVersion: 2,
+          reply: buildBareHourDisambiguationV2(bareHour.options),
+          replyPurpose: 'CLARIFICATION',
+          pendingTransitionCandidate: { kind: 'preserve' },
+          resolutionCandidate: null,
+          unknownServiceEvidence: null,
+        },
       };
     }
     const pendingProof = resolvePendingOptionProofV2({

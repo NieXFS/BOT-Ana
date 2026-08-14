@@ -217,9 +217,18 @@ function availabilityEvidenceState(
 
 function availabilityClaimLicensed(
   candidate: string,
-  toolTrace: ToolTraceLike[]
+  input: BoundaryEvaluationInputV2
 ): boolean {
-  const evidence = availabilityEvidenceState(toolTrace);
+  let evidence = availabilityEvidenceState(input.toolTrace ?? []);
+  if (!evidence.known) {
+    const pendingEvidence = pendingTimeSlotEvidenceV2(input);
+    if (pendingEvidence) {
+      evidence = {
+        known: true,
+        hasAvailability: pendingEvidence.slots.length > 0,
+      };
+    }
+  }
   if (!evidence.known) return false;
   const occupiedClaim = OCCUPIED_AVAILABILITY_RE.test(normalize(candidate));
   return occupiedClaim ? !evidence.hasAvailability : evidence.hasAvailability;
@@ -762,6 +771,48 @@ function currentTurnSlotEvidenceV2(toolTrace: ToolTraceLike[]): Set<string> {
 }
 
 /**
+ * PendingFrame TIME OPEN é uma projeção entregue de uma leitura autoritativa.
+ * Só reutiliza essa evidência em outro turno quando snapshot e FlowState ainda
+ * descrevem exatamente o mesmo fluxo, data, serviço, profissional e slots.
+ */
+function pendingTimeSlotEvidenceV2(
+  input: BoundaryEvaluationInputV2
+): { date: string; slots: readonly string[] } | null {
+  const pending = input.pendingSnapshot;
+  const flow = input.flowState;
+  const evidence = flow?.slotEvidence;
+  if (
+    input.pendingAnaOpen === false ||
+    !pending ||
+    pending.kind !== 'TIME' ||
+    !flow ||
+    !evidence ||
+    pending.flowId !== flow.flowId ||
+    flow.fixedServiceId !== evidence.serviceId ||
+    flow.fixedProfessionalId !== evidence.professionalId ||
+    flow.resolvedDate !== evidence.date ||
+    !evidence.turnId.trim() ||
+    pending.options.length === 0 ||
+    !Number.isFinite(Date.parse(pending.askedAt))
+  ) {
+    return null;
+  }
+  const slots = pending.options.map((option) => option.entityId);
+  if (
+    new Set(slots).size !== slots.length ||
+    pending.options.some((option, index) => option.position !== index + 1) ||
+    slots.some(
+      (slot) =>
+        !/^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(slot) ||
+        !evidence.slots.includes(slot)
+    )
+  ) {
+    return null;
+  }
+  return { date: evidence.date, slots };
+}
+
+/**
  * Exceção v2 estrita para um resumo ainda não escrito. As quatro condições são
  * cumulativas; falha em qualquer uma preserva integralmente o reason herdado.
  */
@@ -790,6 +841,8 @@ export function isLicensedPreBookingSummaryV2(
   }
 
   const licensedTimes = currentTurnSlotEvidenceV2(input.toolTrace ?? []);
+  const pendingEvidence = pendingTimeSlotEvidenceV2(input);
+  for (const slot of pendingEvidence?.slots ?? []) licensedTimes.add(slot);
   const draft = input.flowState?.bookingDraft;
   const slotEvidence = input.flowState?.slotEvidence;
   if (
@@ -811,7 +864,8 @@ export function isLicensedPreBookingSummaryV2(
   ) {
     return false;
   }
-  const expectedDate = draft?.date ?? input.flowState?.resolvedDate;
+  const expectedDate =
+    draft?.date ?? pendingEvidence?.date ?? input.flowState?.resolvedDate;
   if (!expectedDate || !candidateMentionsResolvedDateV2(candidate, expectedDate, input.temporalContext)) {
     return false;
   }
@@ -1209,7 +1263,7 @@ function v2FactReasons(
   }
   if (
     SOFT_AVAILABILITY_RE.test(normalize(normalizedCandidate)) &&
-    !availabilityClaimLicensed(normalizedCandidate, toolTrace)
+    !availabilityClaimLicensed(normalizedCandidate, input)
   ) {
     reasons.add('UNVERIFIED_AVAILABILITY');
   }
@@ -1304,7 +1358,8 @@ export function evaluateBoundaryV2(
     input.forbiddenAppointmentIds ?? [],
     toolTrace,
     input.sourceInboundText,
-    input.temporalContext
+    input.temporalContext,
+    pendingTimeSlotEvidenceV2(input)?.slots ?? []
   );
   const discardedPreBookingAppointmentContext =
     inspection.reasons.includes('unverified_appointment_context') &&
@@ -1336,6 +1391,8 @@ export function evaluateBoundaryV2(
         sourceInboundText: input.sourceInboundText,
         actionRecorded: input.actionRecorded,
         temporalContext: input.temporalContext,
+        verifiedAvailabilitySlots:
+          pendingTimeSlotEvidenceV2(input)?.slots ?? [],
         ...(input.replyPurpose === 'SOCIAL'
           ? { disableSocialContextDrift: true }
           : {}),

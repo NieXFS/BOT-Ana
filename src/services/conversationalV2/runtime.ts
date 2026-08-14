@@ -1193,6 +1193,7 @@ export async function getReceptionistReplyV2(input: {
       pendingAnaOpen:
         frame.pending !== null &&
         frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
     },
     toolTrace: loop.toolTrace as ToolTraceLike[],
     canonicalPendingQuestion:

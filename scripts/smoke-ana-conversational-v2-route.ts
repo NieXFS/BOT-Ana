@@ -495,6 +495,7 @@ async function main(): Promise<void> {
     options: [
       { position: 1, entityId: '14:00', displayName: '14:00' },
       { position: 2, entityId: '15:00', displayName: '15:00' },
+      { position: 3, entityId: '17:00', displayName: '17:00' },
     ],
   });
   const timeFastPath = resolveSelectionFastPathV2({
@@ -511,7 +512,7 @@ async function main(): Promise<void> {
           serviceId: 'svc-drenagem',
           professionalId: 'prof-julia',
           date: '2026-08-14',
-          slots: ['14:00', '15:00'],
+          slots: ['14:00', '15:00', '17:00'],
         },
         fixedByProofVersion: {
           fixedServiceId: 1,
@@ -543,7 +544,14 @@ async function main(): Promise<void> {
     assert.match(timeFastPath.result.reply, /Confirmando: Drenagem Linfática/);
   }
 
-  for (const inboundText of ['pode ser às 15', 'as 15', '15']) {
+  for (const [inboundText, expectedTime] of [
+    ['pode ser às 15', '15:00'],
+    ['as 15', '15:00'],
+    ['15', '15:00'],
+    ['as 17', '17:00'],
+    ['17', '17:00'],
+    ['17h', '17:00'],
+  ] as const) {
     const bareTimeFastPath = resolveSelectionFastPathV2({
       frame: {
         ...promptFrame,
@@ -558,7 +566,7 @@ async function main(): Promise<void> {
             serviceId: 'svc-drenagem',
             professionalId: 'prof-julia',
             date: '2026-08-14',
-            slots: ['14:00', '15:00'],
+            slots: ['14:00', '15:00', '17:00'],
           },
           fixedByProofVersion: {
             fixedServiceId: 1,
@@ -574,7 +582,10 @@ async function main(): Promise<void> {
     });
     assert.equal(bareTimeFastPath.kind, 'resolved', inboundText);
     if (bareTimeFastPath.kind === 'resolved') {
-      assert.equal(bareTimeFastPath.nextFlowState.bookingDraft?.time, '15:00');
+      assert.equal(
+        bareTimeFastPath.nextFlowState.bookingDraft?.time,
+        expectedTime
+      );
       assert.deepEqual(
         bareTimeFastPath.result.pendingTransitionCandidate.kind === 'open'
           ? bareTimeFastPath.result.pendingTransitionCandidate.pendingKind
@@ -620,9 +631,84 @@ async function main(): Promise<void> {
   });
   assert.equal(
     ambiguousBareTime.kind,
-    'continue_model',
-    '15:00 e 15:30 tornam "15" ambíguo; nunca escolhe silenciosamente'
+    'resolved',
+    '15:00 e 15:30 tornam "15" uma clarificação determinística'
   );
+  if (ambiguousBareTime.kind === 'resolved') {
+    assert.equal(ambiguousBareTime.proof, null);
+    assert.equal(ambiguousBareTime.result.reply, '15h ou 15h30?');
+    assert.deepEqual(
+      ambiguousBareTime.result.pendingTransitionCandidate,
+      { kind: 'preserve' }
+    );
+    assert.equal(ambiguousBareTime.nextFlowState.bookingDraft, undefined);
+  }
+
+  const nakedTimeOrdinal = resolveSelectionFastPathV2({
+    frame: {
+      ...promptFrame,
+      pending: timePending,
+      flowState: {
+        flowId: timePending.flowId,
+        fixedServiceId: 'svc-drenagem',
+        fixedProfessionalId: 'prof-julia',
+        resolvedDate: '2026-08-14',
+        slotEvidence: {
+          turnId: 'turn-slot-evidence',
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-14',
+          slots: ['14:00', '15:00', '17:00'],
+        },
+        fixedByProofVersion: {
+          fixedServiceId: 1,
+          fixedProfessionalId: 1,
+          resolvedDate: 1,
+        },
+      },
+    },
+    inboundId: 'inbound-time-naked-ordinal',
+    inboundText: '2',
+    catalog: services,
+    now,
+  });
+  assert.equal(
+    nakedTimeOrdinal.kind,
+    'continue_model',
+    'dígito nu em TIME nunca significa posição ordinal'
+  );
+  const explicitTimeOrdinal = resolveSelectionFastPathV2({
+    frame: {
+      ...promptFrame,
+      pending: timePending,
+      flowState: {
+        flowId: timePending.flowId,
+        fixedServiceId: 'svc-drenagem',
+        fixedProfessionalId: 'prof-julia',
+        resolvedDate: '2026-08-14',
+        slotEvidence: {
+          turnId: 'turn-slot-evidence',
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-14',
+          slots: ['14:00', '15:00', '17:00'],
+        },
+        fixedByProofVersion: {
+          fixedServiceId: 1,
+          fixedProfessionalId: 1,
+          resolvedDate: 1,
+        },
+      },
+    },
+    inboundId: 'inbound-time-explicit-ordinal',
+    inboundText: 'opção 2',
+    catalog: services,
+    now,
+  });
+  assert.equal(explicitTimeOrdinal.kind, 'resolved');
+  if (explicitTimeOrdinal.kind === 'resolved') {
+    assert.equal(explicitTimeOrdinal.nextFlowState.bookingDraft?.time, '15:00');
+  }
 
   const reducerSlots = reduceToolLifecycleV2({
     frame: promptFrame,
@@ -997,7 +1083,7 @@ async function main(): Promise<void> {
       serviceId: 'svc-drenagem',
       professionalId: 'prof-julia',
       date: '2026-08-14',
-      slots: ['14:00', '15:00'],
+      slots: ['14:00', '15:00', '17:00'],
     },
     fixedByProofVersion: {
       fixedServiceId: 1,
@@ -1107,6 +1193,85 @@ async function main(): Promise<void> {
     bareTimeWrite?.result.pendingTransitionCandidate.kind,
     'resolve',
     'bookAppointment success fecha a CONFIRMATION do caminho feliz'
+  );
+
+  const ambiguousTimeStore = new MemoryConversationalV2StateStore();
+  const ambiguousTimePhone = '5511000000021';
+  const ambiguousTimeKey = `${config.phoneNumberId}:${ambiguousTimePhone}`;
+  const ambiguousTimePending = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '17:00', displayName: '17:00' },
+      { position: 2, entityId: '17:30', displayName: '17:30' },
+    ],
+  });
+  seedPending(ambiguousTimeStore, ambiguousTimeKey, ambiguousTimePending, {
+    flowId: ambiguousTimePending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-slot-evidence-ambiguous-runtime',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['17:00', '17:30'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  ambiguousTimeStore.setInputSequence(ambiguousTimeKey, 1);
+  let ambiguousTimeModelCalls = 0;
+  const ambiguousTimePrepared = await getReceptionistReplyV2({
+    phone: ambiguousTimePhone,
+    userMessage: '17',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: '17' }),
+    deps: {
+      ...baseDeps(ambiguousTimeStore),
+      runModelLoop: async () => {
+        ambiguousTimeModelCalls += 1;
+        throw new Error('hora nua ambígua usa clarificação determinística');
+      },
+    },
+  });
+  assert.equal(ambiguousTimeModelCalls, 0);
+  assert.equal(ambiguousTimePrepared.planReceipt.route, 'fast_path');
+  assert.equal(ambiguousTimePrepared.payload, '17h ou 17h30?');
+  assert.equal(ambiguousTimePrepared.transition.kind, 'preserve');
+  await deliverPreparedReceptionistTurnV2(ambiguousTimePrepared, {
+    store: ambiguousTimeStore,
+    id: nextId,
+    now: () => now,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  const ambiguousTimeAccepted = await ambiguousTimeStore.loadLatestState(
+    ambiguousTimeKey,
+    now
+  );
+  assert.equal(
+    ambiguousTimeAccepted.pending?.snapshot.version,
+    ambiguousTimePending.version,
+    'clarificação de hora preserva a mesma versão TIME OPEN'
+  );
+  assert.deepEqual(
+    ambiguousTimeAccepted.pending?.snapshot.options,
+    ambiguousTimePending.options
+  );
+  assert.equal(
+    ambiguousTimeAccepted.pending?.flowState.bookingDraft,
+    undefined,
+    'hora ambígua nunca cria BookingDraft'
   );
 
   // Regressão do loop real: tentativa após "pode" é bloqueada, a copy falsa

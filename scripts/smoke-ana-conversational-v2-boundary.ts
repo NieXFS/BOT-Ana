@@ -667,6 +667,96 @@ assert.equal(
   'K3: horário escolhido sem leitura é contraprova e não licencia resumo'
 );
 
+const crossTurnTimeFlowState = {
+  ...cleaningFlowState,
+  slotEvidence: {
+    turnId: 'turn-that-opened-time',
+    serviceId: 'svc-limpeza',
+    professionalId: 'prof-carla',
+    date: '2026-08-13',
+    slots: ['14:00', '15:00', '17:00'],
+  },
+  fixedByProofVersion: {
+    ...cleaningFlowState.fixedByProofVersion,
+    resolvedDate: 3,
+  },
+};
+const crossTurnTimePending = {
+  questionId: 'question-time-cross-turn',
+  askedAt: '2026-08-13T11:55:00.000Z',
+  kind: 'TIME' as const,
+  flowId: cleaningFlowState.flowId,
+  version: 4,
+  options: [
+    { position: 1, entityId: '14:00', displayName: '14:00' },
+    { position: 2, entityId: '15:00', displayName: '15:00' },
+    { position: 3, entityId: '17:00', displayName: '17:00' },
+  ],
+};
+const crossTurnSummary = boundary(
+  'Ótimo, tenho horário às 17h disponível hoje. Confirmando: Limpeza de pele profunda, hoje às 17h, com a Carla. Posso marcar?',
+  {
+    servicesResult: preBookingServices,
+    flowState: crossTurnTimeFlowState,
+    sourceInboundText: '17',
+    inboundTextsById: { 'in-current': '17' },
+    toolTrace: [],
+    pendingAnaOpen: true,
+    pendingSnapshot: crossTurnTimePending,
+    temporalContext: {
+      now: new Date('2026-08-13T12:00:00.000Z'),
+      timezone: 'America/Sao_Paulo',
+    },
+    pendingTransitionCandidate: {
+      kind: 'open',
+      pendingKind: 'CONFIRMATION',
+      flowId: cleaningFlowState.flowId,
+      optionEntityIds: [`booking-confirmation:${cleaningFlowState.flowId}`],
+    },
+  }
+);
+assert.equal(
+  crossTurnSummary.safe,
+  true,
+  `TIME OPEN entregue licencia seu próprio slot: ${crossTurnSummary.reasonCodes.join(',')}`
+);
+assert.equal(
+  crossTurnSummary.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  false
+);
+assert.equal(
+  crossTurnSummary.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
+  false
+);
+
+const crossTurnOutsideOptions = boundary(
+  'Tenho horário às 16h disponível hoje. Confirmando: Limpeza de pele profunda, hoje às 16h, com a Carla. Posso marcar?',
+  {
+    servicesResult: preBookingServices,
+    flowState: crossTurnTimeFlowState,
+    sourceInboundText: '16',
+    inboundTextsById: { 'in-current': '16' },
+    toolTrace: [],
+    pendingAnaOpen: true,
+    pendingSnapshot: crossTurnTimePending,
+    temporalContext: {
+      now: new Date('2026-08-13T12:00:00.000Z'),
+      timezone: 'America/Sao_Paulo',
+    },
+  }
+);
+assert.equal(crossTurnOutsideOptions.safe, false);
+assert.equal(
+  crossTurnOutsideOptions.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  true,
+  'hora fora das options continua exigindo leitura no turno'
+);
+assert.equal(
+  crossTurnOutsideOptions.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
+  true,
+  'hora fora das options não licencia resumo'
+);
+
 for (const [label, candidate, extra] of [
   [
     'sem pergunta de confirmação',

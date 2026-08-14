@@ -177,6 +177,8 @@ export async function coordinateRecoveryV2(
       route: input.boundaryContext.route ?? 'model',
       pendingAnaOpen:
         input.boundaryContext.pendingAnaOpen ?? input.frame.pending !== null,
+      pendingSnapshot:
+        input.boundaryContext.pendingSnapshot ?? input.frame.pending,
     });
     boundaryAttempts.push({
       index: boundaryAttempts.length,

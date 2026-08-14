@@ -107,6 +107,8 @@ export interface ReceptionistOutboundEvidence {
   disableSocialContextDrift?: boolean;
   /** Instante e fuso do turno usados para validar hoje/amanhã deterministicamente. */
   temporalContext?: AppointmentTemporalContext;
+  /** Slots tipados já entregues em PendingFrame TIME; rota v2 somente. */
+  verifiedAvailabilitySlots?: readonly string[];
 }
 
 export interface ReceptionistOutboundEnvelope {
@@ -304,6 +306,9 @@ function currencyTextToCents(raw: string): number | null {
 
 function offeredSlots(evidence?: ReceptionistOutboundEvidence): Set<string> {
   const slots = new Set<string>();
+  for (const slot of evidence?.verifiedAvailabilitySlots ?? []) {
+    if (/^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(slot)) slots.add(slot);
+  }
   for (const entry of evidence?.toolTrace ?? []) {
     if (entry.name !== 'getAvailableSlots' && entry.name !== 'bookAppointment') continue;
     try {
