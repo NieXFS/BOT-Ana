@@ -77,7 +77,7 @@ export interface BoundaryEvaluationInputV2 {
   >;
   serviceRelistExempt?: boolean;
   /** Rota que invocou a boundary; social estrita usa sua blocklist própria. */
-  route?: 'model' | 'social';
+  route?: 'model' | 'social' | 'interpreter';
   /** Snapshot tipado: existe PendingFrame.OPEN originado pela Ana. */
   pendingAnaOpen?: boolean;
   pendingSnapshot?: PendingFrameSnapshotV2 | null;

@@ -358,7 +358,15 @@ export interface TurnPlanReceiptV2 {
   turnId: string;
   frameHash: string;
   inputSequence: number;
-  route: 'fast_path' | 'model' | 'regen' | 'fallback' | 'preempted';
+  route:
+    | 'fast_path'
+    | 'model'
+    | 'regen'
+    | 'fallback'
+    | 'preempted'
+    | 'interpreter_hit'
+    | 'interpreter_nenhuma'
+    | 'interpreter_error';
   /** Fingerprint técnico do motor; nunca contém prompt, fala ou identificador. */
   provider: 'openai' | 'deepseek' | 'luna';
   requestedModel: string;

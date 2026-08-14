@@ -61,11 +61,12 @@ interface CliOptions {
   thinking: boolean;
   elicitation: ElicitationVariantV2;
   provider: HarnessProvider;
+  interpreter: boolean;
 }
 
 interface ProviderCallMetric {
   provider: HarnessProvider;
-  kind: 'brain' | 'social' | 'regen' | 'resume_thinking';
+  kind: 'brain' | 'social' | 'regen' | 'resume_thinking' | 'interpreter';
   scenarioId: string;
   stepId: string;
   repetition: number;
@@ -88,7 +89,7 @@ interface ParseFailureArtifact {
 }
 
 interface ModelOutputArtifact {
-  stage: 'primary' | 'regen' | 'social';
+  stage: 'primary' | 'regen' | 'social' | 'interpreter';
   loopInvocation: number | null;
   round: number | null;
   completionAttempt: number;
@@ -227,6 +228,7 @@ interface RunContext {
     HUMAN_ECHO_PREFIX: string;
     buildConversationKey: typeof import('../src/services/contextManager').buildConversationKey;
     parseModelTurnResultV2: typeof import('../src/services/conversationalV2/modelResultParser').parseModelTurnResultV2;
+    interpretPowerZeroV2: typeof import('../src/services/conversationalV2/powerZeroInterpreter').interpretPowerZeroV2;
   };
   calls: ProviderCallMetric[];
   mockUnwrapVariants: Set<MockUnwrapVariant>;
@@ -262,6 +264,9 @@ const ALLOWED_ROUTES = new Set([
   'regen',
   'fallback',
   'preempted',
+  'interpreter_hit',
+  'interpreter_nenhuma',
+  'interpreter_error',
 ]);
 const OPERATIONAL_PROGRESS_STEP_IDS = new Set([
   'R1.1',
@@ -293,6 +298,7 @@ function parseArgs(argv: string[]): CliOptions {
   let maxCostUsd: number | null = null;
   let thinking = false;
   let provider: HarnessProvider = 'deepseek';
+  let interpreter = false;
   let elicitation: ElicitationVariantV2 = 'v1';
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
@@ -316,16 +322,28 @@ function parseArgs(argv: string[]): CliOptions {
       maxCostUsd = Number(argv[++index]);
     } else if (arg === '--thinking') {
       thinking = true;
+    } else if (arg === '--interpreter') {
+      const value = (argv[++index] ?? '').toLowerCase();
+      if (value === 'on') interpreter = true;
+      else if (value === 'off') interpreter = false;
+      else throw new Error('--interpreter deve ser on ou off.');
+    } else if (arg.startsWith('--interpreter=')) {
+      const value = arg.slice('--interpreter='.length).toLowerCase();
+      if (value === 'on') interpreter = true;
+      else if (value === 'off') interpreter = false;
+      else throw new Error('--interpreter deve ser on ou off.');
     } else if (arg === '--provider') {
       const value = (argv[++index] ?? '').toLowerCase();
       if (value === 'gpt-4o-mini') provider = 'openai';
+      else if (value === 'flash') provider = 'deepseek';
       else if (value === 'deepseek' || value === 'openai' || value === 'luna') provider = value;
-      else throw new Error('--provider deve ser deepseek, openai, gpt-4o-mini ou luna.');
+      else throw new Error('--provider deve ser flash, deepseek, openai, gpt-4o-mini ou luna.');
     } else if (arg.startsWith('--provider=')) {
       const value = arg.slice('--provider='.length).toLowerCase();
       if (value === 'gpt-4o-mini') provider = 'openai';
+      else if (value === 'flash') provider = 'deepseek';
       else if (value === 'deepseek' || value === 'openai' || value === 'luna') provider = value;
-      else throw new Error('--provider deve ser deepseek, openai, gpt-4o-mini ou luna.');
+      else throw new Error('--provider deve ser flash, deepseek, openai, gpt-4o-mini ou luna.');
     } else if (arg === '--elicitation') {
       const value = (argv[++index] ?? '').toLowerCase();
       if (!['v1', 'v2', 'v3', 'v4'].includes(value)) {
@@ -340,7 +358,7 @@ function parseArgs(argv: string[]): CliOptions {
       elicitation = value as ElicitationVariantV2;
     } else if (arg === '--help' || arg === '-h') {
       console.log(
-        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--provider deepseek|openai|gpt-4o-mini|luna] [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
+        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--provider flash|deepseek|openai|gpt-4o-mini|luna] [--interpreter on|off] [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
       );
       process.exit(0);
     } else {
@@ -376,6 +394,7 @@ function parseArgs(argv: string[]): CliOptions {
     thinking,
     elicitation,
     provider,
+    interpreter,
   };
 }
 
@@ -392,6 +411,9 @@ function neutralizeEnvironment(options: CliOptions): void {
   process.env.DEEPSEEK_PRODUCTION_APPROVED = 'false';
   process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS = ROTEIROS_TENANT_SLUG;
   process.env.ANA_CONVERSATIONAL_V2_ELICITATION = options.elicitation;
+  process.env.ANA_CONVERSATIONAL_V2_INTERPRETER_ENABLED = options.interpreter
+    ? 'true'
+    : 'false';
   if (options.mode === 'mock') {
     process.env.OPENAI_API_KEY = 'sk-mock-provider-no-network';
     process.env.OPENAI_API_KEY_LUNA = 'sk-mock-luna-no-network';
@@ -1745,6 +1767,7 @@ function deterministicChecks(input: {
         'operational_progress_route',
         prepared.planReceipt.route !== 'fallback' &&
           prepared.planReceipt.route !== 'preempted' &&
+          prepared.planReceipt.recoveryKind !== 'direct_fallback' &&
           prepared.preemption === null,
         `progresso operacional pela rota ${prepared.planReceipt.route}, sem fallback/preempção`
       )
@@ -2152,6 +2175,61 @@ async function runCustomerTurn(
     return result;
   };
 
+  const runInterpreter: typeof ctx.runtime.interpretPowerZeroV2 = async (input) =>
+    ctx.runtime.interpretPowerZeroV2({
+      ...input,
+      completionFactory: async (completionInput) => {
+        let completion: OpenAI.Chat.Completions.ChatCompletion;
+        if (ctx.options.mode === 'mock') {
+          const started = Date.now();
+          completion = syntheticCompletion({
+            content: JSON.stringify({ choice: 'NENHUMA' }),
+          });
+          completion.model =
+            ctx.options.provider === 'luna'
+              ? 'gpt-5.6-luna-mock'
+              : ctx.options.provider === 'openai'
+                ? 'gpt-4o-mini-mock'
+                : 'deepseek-v4-flash-mock';
+          ctx.calls.push(
+            metricFromCompletion(
+              completion,
+              Date.now() - started,
+              'interpreter',
+              session.scenarioId,
+              step.id,
+              session.repetition,
+              ctx.options.provider
+            )
+          );
+        } else {
+          completion = await trackedCompletion(ctx, session, 'interpreter', () =>
+            ctx.runtime.createReceptionistChatCompletion(
+              ctx.runtime.resolveReceptionistAiRuntime(config),
+              {
+                messages: completionInput.messages,
+                tools: [],
+                temperature: 0,
+                maxTokens: 160,
+                thinkingMode: 'disabled',
+                responseFormat: 'json_object',
+                timeoutMs: completionInput.timeoutMs,
+              }
+            )
+          );
+        }
+        recordModelOutput(session, {
+          stage: 'interpreter',
+          loopInvocation: null,
+          round: 1,
+          completionAttempt: 1,
+          responseFormat: 'json_object',
+          completion,
+        });
+        return completion;
+      },
+    });
+
   const composeSocial: typeof ctx.runtime.composeSocialReplyV2 = (input) =>
     ctx.runtime.composeSocialReplyV2({
       ...input,
@@ -2360,6 +2438,7 @@ async function runCustomerTurn(
     config,
     elicitationVariant: ctx.options.elicitation,
     thinkingMode: ctx.options.thinking ? 'enabled' : 'disabled',
+    interpreterEnabled: ctx.options.interpreter,
     turnControl: turnControl.control,
     turnRuntime: {
       turnId: nextId(session, 'turn'),
@@ -2382,6 +2461,8 @@ async function runCustomerTurn(
         session.history.map(({ role, content }) => ({ role, content })),
       isPaused: async () => false,
       runModelLoop,
+      interpreterEnabled: ctx.options.interpreter,
+      runInterpreter,
       executeTool: session.executeTool,
       composeSocial,
       regenerate,
@@ -2649,6 +2730,7 @@ function markdownReport(input: {
           : 'Flash non-thinking'
   }
 - Elicitação: ${input.options.elicitation}
+- Intérprete poder-zero: ${input.options.interpreter ? 'on' : 'off'}
 - Repetições: ${input.options.repeats}
 - Chamadas: ${input.calls.length}
 - Tokens: prompt ${tokens.prompt} · completion ${tokens.completion} · reasoning ${tokens.reasoning} · total ${tokens.total}
@@ -2744,7 +2826,13 @@ async function findComparableArmReport(
 ): Promise<any | null> {
   const entries = await readdir(parentDir, { withFileTypes: true });
   const candidates = entries
-    .filter((entry) => entry.isDirectory() && entry.name.endsWith(`-${arm}`))
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        entry.name.endsWith(
+          `-${arm}-interpreter-${current.interpreterEnabled ? 'on' : 'off'}`
+        )
+    )
     .map((entry) => entry.name)
     .sort()
     .reverse();
@@ -2759,6 +2847,7 @@ async function findComparableArmReport(
         parsed.schemaVersion === current.schemaVersion &&
         parsed.repeats === current.repeats &&
         parsed.elicitationVariant === current.elicitationVariant &&
+        parsed.interpreterEnabled === current.interpreterEnabled &&
         JSON.stringify(parsed.selectedScenarioIds) ===
           JSON.stringify(current.selectedScenarioIds)
       ) {
@@ -2783,6 +2872,7 @@ async function loadRuntime(): Promise<RunContext['runtime']> {
     classifier,
     flags,
     contextManager,
+    interpreter,
   ] = await Promise.all([
     import('../src/services/conversationalV2/stateStore'),
     import('../src/services/conversationalV2/runtime'),
@@ -2794,6 +2884,7 @@ async function loadRuntime(): Promise<RunContext['runtime']> {
     import('../src/services/anaResumeClassifier'),
     import('../src/services/conversationalV2/featureFlag'),
     import('../src/services/contextManager'),
+    import('../src/services/conversationalV2/powerZeroInterpreter'),
   ]);
   return {
     MemoryConversationalV2StateStore: stateStore.MemoryConversationalV2StateStore,
@@ -2814,6 +2905,7 @@ async function loadRuntime(): Promise<RunContext['runtime']> {
     parseModelTurnResultV2: (
       await import('../src/services/conversationalV2/modelResultParser')
     ).parseModelTurnResultV2,
+    interpretPowerZeroV2: interpreter.interpretPowerZeroV2,
   };
 }
 
@@ -2951,7 +3043,7 @@ async function main(): Promise<void> {
   );
   const outputDir = path.join(
     outputParent,
-    `${timestamp}-${options.elicitation}-${arm}`
+    `${timestamp}-${options.elicitation}-${arm}-interpreter-${options.interpreter ? 'on' : 'off'}`
   );
   await mkdir(outputDir, { recursive: true });
   const callLatencies = ctx.calls.map((call) => call.durationMs);
@@ -2985,6 +3077,7 @@ async function main(): Promise<void> {
     provider: options.provider,
     arm,
     elicitationVariant: options.elicitation,
+    interpreterEnabled: options.interpreter,
     thinkingMode: options.thinking ? 'enabled' : 'disabled',
     repeats: options.repeats,
     selectedScenarioIds: selected.map((scenario) => scenario.id),

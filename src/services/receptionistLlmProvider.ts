@@ -52,6 +52,8 @@ export interface ReceptionistCompletionInput {
   thinkingMode?: DeepSeekThinkingMode;
   /** Opt-in estrutural para completions JSON one-shot; nunca usado no social. */
   responseFormat?: 'json_object';
+  /** Override estreito por chamada; o intérprete poder-zero usa fail-fast. */
+  timeoutMs?: number;
 }
 
 export interface AnaResumeClassifierCompletionInput {
@@ -592,15 +594,19 @@ export async function createReceptionistChatCompletion(
   runtime: ReceptionistAiRuntime,
   input: ReceptionistCompletionInput
 ): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+  const requestOptions = input.timeoutMs
+    ? { timeout: input.timeoutMs }
+    : undefined;
   if (runtime.transport === 'responses') {
     const response = await getClient(runtime).responses.create(
-      buildLunaResponsesRequest(runtime, input)
+      buildLunaResponsesRequest(runtime, input),
+      requestOptions
     );
     return normalizeLunaResponseToChatCompletion(response);
   }
   const request = buildReceptionistCompletionRequest(runtime, input);
   return getClient(runtimeForStrictToolEndpoint(runtime, input.tools))
-    .chat.completions.create(request);
+    .chat.completions.create(request, requestOptions);
 }
 
 /**

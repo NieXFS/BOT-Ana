@@ -8,7 +8,12 @@ import type {
   UpcomingAppointment,
 } from '../calendarService';
 import { professionalSelectionGate } from '../professional-selection-gate';
-import { classifyExistingAppointmentIntent } from '../receptionistTurnGrounding';
+import {
+  STANDALONE_CANCEL_CUSTOMER_MESSAGE,
+  buildExistingAppointmentReply,
+  classifyExistingAppointmentIntent,
+  type ExistingAppointmentIntent,
+} from '../receptionistTurnGrounding';
 import type {
   ModelTurnResultV2,
   ResolutionProof,
@@ -16,6 +21,7 @@ import type {
 } from './contracts';
 import { hasPositiveClauseMatchV2 } from './polarity';
 import { displayDateV2 } from './lifecycleReducer';
+import { stripPowerZeroMetalinguisticAssignmentsV2 } from './powerZeroWitness';
 
 const UPCOMING_READ_REQUEST_RE =
   /\b(?:(?:ver|consultar|conferir|mostrar|mostra|lembrar|lembra)\b(?:\s+\w+){0,7}\b(?:agendamentos?|horarios?|marcacoes?)|(?:meus?|minhas?)\s+(?:agendamentos?|horarios?|marcacoes?)|(?:quando|qual\s+dia|que\s+dia|que\s+horario)\b(?:\s+\w+){0,6}\b(?:agendamento|horario|marcado)|(?:tenho|tem)\b(?:\s+\w+){0,5}\b(?:agendamento|horario)\b|(?:remarcar|reagendar|cancelar|desmarcar)\b)/gu;
@@ -56,9 +62,10 @@ function normalize(value: string): string {
 }
 
 export function hasExplicitUpcomingReadRequestV2(value: string): boolean {
+  const witnessedValue = stripPowerZeroMetalinguisticAssignmentsV2(value);
   return (
-    classifyExistingAppointmentIntent(value) !== 'none' ||
-    hasPositiveClauseMatchV2(value, UPCOMING_READ_REQUEST_RE)
+    classifyExistingAppointmentIntent(witnessedValue) !== 'none' ||
+    hasPositiveClauseMatchV2(witnessedValue, UPCOMING_READ_REQUEST_RE)
   );
 }
 
@@ -187,23 +194,69 @@ function formatAppointment(
   return `${appointment.serviceName.trim()} em ${date} às ${time} com ${appointment.professionalName.trim()}`;
 }
 
-function upcomingSuccessCopy(
-  parsed: Record<string, unknown>,
+function localAppointmentDate(
+  appointment: UpcomingAppointment,
   timezone: string
 ): string | null {
+  const instant = new Date(appointment.startTime);
+  if (Number.isNaN(instant.getTime())) return null;
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(instant);
+}
+
+function parsedUpcomingAppointments(
+  parsed: Record<string, unknown>,
+  timezone: string,
+  dateFilter?: string
+): UpcomingAppointment[] | null {
   if (!Array.isArray(parsed.appointments)) return null;
-  if (parsed.appointments.length === 0) {
+  const appointments: UpcomingAppointment[] = [];
+  for (const entry of parsed.appointments) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const appointment = entry as UpcomingAppointment;
+    if (!formatAppointment(appointment, timezone)) return null;
+    if (
+      dateFilter &&
+      localAppointmentDate(appointment, timezone) !== dateFilter
+    ) {
+      continue;
+    }
+    appointments.push(appointment);
+  }
+  return appointments;
+}
+
+function upcomingSuccessCopy(
+  parsed: Record<string, unknown>,
+  timezone: string,
+  dateFilter?: string
+): string | null {
+  const appointments = parsedUpcomingAppointments(parsed, timezone, dateFilter);
+  if (!appointments) return null;
+  if (appointments.length === 0) {
     return 'Não encontrei agendamentos futuros para você.';
   }
-  const formatted = parsed.appointments.map((entry) =>
-    entry && typeof entry === 'object' && !Array.isArray(entry)
-      ? formatAppointment(entry as UpcomingAppointment, timezone)
-      : null
-  );
-  if (formatted.some((entry) => !entry)) return null;
+  const formatted = appointments.map((entry) => formatAppointment(entry, timezone));
   return formatted.length === 1
     ? `Encontrei este agendamento: ${formatted[0]}.`
     : `Encontrei estes agendamentos: ${formatted.join('; ')}.`;
+}
+
+function forcedExistingIntentCopy(
+  intent: Exclude<ExistingAppointmentIntent, 'none' | 'inspect'>,
+  parsed: Record<string, unknown>,
+  timezone: string,
+  dateFilter?: string
+): string | null {
+  const appointments = parsedUpcomingAppointments(parsed, timezone, dateFilter);
+  if (!appointments) return null;
+  return intent === 'cancel'
+    ? STANDALONE_CANCEL_CUSTOMER_MESSAGE
+    : buildExistingAppointmentReply('reschedule', appointments, timezone);
 }
 
 function validSlots(parsed: Record<string, unknown>): string[] | null {
@@ -288,6 +341,9 @@ export async function resolveReadFastPathV2(input: {
   config: TenantBotConfig;
   duplicateResolutionProof?: ResolutionProof | null;
   forceUpcomingRead?: boolean;
+  forcedExistingIntent?: Exclude<ExistingAppointmentIntent, 'none'>;
+  /** Recorte somente por data civil unívoca resolvida no lote completo. */
+  upcomingDateFilter?: string;
   now?: Date;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<ReadFastPathResultV2> {
@@ -310,7 +366,18 @@ export async function resolveReadFastPathV2(input: {
     };
     const successCopy =
       read.parsed?.success === true
-        ? upcomingSuccessCopy(read.parsed, input.config.timezone)
+        ? input.forcedExistingIntent && input.forcedExistingIntent !== 'inspect'
+          ? forcedExistingIntentCopy(
+              input.forcedExistingIntent,
+              read.parsed,
+              input.config.timezone,
+              input.upcomingDateFilter
+            )
+          : upcomingSuccessCopy(
+              read.parsed,
+              input.config.timezone,
+              input.upcomingDateFilter
+            )
         : null;
     const reply = successCopy ?? canonicalReadFailureCopyV2(
       'upcoming',

@@ -620,6 +620,58 @@ function professionalFollowUp(
   };
 }
 
+/**
+ * Aplica somente uma prova já validada pelo intérprete no inbound completo.
+ * O intérprete não cria IDs, lifecycle nem prova de CONFIRMATION; este helper
+ * apenas reutiliza as mesmas copies/reducers server-owned do fast-path normal.
+ */
+export function resolveInterpreterPendingOptionFastPathV2(input: {
+  frame: TurnFrameV2;
+  proof: Extract<ResolutionProof, { kind: 'catalog_entity' | 'pending_option' }>;
+  catalog: ServicesResult;
+}): FastPathResultV2 {
+  const pending = input.frame.pending;
+  if (
+    !pending ||
+    pending.flowId !== input.frame.flowState.flowId ||
+    !['SERVICE', 'PROFESSIONAL', 'TIME'].includes(pending.kind)
+  ) {
+    return { kind: 'continue_model', reason: 'interpreter_pending_not_allowlisted' };
+  }
+  const option = pending.options.find(
+    (entry) => entry.entityId === input.proof.entityId
+  );
+  if (!option) {
+    return { kind: 'continue_model', reason: 'interpreter_option_not_in_pending' };
+  }
+  if (pending.kind === 'TIME') {
+    if (input.proof.kind !== 'pending_option') {
+      return { kind: 'continue_model', reason: 'interpreter_time_without_pending_proof' };
+    }
+    const followUp = buildTimeSelectionFollowUpV2(
+      option.entityId,
+      input.frame,
+      input.catalog
+    );
+    return followUp
+      ? { kind: 'resolved', ...followUp, proof: input.proof }
+      : { kind: 'continue_model', reason: 'interpreter_time_without_slot_evidence' };
+  }
+  if (
+    input.proof.kind !== 'catalog_entity' ||
+    input.proof.entityKind !==
+      (pending.kind === 'SERVICE' ? 'service' : 'professional')
+  ) {
+    return { kind: 'continue_model', reason: 'interpreter_catalog_kind_mismatch' };
+  }
+  const followUp = pending.kind === 'SERVICE'
+    ? serviceFollowUp(option.entityId, input.frame, input.catalog)
+    : professionalFollowUp(option.entityId, input.frame, input.catalog);
+  return followUp
+    ? { kind: 'resolved', ...followUp, proof: input.proof }
+    : { kind: 'continue_model', reason: 'interpreter_follow_up_not_materialized' };
+}
+
 export function resolveSelectionFastPathV2(input: {
   frame: TurnFrameV2;
   inboundId: string;

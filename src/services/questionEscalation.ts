@@ -199,11 +199,15 @@ export async function maybeEscalateReceptionistQuestionV2(
     messageId: string | null;
     text: string;
     responsibleName?: string;
+    /** Somente após testemunha lexical server-side do intérprete poder-zero. */
+    witnessedHumanRequest?: boolean;
   },
   deps: EscalationDeps = defaultDeps
 ): Promise<ReceptionistEscalationV2Decision> {
   if (!isAnaEscalationEnabled() || !input.messageId) return { matched: false };
-  const reasonCode = detectEscalationReason(input.text);
+  const reasonCode =
+    detectEscalationReason(input.text) ??
+    (input.witnessedHumanRequest === true ? 'HUMAN_REQUEST' : null);
   if (!reasonCode) return { matched: false };
   const outcome = await escalateQuestion(
     {

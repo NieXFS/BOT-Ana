@@ -33,6 +33,7 @@
     "smoke:receptionist-provider": "ts-node -T scripts/smoke-receptionist-provider.ts",
     "smoke:ana-luna-responses-protocol": "ts-node -T scripts/smoke-ana-luna-responses-protocol.ts",
     "smoke:ana-conversational-v2-escalation": "ts-node -T scripts/smoke-ana-conversational-v2-escalation.ts",
+    "smoke:ana-conversational-v2-interpreter": "ts-node -T scripts/smoke-ana-conversational-v2-interpreter.ts",
     "smoke:receptionist-prompt-guards": "ts-node -T scripts/smoke-receptionist-prompt-guards.ts",
     "smoke:ana-composition-order": "ts-node -T scripts/smoke-ana-composition-order.ts",
     "smoke:clinical-copy": "ts-node -T scripts/smoke-clinical-copy-honesty.ts",

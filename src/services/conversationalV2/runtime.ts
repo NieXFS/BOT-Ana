@@ -48,6 +48,7 @@ import {
 } from './boundary';
 import {
   resolveInitialServiceQuestionFastPathV2,
+  resolveInterpreterPendingOptionFastPathV2,
   resolvePendingOptionProofV2,
   resolveSelectionFastPathV2,
 } from './fastPaths';
@@ -132,6 +133,12 @@ import {
   type MaterializedPendingTransitionV2,
   type PendingFrameRecordV2,
 } from './stateStore';
+import {
+  hasCurrentProfessionalCatalogEntityV2,
+  interpretPowerZeroV2,
+  isPowerZeroInterpreterEnabledV2,
+  type PowerZeroInterpreterResultV2,
+} from './powerZeroInterpreter';
 
 /** Arsenal fechado da rota v2: o catálogo já está congelado no TurnFrame. */
 export const RECEPTIONIST_V2_TOOLS = RECEPTIONIST_TOOLS.filter(
@@ -168,6 +175,8 @@ export interface ReceptionistV2RuntimeDeps {
   ) => Promise<RegenerationResultV2>;
   composeSocial?: typeof composeSocialReplyV2;
   escalate?: typeof maybeEscalateReceptionistQuestionV2;
+  interpreterEnabled?: boolean;
+  runInterpreter?: typeof interpretPowerZeroV2;
   /** Somente observabilidade injetada; não é recibo nem log de produção. */
   onRejectedBoundaryCandidate?: (input: {
     stage: 'primary' | 'regen';
@@ -703,6 +712,8 @@ export async function getReceptionistReplyV2(input: {
   elicitationVariant?: ElicitationVariantV2;
   /** Opt-in explícito equivalente ao deps.thinkingMode. */
   thinkingMode?: DeepSeekThinkingMode;
+  /** Braço ortogonal do intérprete poder-zero; default vem da env e é OFF. */
+  interpreterEnabled?: boolean;
   deps?: ReceptionistV2RuntimeDeps;
 }): Promise<PreparedReceptionistTurnV2> {
   const deps = input.deps ?? {};
@@ -714,6 +725,9 @@ export async function getReceptionistReplyV2(input: {
   const paused = deps.isPaused ?? isConversationPaused;
   const runLoop = deps.runModelLoop ?? runReceptionistModelLoop;
   const thinkingMode = input.thinkingMode ?? deps.thinkingMode ?? 'disabled';
+  const interpreterEnabled = isPowerZeroInterpreterEnabledV2(
+    input.interpreterEnabled ?? deps.interpreterEnabled
+  );
   const elicitationVariant = resolveElicitationVariantV2(
     input.elicitationVariant
   );
@@ -1018,13 +1032,19 @@ export async function getReceptionistReplyV2(input: {
   };
 
   const escalate = deps.escalate ?? maybeEscalateReceptionistQuestionV2;
-  const escalation = await escalate({
-    phoneNumberId: input.config.phoneNumberId,
-    customerPhone: input.phone,
-    messageId: inboundId,
-    text: currentInboundBatchText,
-    responsibleName: input.config.escalationResponsibleName ?? undefined,
+  const professionalCatalogMention = hasCurrentProfessionalCatalogEntityV2({
+    inboundText: currentInboundBatchText,
+    servicesResult: services,
   });
+  const escalation = professionalCatalogMention
+    ? ({ matched: false } as const)
+    : await escalate({
+        phoneNumberId: input.config.phoneNumberId,
+        customerPhone: input.phone,
+        messageId: inboundId,
+        text: currentInboundBatchText,
+        responsibleName: input.config.escalationResponsibleName ?? undefined,
+      });
   if (escalation.matched) {
     const candidate = { kind: 'preserve' } as const;
     const evaluation = evaluateBoundaryV2({
@@ -1408,6 +1428,140 @@ export async function getReceptionistReplyV2(input: {
     duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved' &&
     selectionFastPath?.kind !== 'resolved';
+
+  let interpreterResult: PowerZeroInterpreterResultV2 | null = null;
+  let interpreterReceiptRoute:
+    | 'interpreter_hit'
+    | 'interpreter_nenhuma'
+    | 'interpreter_error'
+    | null = null;
+  let interpreterResolved: {
+    result: ModelTurnResultV2;
+    loop: ReceptionistModelLoopResult;
+    proof: ResolutionProof | null;
+    nextFlowState?: FlowStateV2;
+  } | null = null;
+  let interpreterActionRecorded = false;
+  let interpreterEscalationQuestionId: string | null = null;
+
+  if (noFastPathResolved && interpreterEnabled) {
+    const runInterpreter = deps.runInterpreter ?? interpretPowerZeroV2;
+    interpreterResult = await runInterpreter({
+      config: input.config,
+      frame,
+      inboundId,
+      inboundText: currentInboundBatchText,
+      inboundTextsById,
+      servicesResult: services,
+      now: startedAt,
+      lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
+    });
+
+    if (interpreterResult.kind === 'hit') {
+      const interpreted = interpreterResult.choice;
+      if (interpreted.kind === 'pending_option') {
+        const resolved = resolveInterpreterPendingOptionFastPathV2({
+          frame,
+          proof: interpreted.proof,
+          catalog: services,
+        });
+        if (resolved.kind === 'resolved') {
+          interpreterResolved = {
+            result: resolved.result,
+            loop: interpreterResult.loop,
+            proof: resolved.proof,
+            nextFlowState: resolved.nextFlowState,
+          };
+        }
+      } else if (
+        interpreted.route === 'CONSULTAR_AGENDA' ||
+        interpreted.route === 'CANCELAR' ||
+        interpreted.route === 'REMARCAR'
+      ) {
+        const forcedExistingIntent = interpreted.route === 'CANCELAR'
+          ? 'cancel'
+          : interpreted.route === 'REMARCAR'
+            ? 'reschedule'
+            : 'inspect';
+        const resolved = await resolveReadFastPathV2({
+          frame,
+          inboundText: currentInboundBatchText,
+          servicesResult: services,
+          config: input.config,
+          forceUpcomingRead: true,
+          forcedExistingIntent,
+          ...(dateResolution.kind === 'resolved'
+            ? { upcomingDateFilter: dateResolution.date }
+            : {}),
+          now: startedAt,
+          executeTool: (name, args) => executeEntitledUpcomingRead(name, args),
+        });
+        if (resolved.kind === 'resolved') {
+          interpreterResolved = {
+            result: resolved.result,
+            loop: mergeFastPathLoopsV2(interpreterResult.loop, resolved.loop),
+            proof: null,
+          };
+        }
+      } else if (interpreted.route === 'NOVO_AGENDAMENTO') {
+        const resolved = resolveInitialServiceQuestionFastPathV2({
+          frame,
+          inboundText: currentInboundBatchText,
+          catalog: services,
+          now: startedAt,
+        });
+        if (resolved.kind === 'resolved') {
+          interpreterResolved = {
+            result: resolved.result,
+            loop: interpreterResult.loop,
+            proof: null,
+            nextFlowState: resolved.nextFlowState,
+          };
+        }
+      } else {
+        const witnessedEscalation = await escalate({
+          phoneNumberId: input.config.phoneNumberId,
+          customerPhone: input.phone,
+          messageId: inboundId,
+          text: currentInboundBatchText,
+          responsibleName: input.config.escalationResponsibleName ?? undefined,
+          witnessedHumanRequest: true,
+        });
+        if (witnessedEscalation.matched) {
+          interpreterActionRecorded = witnessedEscalation.actionRecorded;
+          interpreterEscalationQuestionId = witnessedEscalation.questionId;
+          interpreterResolved = {
+            result: {
+              schemaVersion: 2,
+              reply: witnessedEscalation.reply,
+              replyPurpose: 'OPERATIONAL_ANSWER',
+              pendingTransitionCandidate: { kind: 'preserve' },
+              resolutionCandidate: null,
+              unknownServiceEvidence: null,
+            },
+            loop: interpreterResult.loop,
+            proof: null,
+          };
+        }
+      }
+
+      if (interpreterResolved) {
+        interpreterReceiptRoute = 'interpreter_hit';
+      } else {
+        interpreterResult = {
+          kind: 'nenhuma',
+          loop: interpreterResult.loop,
+          reason: 'selected_route_failed_server_postcondition',
+        };
+        interpreterReceiptRoute = 'interpreter_nenhuma';
+      }
+    } else if (interpreterResult.kind === 'nenhuma') {
+      interpreterReceiptRoute = 'interpreter_nenhuma';
+    } else if (interpreterResult.kind === 'error') {
+      interpreterReceiptRoute = 'interpreter_error';
+    }
+  }
+
   if (noFastPathResolved) {
     if (
       frame.flowState.bookingReentry ||
@@ -1473,6 +1627,86 @@ export async function getReceptionistReplyV2(input: {
         reason: selectionFastPath.reason,
       };
     }
+  }
+
+  if (
+    interpreterResolved &&
+    interpreterResult?.kind === 'hit' &&
+    interpreterResult.choice.kind === 'route' &&
+    interpreterResult.choice.route === 'FALAR_HUMANO'
+  ) {
+    const candidate = { kind: 'preserve' } as const;
+    const evaluation = evaluateBoundaryV2({
+      rawCandidate: interpreterResolved.result.reply,
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: frame.flowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER',
+      source: 'CANONICAL',
+      actionRecorded: interpreterActionRecorded,
+      route: 'interpreter',
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    });
+    if (
+      !evaluation.safe ||
+      !evaluation.originalAccepted ||
+      !evaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Copy canônica de escalada testemunhada rejeitada pela boundary.');
+    }
+    const transition = materializeTransition(
+      candidate,
+      frame,
+      frame.flowState,
+      services,
+      startedAt,
+      id
+    );
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'interpreter_hit',
+    });
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame,
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: evaluation.acceptedPayload,
+      transition,
+      planReceipt: makePlan({
+        route: 'interpreter_hit',
+        loop: interpreterResolved.loop,
+        candidate,
+        recoveryKind: 'none',
+        regenCalls: 0,
+        boundaryAttempts: [
+          {
+            index: 0,
+            candidateHash: opaqueReceiptHashV2(interpreterResolved.result.reply),
+            reasonCodes: evaluation.reasonCodes,
+          },
+        ],
+      }),
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: false,
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
+      elicitationVariant,
+      copyVariant,
+      ...(interpreterActionRecorded && interpreterEscalationQuestionId
+        ? {
+            authoritativeEscalationQuestionId:
+              interpreterEscalationQuestionId,
+          }
+        : {}),
+    };
   }
 
   if (bookingReentryFastPath.kind === 'resolved') {
@@ -1576,6 +1810,17 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: selectionFastPath.proof,
       resolutionProofRejections: [],
     };
+  } else if (interpreterResolved) {
+    nominalRoute = 'interpreter_hit';
+    loop = interpreterResolved.loop;
+    proof = interpreterResolved.proof;
+    selectionNextFlowState = interpreterResolved.nextFlowState ?? null;
+    primary = {
+      ok: true,
+      value: interpreterResolved.result,
+      resolutionProof: interpreterResolved.proof,
+      resolutionProofRejections: [],
+    };
   } else {
     const runPrimaryLoop = () => runLoop({
       config: input.config,
@@ -1593,11 +1838,16 @@ export async function getReceptionistReplyV2(input: {
         elicitation.retryEmptyCompletionInsideLoop,
       thinkingMode,
     });
-    loop = await runPrimaryLoop();
-    if (isEmptyFinalModelOutputV2(loop) && loop.toolTrace.length === 0) {
+    let modelLoop = await runPrimaryLoop();
+    if (isEmptyFinalModelOutputV2(modelLoop) && modelLoop.toolTrace.length === 0) {
       const retried = await runPrimaryLoop();
-      loop = mergeEffectFreeLoopRetryV2(loop, retried);
+      modelLoop = mergeEffectFreeLoopRetryV2(modelLoop, retried);
     }
+    loop = interpreterResult &&
+      (interpreterResult.kind === 'nenhuma' || interpreterResult.kind === 'error')
+      ? mergeFastPathLoopsV2(interpreterResult.loop, modelLoop)
+      : modelLoop;
+    if (interpreterReceiptRoute) nominalRoute = interpreterReceiptRoute;
     primary = loop.terminalFailure === 'AI_RESPONSE_TRUNCATED'
       ? {
           ok: false,
@@ -1728,7 +1978,7 @@ export async function getReceptionistReplyV2(input: {
       sourceInboundText: input.userMessage,
       currentInboundIds,
       inboundTextsById,
-      route: 'model',
+      route: interpreterResolved ? 'interpreter' : 'model',
       pendingAnaOpen:
         frame.pending !== null &&
         frame.pending.flowId === frame.flowState.flowId,
@@ -1806,11 +2056,12 @@ export async function getReceptionistReplyV2(input: {
     hasDuplicateResolutionReadEvidence(loop)
   );
   const route: TurnPlanReceiptV2['route'] =
-    recovery.recoveryKind === 'regen'
+    interpreterReceiptRoute ??
+    (recovery.recoveryKind === 'regen'
       ? 'regen'
       : recovery.recoveryKind === 'direct_fallback'
         ? 'fallback'
-        : nominalRoute;
+        : nominalRoute);
   const boundaryAttempts = recovery.boundaryAttempts.map((entry) => ({
     index: entry.index,
     candidateHash: entry.candidateHash,
