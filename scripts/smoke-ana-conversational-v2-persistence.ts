@@ -164,7 +164,7 @@ async function main(): Promise<void> {
       },
     });
     assert.equal(result.receipt.transportOutcome, outcome);
-    assert.equal((await store.loadLatestState(turn.conversationKey)).pending, null);
+    assert.equal((await store.loadLatestState(turn.conversationKey, now)).pending, null);
   }
 
   const suppressedStore = new MemoryConversationalV2StateStore();
@@ -179,7 +179,7 @@ async function main(): Promise<void> {
   });
   assert.equal(suppressedResult.receipt.transportOutcome, 'suppressed_pause');
   assert.equal(suppressedStore.transportPostCount, 0);
-  assert.equal((await suppressedStore.loadLatestState(suppressed.conversationKey)).pending, null);
+  assert.equal((await suppressedStore.loadLatestState(suppressed.conversationKey, now)).pending, null);
   assert.deepEqual(
     await suppressedStore.verifyReceiptReconciliation([suppressed.frame.turnId]),
     {
@@ -202,7 +202,8 @@ async function main(): Promise<void> {
   const acceptedResult = await deliver({ store: acceptedStore, prepared: accepted });
   assert.equal(acceptedResult.receipt.transportOutcome, 'accepted_by_provider');
   const acceptedState = await acceptedStore.loadLatestState(
-    accepted.conversationKey
+    accepted.conversationKey,
+    now
   );
   assert.equal(acceptedState.pending?.state, 'OPEN');
   assert.equal(acceptedState.lastAcceptedDelivery?.payload, accepted.payload);
@@ -220,7 +221,7 @@ async function main(): Promise<void> {
     'aceite abre exatamente uma PendingFrame'
   );
 
-  const existing = (await acceptedStore.loadLatestState(accepted.conversationKey)).pending!;
+  const existing = (await acceptedStore.loadLatestState(accepted.conversationKey, now)).pending!;
   const social = prepared({
     conversationKey: accepted.conversationKey,
     pending: existing.snapshot,
@@ -228,7 +229,7 @@ async function main(): Promise<void> {
     payload: 'Claro! 😊',
   });
   await deliver({ store: acceptedStore, prepared: social });
-  const afterSocial = (await acceptedStore.loadLatestState(accepted.conversationKey)).pending!;
+  const afterSocial = (await acceptedStore.loadLatestState(accepted.conversationKey, now)).pending!;
   assert.equal(afterSocial.snapshot.questionId, existing.snapshot.questionId);
   assert.equal(afterSocial.snapshot.version, existing.snapshot.version);
 
@@ -253,7 +254,7 @@ async function main(): Promise<void> {
   });
   assert.equal(proofPreserveResult.receipt.pendingCommitOutcome, 'preserved');
   const afterProofPreserve = (
-    await acceptedStore.loadLatestState(accepted.conversationKey)
+    await acceptedStore.loadLatestState(accepted.conversationKey, now)
   ).pending!;
   assert.equal(afterProofPreserve.snapshot.version, afterSocial.snapshot.version);
   assert.equal(afterProofPreserve.flowState.fixedServiceId, 'svc-a');
@@ -276,7 +277,7 @@ async function main(): Promise<void> {
   const rejectedResult = await deliver({ store: acceptedStore, prepared: rejectedReset });
   assert.equal(rejectedResult.receipt.pendingCommitOutcome, 'cas_conflict');
   assert.equal(
-    (await acceptedStore.loadLatestState(accepted.conversationKey)).pending?.snapshot.version,
+    (await acceptedStore.loadLatestState(accepted.conversationKey, now)).pending?.snapshot.version,
     afterSocial.snapshot.version,
     'CAS rejeitado não transiciona PendingFrame'
   );
@@ -293,12 +294,12 @@ async function main(): Promise<void> {
   });
   assert.equal(uncommittedResult.receipt.outboxState, 'accepted_uncommitted');
   assert.equal(uncommittedStore.transportPostCount, 1);
-  assert.equal((await uncommittedStore.loadLatestState(uncommitted.conversationKey)).pending, null);
+  assert.equal((await uncommittedStore.loadLatestState(uncommitted.conversationKey, now)).pending, null);
   const guard = await uncommittedStore.inspectInboundGuard(uncommitted.conversationKey, now);
   assert.equal(guard.kind, 'reconstructed');
   await uncommittedStore.sweep(now);
   assert.equal(uncommittedStore.transportPostCount, 1, 'reconciliação local nunca repete POST');
-  assert.equal((await uncommittedStore.loadLatestState(uncommitted.conversationKey)).pending?.state, 'OPEN');
+  assert.equal((await uncommittedStore.loadLatestState(uncommitted.conversationKey, now)).pending?.state, 'OPEN');
 
   const crashStore = new MemoryConversationalV2StateStore();
   const crash = prepared({
@@ -326,7 +327,7 @@ async function main(): Promise<void> {
     now
   );
   assert.equal(invalidated, 1);
-  assert.equal((await acceptedStore.loadLatestState(accepted.conversationKey)).pending, null);
+  assert.equal((await acceptedStore.loadLatestState(accepted.conversationKey, now)).pending, null);
 
   const successorStore = new MemoryConversationalV2StateStore();
   const superseded = prepared({

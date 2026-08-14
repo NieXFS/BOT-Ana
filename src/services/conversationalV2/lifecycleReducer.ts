@@ -168,8 +168,13 @@ export function reduceToolLifecycleV2(input: {
     [...input.toolTrace] as ToolTraceLike[]
   );
   if (writeConfirmation) {
-    const { bookingDraft: _draft, slotEvidence: _slots, ...rest } =
-      input.frame.flowState;
+    const {
+      bookingDraft: _draft,
+      slotEvidence: _slots,
+      duplicatePreflightClearance: _duplicatePreflightClearance,
+      duplicateResolution: _duplicateResolution,
+      ...rest
+    } = input.frame.flowState;
     return {
       kind: 'canonical_write',
       nextFlowState: rest,

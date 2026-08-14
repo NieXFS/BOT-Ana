@@ -55,6 +55,7 @@ import {
   cancellationIntentGate,
   CONFIRMATION_HINT,
   hasTypedKeepBothEvidenceV2,
+  hasTypedNoConflictPreflightEvidenceV2,
   RescheduleCancellationEvidenceStore,
   type BookingProposal,
   type V2BookingConfirmationContext,
@@ -636,6 +637,8 @@ export async function executeReceptionistFunction(
       functionName === 'bookAppointment' &&
       rescheduleCancellationEvidence.peek(conversationKey) !== null;
     const hasTypedKeepBoth = hasTypedKeepBothEvidenceV2(v2Grounding);
+    const hasTypedNoConflictPreflight =
+      hasTypedNoConflictPreflightEvidenceV2(v2Grounding);
     const isDuplicateBookingPath =
       functionName === 'bookAppointment' &&
       (args.confirmedDuplicate === true ||
@@ -770,6 +773,7 @@ export async function executeReceptionistFunction(
         const shouldBypassDuplicateCheck =
           args.confirmedDuplicate === true ||
           hasTypedKeepBoth ||
+          hasTypedNoConflictPreflight ||
           cancellationEvidence !== null;
         const serviceId = String(args.serviceId ?? '');
         const professionalId = effectiveProfessionalId;

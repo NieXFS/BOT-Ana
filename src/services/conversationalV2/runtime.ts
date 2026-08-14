@@ -49,6 +49,7 @@ import {
   resolveReadFastPathV2,
 } from './readFastPaths';
 import {
+  resolveConfirmationDuplicatePreflightV2,
   resolveBookingConfirmationWriteFastPathV2,
   resolveDateSlotsFastPathV2,
   resolveDuplicateKeepBothFastPathV2,
@@ -346,6 +347,8 @@ function flowStateWithProof(
     const {
       bookingDraft: _bookingDraft,
       slotEvidence: _slotEvidence,
+      duplicatePreflightClearance: _duplicatePreflightClearance,
+      duplicateResolution: _duplicateResolution,
       resolvedDate: _resolvedDate,
       ...stateWithoutProfessionalDependentDraft
     } = frame.flowState;
@@ -562,6 +565,26 @@ function emptyLoopResult(): ReceptionistModelLoopResult {
     messages: [],
     toolTrace: [],
     usage: [],
+  };
+}
+
+function mergeFastPathLoopsV2(
+  ...loops: Array<ReceptionistModelLoopResult | undefined>
+): ReceptionistModelLoopResult {
+  const present = loops.filter(
+    (entry): entry is ReceptionistModelLoopResult => Boolean(entry)
+  );
+  if (present.length === 0) return emptyLoopResult();
+  const last = present.at(-1)!;
+  return {
+    ...last,
+    providerReportedModels: present.flatMap(
+      (entry) => entry.providerReportedModels
+    ),
+    rounds: present.reduce((sum, entry) => sum + entry.rounds, 0),
+    messages: present.flatMap((entry) => entry.messages),
+    toolTrace: present.flatMap((entry) => entry.toolTrace),
+    usage: present.flatMap((entry) => entry.usage),
   };
 }
 
@@ -882,7 +905,7 @@ export async function getReceptionistReplyV2(input: {
   const inboundId = currentInboundIds.at(-1)!;
   const currentInboundText =
     inboundTextsById[inboundId] ?? input.userMessage;
-  const executeTool =
+  const executeToolForFrame = (groundingFrame: TurnFrameV2) =>
     deps.executeTool ??
     ((functionName: string, args: Record<string, unknown>) =>
       executeReceptionistFunction(
@@ -897,8 +920,8 @@ export async function getReceptionistReplyV2(input: {
         services,
         conversationKey,
         {
-          flowState: frame.flowState,
-          pending: frame.pending,
+          flowState: groundingFrame.flowState,
+          pending: groundingFrame.pending,
           catalog: services,
           lastAcceptedDelivery: stored.lastAcceptedDelivery,
           now: startedAt,
@@ -907,6 +930,7 @@ export async function getReceptionistReplyV2(input: {
           },
         }
       ));
+  const executeTool = executeToolForFrame(frame);
   // Entitlement v2 deliberadamente separado do executor compartilhado: ele
   // só é usado depois que o fast-path provou uma opção TIME autoritativa. O
   // modelo continua sujeito ao upcomingAppointmentReadGate da rota legada.
@@ -1119,18 +1143,61 @@ export async function getReceptionistReplyV2(input: {
           executeTool: executeDuplicatePreflightRead,
         })
       : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
-  const bookingConfirmationFastPath =
+  const confirmationDuplicatePreflight =
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model'
-      ? await resolveBookingConfirmationWriteFastPathV2({
+      ? await resolveConfirmationDuplicatePreflightV2({
           frame,
+          inboundText: currentInboundText,
+          history: modelHistory,
+          servicesResult: services,
+          config: input.config,
+          now: startedAt,
+          lastAcceptedDelivery: stored.lastAcceptedDelivery,
+          executeTool: executeDuplicatePreflightRead,
+        })
+      : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
+  if (
+    confirmationDuplicatePreflight.kind === 'resolved' &&
+    frame.pending?.kind === 'CONFIRMATION' &&
+    frame.pending.options.some((option) =>
+      option.entityId.startsWith('booking-confirmation:')
+    )
+  ) {
+    selectedGateDecline = {
+      gate: 'duplicate_preflight',
+      reason:
+        confirmationDuplicatePreflight.result.pendingTransitionCandidate.kind ===
+          'open' &&
+        confirmationDuplicatePreflight.result.pendingTransitionCandidate.optionEntityIds.some(
+          (entityId) => entityId.startsWith('duplicate-resolution:')
+        )
+          ? 'lexicon_preempted_duplicate_conflict'
+          : 'lexicon_preempted_duplicate_read_failure',
+    };
+  }
+  const confirmationFrame: TurnFrameV2 =
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.nextFlowState
+      ? {
+          ...frame,
+          flowState: confirmationDuplicatePreflight.nextFlowState,
+        }
+      : frame;
+  const bookingConfirmationFastPath =
+    bookingReentryFastPath.kind === 'continue_model' &&
+    dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model'
+      ? await resolveBookingConfirmationWriteFastPathV2({
+          frame: confirmationFrame,
           inboundText: currentInboundText,
           history: modelHistory,
           servicesResult: services,
           lastAcceptedDelivery: stored.lastAcceptedDelivery,
           now: startedAt,
-          executeTool,
+          executeTool: executeToolForFrame(confirmationFrame),
           onGateDecline: (decline) => {
             selectedGateDecline = decline;
           },
@@ -1140,6 +1207,7 @@ export async function getReceptionistReplyV2(input: {
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model'
       ? await resolveReadFastPathV2({
         frame,
@@ -1159,6 +1227,7 @@ export async function getReceptionistReplyV2(input: {
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model'
       ? await resolveTimeDuplicatePreflightV2({
@@ -1177,6 +1246,7 @@ export async function getReceptionistReplyV2(input: {
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model'
@@ -1191,6 +1261,7 @@ export async function getReceptionistReplyV2(input: {
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
@@ -1210,6 +1281,7 @@ export async function getReceptionistReplyV2(input: {
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
@@ -1314,9 +1386,24 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: duplicateResolutionFastPath.proof,
       resolutionProofRejections: [],
     };
+  } else if (confirmationDuplicatePreflight.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    loop = confirmationDuplicatePreflight.loop;
+    proof = confirmationDuplicatePreflight.proof;
+    selectionNextFlowState =
+      confirmationDuplicatePreflight.nextFlowState;
+    primary = {
+      ok: true,
+      value: confirmationDuplicatePreflight.result,
+      resolutionProof: confirmationDuplicatePreflight.proof,
+      resolutionProofRejections: [],
+    };
   } else if (bookingConfirmationFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
-    loop = bookingConfirmationFastPath.loop;
+    loop = mergeFastPathLoopsV2(
+      confirmationDuplicatePreflight.loop,
+      bookingConfirmationFastPath.loop
+    );
     proof = bookingConfirmationFastPath.proof;
     selectionNextFlowState = bookingConfirmationFastPath.nextFlowState;
     primary = {
@@ -1360,7 +1447,8 @@ export async function getReceptionistReplyV2(input: {
     nominalRoute = 'fast_path';
     if (duplicatePreflight.loop) loop = duplicatePreflight.loop;
     proof = selectionFastPath.proof;
-    selectionNextFlowState = selectionFastPath.nextFlowState;
+    selectionNextFlowState =
+      duplicatePreflight.nextFlowState ?? selectionFastPath.nextFlowState;
     primary = {
       ok: true,
       value: selectionFastPath.result,
@@ -1403,6 +1491,14 @@ export async function getReceptionistReplyV2(input: {
           issues: [{ code: 'INVALID_VALUE', path: '$.reply' }],
         };
     proof = primary.ok ? primary.resolutionProof : null;
+  }
+
+  if (
+    !selectionNextFlowState &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.nextFlowState
+  ) {
+    selectionNextFlowState = confirmationDuplicatePreflight.nextFlowState;
   }
 
   writeCommitted = hasCommittedWrite(loop);

@@ -31,6 +31,7 @@ import {
   bookingConfirmationGate,
   CONFIRMATION_HINT,
   ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION,
+  hasTypedNoConflictPreflightEvidenceV2,
   matchesScopedV2ModalEchoConfirmation,
 } from '../src/services/bookingConfirmationGate';
 import {
@@ -1895,6 +1896,19 @@ async function main(): Promise<void> {
     turnRuntime: turnRuntime({ text: '10h' }),
     deps: {
       ...baseDeps(lexicalBookingStore),
+      executeProactiveDuplicateRead: async () =>
+        JSON.stringify({
+          success: true,
+          appointments: [
+            {
+              id: 'appointment-non-conflicting',
+              startTime: '2026-08-15T16:00:00.000Z',
+              endTime: '2026-08-15T17:00:00.000Z',
+              serviceName: 'Peeling Facial',
+              professionalName: 'Marina',
+            },
+          ],
+        }),
       runModelLoop: async () => {
         throw new Error('TIME validado não chama modelo');
       },
@@ -1953,9 +1967,64 @@ async function main(): Promise<void> {
   );
   assert.equal(afterLexicalSummary.pending?.snapshot.kind, 'CONFIRMATION');
   assert.equal(afterLexicalSummary.pending?.flowState.bookingDraft?.time, '10:00');
+  assert.deepEqual(
+    afterLexicalSummary.pending?.flowState.duplicatePreflightClearance,
+    {
+      kind: 'no_conflict',
+      readEvidenceTurnId: lexicalSummary.frame.turnId,
+      sourcePendingKind: 'TIME',
+      sourcePendingVersion: lexicalTimePending.version,
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      time: '10:00',
+    },
+    'read sem conflito fica vinculado à tupla completa do draft'
+  );
+  assert.equal(
+    hasTypedNoConflictPreflightEvidenceV2({
+      pending: afterLexicalSummary.pending!.snapshot,
+      flowState: afterLexicalSummary.pending!.flowState,
+      catalog: services,
+      lastAcceptedDelivery: afterLexicalSummary.lastAcceptedDelivery,
+      now,
+    }),
+    true,
+    'executor compartilhado reconhece clearance apenas na CONFIRMATION normal'
+  );
+  assert.equal(
+    hasTypedNoConflictPreflightEvidenceV2({
+      pending: afterLexicalSummary.pending!.snapshot,
+      flowState: {
+        ...afterLexicalSummary.pending!.flowState,
+        bookingDraft: {
+          ...afterLexicalSummary.pending!.flowState.bookingDraft!,
+          time: '11:00',
+        },
+      },
+      catalog: services,
+      lastAcceptedDelivery: afterLexicalSummary.lastAcceptedDelivery,
+      now,
+    }),
+    false,
+    'mudança de horário invalida o clearance'
+  );
+  // Compatibilidade de rollout: simula uma CONFIRMATION aberta pelo 9d antes
+  // de o campo de clearance existir. O turno do modal deve fazer o read uma
+  // vez e continuar até o write, sem reemitir o resumo.
+  const lexicalOpen = lexicalBookingStore.pending
+    .get(lexicalBookingKey)
+    ?.find((entry) => entry.state === 'OPEN');
+  assert.ok(lexicalOpen);
+  const {
+    duplicatePreflightClearance: _legacyMissingClearance,
+    ...legacyConfirmationFlowState
+  } = lexicalOpen.flowState;
+  lexicalOpen.flowState = legacyConfirmationFlowState;
 
   lexicalBookingStore.setInputSequence(lexicalBookingKey, 2);
   let lexicalBookCalls = 0;
+  let lexicalConfirmationReads = 0;
   const lexicalBook = await getReceptionistReplyV2({
     phone: lexicalBookingPhone,
     userMessage: 'pode',
@@ -1964,6 +2033,21 @@ async function main(): Promise<void> {
     turnRuntime: turnRuntime({ text: 'pode', sequence: 2 }),
     deps: {
       ...baseDeps(lexicalBookingStore),
+      executeProactiveDuplicateRead: async () => {
+        lexicalConfirmationReads += 1;
+        return JSON.stringify({
+          success: true,
+          appointments: [
+            {
+              id: 'appointment-non-conflicting',
+              startTime: '2026-08-15T16:00:00.000Z',
+              endTime: '2026-08-15T17:00:00.000Z',
+              serviceName: 'Peeling Facial',
+              professionalName: 'Marina',
+            },
+          ],
+        });
+      },
       loadHistory: async () => [
         { role: 'assistant', content: lexicalSummary.payload! },
         { role: 'user', content: 'pode' },
@@ -1989,10 +2073,21 @@ async function main(): Promise<void> {
     },
   });
   assert.equal(lexicalBookCalls, 1, 'léxico executa exatamente um write');
+  assert.equal(
+    lexicalConfirmationReads,
+    1,
+    'CONFIRMATION legada executa o preflight uma única vez'
+  );
   assert.equal(lexicalBook.planReceipt.route, 'fast_path');
   assert.equal(lexicalBook.planReceipt.primaryProviderCalls, 0);
-  assert.equal(lexicalBook.planReceipt.toolEffects[0]?.tool, 'bookAppointment');
-  assert.equal(lexicalBook.planReceipt.toolEffects[0]?.outcome, 'success');
+  assert.equal(lexicalBook.planReceipt.gateDecline, undefined);
+  assert.deepEqual(
+    lexicalBook.planReceipt.toolEffects.map((effect) => effect.tool),
+    ['getUpcomingAppointments', 'bookAppointment'],
+    'read sem conflito passa ao léxico e ao write no mesmo turno'
+  );
+  assert.equal(lexicalBook.planReceipt.toolEffects.at(-1)?.tool, 'bookAppointment');
+  assert.equal(lexicalBook.planReceipt.toolEffects.at(-1)?.outcome, 'success');
   assert.equal(lexicalBook.transition.kind, 'resolve');
   assert.match(lexicalBook.payload ?? '', /confirmado com sucesso|agendado com sucesso/iu);
   const lexicalBookDelivery = await deliverPreparedReceptionistTurnV2(
@@ -2016,6 +2111,294 @@ async function main(): Promise<void> {
     null,
     'booking_committed fecha a CONFIRMATION'
   );
+
+  // Rodada 9e: CONFIRMATION sem cache faz um read único. Conflito preempta o
+  // léxico com recibo explícito; keep-both reabre o resumo e o modal seguinte
+  // escreve uma única vez sem repetir o preflight.
+  const duplicatePassStore = new MemoryConversationalV2StateStore();
+  const duplicatePassPhone = '5511000000028';
+  const duplicatePassKey = `${config.phoneNumberId}:${duplicatePassPhone}`;
+  const duplicatePassNow = (step: number) =>
+    new Date(now.getTime() + step * 1_000);
+  const duplicatePassTime = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '10:00', displayName: '10:00' },
+      { position: 2, entityId: '11:00', displayName: '11:00' },
+    ],
+  });
+  seedPending(duplicatePassStore, duplicatePassKey, duplicatePassTime, {
+    flowId: duplicatePassTime.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-duplicate-pass-slots',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['10:00', '11:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  let duplicatePassReads = 0;
+  const conflictingUpcoming = JSON.stringify({
+    success: true,
+    appointments: [
+      {
+        id: 'appointment-existing',
+        startTime: '2026-08-14T13:00:00.000Z',
+        endTime: '2026-08-14T14:00:00.000Z',
+        serviceName: 'Drenagem Linfática',
+        professionalName: 'Júlia',
+      },
+    ],
+  });
+  const duplicatePassRead = async () => {
+    duplicatePassReads += 1;
+    return duplicatePassReads === 1
+      ? JSON.stringify({ success: false, reason: 'executor_error' })
+      : conflictingUpcoming;
+  };
+  duplicatePassStore.setInputSequence(duplicatePassKey, 1);
+  const duplicatePassSummary = await getReceptionistReplyV2({
+    phone: duplicatePassPhone,
+    userMessage: '10h',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: '10h' }),
+    deps: {
+      ...baseDeps(duplicatePassStore),
+      now: () => duplicatePassNow(1),
+      executeProactiveDuplicateRead: duplicatePassRead,
+      runModelLoop: async () => {
+        throw new Error('TIME validado não chama modelo');
+      },
+    },
+  });
+  assert.match(duplicatePassSummary.payload ?? '', /^Confirmando:/u);
+  assert.equal(duplicatePassSummary.transition.kind, 'open');
+  await deliverPreparedReceptionistTurnV2(duplicatePassSummary, {
+    store: duplicatePassStore,
+    id: nextId,
+    now: () => duplicatePassNow(1),
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  assert.equal(
+    (
+      await duplicatePassStore.loadLatestState(
+        duplicatePassKey,
+        duplicatePassNow(1)
+      )
+    ).pending
+      ?.snapshot.kind,
+    'CONFIRMATION'
+  );
+
+  duplicatePassStore.setInputSequence(duplicatePassKey, 2);
+  const duplicateQuestionPrepared = await getReceptionistReplyV2({
+    phone: duplicatePassPhone,
+    userMessage: 'pode',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'pode', sequence: 2 }),
+    deps: {
+      ...baseDeps(duplicatePassStore),
+      now: () => duplicatePassNow(2),
+      executeProactiveDuplicateRead: duplicatePassRead,
+      loadHistory: async () => [
+        { role: 'assistant', content: duplicatePassSummary.payload! },
+        { role: 'user', content: 'pode' },
+      ],
+      executeTool: async () => {
+        throw new Error('conflito deve preemptar o write');
+      },
+      runModelLoop: async () => {
+        throw new Error('conflito tipado não chama modelo');
+      },
+    },
+  });
+  assert.match(duplicateQuestionPrepared.payload ?? '', /manter os dois/iu);
+  assert.deepEqual(duplicateQuestionPrepared.planReceipt.gateDecline, {
+    gate: 'duplicate_preflight',
+    reason: 'lexicon_preempted_duplicate_conflict',
+  });
+  assert.deepEqual(
+    duplicateQuestionPrepared.planReceipt.toolEffects.map(
+      (effect) => effect.tool
+    ),
+    ['getUpcomingAppointments']
+  );
+  const duplicateQuestionDelivery = await deliverPreparedReceptionistTurnV2(
+    duplicateQuestionPrepared,
+    {
+      store: duplicatePassStore,
+      id: nextId,
+      now: () => duplicatePassNow(2),
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 2,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    }
+  );
+  assert.equal(duplicateQuestionDelivery.receipt.pendingCommitOutcome, 'opened');
+
+  duplicatePassStore.setInputSequence(duplicatePassKey, 3);
+  const keepBothPrepared = await getReceptionistReplyV2({
+    phone: duplicatePassPhone,
+    userMessage: 'outro atendimento',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'outro atendimento', sequence: 3 }),
+    deps: {
+      ...baseDeps(duplicatePassStore),
+      now: () => duplicatePassNow(3),
+      executeProactiveDuplicateRead: duplicatePassRead,
+      loadHistory: async () => [
+        { role: 'assistant', content: duplicatePassSummary.payload! },
+        { role: 'user', content: 'pode' },
+        { role: 'assistant', content: duplicateQuestionPrepared.payload! },
+        { role: 'user', content: 'outro atendimento' },
+      ],
+      runModelLoop: async () => {
+        throw new Error('keep-both tipado não chama modelo');
+      },
+    },
+  });
+  assert.match(keepBothPrepared.payload ?? '', /^Confirmando:/u);
+  assert.equal(keepBothPrepared.transition.kind, 'open');
+  const keepBothDelivery = await deliverPreparedReceptionistTurnV2(
+    keepBothPrepared,
+    {
+      store: duplicatePassStore,
+      id: nextId,
+      now: () => duplicatePassNow(3),
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 3,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    }
+  );
+  assert.equal(keepBothDelivery.receipt.pendingCommitOutcome, 'opened');
+  const afterKeepBoth = await duplicatePassStore.loadLatestState(
+    duplicatePassKey,
+    duplicatePassNow(3)
+  );
+  assert.deepEqual(
+    afterKeepBoth.pending?.snapshot.options.map((option) => option.entityId),
+    [`booking-confirmation:${duplicatePassTime.flowId}`]
+  );
+  assert.equal(
+    afterKeepBoth.pending?.flowState.duplicateResolution?.kind,
+    'keep_both'
+  );
+  const keepBothHistory = [
+    { role: 'assistant', content: duplicatePassSummary.payload! },
+    { role: 'user', content: 'pode' },
+    { role: 'assistant', content: duplicateQuestionPrepared.payload! },
+    { role: 'user', content: 'outro atendimento' },
+    { role: 'assistant', content: keepBothPrepared.payload! },
+    { role: 'user', content: 'pode' },
+  ];
+  const keepBothGateDecision = bookingConfirmationGate({
+    currentUserMessage: 'pode',
+    history: keepBothHistory,
+    confirmedDuplicate: false,
+    expectedBooking: {
+      date: '2026-08-14',
+      time: '10:00',
+      serviceName: 'Drenagem Linfática',
+      professionalName: 'Júlia',
+    },
+    v2ConfirmationContext: {
+      pending: afterKeepBoth.pending!.snapshot,
+      flowState: afterKeepBoth.pending!.flowState,
+      catalog: services,
+      lastAcceptedDelivery: afterKeepBoth.lastAcceptedDelivery,
+      now: duplicatePassNow(4),
+    },
+  });
+  assert.equal(
+    keepBothGateDecision.ok,
+    true,
+    keepBothGateDecision.ok ? '' : keepBothGateDecision.reason
+  );
+
+  duplicatePassStore.setInputSequence(duplicatePassKey, 4);
+  let duplicatePassWrites = 0;
+  const keepBothBookPrepared = await getReceptionistReplyV2({
+    phone: duplicatePassPhone,
+    userMessage: 'pode',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'pode', sequence: 4 }),
+    deps: {
+      ...baseDeps(duplicatePassStore),
+      now: () => duplicatePassNow(4),
+      executeProactiveDuplicateRead: async () => {
+        throw new Error('keep-both tipado não relê duplicidade');
+      },
+      loadHistory: async () => keepBothHistory,
+      executeTool: async (name, args) => {
+        assert.equal(name, 'bookAppointment');
+        assert.deepEqual(args, {
+          serviceId: 'svc-drenagem',
+          date: '2026-08-14',
+          time: '10:00',
+          professionalId: 'prof-julia',
+        });
+        duplicatePassWrites += 1;
+        return JSON.stringify({ success: true });
+      },
+      runModelLoop: async () => {
+        throw new Error('modal pós-keep-both não chama modelo');
+      },
+    },
+  });
+  assert.equal(duplicatePassWrites, 1);
+  assert.equal(keepBothBookPrepared.transition.kind, 'resolve');
+  const keepBothBookDelivery = await deliverPreparedReceptionistTurnV2(
+    keepBothBookPrepared,
+    {
+      store: duplicatePassStore,
+      id: nextId,
+      now: () => duplicatePassNow(4),
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 4,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    }
+  );
+  assert.equal(keepBothBookDelivery.receipt.pendingCommitOutcome, 'resolved');
+  assert.equal(
+    (
+      await duplicatePassStore.loadLatestState(
+        duplicatePassKey,
+        duplicatePassNow(4)
+      )
+    ).pending,
+    null
+  );
+  assert.equal(duplicatePassReads, 3, 'cada etapa autorizada lê uma única vez');
 
   // Rodada 9c: um booking nu com progresso velho abre continuar|novo antes do
   // reset/modelo; continuar restaura a pendência operacional com recap.

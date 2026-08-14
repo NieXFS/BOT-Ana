@@ -539,8 +539,13 @@ export function buildTimeSelectionFollowUpV2(
     time,
     slotEvidenceTurnId: evidence.turnId,
   };
+  const {
+    duplicatePreflightClearance: _duplicatePreflightClearance,
+    duplicateResolution: _duplicateResolution,
+    ...stateWithoutPriorDuplicateEvidence
+  } = frame.flowState;
   const nextFlowState: FlowStateV2 = {
-    ...frame.flowState,
+    ...stateWithoutPriorDuplicateEvidence,
     bookingDraft: draft,
   };
   return {
@@ -578,6 +583,8 @@ function professionalFollowUp(
   const {
     bookingDraft: _bookingDraft,
     slotEvidence: _slotEvidence,
+    duplicatePreflightClearance: _duplicatePreflightClearance,
+    duplicateResolution: _duplicateResolution,
     resolvedDate: _resolvedDate,
     ...stateWithoutProfessionalDependentDraft
   } = frame.flowState;

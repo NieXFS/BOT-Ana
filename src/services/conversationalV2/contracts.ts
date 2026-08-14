@@ -111,6 +111,20 @@ export interface DuplicateResolutionEvidenceV2 {
   readonly time: string;
 }
 
+export interface DuplicatePreflightClearanceV2 {
+  readonly kind: 'no_conflict';
+  /** Turno da leitura autoritativa que não encontrou conflito para o draft. */
+  readonly readEvidenceTurnId: string;
+  /** A pendência contra a qual a leitura foi executada. */
+  readonly sourcePendingKind: 'TIME' | 'CONFIRMATION';
+  readonly sourcePendingVersion: number;
+  /** Tupla completa: qualquer mudança invalida o pass-through. */
+  readonly serviceId: string;
+  readonly professionalId?: string;
+  readonly date: string;
+  readonly time: string;
+}
+
 export interface FlowStateV2 {
   readonly flowId: string;
   /** Relógio server-owned do último avanço operacional commitado. */
@@ -126,6 +140,8 @@ export interface FlowStateV2 {
   readonly bookingReentry?: BookingReentryV2;
   /** Resolução tipada de duplicidade; só o gate v2 pode consumi-la. */
   readonly duplicateResolution?: DuplicateResolutionEvidenceV2;
+  /** Read v2 já executado para este draft e sem conflito computável. */
+  readonly duplicatePreflightClearance?: DuplicatePreflightClearanceV2;
   readonly fixedByProofVersion: FixedByProofVersionV2;
 }
 

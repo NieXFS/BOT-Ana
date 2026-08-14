@@ -596,6 +596,50 @@ export function hasTypedKeepBothEvidenceV2(
   );
 }
 
+/**
+ * Contraprova tipada do preflight v2. Ela só evita a segunda leitura de
+ * duplicidade para o MESMO draft e para a CONFIRMATION normal resultante.
+ * Não confirma a fala do cliente e não licencia o write por si só.
+ */
+export function hasTypedNoConflictPreflightEvidenceV2(
+  context?: V2BookingConfirmationContext
+): boolean {
+  const pending = context?.pending;
+  const flowState = context?.flowState;
+  const clearance = flowState?.duplicatePreflightClearance;
+  const draft = flowState?.bookingDraft;
+  if (
+    !context ||
+    !pending ||
+    pending.kind !== 'CONFIRMATION' ||
+    pending.flowId !== flowState?.flowId ||
+    pending.options.length !== 1 ||
+    pending.options[0]?.entityId !== `booking-confirmation:${pending.flowId}` ||
+    clearance?.kind !== 'no_conflict' ||
+    !clearance.readEvidenceTurnId.trim() ||
+    !draft ||
+    clearance.serviceId !== draft.serviceId ||
+    clearance.professionalId !== draft.professionalId ||
+    clearance.date !== draft.date ||
+    clearance.time !== draft.time
+  ) {
+    return false;
+  }
+  const versionMatches =
+    (clearance.sourcePendingKind === 'TIME' &&
+      clearance.sourcePendingVersion < pending.version) ||
+    (clearance.sourcePendingKind === 'CONFIRMATION' &&
+      clearance.sourcePendingVersion === pending.version);
+  if (!versionMatches) return false;
+  return Boolean(
+    validatedBookingDraftForPendingV2({
+      pending,
+      flowState,
+      catalog: context.catalog,
+    })
+  );
+}
+
 export function priorUserSelectedDuplicateAction(
   history: ConversationMessage[],
   currentUserMessageIndex: number

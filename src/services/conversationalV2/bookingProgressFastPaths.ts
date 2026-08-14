@@ -1,6 +1,8 @@
 import type { TenantBotConfig } from '../../configProvider';
 import {
   bookingConfirmationGate,
+  hasTypedKeepBothEvidenceV2,
+  hasTypedNoConflictPreflightEvidenceV2,
   type V2BookingConfirmationContext,
 } from '../bookingConfirmationGate';
 import type {
@@ -36,7 +38,13 @@ import {
 import { validatedBookingDraftForPendingV2 } from './pendingQuestion';
 
 export type BookingProgressFastPathV2 =
-  | { kind: 'continue_model'; reason: string; loop?: ReceptionistModelLoopResult }
+  | {
+      kind: 'continue_model';
+      reason: string;
+      loop?: ReceptionistModelLoopResult;
+      proof?: ResolutionProof | null;
+      nextFlowState?: FlowStateV2;
+    }
   | {
       kind: 'resolved';
       result: ModelTurnResultV2;
@@ -241,6 +249,7 @@ function clearTemporalState(flowState: FlowStateV2): FlowStateV2 {
     resolvedDate: _date,
     slotEvidence: _evidence,
     bookingDraft: _draft,
+    duplicatePreflightClearance: _duplicatePreflightClearance,
     ...base
   } = flowState;
   const fixedByProofVersion = { ...base.fixedByProofVersion };
@@ -627,6 +636,212 @@ function duplicateQuestion(
   } às ${time}. Quer manter os dois, remarcar, só cancelar o anterior ou decidir depois?`;
 }
 
+function withNoConflictClearanceV2(input: {
+  frame: TurnFrameV2;
+  flowState: FlowStateV2;
+  draft: NonNullable<FlowStateV2['bookingDraft']>;
+}): FlowStateV2 {
+  const sourcePendingKind = input.frame.pending?.kind;
+  if (
+    (sourcePendingKind !== 'TIME' && sourcePendingKind !== 'CONFIRMATION') ||
+    !input.frame.pending
+  ) {
+    return input.flowState;
+  }
+  return {
+    ...input.flowState,
+    duplicatePreflightClearance: {
+      kind: 'no_conflict',
+      readEvidenceTurnId: input.frame.turnId,
+      sourcePendingKind,
+      sourcePendingVersion: input.frame.pending.version,
+      serviceId: input.draft.serviceId,
+      ...(input.draft.professionalId
+        ? { professionalId: input.draft.professionalId }
+        : {}),
+      date: input.draft.date,
+      time: input.draft.time,
+    },
+  };
+}
+
+function withoutDuplicatePreflightClearanceV2(
+  flowState: FlowStateV2
+): FlowStateV2 {
+  const {
+    duplicatePreflightClearance: _clearance,
+    ...rest
+  } = flowState;
+  return rest;
+}
+
+/**
+ * Compatibilidade para uma CONFIRMATION já aberta sem o cache do turno TIME.
+ * Sem conflito, o read é somente um pass-through e o léxico continua no MESMO
+ * turno. Com conflito, a pergunta própria continua preemptando o write.
+ */
+export async function resolveConfirmationDuplicatePreflightV2(input: {
+  frame: TurnFrameV2;
+  inboundText: string;
+  history: readonly { role: string; content?: unknown }[];
+  servicesResult: ServicesResult;
+  config: TenantBotConfig;
+  now: Date;
+  lastAcceptedDelivery: V2BookingConfirmationContext['lastAcceptedDelivery'];
+  executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
+}): Promise<BookingProgressFastPathV2> {
+  const pending = input.frame.pending;
+  const draft = pending
+    ? validatedBookingDraftForPendingV2({
+        pending,
+        flowState: input.frame.flowState,
+        catalog: input.servicesResult,
+      })
+    : null;
+  if (!pending || !draft) {
+    return { kind: 'continue_model', reason: 'normal_confirmation_not_ready' };
+  }
+  const context: V2BookingConfirmationContext = {
+    pending,
+    flowState: input.frame.flowState,
+    catalog: input.servicesResult,
+    lastAcceptedDelivery: input.lastAcceptedDelivery,
+    now: input.now,
+  };
+  if (hasTypedKeepBothEvidenceV2(context)) {
+    return { kind: 'continue_model', reason: 'duplicate_keep_both_already_typed' };
+  }
+  if (hasTypedNoConflictPreflightEvidenceV2(context)) {
+    return { kind: 'continue_model', reason: 'duplicate_preflight_already_clear' };
+  }
+  const service = input.servicesResult.services?.find(
+    (entry) => entry.id === draft.serviceId
+  );
+  const professional = draft.professionalId
+    ? input.servicesResult.professionals?.find(
+        (entry) => entry.id === draft.professionalId
+      )
+    : undefined;
+  if (!service || (draft.professionalId && !professional)) {
+    return { kind: 'continue_model', reason: 'confirmation_catalog_mismatch' };
+  }
+  const confirmation = bookingConfirmationGate({
+    currentUserMessage: input.inboundText,
+    history: [...input.history],
+    confirmedDuplicate: false,
+    expectedBooking: {
+      date: draft.date,
+      time: draft.time,
+      serviceName: service.name,
+      ...(professional ? { professionalName: professional.name } : {}),
+    },
+    v2ConfirmationContext: context,
+  });
+  if (!confirmation.ok) {
+    return {
+      kind: 'continue_model',
+      reason: `confirmation_not_licensed:${confirmation.reason}`,
+    };
+  }
+
+  const read = await safeTool({
+    name: 'getUpcomingAppointments',
+    args: {},
+    executeTool: input.executeTool,
+  });
+  const trace: ReceptionistToolTraceEntry = {
+    round: 0,
+    name: 'getUpcomingAppointments',
+    args: {},
+    argumentsValidJson: true,
+    result: read.raw,
+  };
+  const loop = loopForReads([trace]);
+  const reason = readReason(read.parsed);
+  const appointments = validUpcomingAppointmentsV2(read.parsed);
+  if (!appointments) {
+    return {
+      kind: 'resolved',
+      result: {
+        schemaVersion: 2,
+        reply: canonicalReadFailureCopyV2('upcoming', reason),
+        replyPurpose: 'OPERATIONAL_ANSWER',
+        pendingTransitionCandidate: { kind: 'preserve' },
+        resolutionCandidate: null,
+        unknownServiceEvidence: null,
+      },
+      loop,
+      proof: null,
+      nextFlowState: withoutDuplicatePreflightClearanceV2(
+        input.frame.flowState
+      ),
+    };
+  }
+  const conflicts = conflictsForDraftV2({
+    appointments,
+    flowState: input.frame.flowState,
+    servicesResult: input.servicesResult,
+    config: input.config,
+  });
+  if (!conflicts) {
+    return {
+      kind: 'resolved',
+      result: {
+        schemaVersion: 2,
+        reply: canonicalReadFailureCopyV2('upcoming', 'invalid_payload'),
+        replyPurpose: 'OPERATIONAL_ANSWER',
+        pendingTransitionCandidate: { kind: 'preserve' },
+        resolutionCandidate: null,
+        unknownServiceEvidence: null,
+      },
+      loop,
+      proof: null,
+      nextFlowState: withoutDuplicatePreflightClearanceV2(
+        input.frame.flowState
+      ),
+    };
+  }
+  if (conflicts.length === 0) {
+    return {
+      kind: 'continue_model',
+      reason: 'no_duplicate_conflict',
+      loop,
+      proof: null,
+      nextFlowState: withNoConflictClearanceV2({
+        frame: input.frame,
+        flowState: input.frame.flowState,
+        draft,
+      }),
+    };
+  }
+  return {
+    kind: 'resolved',
+    result: {
+      schemaVersion: 2,
+      reply: duplicateQuestion(conflicts[0]!, input.config.timezone),
+      replyPurpose: 'OPERATIONAL_ANSWER',
+      pendingTransitionCandidate: {
+        kind: 'open',
+        pendingKind: 'CONFIRMATION',
+        flowId: input.frame.flowState.flowId,
+        optionEntityIds: [
+          'duplicate-resolution:keep-both',
+          'duplicate-resolution:reschedule',
+          'duplicate-resolution:cancel-only',
+          'duplicate-resolution:decide-later',
+        ],
+      },
+      resolutionCandidate: null,
+      unknownServiceEvidence: null,
+    },
+    loop,
+    proof: null,
+    nextFlowState: withoutDuplicatePreflightClearanceV2(
+      input.frame.flowState
+    ),
+  };
+}
+
 /** Preflight proativo somente após uma opção TIME autoritativa ser escolhida. */
 export async function resolveTimeDuplicatePreflightV2(input: {
   frame: TurnFrameV2;
@@ -717,7 +932,17 @@ export async function resolveTimeDuplicatePreflightV2(input: {
     return { kind: 'continue_model', reason: 'draft_conflict_unavailable', loop };
   }
   if (conflicts.length === 0) {
-    return { kind: 'continue_model', reason: 'no_duplicate_conflict', loop };
+    return {
+      kind: 'continue_model',
+      reason: 'no_duplicate_conflict',
+      loop,
+      proof,
+      nextFlowState: withNoConflictClearanceV2({
+        frame: input.frame,
+        flowState: followUp.nextFlowState,
+        draft,
+      }),
+    };
   }
   return {
     kind: 'resolved',
@@ -741,6 +966,8 @@ export async function resolveTimeDuplicatePreflightV2(input: {
     },
     loop,
     proof,
-    nextFlowState: followUp.nextFlowState,
+    nextFlowState: withoutDuplicatePreflightClearanceV2(
+      followUp.nextFlowState
+    ),
   };
 }
