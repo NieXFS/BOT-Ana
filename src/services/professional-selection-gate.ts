@@ -95,6 +95,11 @@ export interface ProfessionalSelectionGateInput {
   servicesResult: ServicesResult;
   /** Somente falas do cliente; texto do assistant nunca licencia uma escolha. */
   userMessages: string[];
+  /** Estado v2 fixado exclusivamente por ResolutionProof previamente commitado. */
+  trustedFlowState?: {
+    fixedServiceId?: string;
+    fixedProfessionalId?: string;
+  };
 }
 
 type Preference =
@@ -737,6 +742,13 @@ export function professionalSelectionGate(
     activeProfessionals,
     input.professionalId
   );
+  const trustedProfessional =
+    input.trustedFlowState?.fixedServiceId === selectedService.id
+      ? eligible.find(
+          (professional) =>
+            professional.id === input.trustedFlowState?.fixedProfessionalId
+        )
+      : undefined;
 
   if (eligible.length === 1) {
     const onlyProfessional = eligible[0];
@@ -748,6 +760,16 @@ export function professionalSelectionGate(
       };
     }
     return { ok: true, effectiveProfessionalId: onlyProfessional.id };
+  }
+
+  // Uma escolha v2 já commitada continua licenciada quando o modelo a preserva
+  // explicitamente. Tentativa diferente ainda passa pela matriz humana abaixo;
+  // o estado confiável nunca transforma texto do assistant em nova preferência.
+  if (trustedProfessional && requested?.id === trustedProfessional.id) {
+    return {
+      ok: true,
+      effectiveProfessionalId: trustedProfessional.id,
+    };
   }
 
   const preference = inferLatestPreference(

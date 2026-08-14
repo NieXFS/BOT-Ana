@@ -69,6 +69,7 @@ assert.equal(openaiRuntime.provider, 'openai');
 assert.equal(openaiRuntime.model, 'gpt-4o-mini');
 assert.equal(openaiRuntime.baseURL, undefined);
 assert.equal(openaiRuntime.apiKey, 'sk-openai-smoke');
+assert.equal(openaiRuntime.supportsJsonObjectResponseFormat, true);
 
 const openaiRequest = buildReceptionistCompletionRequest(openaiRuntime, {
   messages,
@@ -79,6 +80,7 @@ const openaiRequest = buildReceptionistCompletionRequest(openaiRuntime, {
 assert.equal(openaiRequest.tool_choice, 'auto');
 assert.equal(openaiRequest.temperature, 0.4);
 assert.equal('thinking' in openaiRequest, false);
+assert.equal('response_format' in openaiRequest, false, 'caller v1/texto puro não ganha JSON mode');
 
 const deepseekConfig = config({
   aiProvider: 'deepseek',
@@ -91,6 +93,20 @@ assert.equal(deepseekRuntime.provider, 'deepseek');
 assert.equal(deepseekRuntime.model, DEEPSEEK_V4_FLASH_MODEL);
 assert.equal(deepseekRuntime.baseURL, DEEPSEEK_BASE_URL);
 assert.equal(deepseekRuntime.apiKey, 'sk-deepseek-smoke');
+assert.equal(deepseekRuntime.supportsJsonObjectResponseFormat, true);
+
+const jsonRequest = buildReceptionistCompletionRequest(deepseekRuntime, {
+  messages,
+  tools: [],
+  temperature: 0.2,
+  maxTokens: 1_200,
+  responseFormat: 'json_object',
+});
+assert.deepEqual(
+  (jsonRequest as unknown as { response_format: unknown }).response_format,
+  { type: 'json_object' },
+  'response_format JSON é opt-in para completions estruturadas'
+);
 
 const deepseekClientOptions = buildReceptionistClientOptions(deepseekRuntime);
 assert.equal(deepseekClientOptions.baseURL, DEEPSEEK_BASE_URL);

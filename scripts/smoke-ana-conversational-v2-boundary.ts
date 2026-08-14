@@ -1,0 +1,908 @@
+import assert from 'node:assert/strict';
+import type { ServicesResult } from '../src/services/calendarService';
+import {
+  UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2,
+  classifyReceptionistTurnPermissionV2,
+  evaluateBoundaryV2,
+  isV2BusinessHoursInformationRequest,
+  isLicensedPreBookingSummaryV2,
+  isTemporalOnlyServiceOfferSpanV2,
+  shouldProhibitServiceRelistV2,
+} from '../src/services/conversationalV2/boundary';
+import { hasPositiveClauseMatchV2 } from '../src/services/conversationalV2/polarity';
+import { normalizeTemporalAssertionsV2 } from '../src/services/conversationalV2/temporalNormalizer';
+import { classifyReceptionistTurnPermission } from '../src/services/receptionistSocialSafety';
+
+const servicesResult: ServicesResult = {
+  success: true,
+  services: [
+    {
+      id: 'svc-peeling',
+      name: 'Peeling Facial',
+      durationMinutes: 60,
+      price: 100,
+      priceFormatted: 'R$ 100,00',
+      professionalIds: ['prof-julia'],
+    },
+    {
+      id: 'svc-drenagem',
+      name: 'Drenagem',
+      durationMinutes: 60,
+      price: 120,
+      priceFormatted: 'R$ 120,00',
+      professionalIds: ['prof-marina'],
+    },
+  ],
+  professionals: [
+    { id: 'prof-julia', name: 'Júlia' },
+    { id: 'prof-marina', name: 'Marina' },
+  ],
+};
+const flowState = {
+  flowId: 'flow-v2',
+  fixedServiceId: 'svc-peeling',
+  fixedByProofVersion: { fixedServiceId: 1 },
+};
+
+const r8Inbound = 'obrigada!! e amanhã tem horário pra drenagem?';
+const r8Accepted = boundary(
+  'Obrigada! Amanhã há horários para Drenagem às 09:00 e 15:00. Qual você prefere?',
+  {
+    route: 'model',
+    replyPurpose: 'DATE_TIME_QUESTION',
+    sourceInboundText: r8Inbound,
+    inboundTextsById: { 'in-current': r8Inbound },
+    toolTrace: [
+      {
+        round: 1,
+        name: 'getAvailableSlots',
+        args: { date: '2026-08-14', serviceId: 'svc-drenagem' },
+        argumentsValidJson: true,
+        result: JSON.stringify({ success: true, slots: ['09:00', '15:00'] }),
+      },
+    ],
+  }
+);
+assert.equal(r8Accepted.safe, true);
+assert.equal(r8Accepted.originalAccepted, true);
+assert.equal(
+  r8Accepted.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'),
+  false,
+  'R8 misto com operação e evidência descarta drift herdado'
+);
+assert.match(r8Accepted.acceptedPayload, /Obrigada!/);
+
+for (const inbound of [
+  'vocês atendem sábado?',
+  'funciona sábado?',
+  'que horas abre?',
+  'que horas fecha?',
+  'atendem no feriado?',
+]) {
+  assert.equal(
+    classifyReceptionistTurnPermissionV2(inbound, servicesResult),
+    'INFORMATION_REQUEST',
+    `overlay v2 licencia funcionamento: ${inbound}`
+  );
+}
+assert.equal(
+  classifyReceptionistTurnPermission('vocês atendem sábado?'),
+  'NO_OPERATIONAL_INTENT',
+  'classificador compartilhado/v1 permanece intocado'
+);
+const saturdayInformation = boundary('Sim, atendemos aos sábados.', {
+  route: 'model',
+  replyPurpose: 'OPERATIONAL_ANSWER',
+  sourceInboundText: 'vocês atendem sábado?',
+  inboundTextsById: { 'in-current': 'vocês atendem sábado?' },
+  flowState: { flowId: 'flow-hours', fixedByProofVersion: {} },
+});
+assert.equal(
+  saturdayInformation.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'),
+  false,
+  'R10.1: resposta legítima de funcionamento não herda drift na v2'
+);
+assert.equal(
+  classifyReceptionistTurnPermissionV2(
+    'sábado tem festa da minha filha',
+    servicesResult
+  ),
+  'NO_OPERATIONAL_INTENT',
+  'menção pessoal de sábado não ganha permissão informacional'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('minha irmã atende sábado?'),
+  false,
+  'A1: sujeito de terceira pessoa não é o estabelecimento'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('que horas minha irmã atende sábado?'),
+  false,
+  'A1: prefixo interrogativo não apaga sujeito explícito de terceira pessoa'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('o peeling funciona?'),
+  false,
+  'A1: eficácia de procedimento não é expediente'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('que horas o peeling funciona?'),
+  false,
+  'A1: prefixo interrogativo não transforma procedimento em estabelecimento'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('a clínica atende no feriado?'),
+  true,
+  'A1: sujeito explícito do estabelecimento é aceito'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('vocês vão atender sábado?'),
+  true,
+  'A1: auxiliar com infinitivo preserva o sujeito do estabelecimento'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('qual o horário de atendimento?'),
+  true,
+  'A1: expediente nominal admite estabelecimento elíptico'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('qual o expediente da minha irmã?'),
+  false,
+  'A1: expediente nominal de terceira pessoa permanece excluído'
+);
+assert.equal(
+  isV2BusinessHoursInformationRequest('vocês atendem sábado'),
+  false,
+  'A1: declaração sem forma interrogativa não ativa o overlay'
+);
+
+const personalInbound = 'amanhã é aniversário da minha filha';
+const personalAgendaPush = boundary('Que legal! Quer aproveitar e marcar um horário?', {
+  route: 'model',
+  replyPurpose: 'SERVICE_QUESTION',
+  sourceInboundText: personalInbound,
+  inboundTextsById: { 'in-current': personalInbound },
+  flowState: { flowId: 'flow-personal', fixedByProofVersion: {} },
+});
+assert.equal(
+  personalAgendaPush.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'),
+  true,
+  'papo pessoal continua protegido contra empurrão de agenda'
+);
+
+const personalWarm = boundary('Que momento especial! Espero que seja um dia lindo para vocês 💛', {
+  route: 'model',
+  replyPurpose: 'SOCIAL',
+  sourceInboundText: personalInbound,
+  inboundTextsById: { 'in-current': personalInbound },
+  flowState: { flowId: 'flow-personal', fixedByProofVersion: {} },
+});
+assert.equal(personalWarm.safe, true);
+assert.equal(personalWarm.originalAccepted, true);
+
+const catalogSocialInbound = 'kkk drenajem';
+const catalogSocial = boundary('Temos Drenagem. Quer escolher uma data?', {
+  route: 'model',
+  replyPurpose: 'DATE_TIME_QUESTION',
+  sourceInboundText: catalogSocialInbound,
+  inboundTextsById: { 'in-current': catalogSocialInbound },
+  flowState: { flowId: 'flow-catalog-social', fixedByProofVersion: {} },
+});
+assert.equal(
+  catalogSocial.reasonCodes.includes('SOCIAL_CONTEXT_DRIFT'),
+  true,
+  'K4: entidade de catálogo não desarma drift em permissão social-only'
+);
+
+function spanFor(text: string, fragment: string) {
+  const points = Array.from(text);
+  const fragmentPoints = Array.from(fragment);
+  const start = points.join('').indexOf(fragment);
+  assert.notEqual(start, -1);
+  // As fixtures abaixo são ASCII antes do fragmento; o cálculo explícito por
+  // code points evita tornar essa suposição parte do código de produção.
+  const codePointStart = Array.from(text.slice(0, start)).length;
+  return { start: codePointStart, end: codePointStart + fragmentPoints.length };
+}
+
+function boundary(
+  rawCandidate: string,
+  extra: Record<string, unknown> = {}
+) {
+  return evaluateBoundaryV2({
+    rawCandidate,
+    servicesResult,
+    flowState,
+    pendingTransitionCandidate: { kind: 'preserve' },
+    sourceInboundText: 'Quero agendar',
+    currentInboundIds: ['in-current'],
+    inboundTextsById: { 'in-current': 'Quero agendar' },
+    ...extra,
+  });
+}
+
+const offerMatcher = /\b(?:temos?|oferecemos?|fazemos?|realizamos?)\s+([^.!?]+)/gu;
+assert.equal(hasPositiveClauseMatchV2('Não fazemos Botox.', offerMatcher), false);
+assert.equal(
+  hasPositiveClauseMatchV2('Não fazemos laser, mas fazemos Botox.', offerMatcher),
+  true
+);
+
+const negatedOffer = boundary('Não fazemos Botox.');
+assert.equal(negatedOffer.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'), false);
+assert.equal(
+  negatedOffer.reasonCodes.includes('UNLICENSED_SERVICE_UNAVAILABLE_DENIAL'),
+  true
+);
+
+const noSpan = boundary(UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2);
+assert.equal(
+  noSpan.reasonCodes.includes('UNLICENSED_SERVICE_UNAVAILABLE_DENIAL'),
+  true
+);
+
+for (const generic of ['retorno', 'unidade']) {
+  const inbound = `Quero ${generic}`;
+  const result = boundary(UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2, {
+    sourceInboundText: inbound,
+    inboundTextsById: { 'in-current': inbound },
+    unknownServiceEvidence: {
+      inboundId: 'in-current',
+      span: spanFor(inbound, generic),
+    },
+  });
+  assert.equal(
+    result.reasonCodes.includes('UNLICENSED_SERVICE_UNAVAILABLE_DENIAL'),
+    true,
+    generic
+  );
+}
+
+for (const catalogSignal of ['peeling', 'drenajem']) {
+  const inbound = `Quero ${catalogSignal}`;
+  const result = boundary(UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2, {
+    sourceInboundText: inbound,
+    inboundTextsById: { 'in-current': inbound },
+    unknownServiceEvidence: {
+      inboundId: 'in-current',
+      span: spanFor(inbound, catalogSignal),
+    },
+  });
+  assert.equal(
+    result.reasonCodes.includes('UNLICENSED_SERVICE_UNAVAILABLE_DENIAL'),
+    true,
+    `${catalogSignal} deve continuar no modelo, nunca licenciar negação`
+  );
+}
+
+const unknownInbound = 'Quero fazer botox';
+const licensedDenial = boundary(UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2, {
+  sourceInboundText: unknownInbound,
+  inboundTextsById: { 'in-current': unknownInbound },
+  unknownServiceEvidence: {
+    inboundId: 'in-current',
+    span: spanFor(unknownInbound, 'botox'),
+  },
+});
+assert.equal(licensedDenial.safe, true);
+assert.equal(licensedDenial.acceptedPayload, UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2);
+
+const positiveOffer = boundary('Fazemos Botox e podemos agendar.');
+assert.equal(positiveOffer.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'), true);
+
+assert.equal(
+  isTemporalOnlyServiceOfferSpanV2(
+    'horários às 14h, 15h e 17h',
+    new Set(['14:00', '15:00', '17:00'])
+  ),
+  true,
+  'lista canônica de horários não é entidade de serviço'
+);
+assert.equal(
+  isTemporalOnlyServiceOfferSpanV2('drenagem a vapor'),
+  false,
+  'token substantivo residual impede a exceção temporal'
+);
+const exactR23Regression = boundary(
+  'Para quinta-feira à tarde temos horários às 14h, 15h e 17h. Qual prefere?',
+  {
+    toolTrace: [
+      {
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: true, slots: ['14:00', '15:00', '17:00'] }),
+      },
+    ],
+  }
+);
+assert.equal(
+  exactR23Regression.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  false,
+  'texto exato do reject real R2.3 descarta falso serviço temporal'
+);
+assert.equal(exactR23Regression.safe, true, exactR23Regression.reasonCodes.join(','));
+
+const realUnknownServiceVariant = boundary('Temos drenagem a vapor.');
+assert.equal(
+  realUnknownServiceVariant.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  true,
+  'serviço composto inexistente não é licenciado pelo prefixo Drenagem'
+);
+const typoEchoOffer = boundary('Boa tarde! Sim, fazemos drenajem. Qual dia você prefere?');
+assert.equal(
+  typoEchoOffer.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  false,
+  'eco de typo resolvido univocamente pelo matcher canônico não vira oferta desconhecida'
+);
+const enumerationServices: ServicesResult = {
+  ...servicesResult,
+  services: [
+    {
+      id: 'svc-drenagem-enum',
+      name: 'Drenagem linfática',
+      durationMinutes: 50,
+      price: 160,
+      priceFormatted: 'R$ 160,00',
+      professionalIds: ['prof-carla-enum'],
+    },
+    {
+      id: 'svc-limpeza-enum',
+      name: 'Limpeza de pele profunda',
+      durationMinutes: 60,
+      price: 180,
+      priceFormatted: 'R$ 180,00',
+      professionalIds: ['prof-carla-enum'],
+    },
+    {
+      id: 'svc-peeling-enum',
+      name: 'Peeling facial',
+      durationMinutes: 45,
+      price: 140,
+      priceFormatted: 'R$ 140,00',
+      professionalIds: ['prof-carla-enum'],
+    },
+  ],
+  professionals: [{ id: 'prof-carla-enum', name: 'Carla Mendes' }],
+};
+for (const knownCatalogSequence of [
+  'Fazemos drenajem e posso te ajudar a agendar.',
+  'Temos Drenagem, Limpeza e Peeling.',
+  'Temos Drenagem linfática, Limpeza de pele profunda e Peeling facial, quer agendar?',
+  'Claro, fazemos Peeling, sim.',
+  'Boa tarde! Sim, fazemos drenagem linfática (50min, R$ 160,00). Gostaria de agendar?',
+  'Temos sim! Peeling facial, 45 minutos, R$ 140, com a Carla Mendes. Quer agendar?',
+  'Temos sim! Peeling facial é com a Carla Mendes, 45 minutos, R$ 140. Qual dia você prefere?',
+]) {
+  const knownOffer = boundary(knownCatalogSequence, {
+    servicesResult: enumerationServices,
+  });
+  assert.equal(
+    knownOffer.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+    false,
+    `lista/adjunto composto só de catálogo não vira serviço desconhecido: ${knownCatalogSequence}`
+  );
+}
+for (const unknownCatalogSequence of [
+  'Temos Drenagem linfática, Limpeza de pele profunda e Drenagem a vapor.',
+  'Temos Drenagem linfática, Limpeza de pele profunda e Ozonioterapia, quer agendar?',
+]) {
+  const unknownOffer = boundary(unknownCatalogSequence, {
+    servicesResult: enumerationServices,
+  });
+  assert.equal(
+    unknownOffer.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+    true,
+    `item desconhecido na enumeração continua bloqueado: ${unknownCatalogSequence}`
+  );
+}
+const temporalPlusUnknownClaim = boundary(
+  'Temos horários às 14h. Seu agendamento é para a drenagem a vapor.',
+  {
+    toolTrace: [
+      {
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: true, slots: ['14:00'] }),
+      },
+    ],
+  }
+);
+assert.equal(
+  temporalPlusUnknownClaim.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  true,
+  'oferta temporal não apaga outro claim de serviço desconhecido'
+);
+
+for (const candidate of [
+  'Tem vaga amanhã.',
+  'Tem horário amanhã.',
+  'Está cheio hoje.',
+  'Tem espaço na agenda.',
+  'A agenda está cheia.',
+]) {
+  const result = boundary(candidate);
+  assert.equal(
+    result.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+    true,
+    candidate
+  );
+}
+const licensedAvailability = boundary('Tem vaga amanhã.', {
+  toolTrace: [
+    {
+      name: 'getAvailableSlots',
+      result: JSON.stringify({ success: true, slots: ['09:00'] }),
+    },
+  ],
+});
+assert.equal(
+  licensedAvailability.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  false
+);
+const contradictoryAvailability = boundary('Tem vaga amanhã.', {
+  toolTrace: [
+    {
+      name: 'getAvailableSlots',
+      result: JSON.stringify({ success: true, slots: [] }),
+    },
+  ],
+});
+assert.equal(
+  contradictoryAvailability.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  true
+);
+const licensedOccupied = boundary('A agenda está cheia.', {
+  toolTrace: [
+    {
+      name: 'getAvailableSlots',
+      result: JSON.stringify({ success: true, slots: [] }),
+    },
+  ],
+});
+assert.equal(
+  licensedOccupied.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  false
+);
+
+const implicitCommitment = boundary('Te aguardo às oito amanhã.');
+assert.equal(
+  implicitCommitment.reasonCodes.includes('UNVERIFIED_IMPLICIT_COMMITMENT'),
+  true
+);
+const licensedCommitment = boundary('Te aguardo às oito amanhã.', {
+  toolTrace: [
+    {
+      name: 'bookAppointment',
+      result: JSON.stringify({ success: true }),
+    },
+  ],
+});
+assert.equal(
+  licensedCommitment.reasonCodes.includes('UNVERIFIED_IMPLICIT_COMMITMENT'),
+  false
+);
+
+const incompatibleProfessional = boundary('A Marina vai te atender.');
+assert.equal(
+  incompatibleProfessional.reasonCodes.includes('INELIGIBLE_PROFESSIONAL'),
+  true
+);
+
+const preBookingServices: ServicesResult = {
+  ...servicesResult,
+  services: [
+    ...(servicesResult.services ?? []),
+    {
+      id: 'svc-limpeza',
+      name: 'Limpeza de pele profunda',
+      durationMinutes: 60,
+      price: 180,
+      priceFormatted: 'R$ 180,00',
+      professionalIds: ['prof-carla'],
+    },
+  ],
+  professionals: [
+    ...(servicesResult.professionals ?? []),
+    { id: 'prof-carla', name: 'Carla Mendes' },
+  ],
+};
+const cleaningFlowState = {
+  flowId: 'flow-pre-booking',
+  fixedServiceId: 'svc-limpeza',
+  fixedProfessionalId: 'prof-carla',
+  resolvedDate: '2026-08-13',
+  fixedByProofVersion: { fixedServiceId: 2, fixedProfessionalId: 2 },
+};
+const slotEvidence = [
+  {
+    name: 'getAvailableSlots',
+    result: JSON.stringify({ success: true, slots: ['14:00', '15:00', '17:00'] }),
+  },
+];
+const exactR24Text =
+  'Ótimo, tenho horário às 15h disponível hoje. Confirmando: Limpeza de pele profunda, hoje (quinta, 13/08) às 15h, com a Carla. Posso marcar?';
+const exactR24Regression = boundary(exactR24Text, {
+  servicesResult: preBookingServices,
+  flowState: cleaningFlowState,
+  sourceInboundText: 'pode ser às 15h',
+  inboundTextsById: { 'in-current': 'pode ser às 15h' },
+  toolTrace: slotEvidence,
+  temporalContext: { now: new Date('2026-08-13T12:00:00.000Z'), timezone: 'America/Sao_Paulo' },
+  pendingTransitionCandidate: {
+    kind: 'open',
+    pendingKind: 'CONFIRMATION',
+    flowId: cleaningFlowState.flowId,
+    optionEntityIds: ['confirm-booking'],
+  },
+});
+assert.equal(
+  exactR24Regression.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
+  false,
+  'texto exato do reject real R2.4 é resumo pré-booking licenciado'
+);
+assert.equal(exactR24Regression.safe, true, exactR24Regression.reasonCodes.join(','));
+assert.equal(
+  isLicensedPreBookingSummaryV2(exactR24Text, {
+    rawCandidate: exactR24Text,
+    servicesResult: preBookingServices,
+    flowState: cleaningFlowState,
+    sourceInboundText: 'pode ser às 15h',
+    toolTrace: slotEvidence,
+    temporalContext: { now: new Date('2026-08-13T12:00:00.000Z'), timezone: 'America/Sao_Paulo' },
+  }),
+  true
+);
+
+const chosenTimeWithoutRead = boundary(
+  'Confirmando: Limpeza de pele profunda, hoje às 15h, com a Carla. Podemos confirmar?',
+  {
+    servicesResult: preBookingServices,
+    flowState: cleaningFlowState,
+    sourceInboundText: 'pode ser às 15h',
+    inboundTextsById: { 'in-current': 'pode ser às 15h' },
+    toolTrace: [],
+  }
+);
+assert.equal(
+  chosenTimeWithoutRead.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
+  true,
+  'K3: horário escolhido sem leitura é contraprova e não licencia resumo'
+);
+
+for (const [label, candidate, extra] of [
+  [
+    'sem pergunta de confirmação',
+    'Confirmando: Limpeza de pele profunda, hoje às 15h, com a Carla.',
+    { sourceInboundText: 'pode ser às 15h', toolTrace: slotEvidence },
+  ],
+  [
+    'serviço diferente do fixo',
+    'Confirmando: Peeling Facial, hoje às 15h, com a Carla. Posso marcar?',
+    { sourceInboundText: 'pode ser às 15h', toolTrace: slotEvidence },
+  ],
+  [
+    'horário sem evidência',
+    'Confirmando: Limpeza de pele profunda, hoje às 15h, com a Carla. Confirma?',
+    { sourceInboundText: 'pode ser às 16h', toolTrace: [] },
+  ],
+  [
+    'estado consumado',
+    'Seu horário está confirmado para Limpeza de pele profunda hoje às 15h com a Carla. Confirma?',
+    { sourceInboundText: 'pode ser às 15h', toolTrace: slotEvidence },
+  ],
+] as const) {
+  const result = boundary(candidate, {
+    servicesResult: preBookingServices,
+    flowState: cleaningFlowState,
+    inboundTextsById: { 'in-current': extra.sourceInboundText },
+    temporalContext: { now: new Date('2026-08-13T12:00:00.000Z'), timezone: 'America/Sao_Paulo' },
+    ...extra,
+  });
+  assert.equal(
+    result.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
+    true,
+    label
+  );
+}
+
+const ungroundedExistingClaim = boundary('Seu horário está confirmado.', {
+  servicesResult: preBookingServices,
+  flowState: cleaningFlowState,
+  sourceInboundText: 'obrigada',
+  inboundTextsById: { 'in-current': 'obrigada' },
+  toolTrace: [],
+});
+assert.equal(ungroundedExistingClaim.safe, false);
+assert.equal(
+  ungroundedExistingClaim.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
+  true,
+  'claim de agendamento existente continua exigindo leitura/write'
+);
+
+const uniquePartialProfessional = boundary('Tudo certo com a Júlia.', {
+  sourceInboundText: 'Quero atendimento com a Júlia',
+  inboundTextsById: { 'in-current': 'Quero atendimento com a Júlia' },
+});
+assert.equal(
+  uniquePartialProfessional.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  false,
+  'primeiro nome unívoco da profissional é aceito na saída v2'
+);
+assert.equal(uniquePartialProfessional.safe, true);
+
+const ambiguousProfessionals: ServicesResult = {
+  ...servicesResult,
+  services: servicesResult.services?.map((service) => ({
+    ...service,
+    professionalIds: ['prof-julia-costa', 'prof-julia-souza'],
+  })),
+  professionals: [
+    { id: 'prof-julia-costa', name: 'Júlia Costa' },
+    { id: 'prof-julia-souza', name: 'Júlia Souza' },
+  ],
+};
+const ambiguousPartialProfessional = boundary('Tudo certo com a Júlia.', {
+  servicesResult: ambiguousProfessionals,
+  sourceInboundText: 'Quero atendimento com a Júlia',
+  inboundTextsById: { 'in-current': 'Quero atendimento com a Júlia' },
+});
+assert.equal(
+  ambiguousPartialProfessional.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  true,
+  'duas profissionais com o mesmo primeiro nome continuam ambíguas'
+);
+
+const negatedPartialProfessional = boundary('Tudo certo com a Carla.', {
+  servicesResult: preBookingServices,
+  sourceInboundText: 'Não quero atendimento com a Carla',
+  inboundTextsById: { 'in-current': 'Não quero atendimento com a Carla' },
+});
+assert.equal(
+  negatedPartialProfessional.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  true,
+  'K5: primeiro nome em oração negada não ancora profissional'
+);
+
+const toolAnchoredProfessional = boundary('Encontrei opções com a Carla.', {
+  servicesResult: preBookingServices,
+  sourceInboundText: 'quinta-feira',
+  inboundTextsById: { 'in-current': 'quinta-feira' },
+  toolTrace: [
+    {
+      name: 'getAvailableSlots',
+      result: JSON.stringify({
+        success: true,
+        professionalId: 'prof-carla',
+        slots: ['14:00'],
+      }),
+    },
+  ],
+});
+assert.equal(
+  toolAnchoredProfessional.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  false,
+  'K5: read do turno com professionalId ancora primeiro nome unívoco'
+);
+
+const trustedProfessional = boundary('Tudo certo com a Carla.', {
+  servicesResult: preBookingServices,
+  sourceInboundText: 'pode continuar',
+  inboundTextsById: { 'in-current': 'pode continuar' },
+  flowState: {
+    flowId: 'flow-trusted-professional',
+    fixedServiceId: 'svc-limpeza',
+    fixedProfessionalId: 'prof-carla',
+    fixedByProofVersion: { fixedServiceId: 4, fixedProfessionalId: 4 },
+  },
+});
+assert.equal(
+  trustedProfessional.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  false,
+  'K5: profissional fixada na versão atual e elegível é trustedProfessional'
+);
+
+const staleTrustedProfessional = boundary('Tudo certo com a Carla.', {
+  servicesResult: {
+    ...preBookingServices,
+    services: preBookingServices.services?.map((service) =>
+      service.id === 'svc-limpeza'
+        ? { ...service, professionalIds: ['prof-carla', 'prof-marina'] }
+        : service
+    ),
+  },
+  sourceInboundText: 'pode continuar',
+  inboundTextsById: { 'in-current': 'pode continuar' },
+  flowState: {
+    flowId: 'flow-stale-professional',
+    fixedServiceId: 'svc-limpeza',
+    fixedProfessionalId: 'prof-carla',
+    fixedByProofVersion: { fixedServiceId: 5, fixedProfessionalId: 4 },
+  },
+});
+assert.equal(
+  staleTrustedProfessional.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  true,
+  'K5: profissional de versão anterior não é trustedProfessional'
+);
+
+const uniqueEligibleWithoutOtherAnchor = boundary(
+  'Limpeza de pele profunda é com a Carla. Qual dia você prefere?',
+  {
+    servicesResult: preBookingServices,
+    sourceInboundText: 'limpeza',
+    inboundTextsById: { 'in-current': 'limpeza' },
+    flowState: {
+      flowId: 'flow-unique-eligible',
+      fixedServiceId: 'svc-limpeza',
+      fixedByProofVersion: { fixedServiceId: 7 },
+    },
+  }
+);
+assert.equal(
+  uniqueEligibleWithoutOtherAnchor.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  false,
+  'K5 pós-matriz: única profissional elegível do serviço atual é 4ª âncora tipada'
+);
+const twoEligibleServices: ServicesResult = {
+  ...preBookingServices,
+  services: preBookingServices.services?.map((service) =>
+    service.id === 'svc-limpeza'
+      ? { ...service, professionalIds: ['prof-carla', 'prof-marina'] }
+      : service
+  ),
+  professionals: [
+    ...(preBookingServices.professionals ?? []),
+    { id: 'prof-marina', name: 'Marina Costa' },
+  ],
+};
+const nonUniqueEligibleWithoutAnchor = boundary('Tudo certo com a Carla.', {
+  servicesResult: twoEligibleServices,
+  sourceInboundText: 'limpeza',
+  inboundTextsById: { 'in-current': 'limpeza' },
+  flowState: {
+    flowId: 'flow-two-eligible',
+    fixedServiceId: 'svc-limpeza',
+    fixedByProofVersion: { fixedServiceId: 8 },
+  },
+});
+assert.equal(
+  nonUniqueEligibleWithoutAnchor.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  true,
+  '4ª âncora falha fechado quando há 2 profissionais elegíveis'
+);
+const undefinedEligibilityUsesGlobal = boundary('Tudo certo com a Carla.', {
+  servicesResult: {
+    success: true,
+    services: [
+      {
+        id: 'svc-global-fallback',
+        name: 'Serviço legado',
+        durationMinutes: 30,
+        price: 90,
+        priceFormatted: 'R$ 90,00',
+      },
+    ],
+    professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
+  },
+  sourceInboundText: 'serviço legado',
+  inboundTextsById: { 'in-current': 'serviço legado' },
+  flowState: {
+    flowId: 'flow-global-fallback',
+    fixedServiceId: 'svc-global-fallback',
+    fixedByProofVersion: { fixedServiceId: 9 },
+  },
+});
+assert.equal(
+  undefinedEligibilityUsesGlobal.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  false,
+  'A2: professionalIds undefined usa a lista global ativa'
+);
+const emptyEligibilityAnchorsNobody = boundary('Tudo certo com a Carla.', {
+  servicesResult: {
+    success: true,
+    services: [
+      {
+        id: 'svc-no-professional',
+        name: 'Serviço sem profissional',
+        durationMinutes: 30,
+        price: 90,
+        priceFormatted: 'R$ 90,00',
+        professionalIds: [],
+      },
+    ],
+    professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
+  },
+  sourceInboundText: 'serviço sem profissional',
+  inboundTextsById: { 'in-current': 'serviço sem profissional' },
+  flowState: {
+    flowId: 'flow-no-professional',
+    fixedServiceId: 'svc-no-professional',
+    fixedByProofVersion: { fixedServiceId: 10 },
+  },
+});
+assert.equal(
+  emptyEligibilityAnchorsNobody.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  true,
+  'A2: professionalIds [] não ancora nenhuma profissional'
+);
+
+const botNameCatalog: ServicesResult = {
+  ...servicesResult,
+  services: servicesResult.services?.map((service) => ({
+    ...service,
+    professionalIds: [...(service.professionalIds ?? []), 'prof-ana'],
+  })),
+  professionals: [
+    ...(servicesResult.professionals ?? []),
+    { id: 'prof-ana', name: 'Ana Silva' },
+  ],
+};
+const stoplistedBotName = boundary('Tudo certo com a Ana.', {
+  servicesResult: botNameCatalog,
+  sourceInboundText: 'Quero atendimento com a Ana',
+  inboundTextsById: { 'in-current': 'Quero atendimento com a Ana' },
+});
+assert.equal(
+  stoplistedBotName.reasonCodes.includes('UNKNOWN_PROFESSIONAL'),
+  true,
+  'K5: nome da bot permanece na stoplist mesmo se aparecer no catálogo'
+);
+
+const temporalInbound = 'sexta às 20h';
+const temporalSpan = spanFor(temporalInbound, temporalInbound);
+const socialLicensed = boundary('Sexta às 20h então!', {
+  replyPurpose: 'SOCIAL',
+  sourceInboundText: temporalInbound,
+  inboundTextsById: { 'in-current': temporalInbound },
+  socialTemporalEvidence: { inboundId: 'in-current', ...temporalSpan },
+  flowState: { flowId: 'social-flow', fixedByProofVersion: {} },
+});
+assert.equal(socialLicensed.safe, true, socialLicensed.reasonCodes.join(','));
+const socialUnlicensed = boundary('Sexta às 20h então!', {
+  replyPurpose: 'SOCIAL',
+  sourceInboundText: temporalInbound,
+  inboundTextsById: { 'in-current': temporalInbound },
+  flowState: { flowId: 'social-flow', fixedByProofVersion: {} },
+});
+assert.equal(
+  socialUnlicensed.reasonCodes.includes('UNLICENSED_SOCIAL_TEMPORAL_ECHO'),
+  true
+);
+
+const relist = boundary('Temos Peeling Facial e Drenagem. Qual você prefere?');
+assert.equal(relist.reasonCodes.includes('SERVICE_RELIST_AFTER_FIXED'), true);
+assert.equal(
+  shouldProhibitServiceRelistV2(flowState, {
+    kind: 'open',
+    pendingKind: 'SERVICE',
+    flowId: 'flow-v2',
+    optionEntityIds: ['svc-peeling', 'svc-drenagem'],
+  }),
+  false
+);
+
+const temporal = normalizeTemporalAssertionsV2(
+  'Atendo 15 horas, das 8 às 18 e oito da manhã.'
+).map((entry) => entry.normalized);
+assert.ok(temporal.includes('15:00'));
+assert.ok(temporal.includes('08:00'));
+assert.ok(temporal.includes('18:00'));
+
+const rawLeak = boundary('**INTERNAL_HINT svc-peeling**');
+assert.deepEqual(
+  rawLeak.stages.map((entry) => entry.stage),
+  [
+    'raw_candidate_scan',
+    'mechanical_normalization',
+    'customer_reply_guard',
+    'receptionist_outbound',
+  ]
+);
+assert.equal(rawLeak.stages[0]!.reasonCodes.includes('INTERNAL_HINT'), true);
+assert.equal(rawLeak.stages[0]!.reasonCodes.includes('CATALOG_SERVICE_ID'), true);
+const unrecordedHandoff = boundary('Vou te encaminhar para a equipe.');
+assert.equal(
+  unrecordedHandoff.stages[0]!.reasonCodes.includes('UNRECORDED_HANDOFF'),
+  true,
+  'handoff global roda no scan bruto, antes de qualquer exceção social'
+);
+
+console.log('smoke ana conversational v2 boundary: OK');

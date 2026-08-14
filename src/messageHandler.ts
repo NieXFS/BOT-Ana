@@ -1,4 +1,4 @@
-import type { TenantBotConfig } from './configProvider';
+import { getTenantConfig, type TenantBotConfig } from './configProvider';
 import {
   ConversationPausedBeforeDispatch,
   getLastResolvedSalesConversationRole,
@@ -7,6 +7,7 @@ import {
 import {
   addMessage,
   buildConversationKey,
+  getPersistedInboundBatch,
   withPersistedInboundContext,
 } from './services/contextManager';
 import { tryHandleOptOut } from './services/optOutService';
@@ -74,8 +75,14 @@ import {
   type ValidatedReceptionistOutbound,
 } from './services/receptionistOutbound';
 import { withConversationLock } from './services/conversationOrder';
+import type {
+  ConversationalV2Checkpoint,
+  PreparedReceptionistTurnV2,
+} from './services/conversationalV2/runtimeTypes';
+import type { DurableSuccessorBatchV2 } from './services/conversationalV2/stateStore';
 
 type OutboundReply = string | ValidatedReceptionistOutbound;
+type BufferedReply = OutboundReply | PreparedReceptionistTurnV2;
 export type ConfiguredReplyDelivery = 'sent' | 'suppressed';
 
 interface MessageBuffer {
@@ -92,6 +99,12 @@ interface MessageBuffer {
   inboundPersisted: boolean;
   messageIds: string[];
   pendingMessageIds: string[];
+  inputSequences: number[];
+  pendingInputSequences: number[];
+  activeDurableSuccessorTurnIds: string[];
+  pendingDurableSuccessorTurnIds: string[];
+  forceUpcomingReadV2?: boolean;
+  pendingForceUpcomingReadV2?: boolean;
   turnControl?: ReceptionistTurnControl;
 }
 
@@ -102,6 +115,8 @@ const MAX_WAIT_TIME_MS = 30_000;
 const FLUSH_RECOVERY_WINDOW_MS = 60_000;
 const FLUSH_FALLBACK_MESSAGE =
   'Tive um probleminha aqui. Pode repetir sua última mensagem?';
+const V2_SUCCESSOR_STARVATION_FALLBACK =
+  'Recebi várias mensagens. Pode me confirmar o que você prefere?';
 
 // Janela (por CONVERSA) em que NÃO reenviamos o fallback de erro — evita spam se
 // o cliente insistir e o flush continuar falhando. Chave = bufferKey
@@ -169,6 +184,13 @@ export interface FlushDeps {
     customerPhone: string,
     work: () => Promise<void>
   ) => Promise<void>;
+  deliverV2?: (
+    prepared: PreparedReceptionistTurnV2,
+    checkpoint: () => Promise<ConversationalV2Checkpoint>
+  ) => Promise<{
+    delivery: 'sent' | 'suppressed' | 'transport_unknown' | 'transport_failed';
+    successor?: DurableSuccessorBatchV2 | null;
+  }>;
 }
 
 /**
@@ -407,6 +429,20 @@ function isBotActive(config: TenantBotConfig): boolean {
   return now >= config.botActiveStart && now < config.botActiveEnd;
 }
 
+async function completeActiveDurableSuccessorsV2(
+  buffer: MessageBuffer
+): Promise<void> {
+  if (buffer.activeDurableSuccessorTurnIds.length === 0) return;
+  const ids = [...new Set(buffer.activeDurableSuccessorTurnIds)];
+  const { pgConversationalV2StateStore } = await import(
+    './services/conversationalV2/stateStore'
+  );
+  for (const successorTurnId of ids) {
+    await pgConversationalV2StateStore.markSuccessorCompleted(successorTurnId);
+  }
+  buffer.activeDurableSuccessorTurnIds = [];
+}
+
 function buildOutsideHoursMessage(config: TenantBotConfig): string {
   return `Nosso atendimento funciona das ${config.botActiveStart} às ${config.botActiveEnd}. Envie sua mensagem e responderemos assim que possível!`;
 }
@@ -432,6 +468,7 @@ async function suppressFlushIfPaused(params: {
   const unprocessedTexts = [...alreadyProcessedTexts, ...buffer.pendingTexts];
   buffer.pendingTexts = [];
   buffer.pendingMessageIds = [];
+  buffer.pendingInputSequences = [];
   if (!buffer.inboundPersisted) {
     for (const text of unprocessedTexts) {
       if (text.trim()) {
@@ -443,6 +480,12 @@ async function suppressFlushIfPaused(params: {
       }
     }
   }
+
+  buffer.activeDurableSuccessorTurnIds.push(
+    ...buffer.pendingDurableSuccessorTurnIds
+  );
+  buffer.pendingDurableSuccessorTurnIds = [];
+  await completeActiveDurableSuccessorsV2(buffer);
 
   messageBuffers.delete(bufferKey);
   console.log('⏸️ [pausado] resposta pendente suprimida após intervenção humana.');
@@ -483,16 +526,53 @@ async function resolveInboundTurnControl(
 async function getBufferedReply(
   buffer: MessageBuffer,
   bufferedMessageIds: string[],
+  bufferedTexts: string[],
+  bufferedInputSequences: number[],
   consolidatedText: string,
   deps: FlushDeps
-): Promise<OutboundReply> {
+): Promise<BufferedReply> {
+  const inputSequence = bufferedInputSequences.length > 0
+    ? Math.max(...bufferedInputSequences)
+    : 0;
+  const currentInboundTextsById = Object.fromEntries(
+    bufferedMessageIds.map((messageId, index) => [
+      messageId,
+      bufferedTexts[index] ?? consolidatedText,
+    ])
+  );
   const work = () =>
     deps.getReply(
       buffer.from,
       consolidatedText,
       buffer.name,
       buffer.config,
-      buffer.turnControl
+      buffer.turnControl,
+      {
+        ...(buffer.activeDurableSuccessorTurnIds[0]
+          ? { turnId: buffer.activeDurableSuccessorTurnIds[0] }
+          : {}),
+        inputSequence,
+        currentInboundIds: [...bufferedMessageIds],
+        currentInboundTextsById,
+        forceUpcomingRead: buffer.forceUpcomingReadV2 === true,
+        checkpoint: async () => {
+          const pendingSequence = buffer.pendingInputSequences.length > 0
+            ? Math.max(...buffer.pendingInputSequences)
+            : null;
+          return {
+            paused: await (deps.isPaused ?? isConversationPaused)(
+              buffer.config.phoneNumberId,
+              buffer.from
+            ),
+            latestInputSequence: Math.max(
+              inputSequence,
+              pendingSequence ?? inputSequence
+            ),
+            successorInputSequence: pendingSequence,
+            successorInboundMessageIds: [...buffer.pendingMessageIds],
+          };
+        },
+      }
     );
   if (!buffer.inboundPersisted) return work();
   return withPersistedInboundContext(bufferedMessageIds, work);
@@ -513,10 +593,12 @@ export async function flushBuffer(
   buffer.isProcessing = true;
   const bufferedTexts = [...buffer.texts];
   const bufferedMessageIds = [...buffer.messageIds];
+  const bufferedInputSequences = [...buffer.inputSequences];
   const consolidatedText = bufferedTexts.join(' ');
   const messageCount = buffer.texts.length;
   buffer.texts = [];
   buffer.messageIds = [];
+  buffer.inputSequences = [];
   const { name, config, from } = buffer;
 
   // A conversa pode ter sido pausada DEPOIS que o inbound entrou no debounce.
@@ -543,10 +625,12 @@ export async function flushBuffer(
       const generated = await getBufferedReply(
         buffer,
         bufferedMessageIds,
+        bufferedTexts,
+        bufferedInputSequences,
         consolidatedText,
         deps
       );
-      reply = typeof generated === 'string' ? generated : generated.payload;
+      reply = typeof generated === 'string' ? generated : generated.payload ?? '';
     } catch (err) {
       flushFailed = true;
       Sentry.captureException(new Error('message_handler sales brain failed'), {
@@ -657,6 +741,7 @@ export async function flushBuffer(
           if (current) {
             current.pendingTexts = [];
             current.pendingMessageIds = [];
+            current.pendingInputSequences = [];
           }
           messageBuffers.delete(bufferKey);
           return;
@@ -691,6 +776,8 @@ export async function flushBuffer(
       const reply = await getBufferedReply(
         buffer,
         bufferedMessageIds,
+        bufferedTexts,
+        bufferedInputSequences,
         consolidatedText,
         deps
       );
@@ -719,13 +806,67 @@ export async function flushBuffer(
           delivery = 'suppressed';
           return;
         }
-        const result = await deps.sendReply(from, reply, config);
-        if (result === 'suppressed') delivery = 'suppressed';
+        if (
+          typeof reply === 'object' &&
+          reply !== null &&
+          (reply as { kind?: unknown }).kind === 'ana_conversational_v2_prepared'
+        ) {
+          const prepared = reply as PreparedReceptionistTurnV2;
+          const deliverV2 = deps.deliverV2 ??
+            (async (
+              value: PreparedReceptionistTurnV2,
+              checkpoint: () => Promise<ConversationalV2Checkpoint>
+            ) => {
+              const { deliverPreparedReceptionistTurnV2 } = await import(
+                './services/conversationalV2/delivery'
+              );
+              return deliverPreparedReceptionistTurnV2(value, {
+                checkpoint,
+                sendTransport: (payload) =>
+                  sendFreeformMessageWithReceipt(from, payload, config),
+              });
+            });
+          const result = await deliverV2(prepared, async () => {
+            const pendingSequence = buffer.pendingInputSequences.length > 0
+              ? Math.max(...buffer.pendingInputSequences)
+              : null;
+            return {
+              paused: await (deps.isPaused ?? isConversationPaused)(
+                config.phoneNumberId,
+                from
+              ),
+              latestInputSequence: Math.max(
+                prepared.frame.inputSequence,
+                pendingSequence ?? prepared.frame.inputSequence
+              ),
+              successorInputSequence: pendingSequence,
+              successorInboundMessageIds: [...buffer.pendingMessageIds],
+            };
+          });
+          if (result.successor) {
+            if (
+              !buffer.pendingDurableSuccessorTurnIds.includes(
+                result.successor.successorTurnId
+              )
+            ) {
+              buffer.pendingDurableSuccessorTurnIds.push(
+                result.successor.successorTurnId
+              );
+            }
+            buffer.pendingForceUpcomingReadV2 =
+              buffer.pendingForceUpcomingReadV2 === true ||
+              result.successor.requiresAuthoritativeRead;
+          }
+          if (result.delivery !== 'sent') delivery = 'suppressed';
+        } else {
+          const result = await deps.sendReply(from, reply as OutboundReply, config);
+          if (result === 'suppressed') delivery = 'suppressed';
+        }
       });
 
       if (delivery === 'sent') {
         console.log(
-          `🤖 Resposta enviada | ${safeSalesContext(config, from)} | chars=${typeof reply === 'string' ? reply.length : reply.payload.length}`
+          `🤖 Resposta enviada | ${safeSalesContext(config, from)} | chars=${typeof reply === 'string' ? reply.length : reply.payload?.length ?? 0}`
         );
       } else {
         console.warn(
@@ -779,8 +920,10 @@ export async function flushBuffer(
         // criaria duplicidade, então este turno termina em silêncio.
         const current = messageBuffers.get(bufferKey);
         if (current) {
+          await completeActiveDurableSuccessorsV2(current);
           current.pendingTexts = [];
           current.pendingMessageIds = [];
+          current.pendingInputSequences = [];
         }
         messageBuffers.delete(bufferKey);
         return;
@@ -795,6 +938,7 @@ export async function flushBuffer(
 
   const currentBuffer = messageBuffers.get(bufferKey);
   if (!currentBuffer) return;
+  await completeActiveDurableSuccessorsV2(currentBuffer);
 
   // Falha no flush → limpa o buffer INTEIRO (inclui pendingTexts) e NÃO re-arma.
   // No receptionist, M24 já convidou o cliente a reenviar; em sales, o recovery
@@ -812,6 +956,14 @@ export async function flushBuffer(
     currentBuffer.pendingTexts = [];
     currentBuffer.messageIds = currentBuffer.pendingMessageIds;
     currentBuffer.pendingMessageIds = [];
+    currentBuffer.inputSequences = currentBuffer.pendingInputSequences;
+    currentBuffer.pendingInputSequences = [];
+    currentBuffer.activeDurableSuccessorTurnIds =
+      currentBuffer.pendingDurableSuccessorTurnIds;
+    currentBuffer.pendingDurableSuccessorTurnIds = [];
+    currentBuffer.forceUpcomingReadV2 =
+      currentBuffer.pendingForceUpcomingReadV2 === true;
+    currentBuffer.pendingForceUpcomingReadV2 = false;
     currentBuffer.isProcessing = false;
     currentBuffer.firstMessageAt = Date.now();
 
@@ -1057,6 +1209,7 @@ export async function handleIncomingMessage(
   let conversationKey = buildConversationKey(config.phoneNumberId, from);
   const inboundPersisted = config.botRole !== 'sales';
   let inboundDeliveryPending = false;
+  let persistedInputSequence: number | null = null;
   const normalizedInbound = normalizeInboundContent(message, inboundPersisted);
   const convHash = conversationHash(config.phoneNumberId, from);
 
@@ -1099,6 +1252,7 @@ export async function handleIncomingMessage(
       return;
     }
     conversationKey = intake.conversationKey;
+    persistedInputSequence = intake.sequence;
   }
 
   let text = '';
@@ -1344,6 +1498,9 @@ export async function handleIncomingMessage(
     if (existing.isProcessing) {
       existing.pendingTexts.push(text);
       if (inboundPersisted) existing.pendingMessageIds.push(message.id);
+      if (persistedInputSequence !== null) {
+        existing.pendingInputSequences.push(persistedInputSequence);
+      }
       existing.name = name;
       existing.config = config;
       if (inboundTurnControl) existing.turnControl = inboundTurnControl;
@@ -1354,6 +1511,9 @@ export async function handleIncomingMessage(
       if (existing.timer) clearTimeout(existing.timer);
       existing.texts.push(text);
       if (inboundPersisted) existing.messageIds.push(message.id);
+      if (persistedInputSequence !== null) {
+        existing.inputSequences.push(persistedInputSequence);
+      }
       existing.name = name;
       existing.config = config;
       if (inboundTurnControl) existing.turnControl = inboundTurnControl;
@@ -1380,6 +1540,11 @@ export async function handleIncomingMessage(
       inboundPersisted,
       messageIds: inboundPersisted ? [message.id] : [],
       pendingMessageIds: [],
+      inputSequences:
+        persistedInputSequence !== null ? [persistedInputSequence] : [],
+      pendingInputSequences: [],
+      activeDurableSuccessorTurnIds: [],
+      pendingDurableSuccessorTurnIds: [],
       turnControl: inboundTurnControl,
     };
 
@@ -1401,6 +1566,103 @@ export async function handleIncomingMessage(
     }, MAX_WAIT_TIME_MS);
 
     messageBuffers.set(bufferKey, newBuffer);
+  }
+}
+
+/**
+ * Callback do sweeper v2 após restart. Reconstrói o lote exclusivamente pelas
+ * referências duráveis do history e reutiliza o mesmo flush/lock/transporte da
+ * rota online; não reinsere inbound nem chama o intake novamente.
+ */
+export async function reprocessDurableSuccessorBatchV2(
+  batch: DurableSuccessorBatchV2
+): Promise<void> {
+  if (messageBuffers.has(batch.conversationKey)) {
+    throw new Error('Conversa com debounce em memória; lote durável será rearmado.');
+  }
+  const config = await getTenantConfig(batch.phoneNumberId);
+  if (!config || config.botRole === 'sales') {
+    throw new Error('Configuração receptionist indisponível para lote sucessor v2.');
+  }
+  const { isAnaConversationalV2Enabled } = await import(
+    './services/conversationalV2/featureFlag'
+  );
+  if (!isAnaConversationalV2Enabled(config.tenantSlug)) return;
+
+  const persisted = await getPersistedInboundBatch(
+    batch.conversationKey,
+    batch.inboundMessageIds
+  );
+  const expected = new Set(batch.inboundMessageIds);
+  const observed = new Set(persisted.map((entry) => entry.messageId));
+  if (
+    expected.size === 0 ||
+    observed.size !== expected.size ||
+    [...expected].some((messageId) => !observed.has(messageId))
+  ) {
+    throw new Error('Lote sucessor v2 incompleto no histórico durável.');
+  }
+
+  const buffer: MessageBuffer = {
+    texts: persisted.map((entry) => entry.content),
+    name: 'Cliente',
+    timer: null,
+    maxWaitTimer: null,
+    firstMessageAt: Date.now(),
+    config,
+    from: batch.customerPhone,
+    isProcessing: false,
+    pendingTexts: [],
+    inboundPersisted: true,
+    messageIds: persisted.map((entry) => entry.messageId),
+    pendingMessageIds: [],
+    inputSequences: persisted.map(() => batch.inputSequence),
+    pendingInputSequences: [],
+    activeDurableSuccessorTurnIds: [batch.successorTurnId],
+    pendingDurableSuccessorTurnIds: [],
+    forceUpcomingReadV2: batch.requiresAuthoritativeRead,
+    pendingForceUpcomingReadV2: false,
+  };
+  messageBuffers.set(batch.conversationKey, buffer);
+  try {
+    await flushBuffer(batch.conversationKey);
+  } finally {
+    if (messageBuffers.get(batch.conversationKey) === buffer) {
+      messageBuffers.delete(batch.conversationKey);
+    }
+  }
+}
+
+/** Fallback dirigido do teto anti-starvation; echo/pausa continuam soberanos. */
+export async function deliverDurableSuccessorFallbackV2(
+  batch: DurableSuccessorBatchV2
+): Promise<void> {
+  try {
+    const config = await getTenantConfig(batch.phoneNumberId);
+    if (!config || config.botRole === 'sales') return;
+    await withConversationLock(
+      batch.phoneNumberId,
+      batch.customerPhone,
+      async () => {
+        if (await isConversationPaused(batch.phoneNumberId, batch.customerPhone)) {
+          return;
+        }
+        await sendConfiguredReply(
+          batch.customerPhone,
+          V2_SUCCESSOR_STARVATION_FALLBACK,
+          config
+        );
+      }
+    );
+  } catch (error) {
+    Sentry.captureException(new Error('v2 durable successor fallback failed'), {
+      tags: {
+        service: 'message_handler',
+        operation: 'v2_successor_fallback',
+        phoneNumberId: batch.phoneNumberId,
+        error_kind: runtimeErrorKind(error),
+      },
+    });
   }
 }
 
@@ -1429,6 +1691,10 @@ export function __seedFlushBufferForTest(
     inboundPersisted: false,
     messageIds: [],
     pendingMessageIds: [],
+    inputSequences: [],
+    pendingInputSequences: [],
+    activeDurableSuccessorTurnIds: [],
+    pendingDurableSuccessorTurnIds: [],
     turnControl,
   });
   return bufferKey;

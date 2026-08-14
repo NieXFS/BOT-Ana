@@ -52,8 +52,9 @@ export function isValidMetaSignature(
 /**
  * Middleware Express: verifica o HMAC do forward Receps→Receps-IA.
  *
- * O webhook do Receps-IA recebe o payload ENCAMINHADO pelo Receps (não direto da
- * Meta): Meta → Receps /api/v1/bot/webhook (verifica X-Hub-Signature-256 da
+ * O webhook da Ana recebe o payload ENCAMINHADO pelo Receps (não direto da
+ * Meta) dentro do runtime Receps-IA: Meta → Receps /api/v1/bot/webhook
+ * (verifica X-Hub-Signature-256 da
  * Meta) → forward assinado com RECEPS_BOT_WEBHOOK_SECRET (header X-Bot-Signature)
  * → Receps-IA. A assinatura da Meta NÃO sobrevive ao reenvio (corpo re-serializado +
  * header não repassado), então a defesa real deste hop é o segredo do forward.

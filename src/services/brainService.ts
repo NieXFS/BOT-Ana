@@ -53,6 +53,7 @@ import {
 import {
   bookingConfirmationGate,
   cancellationIntentGate,
+  CONFIRMATION_HINT,
   RescheduleCancellationEvidenceStore,
   type BookingProposal,
 } from './bookingConfirmationGate';
@@ -99,6 +100,15 @@ import {
   buildSocialReceptionistReply,
   isSocialOnlyReceptionistMessage,
 } from './receptionistSocialSafety';
+import { isAnaConversationalV2Enabled } from './conversationalV2/featureFlag';
+import type {
+  ConversationalV2TurnRuntime,
+  PreparedReceptionistTurnV2,
+} from './conversationalV2/runtimeTypes';
+import type {
+  BookingDraftV2,
+  PendingFrameSnapshotV2,
+} from './conversationalV2/contracts';
 
 export {
   buildSocialReceptionistReply,
@@ -595,7 +605,7 @@ export const RECEPTIONIST_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = 
   },
 ];
 
-async function executeFunction(
+export async function executeReceptionistFunction(
   functionName: string,
   args: Record<string, unknown>,
   phone: string,
@@ -605,7 +615,16 @@ async function executeFunction(
   userMessages: string[],
   conversationHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
   servicesResult: ServicesResult,
-  conversationKey: string
+  conversationKey: string,
+  v2Grounding?: {
+    flowState: {
+      flowId?: string;
+      fixedServiceId?: string;
+      fixedProfessionalId?: string;
+      bookingDraft?: BookingDraftV2;
+    };
+    pending?: PendingFrameSnapshotV2 | null;
+  }
 ): Promise<string> {
   try {
     // O trace do loop preserva `args` como o modelo os enviou. Se um prefixo de
@@ -626,6 +645,31 @@ async function executeFunction(
     const isConfirmedRescheduleAfterCancellation =
       functionName === 'bookAppointment' &&
       rescheduleCancellationEvidence.peek(conversationKey) !== null;
+    const isDuplicateBookingPath =
+      functionName === 'bookAppointment' &&
+      (args.confirmedDuplicate === true || isConfirmedRescheduleAfterCancellation);
+    if (functionName === 'bookAppointment' && v2Grounding && !isDuplicateBookingPath) {
+      const pending = v2Grounding.pending;
+      const draft = v2Grounding.flowState.bookingDraft;
+      const isNormalConfirmation =
+        pending?.kind === 'CONFIRMATION' &&
+        pending.flowId === v2Grounding.flowState.flowId &&
+        !pending.options.some((option) =>
+          option.entityId.startsWith('duplicate-resolution:')
+        );
+      const argsMatchDraft = Boolean(
+        draft &&
+          String(args.serviceId ?? '') === draft.serviceId &&
+          String(args.date ?? '') === draft.date &&
+          String(args.time ?? '') === draft.time &&
+          (draft.professionalId === undefined
+            ? args.professionalId === undefined
+            : String(args.professionalId ?? '') === draft.professionalId)
+      );
+      if (!isNormalConfirmation || !argsMatchDraft) {
+        return JSON.stringify({ success: false, message: CONFIRMATION_HINT });
+      }
+    }
     if (
       (functionName === 'getAvailableSlots' ||
         functionName === 'bookAppointment') &&
@@ -634,7 +678,8 @@ async function executeFunction(
       if (
         servicesResult.success &&
         servicesResult.services &&
-        servicesResult.services.length >= 2
+        servicesResult.services.length >= 2 &&
+        v2Grounding?.flowState.fixedServiceId !== String(args.serviceId ?? '')
       ) {
         const gate = serviceSelectionGate(
           String(args.serviceId ?? ''),
@@ -665,6 +710,7 @@ async function executeFunction(
         professionalId: effectiveProfessionalId,
         servicesResult,
         userMessages,
+        trustedFlowState: v2Grounding?.flowState,
       });
       if (!selection.ok) {
         console.log(
@@ -846,6 +892,8 @@ export interface ReceptionistModelLoopResult {
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
   toolTrace: ReceptionistToolTraceEntry[];
   usage: ReceptionistRequestUsage[];
+  /** Terminal recuperável apenas quando explicitamente ativado pelo caller v2. */
+  terminalFailure?: 'AI_RESPONSE_TRUNCATED';
 }
 
 export type ReceptionistToolExecutor = (
@@ -862,10 +910,29 @@ export interface RunReceptionistModelLoopInput {
   maxToolRounds?: number;
   /** O harness comportamental desativa retries para tratar toda falha como bug. */
   retryOnFailure?: boolean;
+  /**
+   * Faz `finish_reason=length` retornar o trace congelado em vez de lançar.
+   * Default false preserva byte a byte o comportamento dos callers v1.
+   */
+  captureTruncationAsResult?: boolean;
+  /**
+   * Lembrete opt-in anexado depois de uma rodada que executou tools. O default
+   * ausente preserva integralmente o histórico enviado pelos callers v1.
+   */
+  postToolResultReminder?: string;
+  /** Opt-in exclusivo do brain v2; v1 omite e preserva o request legado. */
+  responseFormat?: 'json_object';
+  /**
+   * V4: uma única repetição imediata de completion vazia, na mesma rodada e
+   * antes de anexar qualquer assistant message. Callers v1 omitem.
+   */
+  retryEmptyCompletionOnce?: boolean;
   /** Fixture offline de completion; omitida em produção. */
   completionFactory?: (input: {
     round: number;
     messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+    responseFormat?: 'json_object';
+    tools: OpenAI.Chat.Completions.ChatCompletionTool[];
   }) => Promise<OpenAI.Chat.Completions.ChatCompletion>;
   /**
    * Ativa o terminal determinístico quando o gate de serviço bloquear. A chave
@@ -1031,8 +1098,23 @@ function validateCompletionResponse(
 function normalizeAssistantMessageForReplay(
   message: OpenAI.Chat.Completions.ChatCompletionMessage,
   runtime: ReceptionistAiRuntime,
-  thinkingMode: DeepSeekThinkingMode
+  thinkingMode: DeepSeekThinkingMode,
+  normalizeWhitespaceToolContent = false
 ): OpenAI.Chat.Completions.ChatCompletionMessageParam {
+  const hasToolCalls = Boolean(message.tool_calls?.length);
+  const whitespaceOnlyContent =
+    typeof message.content === 'string' && message.content.trim() === '';
+  if (normalizeWhitespaceToolContent && hasToolCalls && whitespaceOnlyContent) {
+    return {
+      ...(message as unknown as Record<string, unknown>),
+      // DeepSeek Thinking exige content não-nulo no replay; os demais aceitam
+      // null e não devem carregar whitespace provider-specific no contexto.
+      content:
+        runtime.provider === 'deepseek' && thinkingMode === 'enabled'
+          ? ''
+          : null,
+    } as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam;
+  }
   if (
     runtime.provider !== 'deepseek' ||
     thinkingMode !== 'enabled' ||
@@ -1106,50 +1188,111 @@ export async function runReceptionistModelLoop(
   const providerReportedModels: string[] = [];
   const blockedServiceAttempts = new Set<string>();
   const blockedServiceTools = new Set<string>();
+  let emptyCompletionRetryUsed = false;
   const canonicalServiceQuestion = input.serviceSelectionAntiLoop
     ? buildServiceQuestion(input.serviceSelectionAntiLoop.services)
     : null;
 
   for (let index = 0; index < maxToolRounds; index += 1) {
     const round = index + 1;
-    const startedAt = Date.now();
-    const requestCompletion = async () =>
-      validateCompletionResponse(
-        input.completionFactory
-          ? await input.completionFactory({ round, messages: [...messages] })
-          : await createReceptionistChatCompletion(runtime, {
-              messages,
-              tools: RECEPTIONIST_TOOLS,
-              temperature: sanitizeTemperature(input.config.aiTemperature),
-              maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
-              userId: input.userId,
-              thinkingMode,
-            })
+    const requestCompletion = async () => {
+      const completion = input.completionFactory
+        ? await input.completionFactory({
+            round,
+            messages: [...messages],
+            ...(input.responseFormat && runtime.supportsJsonObjectResponseFormat
+              ? { responseFormat: input.responseFormat }
+              : {}),
+            tools: RECEPTIONIST_TOOLS,
+          })
+        : await createReceptionistChatCompletion(runtime, {
+            messages,
+            tools: RECEPTIONIST_TOOLS,
+            temperature: sanitizeTemperature(input.config.aiTemperature),
+            maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
+            userId: input.userId,
+            thinkingMode,
+            ...(input.responseFormat && runtime.supportsJsonObjectResponseFormat
+              ? { responseFormat: input.responseFormat }
+              : {}),
+          });
+      if (
+        input.captureTruncationAsResult === true &&
+        completion.choices[0]?.finish_reason === 'length'
+      ) {
+        return completion;
+      }
+      return validateCompletionResponse(completion);
+    };
+    const completeAndRecord = async () => {
+      const startedAt = Date.now();
+      const response =
+        input.retryOnFailure === false
+          ? await requestCompletion()
+          : await callAiWithRetry(
+              requestCompletion,
+              `receptionist tenant=${input.config.tenantSlug} round=${round}/${maxToolRounds}`,
+              runtime.provider
+            );
+      const durationMs = Date.now() - startedAt;
+      if (response.model) providerReportedModels.push(response.model);
+      const choice = response.choices[0]!;
+      usage.push(
+        normalizeUsage(
+          round,
+          durationMs,
+          choice.finish_reason ?? null,
+          response.usage
+        )
       );
-    const response =
-      input.retryOnFailure === false
-        ? await requestCompletion()
-        : await callAiWithRetry(
-            requestCompletion,
-            `receptionist tenant=${input.config.tenantSlug} round=${round}/${maxToolRounds}`,
-            runtime.provider
-          );
-    const durationMs = Date.now() - startedAt;
-    if (response.model) {
-      providerReportedModels.push(response.model);
-    }
-    const choice = response.choices[0]!;
+      return response;
+    };
+    let response = await completeAndRecord();
+    let choice = response.choices[0]!;
 
-    usage.push(
-      normalizeUsage(round, durationMs, choice.finish_reason ?? null, response.usage)
-    );
+    const isEffectFreeEmptyCompletion =
+      choice.finish_reason !== 'length' &&
+      (!choice.message.tool_calls || choice.message.tool_calls.length === 0) &&
+      (typeof choice.message.content !== 'string' ||
+        choice.message.content.trim() === '');
+    if (
+      input.retryEmptyCompletionOnce === true &&
+      !emptyCompletionRetryUsed &&
+      isEffectFreeEmptyCompletion
+    ) {
+      emptyCompletionRetryUsed = true;
+      response = await completeAndRecord();
+      choice = response.choices[0]!;
+    }
+
+    if (
+      input.captureTruncationAsResult === true &&
+      choice.finish_reason === 'length'
+    ) {
+      return {
+        rawReply:
+          typeof choice.message.content === 'string'
+            ? choice.message.content
+            : null,
+        exhausted: false,
+        provider: runtime.provider,
+        model: runtime.model,
+        providerReportedModels,
+        rounds: round,
+        messages,
+        toolTrace,
+        usage,
+        terminalFailure: 'AI_RESPONSE_TRUNCATED',
+      };
+    }
 
     const assistantMessage = choice.message;
     messages.push(
       normalizeAssistantMessageForReplay(
         assistantMessage,
         runtime,
-        thinkingMode
+        thinkingMode,
+        input.responseFormat === 'json_object'
       )
     );
 
@@ -1239,6 +1382,11 @@ export async function runReceptionistModelLoop(
         tool_call_id: toolCall.id,
         content: result,
       });
+    }
+
+    const postToolResultReminder = input.postToolResultReminder?.trim();
+    if (postToolResultReminder) {
+      messages.push({ role: 'system', content: postToolResultReminder });
     }
   }
 
@@ -1369,8 +1517,9 @@ export async function getReply(
   userMessage: string,
   userName: string,
   config: TenantBotConfig,
-  turnControl?: ReceptionistTurnControl
-): Promise<string | ValidatedReceptionistOutbound> {
+  turnControl?: ReceptionistTurnControl,
+  turnRuntime?: ConversationalV2TurnRuntime
+): Promise<string | ValidatedReceptionistOutbound | PreparedReceptionistTurnV2> {
   const baseRole = resolveBrainRole(config);
   if (baseRole === 'sales') {
     // A checagem duplicada fecha a corrida entre o pre-flush e o claim: uma
@@ -1436,6 +1585,25 @@ export async function getReply(
     // Sem sessão: chama exatamente o entry point de vendas já existente.
     rememberResolvedSalesRole(phone, config, 'sales');
     return getSalesReply(phone, userMessage, userName, config);
+  }
+  // D10: esta é a única bifurcação v1/v2. A allowlist é avaliada antes de
+  // qualquer leitura/modelo/tool/write específico da recepcionista. O import
+  // pesado é dinâmico para que flag vazia carregue somente este gate puro.
+  if (isAnaConversationalV2Enabled(config.tenantSlug)) {
+    const { getReceptionistReplyV2 } = await import(
+      './conversationalV2/runtime'
+    );
+    return getReceptionistReplyV2({
+      phone,
+      userMessage,
+      userName,
+      config,
+      turnControl,
+      turnRuntime,
+    });
+  }
+  if (turnControl === undefined) {
+    return getReceptionistReply(phone, userMessage, userName, config);
   }
   return getReceptionistReply(phone, userMessage, userName, config, turnControl);
 }
@@ -1770,7 +1938,7 @@ async function getReceptionistReply(
         console.log(
           `🔧 Receptionist chamou ${functionName} | phoneNumberId=${config.phoneNumberId}`
         );
-        const result = await executeFunction(
+        const result = await executeReceptionistFunction(
           functionName,
           args,
           phone,

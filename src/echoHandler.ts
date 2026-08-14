@@ -76,6 +76,30 @@ export interface EchoDeps {
     customerPhone: string,
     work: () => Promise<void>
   ) => Promise<void>;
+  /** Fala humana invalida PendingFrame v2 dentro da mesma advisory lock. */
+  invalidatePendingByHuman?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<void>;
+}
+
+async function invalidatePendingByHumanWhenV2Enabled(
+  phoneNumberId: string,
+  customerPhone: string
+): Promise<void> {
+  const raw = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS?.trim();
+  if (!raw) return;
+  const config = await getTenantConfig(phoneNumberId);
+  if (!config) return;
+  const [{ isAnaConversationalV2Enabled }, { pgConversationalV2StateStore }] =
+    await Promise.all([
+      import('./services/conversationalV2/featureFlag'),
+      import('./services/conversationalV2/stateStore'),
+    ]);
+  if (!isAnaConversationalV2Enabled(config.tenantSlug, raw)) return;
+  await pgConversationalV2StateStore.invalidateOpenPendingByHuman(
+    canonicalConversationKey(phoneNumberId, customerPhone)
+  );
 }
 
 const defaultEchoDeps: EchoDeps = {
@@ -90,6 +114,7 @@ const defaultEchoDeps: EchoDeps = {
   downloadAudio: downloadMedia,
   transcribeAudio: transcreverAudioBuffer,
   shouldTranscribeHumanAudio: isAnaResumeGateEnabled,
+  invalidatePendingByHuman: invalidatePendingByHumanWhenV2Enabled,
 };
 
 /** A Meta envia o campo "smb_message_echoes" em change.field (Coexistence). */
@@ -436,6 +461,11 @@ export async function handleSmbMessageEchoes(
             }
           }
         }
+        await (deps.invalidatePendingByHuman ??
+          defaultEchoDeps.invalidatePendingByHuman)?.(
+          target.phoneNumberId,
+          target.customerPhone
+        );
       });
     } catch (err) {
       processingFailure ??= err;

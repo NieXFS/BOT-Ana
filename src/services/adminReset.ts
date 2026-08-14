@@ -1,6 +1,5 @@
 import {
   pool,
-  buildConversationKey,
   parseConversationKey,
 } from './contextManager';
 import { customerPhoneVariants } from './conversationActivity';
@@ -47,7 +46,8 @@ export function buildResetConversationKeys(
     variants.add(digits);
     variants.add(`+${digits}`);
   }
-  return [...variants].map((variant) => buildConversationKey(phoneNumberId, variant));
+  const prefix = phoneNumberId.trim();
+  return [...variants].map((variant) => `${prefix}:${variant}`);
 }
 
 async function countHistory(keys: string[]): Promise<number> {

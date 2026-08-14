@@ -17,8 +17,8 @@
  * usuário, e ainda assim só quando a pergunta anterior contém 2+ nomes exatos
  * do catálogo atual. Os matches são avaliados POR MENSAGEM e em ordem: a
  * escolha explícita inequívoca mais recente substitui a anterior; duas escolhas
- * na mesma mensagem continuam ambíguas. Match em 3 camadas (nome completo >
- * token distintivo > anti-ambiguidade).
+ * na mesma mensagem continuam ambíguas. Match em 4 camadas (nome completo >
+ * token distintivo > plural regular/typo seguro > anti-ambiguidade).
  */
 
 export interface ServiceLike {
@@ -61,6 +61,8 @@ const ROMAN_GRADE_VALUES: Record<string, string> = {
 };
 const SERVICE_CHOICE_QUESTION_RE =
   /\b(?:qual|prefere|escolh(?:e|a|er|eu)|opcao)\b/;
+const NAKED_WEEKDAY_RE =
+  /^(?:segunda|terca|quarta|quinta|sexta|sabado|domingo)(?:\s+feira)?$/;
 
 function normalizeServiceText(value: string): string {
   const normalized = value
@@ -112,10 +114,6 @@ function isFlowContinuation(message: string): boolean {
   );
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function tokensOf(name: string): string[] {
   return normalizeServiceText(name)
     .split(/[^a-z0-9]+/)
@@ -137,32 +135,55 @@ function simplePluralStem(token: string): string {
     : token;
 }
 
-function containsEquivalentToken(text: string, catalogToken: string): boolean {
-  const expected = simplePluralStem(catalogToken);
-  return text
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean)
-    .some((candidate) => simplePluralStem(candidate) === expected);
-}
-
-function buildDistinctiveTokens(services: ServiceLike[]): Map<string, Set<string>> {
-  const freq = new Map<string, number>();
-  const perService = new Map<string, string[]>();
-  for (const service of services) {
-    const tokens = tokensOf(service.name);
-    perService.set(service.id, tokens);
-    for (const token of new Set(tokens)) {
-      freq.set(token, (freq.get(token) ?? 0) + 1);
+/**
+ * Distância conservadora de uma edição para token de catálogo. Substituição,
+ * inserção, remoção e uma transposição adjacente contam como uma edição. Este
+ * helper vive junto do matcher canônico para que boundary/parser não mantenham
+ * implementações fuzzy paralelas.
+ */
+function editDistanceAtMostOne(left: string, right: string): boolean {
+  if (left === right) return true;
+  if (Math.abs(left.length - right.length) > 1) return false;
+  if (left.length === right.length) {
+    const mismatches: number[] = [];
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) mismatches.push(index);
+      if (mismatches.length > 2) return false;
     }
-  }
-  const distinctive = new Map<string, Set<string>>();
-  for (const service of services) {
-    distinctive.set(
-      service.id,
-      new Set((perService.get(service.id) ?? []).filter((token) => freq.get(token) === 1))
+    if (mismatches.length <= 1) return true;
+    return (
+      mismatches[1] === mismatches[0]! + 1 &&
+      left[mismatches[0]!] === right[mismatches[1]!] &&
+      left[mismatches[1]!] === right[mismatches[0]!]
     );
   }
-  return distinctive;
+  const [shorter, longer] =
+    left.length < right.length ? [left, right] : [right, left];
+  let shortIndex = 0;
+  let longIndex = 0;
+  let skipped = false;
+  while (shortIndex < shorter.length && longIndex < longer.length) {
+    if (shorter[shortIndex] === longer[longIndex]) {
+      shortIndex += 1;
+      longIndex += 1;
+      continue;
+    }
+    if (skipped) return false;
+    skipped = true;
+    longIndex += 1;
+  }
+  return true;
+}
+
+function tokenMatchKind(
+  candidate: string,
+  catalogToken: string
+): 'token' | 'typo' | null {
+  const left = simplePluralStem(candidate);
+  const right = simplePluralStem(catalogToken);
+  if (left === right) return 'token';
+  if (left.length < 5 || right.length < 5) return null;
+  return editDistanceAtMostOne(left, right) ? 'typo' : null;
 }
 
 /** Janela de intenção sobre as msgs do usuário + se contém abridor de NOVO agendamento. */
@@ -199,14 +220,16 @@ function computeWindow(userMessages: string[]): {
   return { windowMessages: windowMsgs, hasNewBooking };
 }
 
-type MatchKind = 'full' | 'token';
+type MatchKind = 'full' | 'token' | 'typo';
 
 /** Serviços citados na janela, com o tipo de match (nome completo vs token distintivo). */
 function matchedServices(
   windowText: string,
   services: ServiceLike[]
 ): Array<{ id: string; kind: MatchKind }> {
-  const distinctive = buildDistinctiveTokens(services);
+  const inboundTokens = windowText
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 3 && !STOPWORDS.has(token));
   const out: Array<{ id: string; kind: MatchKind }> = [];
   for (const service of services) {
     const name = normalizeServiceText(service.name);
@@ -214,15 +237,19 @@ function matchedServices(
       out.push({ id: service.id, kind: 'full' });
       continue;
     }
-    for (const token of distinctive.get(service.id) ?? []) {
-      if (
-        new RegExp(`\\b${escapeRegex(token)}\\b`).test(windowText) ||
-        containsEquivalentToken(windowText, token)
-      ) {
-        out.push({ id: service.id, kind: 'token' });
-        break;
+    let best: Exclude<MatchKind, 'full'> | null = null;
+    for (const catalogToken of tokensOf(service.name)) {
+      for (const candidate of inboundTokens) {
+        const kind = tokenMatchKind(candidate, catalogToken);
+        if (kind === 'token') {
+          best = 'token';
+          break;
+        }
+        if (kind === 'typo') best ??= 'typo';
       }
+      if (best === 'token') break;
     }
+    if (best) out.push({ id: service.id, kind: best });
   }
   return out;
 }
@@ -237,7 +264,8 @@ function collapseHierarchicalMatches(
   services: ServiceLike[]
 ): Array<{ id: string; kind: MatchKind }> {
   const full = matches.filter((match) => match.kind === 'full');
-  if (full.length <= 1) return matches;
+  if (full.length === 1) return full;
+  if (full.length === 0) return matches;
 
   return matches.filter((candidate) => {
     const candidateService = services.find((service) => service.id === candidate.id);
@@ -251,6 +279,44 @@ function collapseHierarchicalMatches(
       return otherName.length > candidateName.length && otherName.includes(candidateName);
     });
   });
+}
+
+export type CatalogEntityResolution =
+  | { kind: 'resolved'; entity: ServiceLike; matchKind: MatchKind }
+  | { kind: 'ambiguous'; entityIds: string[] }
+  | { kind: 'no_match'; reason: 'empty' | 'naked_weekday' | 'none' };
+
+/**
+ * Resolução detalhada pelo matcher canônico da casa. O retorno preserva a
+ * distinção entre ambiguidade e ausência de evidência para os validadores v2.
+ */
+export function resolveUniqueCatalogEntityFromCurrentMessage(
+  message: string,
+  entities: ServiceLike[]
+): CatalogEntityResolution {
+  const normalized = normalizeServiceText(message);
+  if (!normalized || entities.length === 0) {
+    return { kind: 'no_match', reason: 'empty' };
+  }
+  if (NAKED_WEEKDAY_RE.test(normalized)) {
+    return { kind: 'no_match', reason: 'naked_weekday' };
+  }
+  const matches = collapseHierarchicalMatches(
+    matchedServices(normalized, entities),
+    entities
+  );
+  if (matches.length === 0) return { kind: 'no_match', reason: 'none' };
+  if (matches.length > 1) {
+    return {
+      kind: 'ambiguous',
+      entityIds: matches.map((match) => match.id),
+    };
+  }
+  const match = matches[0]!;
+  const entity = entities.find((candidate) => candidate.id === match.id);
+  return entity
+    ? { kind: 'resolved', entity, matchKind: match.kind }
+    : { kind: 'no_match', reason: 'none' };
 }
 
 const INFORMATIONAL_SERVICE_QUESTION_RE =
@@ -503,13 +569,11 @@ export function uniqueCatalogServiceFromCurrentMessage(
   message: string,
   services: ServiceLike[]
 ): ServiceLike | undefined {
-  if (!message.trim() || services.length === 0) return undefined;
-  const matches = collapseHierarchicalMatches(
-    matchedServices(normalizeServiceText(message), services),
+  const resolution = resolveUniqueCatalogEntityFromCurrentMessage(
+    message,
     services
   );
-  if (matches.length !== 1) return undefined;
-  return services.find((service) => service.id === matches[0]!.id);
+  return resolution.kind === 'resolved' ? resolution.entity : undefined;
 }
 
 /**

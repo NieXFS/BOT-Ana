@@ -18,6 +18,8 @@ export interface ReceptionistAiRuntime {
   model: string;
   baseURL?: string;
   apiKey: string;
+  /** Capability explícita; callers de texto puro continuam sem opt-in. */
+  supportsJsonObjectResponseFormat: boolean;
 }
 
 export interface ReceptionistCompletionInput {
@@ -35,6 +37,8 @@ export interface ReceptionistCompletionInput {
    * braço experimental explícito, que precisa preservar reasoning_content.
    */
   thinkingMode?: DeepSeekThinkingMode;
+  /** Opt-in estrutural para completions JSON one-shot; nunca usado no social. */
+  responseFormat?: 'json_object';
 }
 
 export interface AnaResumeClassifierCompletionInput {
@@ -103,7 +107,12 @@ export function resolveReceptionistAiRuntime(
       );
     }
 
-    return { provider: 'openai', model, apiKey };
+    return {
+      provider: 'openai',
+      model,
+      apiKey,
+      supportsJsonObjectResponseFormat: true,
+    };
   }
 
   if (provider === 'deepseek') {
@@ -125,6 +134,7 @@ export function resolveReceptionistAiRuntime(
       model,
       baseURL: DEEPSEEK_BASE_URL,
       apiKey,
+      supportsJsonObjectResponseFormat: true,
     };
   }
 
@@ -145,6 +155,7 @@ export function resolveAnaResumeClassifierRuntime(): ReceptionistAiRuntime {
     model: DEEPSEEK_V4_FLASH_MODEL,
     baseURL: DEEPSEEK_BASE_URL,
     apiKey,
+    supportsJsonObjectResponseFormat: true,
   };
 }
 
@@ -196,6 +207,9 @@ export function buildReceptionistCompletionRequest(
     tools: input.tools,
     temperature: input.temperature,
     max_tokens: input.maxTokens,
+    ...(input.responseFormat === 'json_object'
+      ? { response_format: { type: 'json_object' as const } }
+      : {}),
   };
 
   if (runtime.provider === 'openai') {

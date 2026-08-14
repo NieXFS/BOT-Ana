@@ -5,7 +5,9 @@ import { Sentry } from './observability/sentry';
 import express, { Request, Response } from 'express';
 import { getTenantConfig } from './configProvider';
 import {
+  deliverDurableSuccessorFallbackV2,
   handleIncomingMessage,
+  reprocessDurableSuccessorBatchV2,
   CloudMessage,
   CloudContact,
 } from './messageHandler';
@@ -765,6 +767,27 @@ async function boot(): Promise<void> {
   // Garante a tabela de idempotência e o schema da Onda 2 antes do tráfego.
   await ensureProcessedMessagesTable();
   await ensureAnaWave2Tables();
+  // O schema/worker v2 só é carregado quando existe allowlist configurada.
+  // Flag vazia mantém o boot e a rota v1 sem importar o runtime v2 pesado.
+  const v2Allowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
+    ?.split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry && entry !== '*') ?? [];
+  if (v2Allowlist.length > 0) {
+    const {
+      ensureConversationalV2Tables,
+      startConversationalV2Sweep,
+    } = await import('./services/conversationalV2/stateStore');
+    await ensureConversationalV2Tables();
+    startConversationalV2Sweep();
+    const { startConversationalV2SuccessorSweep } = await import(
+      './services/conversationalV2/successorProcessor'
+    );
+    startConversationalV2SuccessorSweep({
+      process: reprocessDurableSuccessorBatchV2,
+      fallback: deliverDurableSuccessorFallbackV2,
+    });
+  }
   // Falha de retenção é observada/sanitizada no serviço e nunca impede o boot.
   await runAnaRetention().catch(() => undefined);
   startAnaRetentionScheduler();

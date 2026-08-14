@@ -1,0 +1,236 @@
+import { buildSafeWriteConfirmation, type ToolTraceLike } from '../customerReplyGuard';
+import type { ServicesResult } from '../calendarService';
+import type { ReceptionistToolTraceEntry } from '../brainService';
+import type {
+  BookingDraftV2,
+  FlowStateV2,
+  ModelTurnResultV2,
+  PendingTransitionCandidate,
+  TurnFrameV2,
+} from './contracts';
+import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
+
+interface ParsedToolResult {
+  success?: unknown;
+  slots?: unknown;
+  professionalId?: unknown;
+}
+
+function parseResult(value: string): ParsedToolResult | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as ParsedToolResult)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizedSlot(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const times = normalizeTemporalAssertionsV2(value).filter(
+    (assertion) => assertion.kind === 'time'
+  );
+  return times.length === 1 ? times[0]!.normalized : null;
+}
+
+function displayTime(value: string): string {
+  const match = /^(\d{2}):(\d{2})$/u.exec(value);
+  if (!match) return value;
+  return match[2] === '00'
+    ? `${Number(match[1])}h`
+    : `${Number(match[1])}h${match[2]}`;
+}
+
+function joinedTimes(slots: readonly string[]): string {
+  const displayed = slots.map(displayTime);
+  if (displayed.length <= 1) return displayed[0] ?? '';
+  return `${displayed.slice(0, -1).join(', ')} e ${displayed.at(-1)}`;
+}
+
+function latestSuccessfulSlots(input: {
+  toolTrace: readonly ReceptionistToolTraceEntry[];
+  services: ServicesResult;
+}): {
+  serviceId: string;
+  professionalId?: string;
+  date: string;
+  slots: string[];
+} | null {
+  for (const entry of [...input.toolTrace].reverse()) {
+    if (entry.name !== 'getAvailableSlots') continue;
+    const parsed = parseResult(entry.result);
+    if (parsed?.success !== true || !Array.isArray(parsed.slots)) continue;
+    const slots = parsed.slots.map(normalizedSlot);
+    if (slots.length === 0 || slots.some((slot) => slot === null)) continue;
+    const serviceId =
+      typeof entry.args.serviceId === 'string' ? entry.args.serviceId : '';
+    const date = typeof entry.args.date === 'string' ? entry.args.date : '';
+    const requestedProfessionalId =
+      typeof entry.args.professionalId === 'string'
+        ? entry.args.professionalId
+        : undefined;
+    const resultProfessionalId =
+      typeof parsed.professionalId === 'string'
+        ? parsed.professionalId
+        : undefined;
+    if (
+      requestedProfessionalId &&
+      resultProfessionalId &&
+      requestedProfessionalId !== resultProfessionalId
+    ) {
+      continue;
+    }
+    const service = input.services.services?.find(
+      (candidate) => candidate.id === serviceId
+    );
+    if (!service || !/^\d{4}-\d{2}-\d{2}$/u.test(date)) continue;
+    const active = new Set(
+      (input.services.professionals ?? []).map((professional) => professional.id)
+    );
+    const eligible = service.professionalIds === undefined
+      ? [...active]
+      : service.professionalIds.filter((id) => active.has(id));
+    const professionalId =
+      resultProfessionalId ??
+      requestedProfessionalId ??
+      (eligible.length === 1 ? eligible[0] : undefined);
+    if (professionalId && !eligible.includes(professionalId)) continue;
+    return {
+      serviceId,
+      ...(professionalId ? { professionalId } : {}),
+      date,
+      slots: slots as string[],
+    };
+  }
+  return null;
+}
+
+function fixedStateForSlots(
+  frame: TurnFrameV2,
+  evidence: NonNullable<ReturnType<typeof latestSuccessfulSlots>>
+): FlowStateV2 {
+  const serviceChanged = frame.flowState.fixedServiceId !== evidence.serviceId;
+  const serviceVersion = serviceChanged
+    ? (frame.flowState.fixedByProofVersion.fixedServiceId ?? 0) + 1
+    : frame.flowState.fixedByProofVersion.fixedServiceId ?? 1;
+  return {
+    flowId: frame.flowState.flowId,
+    fixedServiceId: evidence.serviceId,
+    ...(evidence.professionalId
+      ? { fixedProfessionalId: evidence.professionalId }
+      : {}),
+    resolvedDate: evidence.date,
+    slotEvidence: {
+      turnId: frame.turnId,
+      serviceId: evidence.serviceId,
+      ...(evidence.professionalId
+        ? { professionalId: evidence.professionalId }
+        : {}),
+      date: evidence.date,
+      slots: evidence.slots,
+    },
+    fixedByProofVersion: {
+      fixedServiceId: serviceVersion,
+      ...(evidence.professionalId
+        ? { fixedProfessionalId: serviceVersion }
+        : {}),
+      resolvedDate:
+        (frame.flowState.fixedByProofVersion.resolvedDate ?? 0) + 1,
+    },
+  };
+}
+
+function resolveCurrentPending(frame: TurnFrameV2): PendingTransitionCandidate {
+  return frame.pending
+    ? { kind: 'resolve', questionId: frame.pending.questionId }
+    : { kind: 'preserve' };
+}
+
+export interface LifecycleOverrideV2 {
+  result: ModelTurnResultV2;
+  nextFlowState: FlowStateV2;
+  kind: 'canonical_write' | 'canonical_slots';
+}
+
+/**
+ * Reducers silenciosos: nenhum deles interpreta a copy. Cada mudança de estado
+ * vem de toolTrace tipado e substitui a fala por copy canônica correspondente.
+ */
+export function reduceToolLifecycleV2(input: {
+  frame: TurnFrameV2;
+  toolTrace: readonly ReceptionistToolTraceEntry[];
+  services: ServicesResult;
+  sourceInboundText?: string;
+}): LifecycleOverrideV2 | null {
+  const writeConfirmation = buildSafeWriteConfirmation(
+    [...input.toolTrace] as ToolTraceLike[]
+  );
+  if (writeConfirmation) {
+    const { bookingDraft: _draft, slotEvidence: _slots, ...rest } =
+      input.frame.flowState;
+    return {
+      kind: 'canonical_write',
+      nextFlowState: rest,
+      result: {
+        schemaVersion: 2,
+        reply: writeConfirmation,
+        replyPurpose: 'WRITE_CONFIRMATION',
+        pendingTransitionCandidate: resolveCurrentPending(input.frame),
+        resolutionCandidate: null,
+        unknownServiceEvidence: null,
+      },
+    };
+  }
+
+  const evidence = latestSuccessfulSlots(input);
+  if (!evidence) return null;
+  const socialAcknowledgement = /\bobrigad[ao]s?\b/iu.test(
+    input.sourceInboundText ?? ''
+  )
+    ? 'Obrigada! '
+    : '';
+  return {
+    kind: 'canonical_slots',
+    nextFlowState: fixedStateForSlots(input.frame, evidence),
+    result: {
+      schemaVersion: 2,
+      reply: `${socialAcknowledgement}Encontrei estes horários: ${joinedTimes(
+        evidence.slots
+      )}. Qual você prefere?`,
+      replyPurpose: 'DATE_TIME_QUESTION',
+      pendingTransitionCandidate: {
+        kind: 'open',
+        pendingKind: 'TIME',
+        flowId: input.frame.flowState.flowId,
+        optionEntityIds: evidence.slots,
+      },
+      resolutionCandidate: null,
+      unknownServiceEvidence: null,
+    },
+  };
+}
+
+function displayDate(date: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(date);
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : date;
+}
+
+export function buildCanonicalBookingSummaryV2(input: {
+  draft: BookingDraftV2;
+  services: ServicesResult;
+}): string {
+  const service = input.services.services?.find(
+    (entry) => entry.id === input.draft.serviceId
+  );
+  const professional = input.draft.professionalId
+    ? input.services.professionals?.find(
+        (entry) => entry.id === input.draft.professionalId
+      )
+    : null;
+  const professionalPart = professional ? `, com ${professional.name}` : '';
+  return `Confirmando: ${service?.name ?? 'o serviço escolhido'}, em ${displayDate(
+    input.draft.date
+  )}, às ${displayTime(input.draft.time)}${professionalPart}. Posso marcar?`;
+}

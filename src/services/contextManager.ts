@@ -45,6 +45,10 @@ export function currentSourceInboundMessageId(): string | null {
   return ids.length > 0 ? ids[ids.length - 1] ?? null : null;
 }
 
+export function currentSourceInboundMessageIds(): string[] {
+  return [...(persistedInboundContext.getStore()?.messageIds ?? [])];
+}
+
 /**
  * Marcador de mensagem enviada por um ATENDENTE HUMANO (recepção, via
  * smb_message_echoes). Gravado no início do `content` (role `assistant`) quando a
@@ -219,10 +223,54 @@ export async function getHistory(
   return logical.map((entry) => entry.message);
 }
 
+export interface PersistedInboundBatchEntry {
+  messageId: string;
+  content: string;
+}
+
+/**
+ * Reconstrói somente o lote atômico nomeado pelo sucessor v2. Os ids já vivem
+ * no history durável; o registro do sucessor guarda apenas a referência e evita
+ * duplicar o texto/PII em outra tabela.
+ */
+export async function getPersistedInboundBatch(
+  conversationKey: string,
+  messageIds: readonly string[]
+): Promise<PersistedInboundBatchEntry[]> {
+  const uniqueIds = [...new Set(messageIds.filter(Boolean))];
+  if (uniqueIds.length === 0) return [];
+  const result = await pool.query<{
+    message_id: string;
+    content: string;
+  }>(
+    `SELECT message_id, "content"
+     FROM ana_conversation_history
+     WHERE "conversationKey" = $1
+       AND "role" = 'user'
+       AND message_id = ANY($2::text[])
+     ORDER BY "createdAt" ASC, "id" ASC`,
+    [conversationKey, uniqueIds]
+  );
+  return result.rows.map((row) => ({
+    messageId: row.message_id,
+    content: row.content,
+  }));
+}
+
 export interface LastMessageMeta {
   role: 'user' | 'assistant';
   /** ms epoch da última atividade da conversa = max(createdAt). */
   lastActivityAtMs: number;
+}
+
+function conversationLookupKeys(
+  phoneNumberId: string,
+  customerPhone: string
+): string[] {
+  const prefix = phoneNumberId.trim();
+  return customerPhoneVariants(customerPhone).map(
+    (variant) => `${prefix}:${variant}`
+  );
 }
 
 /**
@@ -235,9 +283,7 @@ export async function getLastMessageMeta(
   phoneNumberId: string,
   customerPhone: string
 ): Promise<LastMessageMeta | null> {
-  const keys = customerPhoneVariants(customerPhone).map((variant) =>
-    buildConversationKey(phoneNumberId, variant)
-  );
+  const keys = conversationLookupKeys(phoneNumberId, customerPhone);
   if (keys.length === 0) return null;
 
   const result = await pool.query<{ role: string; createdAt: Date }>(
@@ -276,9 +322,7 @@ export async function getLastInboundAtMs(
   phoneNumberId: string,
   customerPhone: string
 ): Promise<number | null> {
-  const keys = customerPhoneVariants(customerPhone).map((variant) =>
-    buildConversationKey(phoneNumberId, variant)
-  );
+  const keys = conversationLookupKeys(phoneNumberId, customerPhone);
   if (keys.length === 0) return null;
 
   const result = await pool.query<{ createdAt: Date }>(
@@ -513,9 +557,7 @@ export async function getHistoryWithTimestamps(
   customerPhone: string,
   queryFn: QueryFn = defaultQueryFn
 ): Promise<TimestampedMessage[]> {
-  const keys = customerPhoneVariants(customerPhone).map((variant) =>
-    buildConversationKey(phoneNumberId, variant)
-  );
+  const keys = conversationLookupKeys(phoneNumberId, customerPhone);
   if (keys.length === 0) return [];
 
   const result = await queryFn(
