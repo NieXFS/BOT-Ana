@@ -11,6 +11,7 @@ import {
   hasUnverifiedExistingAppointmentContext,
   type AppointmentTemporalContext,
 } from './customerReplyGuard';
+import { matchForbiddenPromiseInSpeech } from './promiseGuard';
 import {
   CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
   toolTraceHasCustomerIdentityAmbiguity,
@@ -96,6 +97,12 @@ export interface ReceptionistOutboundEvidence {
   /** Falha de identidade detectada pelo ERP; nunca depende de paráfrase do modelo. */
   customerIdentityAmbiguous?: boolean;
   actionRecorded?: boolean;
+  /**
+   * questionId autoritativo da escalada recém-registrada. É a licença da
+   * copy de handoff ("vou avisar…"); boolean sozinho não atravessa o
+   * validador final se este campo for o que o turno preparou.
+   */
+  authoritativeEscalationQuestionId?: string;
   clinicalAuthorization?: ClinicalAuthorization;
   teamReplyAuthorization?: TeamReplyAuthorization;
   sourceInboundMessageId?: string;
@@ -159,7 +166,32 @@ const HANDOFF_RE = new RegExp(
   String.raw`\b(?:vou|vamos|irei|iremos)\s+(?:te\s+)?(?:transf\u0065rir|enc\u0061minhar|passar|acionar|chamar)\b|\b(?:enc\u0061minhei|transf\u0065ri|acionei|chamei)\b`,
   'iu'
 );
+/** Família canônica `vou/iremos/irei avisar <alvo humano>` — nome arbitrário, sem lista fechada. */
+const AVISAR_NOMINAL_HANDOFF_RE = new RegExp(
+  String.raw`\b(?:vou|iremos|irei|vamos)\s+avisar\s+(?:(?:a|o|as|os)\s+)?[\p{L}][\p{L}'-]*(?:\s+[\p{L}][\p{L}'-]*)?`,
+  'iu'
+);
 const CLINICAL_RE = /\b(?:diagn[oó]stic[oa]|diagnosticamos|cura|curamos|elimina|resolve|garante|garantimos|n[aã]o\s+d[oó]i|sem\s+dor|resultado\s+garantido|adequad[oa]\s+para|indicad[oa]\s+para|seguro\s+para|eficaz)\b/iu;
+
+export function hasAuthoritativeHandoffLicense(
+  evidence?: ReceptionistOutboundEvidence
+): boolean {
+  const questionId = evidence?.authoritativeEscalationQuestionId?.trim();
+  if (questionId) return true;
+  return evidence?.actionRecorded === true;
+}
+
+/** Promessa de transferência humana sem questionId/ação autoritativa. */
+export function containsUnlicensedHandoffPromise(
+  text: string,
+  evidence?: ReceptionistOutboundEvidence
+): boolean {
+  const promisesHandoff =
+    Boolean(matchForbiddenPromiseInSpeech(text)) ||
+    HANDOFF_RE.test(text) ||
+    AVISAR_NOMINAL_HANDOFF_RE.test(text);
+  return promisesHandoff && !hasAuthoritativeHandoffLicense(evidence);
+}
 
 export function containsInternalConversationMarker(text: string): boolean {
   const compact = text.trim();
@@ -502,7 +534,9 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   if (HUMAN_DEADLINE_RE.test(text)) reasons.add('HUMAN_RESPONSE_DEADLINE');
   if (CPF_RE.test(text) || PHONE_RE.test(text) || RECORD_RE.test(text)) reasons.add('EXPLICIT_PII');
   if (emojiCount(text) > 1) reasons.add('TOO_MANY_EMOJIS');
-  if (HANDOFF_RE.test(text) && !envelope.evidence?.actionRecorded) reasons.add('UNRECORDED_HANDOFF');
+  if (containsUnlicensedHandoffPromise(text, envelope.evidence)) {
+    reasons.add('UNRECORDED_HANDOFF');
+  }
   for (const block of blocks) {
     if (CLINICAL_RE.test(block.text) && !clinicalAuthorized(block, envelope.evidence)) reasons.add('UNAUTHORIZED_CLINICAL_PROMISE');
   }

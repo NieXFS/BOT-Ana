@@ -1058,6 +1058,9 @@ export async function getReceptionistReplyV2(input: {
       replyPurpose: 'OPERATIONAL_ANSWER',
       source: 'CANONICAL',
       actionRecorded: escalation.actionRecorded,
+      outboundEvidence: escalation.questionId
+        ? { authoritativeEscalationQuestionId: escalation.questionId }
+        : undefined,
       route: 'model',
       pendingAnaOpen:
         frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
@@ -1647,6 +1650,9 @@ export async function getReceptionistReplyV2(input: {
       replyPurpose: 'OPERATIONAL_ANSWER',
       source: 'CANONICAL',
       actionRecorded: interpreterActionRecorded,
+      outboundEvidence: interpreterEscalationQuestionId
+        ? { authoritativeEscalationQuestionId: interpreterEscalationQuestionId }
+        : undefined,
       route: 'interpreter',
       pendingAnaOpen:
         frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,

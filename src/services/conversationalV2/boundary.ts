@@ -1,5 +1,4 @@
 import type { ServicesResult } from '../calendarService';
-import { matchForbiddenPromiseInSpeech } from '../promiseGuard';
 import {
   inspectCustomerReply,
   normalizeCustomerReplyStyle,
@@ -11,6 +10,7 @@ import {
   buildReceptionistEnvelope,
   catalogFromServicesResult,
   containsInternalConversationMarker,
+  containsUnlicensedHandoffPromise,
   validateReceptionistOutbound,
   type AuthoritativeOutboundCatalog,
   type OutboundReasonCode,
@@ -240,7 +240,13 @@ function rawLeakReasons(input: BoundaryEvaluationInputV2): BoundaryReasonCodeV2[
   const raw = input.rawCandidate;
   if (!raw.trim()) reasons.add('EMPTY_PAYLOAD');
   if (/INTERNAL_HINT/iu.test(raw)) reasons.add('INTERNAL_HINT');
-  if (matchForbiddenPromiseInSpeech(raw) && !input.actionRecorded) {
+  if (
+    containsUnlicensedHandoffPromise(raw, {
+      actionRecorded: input.actionRecorded,
+      authoritativeEscalationQuestionId:
+        input.outboundEvidence?.authoritativeEscalationQuestionId,
+    })
+  ) {
     reasons.add('UNRECORDED_HANDOFF');
   }
   if (containsInternalConversationMarker(raw)) {

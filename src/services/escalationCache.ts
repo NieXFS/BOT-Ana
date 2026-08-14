@@ -41,6 +41,55 @@ export function parseEscalationSnapshot(value: unknown): EscalationSnapshot {
 }
 
 /**
+ * Parser fail-closed do pause-ack. `undefined` é ausência (tratada pelo
+ * caller). Qualquer valor presente — null, primitivo, array ou objeto com
+ * `active`/`questionId`/`version` inválidos ou incompletos — devolve null.
+ */
+export function parseStrictEscalationSnapshot(
+  value: unknown
+): EscalationSnapshot | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  if (
+    !Object.prototype.hasOwnProperty.call(raw, 'active') ||
+    !Object.prototype.hasOwnProperty.call(raw, 'questionId') ||
+    !Object.prototype.hasOwnProperty.call(raw, 'version')
+  ) {
+    return null;
+  }
+  if (raw.active !== true && raw.active !== false) {
+    return null;
+  }
+  if (
+    typeof raw.version !== 'number' ||
+    !Number.isFinite(raw.version) ||
+    raw.version < 0
+  ) {
+    return null;
+  }
+  if (raw.active === true) {
+    if (typeof raw.questionId !== 'string' || !raw.questionId.trim()) {
+      return null;
+    }
+    return {
+      active: true,
+      questionId: raw.questionId.trim(),
+      version: Math.floor(raw.version),
+    };
+  }
+  if (raw.questionId !== null) {
+    return null;
+  }
+  return {
+    active: false,
+    questionId: null,
+    version: Math.floor(raw.version),
+  };
+}
+
+/**
  * Atualização versionada vinda de escalate/inbound. Snapshot mais antigo nunca
  * regride o cache. `force` é reservado ao pause-state: por contrato, campo
  * `escalation` AUSENTE significa inactive durante a implantação paralela.

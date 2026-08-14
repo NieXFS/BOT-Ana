@@ -10,7 +10,7 @@ import {
   escalationCacheNeedsRefresh,
   getEscalationSnapshot,
   isEscalationKnownActive,
-  parseEscalationSnapshot,
+  parseStrictEscalationSnapshot,
   updateEscalationFromPauseState,
 } from './escalationCache';
 import { peekCachedTenantSlug } from '../configProvider';
@@ -298,8 +298,14 @@ export async function isConversationPaused(
 
 /**
  * Exceção fechada de transporte: permite somente a confirmação da ação de
- * escalada que acabou de criar a própria pausa. Qualquer outra pausa, snapshot
- * divergente ou indisponibilidade do Receps continua fail-closed.
+ * escalada que acabou de criar a própria pausa. Campo aditivo ausente
+ * (`escalation === undefined`) preserva o snapshot local deste único ack.
+ * Qualquer valor presente passa por validação estrita do snapshot: null,
+ * primitivo, array ou objeto com active/questionId/version inválidos ou
+ * incompletos falha fechado. `active:true` + mesmo questionId atualiza e
+ * libera somente a própria escalada; ID ausente/divergente falha fechado;
+ * `active:false` completo atualiza o cache e aplica a decisão ordinária das
+ * demais pausas. Qualquer outra pausa ou fetch nulo continua fail-closed.
  */
 export async function isConversationPausedForEscalationAcknowledgement(
   phoneNumberId: string,
@@ -307,21 +313,15 @@ export async function isConversationPausedForEscalationAcknowledgement(
   questionId: string,
   deps: ConversationPauseDeps = defaultConversationPauseDeps
 ): Promise<boolean> {
+  const expectedQuestionId = questionId.trim();
+  if (!expectedQuestionId) return true;
   const local = getEscalationSnapshot(phoneNumberId, customerPhone);
-  if (!local?.active || local.questionId !== questionId) return true;
+  if (!local?.active || local.questionId !== expectedQuestionId) return true;
 
   const now = deps.now();
   const canonicalPhone = canonicalCustomerPhone(customerPhone);
   const state = await deps.fetchState(phoneNumberId, canonicalPhone);
   if (!state) return true;
-  const escalation = parseEscalationSnapshot(state.escalation);
-  updateEscalationFromPauseState(
-    phoneNumberId,
-    canonicalPhone,
-    state.escalation,
-    now
-  );
-  if (!escalation.active || escalation.questionId !== questionId) return true;
 
   observeTechnicalMaintenance({
     phoneNumberId,
@@ -336,13 +336,48 @@ export async function isConversationPausedForEscalationAcknowledgement(
   ) {
     return true;
   }
-  return isPausedFromState(
-    {
-      ...state,
-      escalation: { active: false, questionId: null, version: escalation.version },
-    },
+
+  const rawEscalation: unknown = (state as { escalation?: unknown }).escalation;
+  if (rawEscalation === undefined) {
+    // Campo aditivo ausente no rollout: preserva o snapshot local deste único ack.
+    return isPausedFromState(
+      {
+        ...state,
+        escalation: { active: false, questionId: null, version: local.version },
+      },
+      now
+    );
+  }
+
+  const snapshot = parseStrictEscalationSnapshot(rawEscalation);
+  if (!snapshot) {
+    return true;
+  }
+
+  updateEscalationFromPauseState(
+    phoneNumberId,
+    canonicalPhone,
+    rawEscalation,
     now
   );
+  if (snapshot.active) {
+    if (snapshot.questionId !== expectedQuestionId) {
+      return true;
+    }
+    return isPausedFromState(
+      {
+        ...state,
+        escalation: {
+          active: false,
+          questionId: null,
+          version: snapshot.version,
+        },
+      },
+      now
+    );
+  }
+
+  return isPausedFromState({ ...state, escalation: snapshot }, now);
 }
 
 /** Seam de teste: limpa o cache entre casos do smoke. */

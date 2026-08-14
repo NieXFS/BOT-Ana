@@ -26,6 +26,18 @@ async function main(): Promise<void> {
     'pause-state sem escalation é inactive',
     absent.active === false && absent.questionId === null && absent.version === 0
   );
+  check(
+    'parser estrito trata null/primitivo/array/{active:false} incompleto como inválido',
+    cache.parseStrictEscalationSnapshot(null) === null &&
+      cache.parseStrictEscalationSnapshot('inactive') === null &&
+      cache.parseStrictEscalationSnapshot([]) === null &&
+      cache.parseStrictEscalationSnapshot({ active: false }) === null &&
+      cache.parseStrictEscalationSnapshot({
+        active: false,
+        questionId: null,
+        version: 8,
+      })?.active === false
+  );
 
   cache.updateEscalationCache(
     'pnid-cache',

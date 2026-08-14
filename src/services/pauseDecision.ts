@@ -17,12 +17,12 @@ export interface PauseState {
   globalPausedUntil: string | null;
   conversationPausedUntil: string | null;
   schedulePausedUntil: string | null;
-  /** Rev. 3: campo aditivo. Ausente durante rollout = inactive. */
+  /** Rev. 3: campo aditivo. Ausente (`undefined`) durante rollout = inactive. `null` no fio é valor presente. */
   escalation?: {
     active: boolean;
     questionId: string | null;
     version: number;
-  };
+  } | null;
   /**
    * Modo técnico global. Campo aditivo: ERP antigo/ausente = não pausa por
    * este motivo. `paused` é a decisão autoritativa deste tenant.

@@ -1155,5 +1155,52 @@ assert.equal(
   true,
   'handoff global roda no scan bruto, antes de qualquer exceção social'
 );
+const unrecordedAvisar = boundary(
+  'Vou avisar a equipe responsável pelo atendimento.'
+);
+assert.equal(
+  unrecordedAvisar.reasonCodes.includes('UNRECORDED_HANDOFF'),
+  true,
+  'vou avisar a equipe é promessa de handoff sem questionId'
+);
+const recordedAvisar = boundary(
+  'Vou avisar a equipe responsável pelo atendimento.',
+  {
+    source: 'CANONICAL',
+    actionRecorded: true,
+    outboundEvidence: {
+      authoritativeEscalationQuestionId: 'question-authoritative-fixture',
+    },
+  }
+);
+assert.equal(recordedAvisar.safe, true);
+assert.equal(recordedAvisar.originalAccepted, true);
+assert.equal(
+  recordedAvisar.reasonCodes.includes('UNRECORDED_HANDOFF'),
+  false,
+  'questionId confirmado licencia a copy canônica de escalada na boundary'
+);
+const namedAvisarCopy =
+  'Vou avisar Heloísa, responsável por este atendimento.';
+const unrecordedNamedAvisar = boundary(namedAvisarCopy);
+assert.equal(
+  unrecordedNamedAvisar.reasonCodes.includes('UNRECORDED_HANDOFF'),
+  true,
+  'vou avisar <responsável arbitrário> é promessa de handoff sem questionId'
+);
+const recordedNamedAvisar = boundary(namedAvisarCopy, {
+  source: 'CANONICAL',
+  actionRecorded: true,
+  outboundEvidence: {
+    authoritativeEscalationQuestionId: 'question-authoritative-fixture',
+  },
+});
+assert.equal(recordedNamedAvisar.safe, true);
+assert.equal(recordedNamedAvisar.originalAccepted, true);
+assert.equal(
+  recordedNamedAvisar.reasonCodes.includes('UNRECORDED_HANDOFF'),
+  false,
+  'questionId confirmado licencia a copy com responsável nominal arbitrário'
+);
 
 console.log('smoke ana conversational v2 boundary: OK');

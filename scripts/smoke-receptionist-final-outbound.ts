@@ -100,6 +100,47 @@ assert.equal(validate([{ source: 'GENERATED', text: 'CPF 123.456.789-00.' }]).or
 assert.equal(validate([{ source: 'GENERATED', text: 'Tudo certo 😊 🎉' }]).originalAccepted, false);
 assert.equal(validate([{ source: 'GENERATED', text: 'Vou te encaminhar.' }]).originalAccepted, false);
 assert.equal(validate([{ source: 'GENERATED', text: 'Vou te encaminhar.' }], { evidence: { actionRecorded: true } }).originalAccepted, true);
+const escalationPromise = 'Vou avisar a equipe responsável pelo atendimento.';
+const unlicensedEscalation = validate([{ source: 'CANONICAL', text: escalationPromise }]);
+assert.equal(unlicensedEscalation.originalAccepted, false);
+assert.ok(unlicensedEscalation.reasonCodes.includes('UNRECORDED_HANDOFF'));
+assert.equal(
+  validate([{ source: 'CANONICAL', text: escalationPromise }], {
+    evidence: { authoritativeEscalationQuestionId: 'question-authoritative-fixture' },
+  }).originalAccepted,
+  true,
+  'questionId autoritativo licencia a copy canônica de escalada'
+);
+const namedEscalationPromise = 'Vou avisar Heloísa, responsável por este atendimento.';
+const unlicensedNamedEscalation = validate([{ source: 'CANONICAL', text: namedEscalationPromise }]);
+assert.equal(unlicensedNamedEscalation.originalAccepted, false);
+assert.ok(unlicensedNamedEscalation.reasonCodes.includes('UNRECORDED_HANDOFF'));
+assert.equal(
+  validate([{ source: 'CANONICAL', text: namedEscalationPromise }], {
+    evidence: { authoritativeEscalationQuestionId: 'question-authoritative-fixture' },
+  }).originalAccepted,
+  true,
+  'questionId autoritativo licencia a copy com responsável nominal arbitrário'
+);
+assert.equal(
+  validate([{ source: 'CANONICAL', text: 'Irei avisar Zoraide Nunes, responsável por este atendimento.' }]).originalAccepted,
+  false,
+  'irei avisar <nome arbitrário> sem questionId é UNRECORDED_HANDOFF'
+);
+assert.equal(
+  validate([{ source: 'CANONICAL', text: 'Iremos avisar Heloísa, responsável por este atendimento.' }], {
+    evidence: { authoritativeEscalationQuestionId: 'question-authoritative-fixture' },
+  }).originalAccepted,
+  true,
+  'iremos avisar <nome arbitrário> com questionId atravessa'
+);
+assert.equal(
+  validate(
+    [{ source: 'CANONICAL', text: 'Não consigo responder isso com segurança por aqui. Você pode falar diretamente com a equipe do estabelecimento.' }],
+  ).originalAccepted,
+  true,
+  'copy de indisponibilidade não é promessa de handoff'
+);
 assert.equal(validate([{ source: 'GENERATED', text: 'Cura garantida.' }]).originalAccepted, false);
 const validTeamReply = 'Resposta da equipe:\nA avaliação da equipe indica que isso cura a condição.';
 const validTeamResult = validate([{ source: 'TEAM_REPLY', text: validTeamReply }], { evidence: { teamReplyAuthorization: { authoredAt: new Date().toISOString(), authoredBy: 'user-id', questionId: 'question-id', clinicalCapability: true } } });

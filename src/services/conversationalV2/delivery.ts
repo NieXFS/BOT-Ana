@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { isAmbiguousWhatsAppTransportError } from '../../whatsappCloudService';
+import { containsUnlicensedHandoffPromise } from '../receptionistOutbound';
 import type {
   DeliveryPreemptionV2,
   TurnDeliveryReceiptV2,
@@ -192,6 +193,32 @@ export async function deliverPreparedReceptionistTurnV2(
   let payload = prepared.payload;
   if (!payload?.trim()) {
     throw new Error('Plano v2 ativo chegou à entrega sem payload.');
+  }
+
+  const handoffEvidence = prepared.authoritativeEscalationQuestionId
+    ? {
+        actionRecorded: true,
+        authoritativeEscalationQuestionId:
+          prepared.authoritativeEscalationQuestionId,
+      }
+    : undefined;
+  if (containsUnlicensedHandoffPromise(payload, handoffEvidence)) {
+    console.warn(
+      '[receptionist-outbound] suppressed purpose=ESCALATION reasons=UNRECORDED_HANDOFF sources=CANONICAL'
+    );
+    const receipt = buildTerminalReceipt({
+      prepared,
+      id,
+      now: initialNow,
+      transportStartedAt: null,
+      transportOutcome: 'suppressed_pause',
+      outboxState: 'prepared',
+      conversationCommitOutcome: 'not_applicable',
+      pendingCommitOutcome: 'not_applicable',
+    });
+    await store.saveTerminalDeliveryReceipt(receipt);
+    emitDelivery(receipt);
+    return { delivery: 'suppressed', receipt, successor };
   }
 
   // Recheck determinístico de versão/TTL antes de preparar o transporte. Se a
