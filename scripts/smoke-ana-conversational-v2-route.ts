@@ -38,7 +38,10 @@ import {
   MODEL_TURN_RESULT_V2_POST_TOOL_REMINDER,
 } from '../src/services/conversationalV2/modelResultContract';
 import { reduceToolLifecycleV2 } from '../src/services/conversationalV2/lifecycleReducer';
-import { buildPendingQuestionV2 } from '../src/services/conversationalV2/pendingQuestion';
+import {
+  buildPendingQuestionV2,
+  shouldReanchorPendingQuestionV2,
+} from '../src/services/conversationalV2/pendingQuestion';
 import { coerceEquivalentOpenTransitionV2 } from '../src/services/conversationalV2/modelResultParser';
 import * as handler from '../src/messageHandler';
 
@@ -639,10 +642,113 @@ async function main(): Promise<void> {
     assert.equal(ambiguousBareTime.result.reply, '15h ou 15h30?');
     assert.deepEqual(
       ambiguousBareTime.result.pendingTransitionCandidate,
-      { kind: 'preserve' }
+      {
+        kind: 'open',
+        pendingKind: 'TIME',
+        flowId: timePending.flowId,
+        optionEntityIds: ['15:00', '15:30'],
+        forceSupersede: 'time_disambiguation',
+      }
     );
     assert.equal(ambiguousBareTime.nextFlowState.bookingDraft, undefined);
   }
+
+  const ambiguousTimeFrame = {
+    ...promptFrame,
+    pending: {
+      ...timePending,
+      options: [
+        { position: 1, entityId: '17:00', displayName: '17:00' },
+        { position: 2, entityId: '17:30', displayName: '17:30' },
+      ],
+    },
+    flowState: {
+      flowId: timePending.flowId,
+      fixedServiceId: 'svc-drenagem',
+      fixedProfessionalId: 'prof-julia',
+      resolvedDate: '2026-08-14',
+      slotEvidence: {
+        turnId: 'turn-slot-evidence-half-hour',
+        serviceId: 'svc-drenagem',
+        professionalId: 'prof-julia',
+        date: '2026-08-14',
+        slots: ['17:00', '17:30'],
+      },
+      fixedByProofVersion: {
+        fixedServiceId: 1,
+        fixedProfessionalId: 1,
+        resolvedDate: 1,
+      },
+    },
+  };
+  for (const [inboundText, lastReply, expectedTime] of [
+    ['17h', undefined, '17:00'],
+    ['17h30', undefined, '17:30'],
+    ['17 e meia', undefined, '17:30'],
+    ['17', '17h ou 17h30?', '17:00'],
+    ['meia', '17h ou 17h30?', '17:30'],
+    ['e meia', '17h ou 17h30?', '17:30'],
+    ['30', '17h ou 17h30?', '17:30'],
+  ] as const) {
+    const resolved = resolveSelectionFastPathV2({
+      frame: ambiguousTimeFrame,
+      inboundId: 'inbound-half-hour',
+      inboundText,
+      catalog: services,
+      now,
+      lastAcceptedAssistantText: lastReply,
+    });
+    assert.equal(resolved.kind, 'resolved', inboundText);
+    if (resolved.kind === 'resolved') {
+      assert.equal(resolved.nextFlowState.bookingDraft?.time, expectedTime);
+      assert.equal(resolved.result.replyPurpose, 'WRITE_CONFIRMATION');
+    }
+  }
+
+  const repeatedTimeClarification = resolveSelectionFastPathV2({
+    frame: ambiguousTimeFrame,
+    inboundId: 'inbound-half-hour-loop',
+    inboundText: 'as 17',
+    catalog: services,
+    now,
+    lastAcceptedAssistantText: '17h ou 17h30?',
+  });
+  assert.deepEqual(repeatedTimeClarification, {
+    kind: 'continue_model',
+    reason: 'repeated_time_clarification_requires_model',
+  });
+
+  assert.equal(
+    shouldReanchorPendingQuestionV2({
+      pending: ambiguousTimeFrame.pending,
+      flowState: ambiguousTimeFrame.flowState,
+      lastAcceptedTerminalAt: new Date(now.getTime() - 16 * 60 * 1000).toISOString(),
+      now,
+      explicitRestart: false,
+    }),
+    true,
+    'gap maior que 15 minutos reancora TIME do mesmo fluxo'
+  );
+  assert.equal(
+    shouldReanchorPendingQuestionV2({
+      pending: ambiguousTimeFrame.pending,
+      flowState: ambiguousTimeFrame.flowState,
+      lastAcceptedTerminalAt: now.toISOString(),
+      now,
+      explicitRestart: true,
+    }),
+    true,
+    'reinício explícito reancora TIME do mesmo fluxo'
+  );
+  assert.equal(
+    buildPendingQuestionV2({
+      pending: ambiguousTimeFrame.pending,
+      flowState: ambiguousTimeFrame.flowState,
+      catalog: services,
+      reanchor: true,
+    }),
+    'A gente estava marcando Drenagem Linfática para 14/08/2026 — qual horário você prefere?'
+  );
 
   const nakedTimeOrdinal = resolveSelectionFastPathV2({
     frame: {
@@ -1227,10 +1333,10 @@ async function main(): Promise<void> {
   let ambiguousTimeModelCalls = 0;
   const ambiguousTimePrepared = await getReceptionistReplyV2({
     phone: ambiguousTimePhone,
-    userMessage: '17',
+    userMessage: 'as 17',
     userName: 'Cliente',
     config,
-    turnRuntime: turnRuntime({ text: '17' }),
+    turnRuntime: turnRuntime({ text: 'as 17' }),
     deps: {
       ...baseDeps(ambiguousTimeStore),
       runModelLoop: async () => {
@@ -1242,7 +1348,16 @@ async function main(): Promise<void> {
   assert.equal(ambiguousTimeModelCalls, 0);
   assert.equal(ambiguousTimePrepared.planReceipt.route, 'fast_path');
   assert.equal(ambiguousTimePrepared.payload, '17h ou 17h30?');
-  assert.equal(ambiguousTimePrepared.transition.kind, 'preserve');
+  assert.equal(ambiguousTimePrepared.transition.kind, 'open');
+  assert.deepEqual(
+    ambiguousTimePrepared.transition.kind === 'open'
+      ? ambiguousTimePrepared.transition.frame.options.map(
+          (option) => option.entityId
+        )
+      : [],
+    ['17:00', '17:30'],
+    'a clarificação abre snapshot TIME próprio só com as opções ambíguas'
+  );
   await deliverPreparedReceptionistTurnV2(ambiguousTimePrepared, {
     store: ambiguousTimeStore,
     id: nextId,
@@ -1261,17 +1376,209 @@ async function main(): Promise<void> {
   );
   assert.equal(
     ambiguousTimeAccepted.pending?.snapshot.version,
-    ambiguousTimePending.version,
-    'clarificação de hora preserva a mesma versão TIME OPEN'
+    ambiguousTimePending.version + 1,
+    'clarificação de hora ganha questionId/versão próprios'
   );
   assert.deepEqual(
-    ambiguousTimeAccepted.pending?.snapshot.options,
-    ambiguousTimePending.options
+    ambiguousTimeAccepted.pending?.snapshot.options.map(
+      (option) => option.entityId
+    ),
+    ['17:00', '17:30']
   );
   assert.equal(
     ambiguousTimeAccepted.pending?.flowState.bookingDraft,
     undefined,
     'hora ambígua nunca cria BookingDraft'
+  );
+
+  ambiguousTimeStore.setInputSequence(ambiguousTimeKey, 2);
+  const clarifiedWholeHour = await getReceptionistReplyV2({
+    phone: ambiguousTimePhone,
+    userMessage: '17',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: '17', sequence: 2 }),
+    deps: {
+      ...baseDeps(ambiguousTimeStore),
+      runModelLoop: async () => {
+        ambiguousTimeModelCalls += 1;
+        throw new Error('resposta à clarificação TIME fecha por fast-path');
+      },
+    },
+  });
+  assert.equal(ambiguousTimeModelCalls, 0);
+  assert.equal(clarifiedWholeHour.planReceipt.route, 'fast_path');
+  assert.match(clarifiedWholeHour.payload ?? '', /às 17h,/u);
+  assert.equal(
+    clarifiedWholeHour.transition.kind === 'open'
+      ? clarifiedWholeHour.transition.frame.kind
+      : null,
+    'CONFIRMATION'
+  );
+  assert.equal(
+    clarifiedWholeHour.transition.kind === 'open'
+      ? clarifiedWholeHour.transition.nextFlowState.bookingDraft?.time
+      : null,
+    '17:00',
+    '"17" depois da pergunta resolve 17:00 na primeira resposta'
+  );
+
+  const loopBreakerStore = new MemoryConversationalV2StateStore();
+  const loopBreakerPhone = '5511000000022';
+  const loopBreakerKey = `${config.phoneNumberId}:${loopBreakerPhone}`;
+  seedPending(loopBreakerStore, loopBreakerKey, ambiguousTimePending, {
+    flowId: ambiguousTimePending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-slot-evidence-loop-breaker',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['17:00', '17:30'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  loopBreakerStore.setInputSequence(loopBreakerKey, 1);
+  const firstLoopClarification = await getReceptionistReplyV2({
+    phone: loopBreakerPhone,
+    userMessage: 'as 17',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'as 17' }),
+    deps: baseDeps(loopBreakerStore),
+  });
+  await deliverPreparedReceptionistTurnV2(firstLoopClarification, {
+    store: loopBreakerStore,
+    id: nextId,
+    now: () => now,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  loopBreakerStore.setInputSequence(loopBreakerKey, 2);
+  let loopBreakerModelCalls = 0;
+  const secondLoopAttempt = await getReceptionistReplyV2({
+    phone: loopBreakerPhone,
+    userMessage: 'as 17',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'as 17', sequence: 2 }),
+    deps: {
+      ...baseDeps(loopBreakerStore),
+      runModelLoop: async () => {
+        loopBreakerModelCalls += 1;
+        return {
+          rawReply: JSON.stringify(
+            flatResult({
+              reply: 'Você quer a hora cheia ou o horário de meia hora?',
+              nextPending: 'PRESERVE',
+            })
+          ),
+          exhausted: false,
+          provider: 'openai' as const,
+          model: 'gpt-4o-mini',
+          providerReportedModels: ['gpt-4o-mini'],
+          rounds: 1,
+          messages: [],
+          toolTrace: [],
+          usage: [],
+        };
+      },
+    },
+  });
+  assert.equal(loopBreakerModelCalls, 1, 'a segunda clarificação igual vai ao modelo');
+  assert.notEqual(secondLoopAttempt.payload, '17h ou 17h30?');
+
+  const reanchorStore = new MemoryConversationalV2StateStore();
+  const reanchorPhone = '5511000000023';
+  const reanchorKey = `${config.phoneNumberId}:${reanchorPhone}`;
+  const staleDeliveryNow = new Date(now.getTime() - 16 * 60 * 1000);
+  seedPending(reanchorStore, reanchorKey, ambiguousTimePending, {
+    flowId: ambiguousTimePending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-slot-evidence-reanchor',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['17:00', '17:30'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  reanchorStore.setInputSequence(reanchorKey, 1);
+  const staleClarification = await getReceptionistReplyV2({
+    phone: reanchorPhone,
+    userMessage: 'as 17',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'as 17' }),
+    deps: {
+      ...baseDeps(reanchorStore),
+      now: () => staleDeliveryNow,
+    },
+  });
+  await deliverPreparedReceptionistTurnV2(staleClarification, {
+    store: reanchorStore,
+    id: nextId,
+    now: () => staleDeliveryNow,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  reanchorStore.setInputSequence(reanchorKey, 2);
+  const reanchoredFallback = await getReceptionistReplyV2({
+    phone: reanchorPhone,
+    userMessage: 'não lembro',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'não lembro', sequence: 2 }),
+    deps: {
+      ...baseDeps(reanchorStore),
+      runModelLoop: async () => ({
+        rawReply: '{"reply":',
+        exhausted: false,
+        provider: 'openai' as const,
+        model: 'gpt-4o-mini',
+        providerReportedModels: ['gpt-4o-mini'],
+        rounds: 1,
+        messages: [],
+        toolTrace: [],
+        usage: [],
+      }),
+      regenerate: async () => ({
+        ok: false,
+        reasonCode: 'REGEN_MODEL_RESULT_INVALID' as const,
+        providerCalls: 1,
+        validationIssues: [{ code: 'INVALID_JSON', path: '$' }],
+        rawReply: '{"reply":',
+      }),
+    },
+  });
+  assert.equal(reanchoredFallback.planReceipt.route, 'fallback');
+  assert.equal(
+    reanchoredFallback.payload,
+    'A gente estava marcando Drenagem Linfática para 14/08/2026 — qual horário você prefere?',
+    're-ask após 15 minutos recapitula serviço e data do fluxo tipado'
   );
 
   // Regressão do loop real: tentativa após "pode" é bloqueada, a copy falsa

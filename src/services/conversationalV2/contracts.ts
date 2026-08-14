@@ -128,6 +128,12 @@ export type PendingTransitionCandidate =
       pendingKind: PendingKindV2;
       flowId: string;
       optionEntityIds: string[];
+      /**
+       * Marcador exclusivamente server-side. Uma clarificação TIME precisa de
+       * questionId/versão próprios mesmo quando suas opções coincidem com o
+       * snapshot atual. O parser externo nunca produz este campo.
+       */
+      forceSupersede?: 'time_disambiguation';
     };
 
 export type ResolutionCandidate =
@@ -218,6 +224,7 @@ export type BoundaryReasonCodeV2 =
   | 'SOCIAL_PERSON_IDENTITY_FACT'
   | 'SOCIAL_HUMAN_RETURN_PROMISE'
   | 'SOCIAL_RECENT_REPLY_REPETITION'
+  | 'REPEATED_CLARIFICATION'
   | 'SOCIAL_FORMAT_VIOLATION'
   | 'MODEL_RESULT_INVALID'
   | 'REGEN_PROVIDER_ERROR'

@@ -48,6 +48,7 @@ import {
   hasTemporalAssertionV2,
   normalizeTemporalAssertionsV2,
 } from './temporalNormalizer';
+import { buildPendingQuestionV2 } from './pendingQuestion';
 
 export const UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2 =
   'Esse procedimento não está disponível no momento. Posso te ajudar com outro serviço?';
@@ -1290,6 +1291,44 @@ function v2FactReasons(
   return [...reasons];
 }
 
+function repeatedClarificationReasonsV2(
+  normalizedCandidate: string,
+  input: BoundaryEvaluationInputV2
+): BoundaryReasonCodeV2[] {
+  const pending = input.pendingSnapshot;
+  const recent = new Set(
+    (input.recentAssistantReplies ?? []).map((reply) => normalize(reply))
+  );
+  if (!normalizedCandidate || !recent.has(normalize(normalizedCandidate))) {
+    return [];
+  }
+  const canonicalPending = pending
+    ? buildPendingQuestionV2({
+        pending,
+        flowState: input.flowState ?? {
+          flowId: pending.flowId,
+          fixedByProofVersion: {},
+        },
+        catalog: input.servicesResult,
+      })
+    : null;
+  // Somente a copy normativa de CONFIRMATION (booking ou duplicidade) é
+  // repetível: ela reancora gates de escrita. Outra clarificação repetida no
+  // mesmo estado, inclusive sem PendingFrame, continua bloqueada.
+  if (
+    pending?.kind === 'CONFIRMATION' &&
+    canonicalPending !== null &&
+    normalize(canonicalPending) === normalize(normalizedCandidate)
+  ) {
+    return [];
+  }
+  const clarificationLike =
+    input.replyPurpose === 'CLARIFICATION' ||
+    (canonicalPending !== null &&
+      normalize(canonicalPending) === normalize(normalizedCandidate));
+  return clarificationLike ? ['REPEATED_CLARIFICATION'] : [];
+}
+
 function outboundReason(
   reason: OutboundReasonCode,
   input: BoundaryEvaluationInputV2,
@@ -1372,6 +1411,7 @@ export function evaluateBoundaryV2(
   const guardReasons = [
     ...effectiveInspectionReasons.map(customerGuardReason),
     ...v2FactReasons(normalizedCandidate, input, catalog),
+    ...repeatedClarificationReasonsV2(normalizedCandidate, input),
   ];
 
   const outbound = validateReceptionistOutbound(

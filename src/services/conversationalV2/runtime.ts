@@ -51,6 +51,7 @@ import { resolveCurrentInboundDateV2 } from './currentDateResolution';
 import {
   adjustTransitionForFlowResetV2,
   decideFlowResetV2,
+  hasPositiveExplicitBookingVerbV2,
   newFlowStateV2,
   stampFlowOperationalActivityV2,
 } from './flowSession';
@@ -85,7 +86,10 @@ import {
   type RegenerationResultV2,
 } from './regenerator';
 import { reduceToolLifecycleV2 } from './lifecycleReducer';
-import { buildPendingQuestionV2 } from './pendingQuestion';
+import {
+  buildPendingQuestionV2,
+  shouldReanchorPendingQuestionV2,
+} from './pendingQuestion';
 import {
   composeSocialReplyV2,
   detectStrictSocialRouteV2,
@@ -459,7 +463,8 @@ function toolEffects(
 
 function canonicalPendingQuestion(
   frame: TurnFrameV2,
-  catalog: ServicesResult
+  catalog: ServicesResult,
+  reanchor = false
 ): string | null {
   if (frame.pending && frame.pending.flowId !== frame.flowState.flowId) {
     return null;
@@ -468,6 +473,7 @@ function canonicalPendingQuestion(
     pending: frame.pending,
     flowState: frame.flowState,
     catalog,
+    reanchor,
   });
 }
 
@@ -692,6 +698,13 @@ export async function getReceptionistReplyV2(input: {
     pending: pendingRecord?.snapshot ?? null,
     flowState,
   };
+  const shouldReanchorPendingQuestion = shouldReanchorPendingQuestionV2({
+    pending: frame.pending,
+    flowState: frame.flowState,
+    lastAcceptedTerminalAt: stored.lastAcceptedDelivery?.terminalAt,
+    now: startedAt,
+    explicitRestart: hasPositiveExplicitBookingVerbV2(currentInboundBatchText),
+  });
   let copyVariant: CopyVariantIdV2 = 'canonical';
   let variedPrimaryReply: string | null = null;
 
@@ -987,6 +1000,7 @@ export async function getReceptionistReplyV2(input: {
     inboundId,
     inboundText: currentInboundText,
     now: startedAt,
+    lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
   });
   const readFastPath = dateSlotsFastPath.kind === 'continue_model'
     ? await resolveReadFastPathV2({
@@ -1011,6 +1025,7 @@ export async function getReceptionistReplyV2(input: {
           servicesResult: services,
           config: input.config,
           now: startedAt,
+          lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
           executeTool: executeDuplicatePreflightRead,
         })
       : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
@@ -1037,6 +1052,7 @@ export async function getReceptionistReplyV2(input: {
           catalog: services,
           now: startedAt,
           currentDateResolution: dateResolution,
+          lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
         })
       : null;
 
@@ -1194,10 +1210,17 @@ export async function getReceptionistReplyV2(input: {
         frame.pending !== null &&
         frame.pending.flowId === frame.flowState.flowId,
       pendingSnapshot: frame.pending,
+      recentAssistantReplies: stored.lastAcceptedDelivery?.payload
+        ? [stored.lastAcceptedDelivery.payload]
+        : [],
     },
     toolTrace: loop.toolTrace as ToolTraceLike[],
     canonicalPendingQuestion:
-      canonicalPendingQuestion({ ...frame, flowState: nextFlowState }, services) ??
+      canonicalPendingQuestion(
+        { ...frame, flowState: nextFlowState },
+        services,
+        shouldReanchorPendingQuestion
+      ) ??
       undefined,
     beforeRegenerate: () => checkRace('before_regen'),
     afterRegenerate: () => checkRace('during_regen'),
@@ -1319,7 +1342,8 @@ export async function getReceptionistReplyV2(input: {
     hasCommittedWrite: writeCommitted,
     canonicalPendingQuestion: canonicalPendingQuestion(
       { ...frame, flowState: committedFlowState },
-      services
+      services,
+      shouldReanchorPendingQuestion
     ),
     elicitationVariant,
     copyVariant,

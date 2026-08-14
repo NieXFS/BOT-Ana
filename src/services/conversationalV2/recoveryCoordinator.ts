@@ -30,6 +30,8 @@ export const NEUTRAL_CLARIFICATION_FALLBACK_V2 =
   'Não consegui confirmar com segurança. Pode me dizer novamente o que você prefere?';
 export const MINIMAL_CLARIFICATION_FALLBACK_V2 =
   'Pode me dizer novamente o que você prefere?';
+export const ALTERNATE_CLARIFICATION_FALLBACK_V2 =
+  'Pode explicar de outro jeito o que você prefere?';
 
 type BoundaryContextV2 = Omit<
   BoundaryEvaluationInputV2,
@@ -112,11 +114,43 @@ function fallbackCandidate(
       flowState: input.frame.flowState,
       catalog: input.boundaryContext.servicesResult,
     });
-  if (pending) return { text: pending, pendingQuestion: true };
+  const recent = new Set(
+    (input.boundaryContext.recentAssistantReplies ?? []).map((reply) =>
+      reply
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+    )
+  );
+  const wasJustDelivered = (candidate: string): boolean =>
+    recent.has(
+      candidate
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+    );
+  if (
+    pending &&
+    (input.frame.pending?.kind === 'CONFIRMATION' || !wasJustDelivered(pending))
+  ) {
+    return { text: pending, pendingQuestion: true };
+  }
   if (input.frame.catalogState === 'unavailable') {
     return { text: CATALOG_UNAVAILABLE_FALLBACK_V2, pendingQuestion: false };
   }
-  return { text: NEUTRAL_CLARIFICATION_FALLBACK_V2, pendingQuestion: false };
+  const text = [
+    NEUTRAL_CLARIFICATION_FALLBACK_V2,
+    MINIMAL_CLARIFICATION_FALLBACK_V2,
+    ALTERNATE_CLARIFICATION_FALLBACK_V2,
+  ].find((candidate) => !wasJustDelivered(candidate)) ??
+    ALTERNATE_CLARIFICATION_FALLBACK_V2;
+  return { text, pendingQuestion: false };
 }
 
 function boundaryAccepted(evaluation: BoundaryEvaluation): boolean {
@@ -366,7 +400,18 @@ export async function coordinateRecoveryV2(
     directedFallback.pendingQuestion
   );
   if (!boundaryAccepted(fallbackEvaluation)) {
-    fallbackResult.reply = MINIMAL_CLARIFICATION_FALLBACK_V2;
+    const rejectedFallback = fallbackResult.reply;
+    fallbackResult.reply = [
+      MINIMAL_CLARIFICATION_FALLBACK_V2,
+      ALTERNATE_CLARIFICATION_FALLBACK_V2,
+      NEUTRAL_CLARIFICATION_FALLBACK_V2,
+    ].find(
+      (candidate) =>
+        candidate !== rejectedFallback &&
+        !(input.boundaryContext.recentAssistantReplies ?? []).some(
+          (reply) => reply.trim() === candidate.trim()
+        )
+    ) ?? ALTERNATE_CLARIFICATION_FALLBACK_V2;
     fallbackResult.pendingTransitionCandidate = { kind: 'preserve' };
     fallbackEvaluation = evaluate(fallbackResult, 'CANONICAL');
   }

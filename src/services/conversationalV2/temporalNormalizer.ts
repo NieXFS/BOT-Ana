@@ -68,6 +68,18 @@ export function normalizeTemporalAssertionsV2(
     add({ kind: 'time', normalized: formatHour(Number(match[2])), raw: match[0] });
   }
 
+  // Forma coloquial exata. Deve nascer antes das famílias mais permissivas:
+  // "17 e meia" é 17:30, nunca um match por prefixo da hora 17.
+  for (const match of text.matchAll(
+    /\b([01]?\d|2[0-3])\s+e\s+meia\b/gu
+  )) {
+    add({
+      kind: 'time',
+      normalized: formatHour(Number(match[1]), 30),
+      raw: match[0],
+    });
+  }
+
   for (const match of text.matchAll(/\b(?:as|das|de)?\s*([01]?\d|2[0-3])(?::([0-5]\d)|h([0-5]\d)?)?\s*horas?\b|\b([01]?\d|2[0-3])\s*horas?\b/gu)) {
     const hour = Number(match[1] ?? match[4]);
     const minute = Number(match[2] ?? match[3] ?? 0);

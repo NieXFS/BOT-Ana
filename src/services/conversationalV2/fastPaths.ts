@@ -188,7 +188,7 @@ function barePendingHourPosition(
   frame: TurnFrameV2
 ): BarePendingHourResolution {
   if (frame.pending?.kind !== 'TIME') return { kind: 'no_match' };
-  const match = /^(?:(?:pode ser|prefiro|quero)\s+)?(?:as\s+)?([01]?\d|2[0-3])(?:\s*h)?(?:\s+(?:por favor|mesmo))?$/u.exec(
+  const match = /^(?:(?:pode ser|prefiro|quero)\s+)?(?:as\s+)?([01]?\d|2[0-3])(?:\s+(?:por favor|mesmo))?$/u.exec(
     normalize(inboundText)
   );
   if (!match?.[1]) return { kind: 'no_match' };
@@ -221,6 +221,46 @@ function buildBareHourDisambiguationV2(
   return `${displayed.slice(0, -1).join(', ')} ou ${displayed.at(-1)}?`;
 }
 
+function activeHalfHourClarificationPositionV2(input: {
+  inboundText: string;
+  frame: TurnFrameV2;
+  lastAcceptedAssistantText?: string;
+}): number | null {
+  const pending = input.frame.pending;
+  if (pending?.kind !== 'TIME' || pending.options.length !== 2) return null;
+  if (
+    normalize(input.lastAcceptedAssistantText ?? '') !==
+    normalize(buildBareHourDisambiguationV2(pending.options))
+  ) {
+    return null;
+  }
+  const parsed = pending.options.map((option) => {
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/u.exec(option.entityId);
+    return match
+      ? { option, hour: Number(match[1]), minute: Number(match[2]) }
+      : null;
+  });
+  if (parsed.some((entry) => entry === null)) return null;
+  const temporal = parsed as Array<{
+    option: PendingOptionV2;
+    hour: number;
+    minute: number;
+  }>;
+  if (
+    temporal[0]!.hour !== temporal[1]!.hour ||
+    !temporal.some((entry) => entry.minute === 0) ||
+    !temporal.some((entry) => entry.minute === 30)
+  ) {
+    return null;
+  }
+  const answer = normalize(input.inboundText);
+  const wholeHour = temporal.find((entry) => entry.minute === 0)!;
+  const halfHour = temporal.find((entry) => entry.minute === 30)!;
+  if (answer === String(wholeHour.hour)) return wholeHour.option.position;
+  if (['meia', 'e meia', '30'].includes(answer)) return halfHour.option.position;
+  return null;
+}
+
 /**
  * Produz proof apenas para uma opção OPEN/fresca evidenciada no inbound atual.
  * É reutilizado pelo fast-path de reads da duplicidade; flowId e versão vêm do
@@ -233,13 +273,27 @@ export function resolvePendingOptionProofV2(input: {
   now: Date;
   proofVersion?: number;
   catalog?: ServicesResult;
+  lastAcceptedAssistantText?: string;
 }): ResolutionProof | null {
   const { frame, inboundId, inboundText, now } = input;
   if (!frame.pending || !pendingFresh(frame, now)) return null;
-  const bareHour = barePendingHourPosition(inboundText, frame);
+  // Igualdade temporal normalizada é soberana: 17h = 17:00, portanto nunca
+  // pode cair no comparador de "mesma hora" e casar também com 17:30.
+  const exactTemporalPosition = temporalPendingPosition(inboundText, frame);
+  const clarificationPosition = exactTemporalPosition === null
+    ? activeHalfHourClarificationPositionV2({
+        inboundText,
+        frame,
+        lastAcceptedAssistantText: input.lastAcceptedAssistantText,
+      })
+    : null;
+  const bareHour = exactTemporalPosition === null && clarificationPosition === null
+    ? barePendingHourPosition(inboundText, frame)
+    : ({ kind: 'no_match' } as const);
   if (bareHour.kind === 'ambiguous') return null;
   const position =
-    temporalPendingPosition(inboundText, frame) ??
+    exactTemporalPosition ??
+    clarificationPosition ??
     (bareHour.kind === 'resolved' ? bareHour.position : null) ??
     pendingOrdinalPosition(inboundText, frame.pending.kind) ??
     exactPendingNamePosition(inboundText, frame) ??
@@ -544,6 +598,7 @@ export function resolveSelectionFastPathV2(input: {
   now: Date;
   proofVersion?: number;
   currentDateResolution?: CurrentDateResolutionV2;
+  lastAcceptedAssistantText?: string;
 }): FastPathResultV2 {
   const { frame, inboundId, inboundText, catalog, now } = input;
   const proofVersion = input.proofVersion ?? 1;
@@ -563,22 +618,6 @@ export function resolveSelectionFastPathV2(input: {
         reason: 'current_date_correction_preempts_time_selection',
       };
     }
-    const bareHour = barePendingHourPosition(inboundText, frame);
-    if (bareHour.kind === 'ambiguous') {
-      return {
-        kind: 'resolved',
-        proof: null,
-        nextFlowState: frame.flowState,
-        result: {
-          schemaVersion: 2,
-          reply: buildBareHourDisambiguationV2(bareHour.options),
-          replyPurpose: 'CLARIFICATION',
-          pendingTransitionCandidate: { kind: 'preserve' },
-          resolutionCandidate: null,
-          unknownServiceEvidence: null,
-        },
-      };
-    }
     const pendingProof = resolvePendingOptionProofV2({
       frame,
       inboundId,
@@ -586,8 +625,40 @@ export function resolveSelectionFastPathV2(input: {
       now,
       proofVersion,
       catalog,
+      lastAcceptedAssistantText: input.lastAcceptedAssistantText,
     });
     if (pendingProof?.kind !== 'pending_option') {
+      const bareHour = barePendingHourPosition(inboundText, frame);
+      if (bareHour.kind === 'ambiguous') {
+        const reply = buildBareHourDisambiguationV2(bareHour.options);
+        if (
+          normalize(input.lastAcceptedAssistantText ?? '') === normalize(reply)
+        ) {
+          return {
+            kind: 'continue_model',
+            reason: 'repeated_time_clarification_requires_model',
+          };
+        }
+        return {
+          kind: 'resolved',
+          proof: null,
+          nextFlowState: frame.flowState,
+          result: {
+            schemaVersion: 2,
+            reply,
+            replyPurpose: 'CLARIFICATION',
+            pendingTransitionCandidate: {
+              kind: 'open',
+              pendingKind: 'TIME',
+              flowId: frame.pending.flowId,
+              optionEntityIds: bareHour.options.map((option) => option.entityId),
+              forceSupersede: 'time_disambiguation',
+            },
+            resolutionCandidate: null,
+            unknownServiceEvidence: null,
+          },
+        };
+      }
       return { kind: 'continue_model', reason: 'time_option_not_evidenced' };
     }
     const followUp = buildTimeSelectionFollowUpV2(

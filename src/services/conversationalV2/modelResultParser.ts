@@ -808,6 +808,7 @@ export function coerceEquivalentOpenTransitionV2(
   proposedFlowState: TurnFrameV2['flowState']
 ): PendingTransitionCandidate {
   if (candidate.kind !== 'open' || !frame.pending) return candidate;
+  if (candidate.forceSupersede === 'time_disambiguation') return candidate;
   const currentOptionIds = frame.pending.options.map((option) => option.entityId);
   const duplicateResolution = [...currentOptionIds, ...candidate.optionEntityIds].some(
     (entityId) => entityId.startsWith('duplicate-resolution:')

@@ -344,6 +344,7 @@ export async function resolveTimeDuplicatePreflightV2(input: {
   servicesResult: ServicesResult;
   config: TenantBotConfig;
   now: Date;
+  lastAcceptedAssistantText?: string;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<BookingProgressFastPathV2> {
   if (input.frame.pending?.kind !== 'TIME') {
@@ -358,6 +359,7 @@ export async function resolveTimeDuplicatePreflightV2(input: {
     inboundText: input.inboundText,
     now: input.now,
     catalog: input.servicesResult,
+    lastAcceptedAssistantText: input.lastAcceptedAssistantText,
   });
   if (proof?.kind !== 'pending_option') {
     return { kind: 'continue_model', reason: 'time_option_not_evidenced' };

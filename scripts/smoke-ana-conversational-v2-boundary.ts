@@ -1070,11 +1070,72 @@ assert.equal(
 );
 
 const temporal = normalizeTemporalAssertionsV2(
-  'Atendo 15 horas, das 8 às 18 e oito da manhã.'
+  'Atendo 15 horas, das 8 às 18, 17 e meia e oito da manhã.'
 ).map((entry) => entry.normalized);
 assert.ok(temporal.includes('15:00'));
 assert.ok(temporal.includes('08:00'));
 assert.ok(temporal.includes('18:00'));
+assert.ok(temporal.includes('17:30'));
+
+const repeatedTimeQuestion = boundary('17h ou 17h30?', {
+  replyPurpose: 'CLARIFICATION',
+  recentAssistantReplies: ['17h ou 17h30?'],
+  pendingAnaOpen: true,
+  pendingSnapshot: {
+    questionId: 'question-time-clarification',
+    askedAt: '2026-08-14T10:00:00.000Z',
+    kind: 'TIME',
+    flowId: 'flow-v2',
+    version: 3,
+    options: [
+      { position: 1, entityId: '17:00', displayName: '17:00' },
+      { position: 2, entityId: '17:30', displayName: '17:30' },
+    ],
+  },
+});
+assert.equal(
+  repeatedTimeQuestion.reasonCodes.includes('REPEATED_CLARIFICATION'),
+  true,
+  'a mesma clarificação não pode ser aceita duas vezes consecutivas'
+);
+const repeatedGenericClarification = boundary(
+  'Pode me dizer novamente o que você prefere?',
+  {
+    replyPurpose: 'CLARIFICATION',
+    recentAssistantReplies: ['Pode me dizer novamente o que você prefere?'],
+    pendingSnapshot: null,
+    pendingAnaOpen: false,
+  }
+);
+assert.equal(
+  repeatedGenericClarification.reasonCodes.includes('REPEATED_CLARIFICATION'),
+  true,
+  'ask-repeat sem PendingFrame também não pode repetir consecutivamente'
+);
+const repeatedConfirmationAnchor = boundary('Você confirma essa opção?', {
+  replyPurpose: 'CLARIFICATION',
+  recentAssistantReplies: ['Você confirma essa opção?'],
+  pendingAnaOpen: true,
+  pendingSnapshot: {
+    questionId: 'question-booking-confirmation',
+    askedAt: '2026-08-14T10:00:00.000Z',
+    kind: 'CONFIRMATION',
+    flowId: 'flow-v2',
+    version: 4,
+    options: [
+      {
+        position: 1,
+        entityId: 'booking-confirmation:flow-v2',
+        displayName: 'Confirmar agendamento',
+      },
+    ],
+  },
+});
+assert.equal(
+  repeatedConfirmationAnchor.reasonCodes.includes('REPEATED_CLARIFICATION'),
+  false,
+  'a âncora de confirmação permanece reemitível para proteger o gate'
+);
 
 const rawLeak = boundary('**INTERNAL_HINT svc-peeling**');
 assert.deepEqual(

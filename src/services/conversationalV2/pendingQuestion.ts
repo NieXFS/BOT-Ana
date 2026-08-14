@@ -2,7 +2,33 @@ import type {
   FlowStateV2,
   PendingFrameSnapshotV2,
 } from './contracts';
-import { buildCanonicalBookingSummaryV2 } from './lifecycleReducer';
+import {
+  buildCanonicalBookingSummaryV2,
+  displayDateV2,
+} from './lifecycleReducer';
+
+export const PENDING_REANCHOR_GAP_MS_V2 = 15 * 60 * 1000;
+
+export function shouldReanchorPendingQuestionV2(input: {
+  pending: PendingFrameSnapshotV2 | null;
+  flowState: FlowStateV2;
+  lastAcceptedTerminalAt?: string | null;
+  now: Date;
+  explicitRestart: boolean;
+}): boolean {
+  if (
+    input.pending?.kind !== 'TIME' ||
+    input.pending.flowId !== input.flowState.flowId
+  ) {
+    return false;
+  }
+  const terminalAt = Date.parse(input.lastAcceptedTerminalAt ?? '');
+  return (
+    input.explicitRestart ||
+    (Number.isFinite(terminalAt) &&
+      input.now.getTime() - terminalAt > PENDING_REANCHOR_GAP_MS_V2)
+  );
+}
 
 export interface PendingQuestionCatalogV2 {
   services?: readonly { id: string; name: string }[];
@@ -63,6 +89,7 @@ export function buildPendingQuestionV2(input: {
   pending: PendingFrameSnapshotV2 | null;
   flowState: FlowStateV2;
   catalog: PendingQuestionCatalogV2;
+  reanchor?: boolean;
 }): string | null {
   const pending = input.pending;
   if (!pending) return null;
@@ -80,8 +107,22 @@ export function buildPendingQuestionV2(input: {
         : 'Você prefere algum profissional específico?';
     case 'DATE':
       return 'Qual dia você prefere?';
-    case 'TIME':
+    case 'TIME': {
+      const service = input.catalog.services?.find(
+        (entry) => entry.id === input.flowState.fixedServiceId
+      );
+      if (
+        input.reanchor === true &&
+        pending.flowId === input.flowState.flowId &&
+        service &&
+        input.flowState.resolvedDate
+      ) {
+        return `A gente estava marcando ${service.name} para ${displayDateV2(
+          input.flowState.resolvedDate
+        )} — qual horário você prefere?`;
+      }
       return 'Qual horário você prefere?';
+    }
     case 'CONFIRMATION': {
       if (
         pending.options.some((option) =>
