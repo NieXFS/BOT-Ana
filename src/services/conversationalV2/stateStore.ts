@@ -101,6 +101,18 @@ export interface OutboundOutboxRecordV2 {
   updatedAt: string;
 }
 
+/**
+ * Proveniência tipada da última copy que o provider aceitou. O payload só
+ * volta ao runtime em memória; recibos de produção continuam hash-only.
+ */
+export interface AcceptedDeliveryEvidenceV2 {
+  readonly payload: string;
+  readonly terminalAt: string;
+  readonly transition: MaterializedPendingTransitionV2;
+  readonly conversationCommitOutcome: TurnDeliveryReceiptV2['conversationCommitOutcome'];
+  readonly pendingCommitOutcome: TurnDeliveryReceiptV2['pendingCommitOutcome'];
+}
+
 export interface DurableSuccessorBatchV2 {
   successorTurnId: string;
   sourceTurnId: string;
@@ -158,6 +170,7 @@ export interface ConversationalV2StateStore {
   loadLatestState(conversationKey: string, now?: Date): Promise<{
     pending: PendingFrameRecordV2 | null;
     flowState: FlowStateV2 | null;
+    lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
   }>;
   getInputSequence(conversationKey: string): Promise<number>;
   prepareOutbound(input: {
@@ -266,6 +279,7 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
   async loadLatestState(conversationKey: string, now = new Date()): Promise<{
     pending: PendingFrameRecordV2 | null;
     flowState: FlowStateV2 | null;
+    lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
   }> {
     const rows = this.rows(conversationKey);
     for (const row of rows) {
@@ -277,9 +291,35 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
     }
     const latest = rows.at(-1) ?? null;
     const open = [...rows].reverse().find((row) => row.state === 'OPEN') ?? null;
+    const lastAccepted = [...this.outbox.values()]
+      .filter(
+        (record) =>
+          record.conversationKey === conversationKey &&
+          record.state === 'accepted_by_provider' &&
+          record.commitPayload?.deliveryReceipt.transportOutcome ===
+            'accepted_by_provider'
+      )
+      .sort((left, right) => {
+        const terminalDelta =
+          Date.parse(right.commitPayload!.deliveryReceipt.terminalAt) -
+          Date.parse(left.commitPayload!.deliveryReceipt.terminalAt);
+        return terminalDelta || Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+      })[0];
     return {
       pending: open ? clone(open) : null,
       flowState: latest ? clone(latest.flowState) : null,
+      lastAcceptedDelivery: lastAccepted?.commitPayload
+        ? {
+            payload: lastAccepted.payload,
+            terminalAt: lastAccepted.commitPayload.deliveryReceipt.terminalAt,
+            transition: clone(lastAccepted.transition),
+            conversationCommitOutcome:
+              lastAccepted.commitPayload.deliveryReceipt
+                .conversationCommitOutcome,
+            pendingCommitOutcome:
+              lastAccepted.commitPayload.deliveryReceipt.pendingCommitOutcome,
+          }
+        : null,
     };
   }
 
@@ -740,6 +780,11 @@ export async function ensureConversationalV2Tables(): Promise<void> {
     WHERE state IN ('transport_started','accepted_uncommitted')
   `);
   await pool.query(`
+    CREATE INDEX IF NOT EXISTS ana_v2_outbound_outbox_accepted_delivery_idx
+    ON ana_v2_outbound_outbox (conversation_key, updated_at DESC)
+    WHERE state = 'accepted_by_provider'
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS ana_v2_turn_receipts (
       receipt_id text PRIMARY KEY,
       turn_id text NOT NULL,
@@ -1134,9 +1179,39 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
        LIMIT 1`,
       [conversationKey]
     );
+    const accepted = await pool.query<RawOutboxRowV2>(
+      `SELECT *
+       FROM ana_v2_outbound_outbox
+       WHERE conversation_key = $1
+         AND state = 'accepted_by_provider'
+         AND commit_payload_json->'deliveryReceipt'->>'transportOutcome' =
+             'accepted_by_provider'
+       ORDER BY COALESCE(
+                  NULLIF(commit_payload_json->'deliveryReceipt'->>'terminalAt', '')::timestamptz,
+                  updated_at
+                ) DESC,
+                updated_at DESC
+       LIMIT 1`,
+      [conversationKey]
+    );
+    const lastAccepted = accepted.rows[0]
+      ? outboxFromRow(accepted.rows[0])
+      : null;
     return {
       pending: open,
       flowState: latest.rows[0]?.flow_state_json ?? null,
+      lastAcceptedDelivery: lastAccepted?.commitPayload
+        ? {
+            payload: lastAccepted.payload,
+            terminalAt: lastAccepted.commitPayload.deliveryReceipt.terminalAt,
+            transition: lastAccepted.transition,
+            conversationCommitOutcome:
+              lastAccepted.commitPayload.deliveryReceipt
+                .conversationCommitOutcome,
+            pendingCommitOutcome:
+              lastAccepted.commitPayload.deliveryReceipt.pendingCommitOutcome,
+          }
+        : null,
     };
   },
   async getInputSequence(conversationKey) {

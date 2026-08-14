@@ -201,7 +201,19 @@ async function main(): Promise<void> {
   });
   const acceptedResult = await deliver({ store: acceptedStore, prepared: accepted });
   assert.equal(acceptedResult.receipt.transportOutcome, 'accepted_by_provider');
-  assert.equal((await acceptedStore.loadLatestState(accepted.conversationKey)).pending?.state, 'OPEN');
+  const acceptedState = await acceptedStore.loadLatestState(
+    accepted.conversationKey
+  );
+  assert.equal(acceptedState.pending?.state, 'OPEN');
+  assert.equal(acceptedState.lastAcceptedDelivery?.payload, accepted.payload);
+  assert.equal(
+    acceptedState.lastAcceptedDelivery?.transition.kind === 'open' &&
+      acceptedState.lastAcceptedDelivery.transition.frame.questionId,
+    accepted.transition.kind === 'open'
+      ? accepted.transition.frame.questionId
+      : null,
+    'estado expõe a entrega aceita que abriu a versão exata'
+  );
   assert.equal(
     acceptedStore.pending.get(accepted.conversationKey)?.filter((entry) => entry.state === 'OPEN').length,
     1,

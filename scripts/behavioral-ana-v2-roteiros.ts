@@ -169,6 +169,14 @@ interface StepRun {
   checks: MatrixCheck[];
 }
 
+interface HarnessBoundaryAttemptArtifact {
+  index?: unknown;
+  reasonCodes?: unknown;
+  candidateHash?: unknown;
+  rejectionStage?: 'primary' | 'regen';
+  rejectedCandidateText?: string;
+}
+
 interface ReportStepSummary {
   scenarioId: string;
   scenarioTitle: string;
@@ -357,6 +365,38 @@ function neutralizeEnvironment(options: CliOptions): void {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/**
+ * Projeção exclusiva do artefato sintético. O recibo normativo salvo pelo
+ * runtime continua hash-only; o harness cruza o hook em memória com os attempts
+ * depois da entrega e publica a copy rejeitada para auditoria humana.
+ */
+function planReceiptForHarness(
+  planReceipt: unknown,
+  rejections: readonly BoundaryRejectionArtifact[]
+): unknown {
+  const artifact = clone(planReceipt) as {
+    boundaryAttempts?: HarnessBoundaryAttemptArtifact[];
+  };
+  const attempts = artifact.boundaryAttempts ?? [];
+  let rejectionIndex = 0;
+  for (const attempt of attempts) {
+    const reasonCodes = Array.isArray(attempt.reasonCodes)
+      ? attempt.reasonCodes.filter((entry): entry is string => typeof entry === 'string')
+      : [];
+    if (reasonCodes.length === 0) continue;
+    const next = rejections[rejectionIndex];
+    if (!next) continue;
+    const sameReasons =
+      reasonCodes.length === next.reasonCodes.length &&
+      reasonCodes.every((reason, index) => reason === next.reasonCodes[index]);
+    if (!sameReasons) continue;
+    rejectionIndex += 1;
+    attempt.rejectionStage = next.stage;
+    attempt.rejectedCandidateText = next.rawRejectedOutput;
+  }
+  return artifact;
 }
 
 function percentile(values: readonly number[], ratio: number): number {
@@ -2273,6 +2313,10 @@ async function runCustomerTurn(
   const boundaryRejections = clone(
     session.boundaryRejections.slice(boundaryRejectionStart)
   );
+  const harnessPlanReceipt = planReceiptForHarness(
+    prepared.planReceipt,
+    boundaryRejections
+  );
   return {
     scenarioId: scenario.id,
     scenarioTitle: scenario.title,
@@ -2286,7 +2330,7 @@ async function runCustomerTurn(
     preemption: prepared.preemption,
     delivery: deliveryResult.delivery,
     deliveryReceipt: deliveryResult.receipt,
-    planReceipt: prepared.planReceipt,
+    planReceipt: harnessPlanReceipt,
     frame: prepared.frame,
     transition: prepared.transition,
     pendingBefore,
@@ -2711,6 +2755,23 @@ async function main(): Promise<void> {
       if (!rejection?.reasonCodes.includes('UNKNOWN_SERVICE_OFFER')) {
         throw new Error(
           'Mock não persistiu candidato boundary rejeitado com texto/reason.'
+        );
+      }
+      const planAttempts = (
+        boundaryProbe?.planReceipt as {
+          boundaryAttempts?: HarnessBoundaryAttemptArtifact[];
+        } | undefined
+      )?.boundaryAttempts ?? [];
+      const capturedAttempt = planAttempts.find(
+        (attempt) =>
+          attempt.rejectionStage === 'primary' &&
+          attempt.rejectedCandidateText === 'Fazemos drenagem a vapor.' &&
+          Array.isArray(attempt.reasonCodes) &&
+          attempt.reasonCodes.includes('UNKNOWN_SERVICE_OFFER')
+      );
+      if (!capturedAttempt) {
+        throw new Error(
+          'Mock não projetou rejectedCandidateText no plan receipt do harness.'
         );
       }
     }

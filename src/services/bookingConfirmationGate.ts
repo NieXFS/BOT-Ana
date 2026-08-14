@@ -1,3 +1,16 @@
+import type {
+  FlowStateV2,
+  PendingFrameSnapshotV2,
+} from './conversationalV2/contracts';
+import { normalizeCustomerReplyStyle } from './customerReplyGuard';
+import { buildCanonicalBookingSummaryV2 } from './conversationalV2/lifecycleReducer';
+import { PENDING_FAST_PATH_MAX_AGE_MS } from './conversationalV2/modelResultParser';
+import {
+  validatedBookingDraftForPendingV2,
+  type PendingQuestionCatalogV2,
+} from './conversationalV2/pendingQuestion';
+import type { AcceptedDeliveryEvidenceV2 } from './conversationalV2/stateStore';
+
 type ConversationMessage = {
   role: string;
   content?: unknown;
@@ -118,6 +131,17 @@ export const BOOKING_CONFIRMATION_INTERNAL_HINTS = [
   DUPLICATE_CONFIRMATION_HINT,
   CANCELLATION_HINT,
 ] as const;
+
+/** Fecho aprovado: exclusivo da confirmação normal da rota v2. */
+export const ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION = true;
+
+export interface V2BookingConfirmationContext {
+  pending?: PendingFrameSnapshotV2 | null;
+  flowState: FlowStateV2;
+  catalog: PendingQuestionCatalogV2;
+  lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  now: Date;
+}
 
 function normalize(value: string): string {
   return value
@@ -319,6 +343,118 @@ function previousAssistantRequestedConfirmation(
   );
 }
 
+function normalizedModalEcho(message: string): boolean {
+  const value = normalize(message)
+    .replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, '')
+    .trim();
+  return /^(?:pode|pode sim|pode marcar)$/u.test(value);
+}
+
+/**
+ * Modal curto só ecoa a pergunta canônica da pendência CONFIRMATION atual.
+ * A função é pura para o smoke; o gate só a consulta quando a constante acima
+ * estiver ativa.
+ */
+export function matchesScopedV2ModalEchoConfirmation(input: {
+  currentUserMessage: string;
+  history: ConversationMessage[];
+  expectedBooking?: BookingProposal;
+  context?: V2BookingConfirmationContext;
+}): boolean {
+  if (!normalizedModalEcho(input.currentUserMessage)) return false;
+  const pending = input.context?.pending;
+  const flowState = input.context?.flowState;
+  const catalog = input.context?.catalog;
+  if (!pending || !flowState?.flowId || !catalog || !input.context) {
+    return false;
+  }
+  const draft = validatedBookingDraftForPendingV2({
+    pending,
+    flowState,
+    catalog,
+  });
+  if (
+    !draft ||
+    draft.date !== input.expectedBooking?.date ||
+    draft.time !== input.expectedBooking?.time
+  ) {
+    return false;
+  }
+
+  const delivery = input.context.lastAcceptedDelivery;
+  const transition = delivery?.transition;
+  if (
+    !delivery ||
+    delivery.conversationCommitOutcome !== 'committed' ||
+    delivery.pendingCommitOutcome !== 'opened' ||
+    transition?.kind !== 'open' ||
+    transition.frame.questionId !== pending.questionId ||
+    transition.frame.version !== pending.version ||
+    transition.frame.flowId !== pending.flowId ||
+    transition.frame.askedAt !== pending.askedAt ||
+    transition.frame.kind !== pending.kind ||
+    transition.frame.options.length !== pending.options.length ||
+    transition.frame.options.some((option, index) => {
+      const current = pending.options[index];
+      return (
+        !current ||
+        option.position !== current.position ||
+        option.entityId !== current.entityId ||
+        option.displayName !== current.displayName
+      );
+    })
+  ) {
+    return false;
+  }
+
+  const nowMs = input.context.now.getTime();
+  const askedAtMs = Date.parse(pending.askedAt);
+  const terminalAtMs = Date.parse(delivery.terminalAt);
+  const askedAge = nowMs - askedAtMs;
+  const terminalAge = nowMs - terminalAtMs;
+  if (
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(askedAtMs) ||
+    !Number.isFinite(terminalAtMs) ||
+    askedAge < 0 ||
+    terminalAge < 0 ||
+    askedAge > PENDING_FAST_PATH_MAX_AGE_MS ||
+    terminalAge > PENDING_FAST_PATH_MAX_AGE_MS
+  ) {
+    return false;
+  }
+
+  const canonicalCopy = buildCanonicalBookingSummaryV2({
+    draft,
+    services: catalog,
+  });
+  return (
+    normalizeCustomerReplyStyle(delivery.payload) ===
+    normalizeCustomerReplyStyle(canonicalCopy)
+  );
+}
+
+function isExplicitConfirmationForGate(input: {
+  currentUserMessage: string;
+  history: ConversationMessage[];
+  expectedBooking?: BookingProposal;
+  v2ConfirmationContext?: V2BookingConfirmationContext;
+}): boolean {
+  if (
+    ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION &&
+    input.v2ConfirmationContext &&
+    normalizedModalEcho(input.currentUserMessage)
+  ) {
+    return matchesScopedV2ModalEchoConfirmation({
+      currentUserMessage: input.currentUserMessage,
+      history: input.history,
+      expectedBooking: input.expectedBooking,
+      context: input.v2ConfirmationContext,
+    });
+  }
+  return isExplicitBookingConfirmation(input.currentUserMessage);
+}
+
 function historyContainsConfirmedProposal(
   history: ConversationMessage[],
   expected?: BookingProposal
@@ -417,6 +553,7 @@ export function bookingConfirmationGate(input: {
   expectedBooking?: BookingProposal;
   duplicateCancellationSucceeded?: boolean;
   currentUserMessageIndex?: number;
+  v2ConfirmationContext?: V2BookingConfirmationContext;
 }): BookingConfirmationDecision {
   const isSameTurnRemarriageAfterCancellation =
     input.duplicateCancellationSucceeded === true &&
@@ -470,7 +607,7 @@ export function bookingConfirmationGate(input: {
   }
 
   if (
-    isExplicitBookingConfirmation(input.currentUserMessage) &&
+    isExplicitConfirmationForGate(input) &&
     previousAssistantRequestedConfirmation(
       input.history,
       input.expectedBooking

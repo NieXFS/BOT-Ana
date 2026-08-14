@@ -66,6 +66,7 @@ import {
   type RegenerationResultV2,
 } from './regenerator';
 import { reduceToolLifecycleV2 } from './lifecycleReducer';
+import { buildPendingQuestionV2 } from './pendingQuestion';
 import {
   composeSocialReplyV2,
   detectStrictSocialRouteV2,
@@ -428,24 +429,15 @@ function toolEffects(
   });
 }
 
-function canonicalPendingQuestion(frame: TurnFrameV2): string | null {
-  if (!frame.pending) return null;
-  switch (frame.pending.kind) {
-    case 'SERVICE':
-      return `Qual serviço você prefere: ${frame.pending.options
-        .map((entry) => entry.displayName)
-        .join(', ')}?`;
-    case 'PROFESSIONAL':
-      return `Qual profissional você prefere: ${frame.pending.options
-        .map((entry) => entry.displayName)
-        .join(', ')}?`;
-    case 'DATE':
-      return 'Qual dia você prefere?';
-    case 'TIME':
-      return 'Qual horário você prefere?';
-    case 'CONFIRMATION':
-      return 'Você confirma essa opção?';
-  }
+function canonicalPendingQuestion(
+  frame: TurnFrameV2,
+  catalog: ServicesResult
+): string | null {
+  return buildPendingQuestionV2({
+    pending: frame.pending,
+    flowState: frame.flowState,
+    catalog,
+  });
 }
 
 function emptyLoopResult(): ReceptionistModelLoopResult {
@@ -700,7 +692,7 @@ export async function getReceptionistReplyV2(input: {
       preemption,
       successorTurnId,
       hasCommittedWrite: hasCommittedWrite(loop),
-      canonicalPendingQuestion: canonicalPendingQuestion(frame),
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
       elicitationVariant,
     };
   };
@@ -743,7 +735,13 @@ export async function getReceptionistReplyV2(input: {
         modelHistory,
         services,
         conversationKey,
-        { flowState: frame.flowState, pending: frame.pending }
+        {
+          flowState: frame.flowState,
+          pending: frame.pending,
+          catalog: services,
+          lastAcceptedDelivery: stored.lastAcceptedDelivery,
+          now: startedAt,
+        }
       ));
 
   let primary: ModelTurnResultV2ParseResult;
@@ -856,7 +854,7 @@ export async function getReceptionistReplyV2(input: {
       preemption: null,
       successorTurnId,
       hasCommittedWrite: false,
-      canonicalPendingQuestion: canonicalPendingQuestion(frame),
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
       elicitationVariant,
     };
   }
@@ -1049,7 +1047,9 @@ export async function getReceptionistReplyV2(input: {
       pendingAnaOpen: frame.pending !== null,
     },
     toolTrace: loop.toolTrace as ToolTraceLike[],
-    canonicalPendingQuestion: canonicalPendingQuestion(frame) ?? undefined,
+    canonicalPendingQuestion:
+      canonicalPendingQuestion({ ...frame, flowState: nextFlowState }, services) ??
+      undefined,
     beforeRegenerate: () => checkRace('before_regen'),
     afterRegenerate: () => checkRace('during_regen'),
     onRejectedBoundaryCandidate: deps.onRejectedBoundaryCandidate,
@@ -1156,7 +1156,10 @@ export async function getReceptionistReplyV2(input: {
     preemption: null,
     successorTurnId,
     hasCommittedWrite: writeCommitted,
-    canonicalPendingQuestion: canonicalPendingQuestion(frame),
+    canonicalPendingQuestion: canonicalPendingQuestion(
+      { ...frame, flowState: recoveredFlowState },
+      services
+    ),
     elicitationVariant,
   };
 }

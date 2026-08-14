@@ -22,6 +22,7 @@ import {
 import type { ModelTurnResultV2ParseResult } from './modelResultParser';
 import type { RegenerationResultV2 } from './regenerator';
 import { opaqueReceiptHashV2 } from './receipts';
+import { buildPendingQuestionV2 } from './pendingQuestion';
 
 export const CATALOG_UNAVAILABLE_FALLBACK_V2 =
   'Não consegui consultar os serviços agora. Pode tentar novamente em instantes?';
@@ -94,28 +95,6 @@ export type RecoveryCoordinatorResultV2 =
       boundaryAttempts: RecoveryBoundaryAttemptV2[];
     };
 
-function buildPendingQuestion(frame: TurnFrameV2): string | null {
-  const pending = frame.pending;
-  if (!pending) return null;
-  const names = pending.options.map((option) => option.displayName.trim()).filter(Boolean);
-  switch (pending.kind) {
-    case 'SERVICE':
-      return names.length > 0
-        ? `Qual serviço você prefere: ${names.join(', ')}?`
-        : 'Qual serviço você prefere?';
-    case 'PROFESSIONAL':
-      return names.length > 0
-        ? `Qual profissional você prefere: ${names.join(', ')}?`
-        : 'Você prefere algum profissional específico?';
-    case 'DATE':
-      return 'Qual dia você prefere?';
-    case 'TIME':
-      return 'Qual horário você prefere?';
-    case 'CONFIRMATION':
-      return 'Você confirma essa opção?';
-  }
-}
-
 function fallbackCandidate(
   input: RecoveryCoordinatorInputV2,
   safeWriteConfirmation: string | null
@@ -126,7 +105,13 @@ function fallbackCandidate(
   if (safeWriteConfirmation) {
     return { text: safeWriteConfirmation, pendingQuestion: false };
   }
-  const pending = input.canonicalPendingQuestion?.trim() || buildPendingQuestion(input.frame);
+  const pending =
+    input.canonicalPendingQuestion?.trim() ||
+    buildPendingQuestionV2({
+      pending: input.frame.pending,
+      flowState: input.frame.flowState,
+      catalog: input.boundaryContext.servicesResult,
+    });
   if (pending) return { text: pending, pendingQuestion: true };
   if (input.frame.catalogState === 'unavailable') {
     return { text: CATALOG_UNAVAILABLE_FALLBACK_V2, pendingQuestion: false };

@@ -26,13 +26,19 @@ import {
   executeReceptionistFunction,
   runReceptionistModelLoop,
 } from '../src/services/brainService';
-import { CONFIRMATION_HINT } from '../src/services/bookingConfirmationGate';
+import {
+  bookingConfirmationGate,
+  CONFIRMATION_HINT,
+  ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION,
+  matchesScopedV2ModalEchoConfirmation,
+} from '../src/services/bookingConfirmationGate';
 import {
   MODEL_TURN_RESULT_V2_BOOKING_RULE,
   MODEL_TURN_RESULT_V2_CONTRACT_BLOCK,
   MODEL_TURN_RESULT_V2_POST_TOOL_REMINDER,
 } from '../src/services/conversationalV2/modelResultContract';
 import { reduceToolLifecycleV2 } from '../src/services/conversationalV2/lifecycleReducer';
+import { buildPendingQuestionV2 } from '../src/services/conversationalV2/pendingQuestion';
 import { coerceEquivalentOpenTransitionV2 } from '../src/services/conversationalV2/modelResultParser';
 import * as handler from '../src/messageHandler';
 
@@ -103,6 +109,14 @@ const services: ServicesResult = {
     { id: 'prof-julia', name: 'Júlia' },
     { id: 'prof-marina', name: 'Marina' },
   ],
+};
+
+config.authoritativeCatalog = {
+  ...config.authoritativeCatalog,
+  services: services.services!.map((service) => ({ ...service })),
+  professionals: services.professionals!.map((professional) => ({
+    ...professional,
+  })),
 };
 
 function pending(input: {
@@ -403,6 +417,35 @@ async function main(): Promise<void> {
     now,
   });
   assert.equal(stale.kind, 'continue_model');
+
+  const denajemFastPath = resolveSelectionFastPathV2({
+    frame: matrixFrame,
+    inboundId: 'inbound-denajem',
+    inboundText: 'denajem',
+    catalog: services,
+    now,
+  });
+  assert.equal(
+    denajemFastPath.kind,
+    'resolved',
+    'resposta curta à pergunta SERVICE reutiliza o matcher D compartilhado'
+  );
+  if (denajemFastPath.kind === 'resolved') {
+    assert.equal(denajemFastPath.proof.kind, 'pending_option');
+    assert.equal(denajemFastPath.proof.entityId, 'svc-drenagem');
+    assert.equal(denajemFastPath.nextFlowState.fixedServiceId, 'svc-drenagem');
+  }
+  assert.equal(
+    resolveSelectionFastPathV2({
+      frame: matrixFrame,
+      inboundId: 'inbound-denajem-negated',
+      inboundText: 'não denajem',
+      catalog: services,
+      now,
+    }).kind,
+    'continue_model',
+    'typo distância 2 nunca vence polaridade negativa'
+  );
 
   const deterministicServiceQuestion = resolveInitialServiceQuestionFastPathV2({
     frame: promptFrame,
@@ -897,6 +940,42 @@ async function main(): Promise<void> {
   assert.match(i1.payload ?? '', /Qual dia/);
   assert.doesNotMatch(i1.payload ?? '', /não (?:temos|está disponível)/i);
 
+  // Replay canário: o modelo havia devolvido PRESERVE porque o fast-path não
+  // ligava a resposta curta ao matcher D. Agora a prova nasce da pendência e o
+  // provider não participa.
+  const denajemStore = new MemoryConversationalV2StateStore();
+  const denajemPhone = '5511000000019';
+  const denajemKey = `${config.phoneNumberId}:${denajemPhone}`;
+  const denajemPending = pending();
+  seedPending(denajemStore, denajemKey, denajemPending);
+  denajemStore.setInputSequence(denajemKey, 1);
+  let denajemModelCalls = 0;
+  const denajemPrepared = await getReceptionistReplyV2({
+    phone: denajemPhone,
+    userMessage: 'denajem',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'denajem' }),
+    deps: {
+      ...baseDeps(denajemStore),
+      runModelLoop: async () => {
+        denajemModelCalls += 1;
+        throw new Error('denajem ancorado em SERVICE OPEN não chama modelo');
+      },
+    },
+  });
+  assert.equal(denajemModelCalls, 0);
+  assert.equal(denajemPrepared.planReceipt.route, 'fast_path');
+  assert.equal(
+    denajemPrepared.frame.flowState.fixedServiceId,
+    'svc-drenagem'
+  );
+  assert.equal(
+    denajemPrepared.transition.kind === 'open' &&
+      denajemPrepared.transition.frame.kind,
+    'DATE'
+  );
+
   // Replay canário T4: hora nua é preenchida contra TIME OPEN autoritativo; a
   // copy canônica atravessa a boundary usando BookingDraftV2 + slotEvidence.
   const bareTimeStore = new MemoryConversationalV2StateStore();
@@ -951,6 +1030,341 @@ async function main(): Promise<void> {
   assert.equal(
     bareTimePrepared.frame.flowState.bookingDraft?.slotEvidenceTurnId,
     'turn-slot-evidence-prior'
+  );
+  await deliverPreparedReceptionistTurnV2(bareTimePrepared, {
+    store: bareTimeStore,
+    id: nextId,
+    now: () => now,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  const bareTimeAccepted = await bareTimeStore.loadLatestState(bareTimeKey, now);
+  assert.ok(bareTimeAccepted.pending);
+  assert.ok(bareTimeAccepted.lastAcceptedDelivery);
+  const bareTimeExpectedBooking = {
+    date: '2026-08-14',
+    time: '15:00',
+    serviceName: 'Drenagem Linfática',
+    professionalName: 'Júlia',
+  };
+  assert.deepEqual(
+    bookingConfirmationGate({
+      currentUserMessage: 'pode',
+      history: [
+        {
+          role: 'assistant',
+          content: bareTimeAccepted.lastAcceptedDelivery!.payload,
+        },
+      ],
+      confirmedDuplicate: false,
+      expectedBooking: bareTimeExpectedBooking,
+      v2ConfirmationContext: {
+        pending: bareTimeAccepted.pending!.snapshot,
+        flowState: bareTimeAccepted.pending!.flowState,
+        catalog: services,
+        lastAcceptedDelivery: bareTimeAccepted.lastAcceptedDelivery,
+        now,
+      },
+    }),
+    { ok: true, consumesCancellationEvidence: false },
+    'resumo entregue e aceito abre a versão que licencia "pode"'
+  );
+  const bareTimeWrite = reduceToolLifecycleV2({
+    frame: {
+      ...bareTimePrepared.frame,
+      pending: bareTimeAccepted.pending!.snapshot,
+      flowState: bareTimeAccepted.pending!.flowState,
+    },
+    services,
+    toolTrace: [
+      {
+        round: 1,
+        name: 'bookAppointment',
+        args: {
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-14',
+          time: '15:00',
+        },
+        argumentsValidJson: true,
+        result: JSON.stringify({ success: true }),
+      },
+    ],
+  });
+  assert.equal(bareTimeWrite?.kind, 'canonical_write');
+  assert.equal(
+    bareTimeWrite?.result.pendingTransitionCandidate.kind,
+    'resolve',
+    'bookAppointment success fecha a CONFIRMATION do caminho feliz'
+  );
+
+  // Regressão do loop real: tentativa após "pode" é bloqueada, a copy falsa
+  // também é barrada e o fallback reancora o gate com o resumo completo.
+  const confirmationLoopStore = new MemoryConversationalV2StateStore();
+  const confirmationLoopPhone = '5511000000020';
+  const confirmationLoopKey = `${config.phoneNumberId}:${confirmationLoopPhone}`;
+  const confirmationPendingBase = pending({
+    kind: 'CONFIRMATION',
+    options: [],
+  });
+  const confirmationPending = {
+    ...confirmationPendingBase,
+    options: [
+      {
+        position: 1,
+        entityId: `booking-confirmation:${confirmationPendingBase.flowId}`,
+        displayName: 'Confirmar agendamento',
+      },
+    ],
+  } as const;
+  const confirmationFlowState = {
+    flowId: confirmationPending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    bookingDraft: {
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      time: '15:00',
+      slotEvidenceTurnId: 'turn-confirmation-loop-slots',
+    },
+    slotEvidence: {
+      turnId: 'turn-confirmation-loop-slots',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['15:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  } as const;
+  assert.equal(
+    buildPendingQuestionV2({
+      pending: confirmationPending,
+      flowState: {
+        flowId: confirmationPending.flowId,
+        fixedByProofVersion: {},
+      },
+      catalog: services,
+    }),
+    'Você confirma essa opção?',
+    'CONFIRMATION sem BookingDraftV2 completo mantém pergunta neutra'
+  );
+  const duplicateFallbackPending = {
+    ...confirmationPending,
+    options: [
+      {
+        position: 1,
+        entityId: 'duplicate-resolution:keep-both',
+        displayName: 'manter os dois',
+      },
+      {
+        position: 2,
+        entityId: 'duplicate-resolution:reschedule',
+        displayName: 'remarcar',
+      },
+    ],
+  } as const;
+  const duplicateFallbackCopy = buildPendingQuestionV2({
+    pending: duplicateFallbackPending,
+    flowState: confirmationFlowState,
+    catalog: services,
+  });
+  assert.equal(
+    duplicateFallbackCopy,
+    'Qual opção você prefere: manter os dois, remarcar?',
+    'duplicidade usa copy própria e nunca o resumo de booking normal'
+  );
+  assert.doesNotMatch(duplicateFallbackCopy ?? '', /^Confirmando:/u);
+  seedPending(
+    confirmationLoopStore,
+    confirmationLoopKey,
+    confirmationPending,
+    confirmationFlowState
+  );
+  confirmationLoopStore.setInputSequence(confirmationLoopKey, 1);
+  const canonicalConfirmationSummary =
+    'Confirmando: Drenagem Linfática, em 14/08/2026, às 15h, com Júlia. Posso marcar?';
+  const falseWriteClaim = 'Pronto, seu agendamento foi confirmado com sucesso.';
+  const confirmationLoopPrepared = await getReceptionistReplyV2({
+    phone: confirmationLoopPhone,
+    userMessage: 'pode',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'pode' }),
+    deps: {
+      ...baseDeps(confirmationLoopStore),
+      loadHistory: async () => [
+        { role: 'assistant', content: canonicalConfirmationSummary },
+        { role: 'user', content: 'pode' },
+      ],
+      runModelLoop: async (loopInput) => {
+        const args = {
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-14',
+          time: '15:00',
+        };
+        const blockedResult = await loopInput.executeTool(
+          'bookAppointment',
+          args
+        );
+        assert.equal(
+          (JSON.parse(blockedResult) as { message?: unknown }).message,
+          CONFIRMATION_HINT,
+          'o gate real bloqueia "pode" antes de qualquer I/O'
+        );
+        return {
+          rawReply: JSON.stringify(
+            flatResult({
+              reply: falseWriteClaim,
+              nextPending: 'PRESERVE',
+            })
+          ),
+          exhausted: false,
+          provider: 'openai' as const,
+          model: 'gpt-4o-mini',
+          providerReportedModels: ['gpt-4o-mini'],
+          rounds: 2,
+          messages: [],
+          toolTrace: [
+            {
+              round: 1,
+              name: 'bookAppointment',
+              args,
+              argumentsValidJson: true,
+              result: blockedResult,
+            },
+          ],
+          usage: [],
+        };
+      },
+      regenerate: async (reasonCodes) => {
+        assert.ok(reasonCodes.includes('FALSE_WRITE_CLAIM'));
+        return {
+          ok: true,
+          providerCalls: 1,
+          resolutionProof: null,
+          result: modelResult({
+            reply: falseWriteClaim,
+            replyPurpose: 'WRITE_CONFIRMATION',
+            pendingTransitionCandidate: { kind: 'preserve' },
+          }),
+        };
+      },
+    },
+  });
+  assert.equal(confirmationLoopPrepared.planReceipt.route, 'fallback');
+  assert.equal(
+    confirmationLoopPrepared.planReceipt.toolEffects[0]?.outcome,
+    'blocked'
+  );
+  assert.equal(confirmationLoopPrepared.payload, canonicalConfirmationSummary);
+  assert.equal(
+    confirmationLoopPrepared.planReceipt.boundaryAttempts
+      .slice(0, 2)
+      .every((attempt) =>
+        attempt.reasonCodes.includes('FALSE_WRITE_CLAIM')
+      ),
+    true
+  );
+  const confirmationTransportPayloads: string[] = [];
+  await deliverPreparedReceptionistTurnV2(confirmationLoopPrepared, {
+    store: confirmationLoopStore,
+    id: nextId,
+    now: () => now,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async (payload) => {
+      confirmationTransportPayloads.push(payload);
+      return { providerMessageId: nextId() };
+    },
+  });
+  assert.deepEqual(confirmationTransportPayloads, [canonicalConfirmationSummary]);
+  const deliveredConfirmationState = await confirmationLoopStore.loadLatestState(
+    confirmationLoopKey,
+    now
+  );
+  const confirmationHistory = [
+    { role: 'assistant', content: canonicalConfirmationSummary },
+    { role: 'user', content: 'pode' },
+    { role: 'assistant', content: canonicalConfirmationSummary },
+    { role: 'user', content: 'sim' },
+  ];
+  const expectedBooking = {
+    date: '2026-08-14',
+    time: '15:00',
+    serviceName: 'Drenagem Linfática',
+    professionalName: 'Júlia',
+  };
+  const v2ConfirmationContext = {
+    pending: confirmationPending,
+    flowState: confirmationFlowState,
+    catalog: services,
+    lastAcceptedDelivery: deliveredConfirmationState.lastAcceptedDelivery,
+    now,
+  };
+  assert.equal(ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION, true);
+  assert.equal(
+    matchesScopedV2ModalEchoConfirmation({
+      currentUserMessage: 'pode',
+      history: confirmationHistory.slice(0, 1),
+      expectedBooking,
+      context: v2ConfirmationContext,
+    }),
+    false,
+    'fallback que preservou a versão não se finge de entrega que a abriu'
+  );
+  const v2HappyConfirmationContext = {
+    ...v2ConfirmationContext,
+    lastAcceptedDelivery: {
+      payload: canonicalConfirmationSummary,
+      terminalAt: now.toISOString(),
+      conversationCommitOutcome: 'committed' as const,
+      pendingCommitOutcome: 'opened' as const,
+      transition: {
+        kind: 'open' as const,
+        frame: confirmationPending,
+        expectedQuestionId: null,
+        expectedVersion: null,
+        nextFlowState: confirmationFlowState,
+      },
+    },
+  };
+  assert.equal(
+    bookingConfirmationGate({
+      currentUserMessage: 'pode',
+      history: confirmationHistory.slice(0, 1),
+      confirmedDuplicate: false,
+      expectedBooking,
+      v2ConfirmationContext: v2HappyConfirmationContext,
+    }).ok,
+    true,
+    'resumo que abriu a versão atual licencia o eco modal estrito'
+  );
+  assert.equal(
+    bookingConfirmationGate({
+      currentUserMessage: 'sim',
+      history: confirmationHistory,
+      confirmedDuplicate: false,
+      expectedBooking,
+      v2ConfirmationContext,
+    }).ok,
+    true,
+    'o sim seguinte ao fallback-resumo licencia a escrita e encerra o loop'
   );
 
   // Replay canário T1/T2: pedido genérico supersede pendência velha sem modelo,
@@ -1203,8 +1617,8 @@ async function main(): Promise<void> {
   assert.equal(emptyAfterToolPrepared.planReceipt.route, 'regen');
   assert.match(emptyAfterToolPrepared.payload ?? '', /R\$ 120,00/u);
 
-  // Emenda D3 pós-convergência: nome parcial/typo unívoco vindo do modelo
-  // produz ResolutionProof e fixa flowState; o fast-path segue estrito.
+  // Emenda D3 pós-convergência: fora de uma pergunta OPEN, nome parcial/typo
+  // unívoco vindo do modelo produz ResolutionProof e fixa flowState.
   for (const fixture of [
     {
       inboundText: 'peeling',
@@ -1225,8 +1639,6 @@ async function main(): Promise<void> {
     const proofStore = new MemoryConversationalV2StateStore();
     const proofPhone = `5511000003${serial}`;
     const proofKey = `${config.phoneNumberId}:${proofPhone}`;
-    const proofPending = pending();
-    seedPending(proofStore, proofKey, proofPending);
     proofStore.setInputSequence(proofKey, 1);
     const points = Array.from(fixture.inboundText);
     const spanPoints = Array.from(fixture.spanText);

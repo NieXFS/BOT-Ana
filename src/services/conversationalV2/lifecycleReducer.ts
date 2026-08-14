@@ -219,7 +219,10 @@ function displayDate(date: string): string {
 
 export function buildCanonicalBookingSummaryV2(input: {
   draft: BookingDraftV2;
-  services: ServicesResult;
+  services: {
+    services?: readonly { id: string; name: string }[];
+    professionals?: readonly { id: string; name: string }[];
+  };
 }): string {
   const service = input.services.services?.find(
     (entry) => entry.id === input.draft.serviceId

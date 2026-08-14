@@ -2,7 +2,6 @@ import { randomUUID } from 'crypto';
 import { isAmbiguousWhatsAppTransportError } from '../../whatsappCloudService';
 import type {
   DeliveryPreemptionV2,
-  PendingFrameSnapshotV2,
   TurnDeliveryReceiptV2,
 } from './contracts';
 import {
@@ -14,6 +13,7 @@ import type {
   ConversationalV2Checkpoint,
   PreparedReceptionistTurnV2,
 } from './runtimeTypes';
+import { buildPendingQuestionV2 } from './pendingQuestion';
 import {
   pgConversationalV2StateStore,
   type ConversationalV2StateStore,
@@ -35,26 +35,6 @@ export interface DeliverPreparedReceptionistTurnV2Result {
   delivery: 'sent' | 'suppressed' | 'transport_unknown' | 'transport_failed';
   receipt: TurnDeliveryReceiptV2;
   successor: DurableSuccessorBatchV2 | null;
-}
-
-function canonicalPendingQuestion(pending: PendingFrameSnapshotV2): string {
-  const names = pending.options.map((option) => option.displayName.trim()).filter(Boolean);
-  switch (pending.kind) {
-    case 'SERVICE':
-      return names.length > 0
-        ? `Qual serviço você prefere: ${names.join(', ')}?`
-        : 'Qual serviço você prefere?';
-    case 'PROFESSIONAL':
-      return names.length > 0
-        ? `Qual profissional você prefere: ${names.join(', ')}?`
-        : 'Você prefere algum profissional específico?';
-    case 'DATE':
-      return 'Qual dia você prefere?';
-    case 'TIME':
-      return 'Qual horário você prefere?';
-    case 'CONFIRMATION':
-      return 'Você confirma essa opção?';
-  }
 }
 
 function transportForPreemption(preemption: DeliveryPreemptionV2): {
@@ -240,7 +220,11 @@ export async function deliverPreparedReceptionistTurnV2(
       emitDelivery(receipt);
       return { delivery: 'suppressed', receipt, successor };
     }
-    payload = canonicalPendingQuestion(current.pending.snapshot);
+    payload = buildPendingQuestionV2({
+      pending: current.pending.snapshot,
+      flowState: current.pending.flowState,
+      catalog: prepared.config.authoritativeCatalog ?? {},
+    }) ?? 'Você confirma essa opção?';
     prepared.planReceipt.route = 'fallback';
     prepared.planReceipt.recoveryKind = 'direct_fallback';
     prepared.transition = { kind: 'preserve' };

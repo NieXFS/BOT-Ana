@@ -56,6 +56,7 @@ import {
   CONFIRMATION_HINT,
   RescheduleCancellationEvidenceStore,
   type BookingProposal,
+  type V2BookingConfirmationContext,
 } from './bookingConfirmationGate';
 import {
   buildSafeRecoveryReply,
@@ -105,10 +106,6 @@ import type {
   ConversationalV2TurnRuntime,
   PreparedReceptionistTurnV2,
 } from './conversationalV2/runtimeTypes';
-import type {
-  BookingDraftV2,
-  PendingFrameSnapshotV2,
-} from './conversationalV2/contracts';
 
 export {
   buildSocialReceptionistReply,
@@ -616,15 +613,7 @@ export async function executeReceptionistFunction(
   conversationHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
   servicesResult: ServicesResult,
   conversationKey: string,
-  v2Grounding?: {
-    flowState: {
-      flowId?: string;
-      fixedServiceId?: string;
-      fixedProfessionalId?: string;
-      bookingDraft?: BookingDraftV2;
-    };
-    pending?: PendingFrameSnapshotV2 | null;
-  }
+  v2Grounding?: V2BookingConfirmationContext
 ): Promise<string> {
   try {
     // O trace do loop preserva `args` como o modelo os enviou. Se um prefixo de
@@ -775,6 +764,7 @@ export async function executeReceptionistFunction(
           confirmedDuplicate: args.confirmedDuplicate === true,
           expectedBooking,
           duplicateCancellationSucceeded: cancellationEvidence !== null,
+          v2ConfirmationContext: v2Grounding,
         });
         if (!confirmation.ok) {
           console.log(

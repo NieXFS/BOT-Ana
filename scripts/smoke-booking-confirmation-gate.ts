@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import {
   bookingConfirmationGate,
   cancellationIntentGate,
+  ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION,
   isExplicitBookingConfirmation,
+  matchesScopedV2ModalEchoConfirmation,
   priorUserSelectedDuplicateAction,
   RESCHEDULE_CANCELLATION_EVIDENCE_WINDOW_MS,
   RescheduleCancellationEvidenceStore,
@@ -106,6 +108,185 @@ const expectedBooking: BookingProposal = {
   serviceName: 'Limpeza de Pele',
   professionalName: 'Júlia',
 };
+
+const scopedNow = new Date('2026-08-13T15:00:00.000Z');
+const scopedFlowId = 'flow-booking-modal';
+const scopedPending = {
+  questionId: 'question-booking-modal',
+  askedAt: '2026-08-13T14:00:00.000Z',
+  kind: 'CONFIRMATION' as const,
+  flowId: scopedFlowId,
+  version: 3,
+  options: [
+    {
+      position: 1,
+      entityId: `booking-confirmation:${scopedFlowId}`,
+      displayName: 'opção apresentada',
+    },
+  ],
+};
+const scopedFlowState = {
+  flowId: scopedFlowId,
+  fixedServiceId: 'svc-cleaning',
+  fixedProfessionalId: 'prof-julia',
+  resolvedDate: '2026-08-04',
+  bookingDraft: {
+    serviceId: 'svc-cleaning',
+    professionalId: 'prof-julia',
+    date: '2026-08-04',
+    time: '15:00',
+    slotEvidenceTurnId: 'turn-slots-booking-modal',
+  },
+  slotEvidence: {
+    turnId: 'turn-slots-booking-modal',
+    serviceId: 'svc-cleaning',
+    professionalId: 'prof-julia',
+    date: '2026-08-04',
+    slots: ['15:00'],
+  },
+  fixedByProofVersion: {
+    fixedServiceId: 1,
+    fixedProfessionalId: 1,
+    resolvedDate: 1,
+  },
+};
+const scopedCanonicalSummary =
+  'Confirmando: Limpeza de Pele, em 04/08/2026, às 15h, com Júlia. Posso marcar?';
+const scopedContext = {
+  pending: scopedPending,
+  flowState: scopedFlowState,
+  catalog: {
+    services: [{ id: 'svc-cleaning', name: 'Limpeza de Pele' }],
+    professionals: [{ id: 'prof-julia', name: 'Júlia' }],
+  },
+  lastAcceptedDelivery: {
+    payload: scopedCanonicalSummary,
+    terminalAt: '2026-08-13T14:00:01.000Z',
+    conversationCommitOutcome: 'committed' as const,
+    pendingCommitOutcome: 'opened' as const,
+    transition: {
+      kind: 'open' as const,
+      frame: scopedPending,
+      expectedQuestionId: null,
+      expectedVersion: null,
+      nextFlowState: scopedFlowState,
+    },
+  },
+  now: scopedNow,
+};
+
+assert.equal(ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION, true);
+assert.equal(
+  matchesScopedV2ModalEchoConfirmation({
+    currentUserMessage: '👍 pode!',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    expectedBooking,
+    context: scopedContext,
+  }),
+  true,
+  'pontuação/emoji somente nas bordas preservam o lote modal fechado'
+);
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage: 'pode',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: scopedContext,
+  }),
+  { ok: true, consumesCancellationEvidence: false },
+  'resumo aceito que abriu a versão atual licencia o caminho feliz real'
+);
+
+for (const [label, currentUserMessage, context] of [
+  [
+    'última entrega diverge do resumo atual',
+    'pode',
+    {
+      ...scopedContext,
+      lastAcceptedDelivery: {
+        ...scopedContext.lastAcceptedDelivery,
+        payload: 'Você confirma essa opção?',
+      },
+    },
+  ],
+  [
+    'janela de quatro horas expirou',
+    'pode',
+    {
+      ...scopedContext,
+      now: new Date('2026-08-13T19:00:02.000Z'),
+    },
+  ],
+  [
+    'lote tem correção depois do modal',
+    'pode ... na verdade não',
+    scopedContext,
+  ],
+] as const) {
+  assert.equal(
+    matchesScopedV2ModalEchoConfirmation({
+      currentUserMessage,
+      history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+      expectedBooking,
+      context,
+    }),
+    false,
+    label
+  );
+}
+
+const duplicateScopedPending = {
+  ...scopedPending,
+  options: [
+    {
+      position: 1,
+      entityId: 'duplicate-resolution:keep-both',
+      displayName: 'manter os dois',
+    },
+  ],
+};
+const duplicateScopedContext = {
+  ...scopedContext,
+  pending: duplicateScopedPending,
+  lastAcceptedDelivery: {
+    ...scopedContext.lastAcceptedDelivery,
+    transition: {
+      ...scopedContext.lastAcceptedDelivery.transition,
+      frame: duplicateScopedPending,
+    },
+  },
+};
+assert.equal(
+  matchesScopedV2ModalEchoConfirmation({
+    currentUserMessage: 'pode',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    expectedBooking,
+    context: duplicateScopedContext,
+  }),
+  false,
+  'duplicate-resolution nunca usa o eco modal de booking normal'
+);
+assert.equal(
+  bookingConfirmationGate({
+    currentUserMessage: 'pode',
+    history: [
+      {
+        role: 'assistant',
+        content:
+          'Você já tem outro agendamento futuro. Quer manter os dois, remarcar ou pensar?',
+      },
+      { role: 'user', content: 'remarcar' },
+      { role: 'assistant', content: scopedCanonicalSummary },
+    ],
+    confirmedDuplicate: true,
+    duplicateCancellationSucceeded: true,
+    expectedBooking,
+    v2ConfirmationContext: duplicateScopedContext,
+  }).ok,
+  false,
+  '"pode" em CONFIRMATION de duplicate-resolution não licencia write'
+);
 
 const confirmationHistory = [
   {

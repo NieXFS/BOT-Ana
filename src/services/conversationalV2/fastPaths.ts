@@ -84,6 +84,60 @@ function exactPendingNamePosition(
   return matches.length === 1 ? matches[0]!.position : null;
 }
 
+function canonicalPendingEntityPosition(
+  inboundText: string,
+  frame: TurnFrameV2,
+  catalog: ServicesResult | undefined
+): number | null {
+  if (
+    !catalog ||
+    !frame.pending ||
+    !['SERVICE', 'PROFESSIONAL'].includes(frame.pending.kind)
+  ) {
+    return null;
+  }
+  const normalizedInbound = normalize(inboundText);
+  // O degrau fuzzy nunca transforma negação em escolha positiva. Correções
+  // compostas/ambíguas continuam no tradutor completo do modelo. Este caminho
+  // novo é deliberadamente só para a resposta curta de um token ("denajem").
+  if (
+    !/^[a-z0-9]+$/u.test(normalizedInbound) ||
+    /\b(?:nao|nunca)\b/u.test(normalizedInbound)
+  ) {
+    return null;
+  }
+  const allowedIds = new Set(
+    frame.pending.options.map((option) => option.entityId)
+  );
+  const entities = (
+    frame.pending.kind === 'SERVICE'
+      ? catalog.services ?? []
+      : catalog.professionals ?? []
+  ).filter((entry) => allowedIds.has(entry.id));
+  if (entities.length === 0) return null;
+
+  // K2: um nome-pai exato não escolhe quando outra opção é seu filho.
+  const parentOrExact = entities.filter((entry) => {
+    const name = normalize(entry.name);
+    return name === normalizedInbound || name.startsWith(`${normalizedInbound} `);
+  });
+  if (parentOrExact.length > 1) return null;
+
+  const resolution = resolveUniqueCatalogEntityFromCurrentMessage(
+    inboundText,
+    entities,
+    {
+      allowRestrictedDistanceTwo:
+        ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+    }
+  );
+  if (resolution.kind !== 'resolved') return null;
+  const matches = frame.pending.options.filter(
+    (option) => option.entityId === resolution.entity.id
+  );
+  return matches.length === 1 ? matches[0]!.position : null;
+}
+
 function temporalPendingPosition(
   inboundText: string,
   frame: TurnFrameV2
@@ -144,6 +198,7 @@ export function resolvePendingOptionProofV2(input: {
   inboundText: string;
   now: Date;
   proofVersion?: number;
+  catalog?: ServicesResult;
 }): ResolutionProof | null {
   const { frame, inboundId, inboundText, now } = input;
   if (!frame.pending || !pendingFresh(frame, now)) return null;
@@ -154,6 +209,7 @@ export function resolvePendingOptionProofV2(input: {
     (bareHour.kind === 'resolved' ? bareHour.position : null) ??
     strictOrdinal(inboundText) ??
     exactPendingNamePosition(inboundText, frame) ??
+    canonicalPendingEntityPosition(inboundText, frame, input.catalog) ??
     (frame.pending.options.length === 1 && compactAffirmative(inboundText)
       ? frame.pending.options[0]!.position
       : null);
@@ -483,6 +539,7 @@ export function resolveSelectionFastPathV2(input: {
       inboundText,
       now,
       proofVersion,
+      catalog,
     });
     if (pendingProof?.kind !== 'pending_option') {
       return { kind: 'continue_model', reason: 'time_option_not_evidenced' };
@@ -514,6 +571,7 @@ export function resolveSelectionFastPathV2(input: {
       inboundText,
       now,
       proofVersion,
+      catalog,
     });
     const option = pendingProof?.kind === 'pending_option'
       ? frame.pending.options.find(
@@ -544,6 +602,7 @@ export function resolveSelectionFastPathV2(input: {
         inboundText,
         now,
         proofVersion,
+        catalog,
       })!
     : {
         kind: 'catalog_entity',
