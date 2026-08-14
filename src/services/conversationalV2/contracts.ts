@@ -93,6 +93,24 @@ export interface SlotEvidenceV2 {
   readonly slots: readonly string[];
 }
 
+export interface BookingReentryV2 {
+  /** Snapshot mínimo server-owned da pergunta operacional substituída. */
+  readonly pendingKind: PendingKindV2;
+  readonly optionEntityIds: readonly string[];
+}
+
+export interface DuplicateResolutionEvidenceV2 {
+  readonly kind: 'keep_both';
+  /** Turno da releitura autoritativa que confirmou o conflito. */
+  readonly readEvidenceTurnId: string;
+  readonly sourcePendingVersion: number;
+  /** Tupla do draft relido; mudança posterior invalida a autorização. */
+  readonly serviceId: string;
+  readonly professionalId?: string;
+  readonly date: string;
+  readonly time: string;
+}
+
 export interface FlowStateV2 {
   readonly flowId: string;
   /** Relógio server-owned do último avanço operacional commitado. */
@@ -104,6 +122,10 @@ export interface FlowStateV2 {
   readonly bookingDraft?: BookingDraftV2;
   /** Evidência tipada que originou um PendingFrame TIME. */
   readonly slotEvidence?: SlotEvidenceV2;
+  /** Escolha intermediária continuar|novo; nunca licencia write. */
+  readonly bookingReentry?: BookingReentryV2;
+  /** Resolução tipada de duplicidade; só o gate v2 pode consumi-la. */
+  readonly duplicateResolution?: DuplicateResolutionEvidenceV2;
   readonly fixedByProofVersion: FixedByProofVersionV2;
 }
 
@@ -299,6 +321,21 @@ export interface TurnPlanBoundaryAttemptV2 {
   reasonCodes: BoundaryReasonCodeV2[];
 }
 
+export interface GateDeclineV2 {
+  gate:
+    | 'booking_reentry'
+    | 'date_slots'
+    | 'existing_appointment_read'
+    | 'duplicate_resolution'
+    | 'duplicate_preflight'
+    | 'initial_service_question'
+    | 'selection'
+    | 'booking_confirmation'
+    | 'upcoming_appointment_read'
+    | 'cancellation';
+  reason: string;
+}
+
 export interface TurnPlanReceiptV2 {
   schemaVersion: 2;
   planReceiptId: string;
@@ -312,6 +349,8 @@ export interface TurnPlanReceiptV2 {
   pendingTransitionCandidate: RedactedPendingTransitionCandidateV2;
   toolEffects: TurnPlanToolEffectV2[];
   boundaryAttempts: TurnPlanBoundaryAttemptV2[];
+  /** Último declínio determinístico relevante; valores são enumerações técnicas. */
+  gateDecline?: GateDeclineV2;
   recoveryKind:
     | 'none'
     | 'regen'

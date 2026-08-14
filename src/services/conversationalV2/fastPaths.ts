@@ -100,6 +100,28 @@ function exactPendingNamePosition(
   return matches.length === 1 ? matches[0]!.position : null;
 }
 
+function typedControlOptionPositionV2(
+  inboundText: string,
+  frame: TurnFrameV2
+): number | null {
+  if (frame.pending?.kind !== 'CONFIRMATION') return null;
+  const text = normalize(inboundText);
+  const aliasId = /^(?:continuar|continuar esse agendamento)$/u.test(text)
+    ? 'booking-reentry:continue'
+    : /^(?:novo|marcar outro|outro agendamento)$/u.test(text)
+      ? 'booking-reentry:new'
+      : /^(?:outro atendimento|e outro atendimento|marcar outro atendimento)$/u.test(
+            text
+          )
+        ? 'duplicate-resolution:keep-both'
+        : null;
+  if (!aliasId) return null;
+  const matches = frame.pending.options.filter(
+    (option) => option.entityId === aliasId
+  );
+  return matches.length === 1 ? matches[0]!.position : null;
+}
+
 function canonicalPendingEntityPosition(
   inboundText: string,
   frame: TurnFrameV2,
@@ -295,6 +317,7 @@ export function resolvePendingOptionProofV2(input: {
     exactTemporalPosition ??
     clarificationPosition ??
     (bareHour.kind === 'resolved' ? bareHour.position : null) ??
+    typedControlOptionPositionV2(inboundText, frame) ??
     pendingOrdinalPosition(inboundText, frame.pending.kind) ??
     exactPendingNamePosition(inboundText, frame) ??
     canonicalPendingEntityPosition(inboundText, frame, input.catalog) ??

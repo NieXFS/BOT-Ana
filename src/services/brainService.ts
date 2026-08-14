@@ -54,6 +54,7 @@ import {
   bookingConfirmationGate,
   cancellationIntentGate,
   CONFIRMATION_HINT,
+  hasTypedKeepBothEvidenceV2,
   RescheduleCancellationEvidenceStore,
   type BookingProposal,
   type V2BookingConfirmationContext,
@@ -634,18 +635,21 @@ export async function executeReceptionistFunction(
     const isConfirmedRescheduleAfterCancellation =
       functionName === 'bookAppointment' &&
       rescheduleCancellationEvidence.peek(conversationKey) !== null;
+    const hasTypedKeepBoth = hasTypedKeepBothEvidenceV2(v2Grounding);
     const isDuplicateBookingPath =
       functionName === 'bookAppointment' &&
-      (args.confirmedDuplicate === true || isConfirmedRescheduleAfterCancellation);
+      (args.confirmedDuplicate === true ||
+        hasTypedKeepBoth ||
+        isConfirmedRescheduleAfterCancellation);
     if (functionName === 'bookAppointment' && v2Grounding && !isDuplicateBookingPath) {
       const pending = v2Grounding.pending;
       const draft = v2Grounding.flowState.bookingDraft;
       const isNormalConfirmation =
         pending?.kind === 'CONFIRMATION' &&
         pending.flowId === v2Grounding.flowState.flowId &&
-        !pending.options.some((option) =>
-          option.entityId.startsWith('duplicate-resolution:')
-        );
+        pending.options.length === 1 &&
+        pending.options[0]?.entityId ===
+          `booking-confirmation:${v2Grounding.flowState.flowId}`;
       const argsMatchDraft = Boolean(
         draft &&
           String(args.serviceId ?? '') === draft.serviceId &&
@@ -656,6 +660,16 @@ export async function executeReceptionistFunction(
             : String(args.professionalId ?? '') === draft.professionalId)
       );
       if (!isNormalConfirmation || !argsMatchDraft) {
+        v2Grounding.onGateDecline?.({
+          gate: 'booking_confirmation',
+          reason: !isNormalConfirmation
+            ? pending?.options.some((option) =>
+                option.entityId.startsWith('duplicate-resolution:')
+              )
+              ? 'scoped_modal_duplicate_pending'
+              : 'normal_confirmation_pending_required'
+            : 'booking_args_do_not_match_draft',
+        });
         return JSON.stringify({ success: false, message: CONFIRMATION_HINT });
       }
     }
@@ -677,6 +691,10 @@ export async function executeReceptionistFunction(
           conversationHistory
         );
         if (!gate.ok) {
+          v2Grounding?.onGateDecline?.({
+            gate: 'selection',
+            reason: 'service_selection_not_grounded',
+          });
           console.log(
             `🚧 Receptionist gate de serviço bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId}`
           );
@@ -702,6 +720,10 @@ export async function executeReceptionistFunction(
         trustedFlowState: v2Grounding?.flowState,
       });
       if (!selection.ok) {
+        v2Grounding?.onGateDecline?.({
+          gate: 'selection',
+          reason: `professional_selection_${selection.reason}`,
+        });
         console.log(
           `🚧 Receptionist gate de profissional bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId} reason=${selection.reason}`
         );
@@ -730,6 +752,10 @@ export async function executeReceptionistFunction(
           conversationHistory,
         });
         if (!gate.ok) {
+          v2Grounding?.onGateDecline?.({
+            gate: 'upcoming_appointment_read',
+            reason: 'existing_appointment_intent_missing',
+          });
           console.log(
             `🛑 Receptionist bloqueou leitura de agendamentos sem intenção do cliente | phoneNumberId=${config.phoneNumberId}`
           );
@@ -742,7 +768,9 @@ export async function executeReceptionistFunction(
         const cancellationEvidence =
           rescheduleCancellationEvidence.peek(conversationKey);
         const shouldBypassDuplicateCheck =
-          args.confirmedDuplicate === true || cancellationEvidence !== null;
+          args.confirmedDuplicate === true ||
+          hasTypedKeepBoth ||
+          cancellationEvidence !== null;
         const serviceId = String(args.serviceId ?? '');
         const professionalId = effectiveProfessionalId;
         const expectedBooking: BookingProposal = {
@@ -761,12 +789,17 @@ export async function executeReceptionistFunction(
           currentUserMessage,
           history: conversationHistory,
           currentUserMessageIndex: conversationHistory.length - 1,
-          confirmedDuplicate: args.confirmedDuplicate === true,
+          confirmedDuplicate:
+            args.confirmedDuplicate === true || hasTypedKeepBoth,
           expectedBooking,
           duplicateCancellationSucceeded: cancellationEvidence !== null,
           v2ConfirmationContext: v2Grounding,
         });
         if (!confirmation.ok) {
+          v2Grounding?.onGateDecline?.({
+            gate: 'booking_confirmation',
+            reason: confirmation.reason,
+          });
           console.log(
             `🛑 Receptionist bloqueou book sem confirmação inequívoca | phoneNumberId=${config.phoneNumberId}`
           );
@@ -815,6 +848,10 @@ export async function executeReceptionistFunction(
           history: conversationHistory,
         });
         if (!cancellation.ok) {
+          v2Grounding?.onGateDecline?.({
+            gate: 'cancellation',
+            reason: 'duplicate_cancellation_not_licensed',
+          });
           console.log(
             `🛑 Receptionist bloqueou cancelamento fora do fluxo de duplicidade | phoneNumberId=${config.phoneNumberId}`
           );

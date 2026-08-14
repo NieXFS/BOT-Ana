@@ -765,6 +765,10 @@ const planReceipt: TurnPlanReceiptV2 = {
       reasonCodes: [],
     },
   ],
+  gateDecline: {
+    gate: 'booking_confirmation',
+    reason: 'scoped_modal_delivery_missing',
+  },
   recoveryKind: 'none',
   result: 'accepted_for_delivery',
 };

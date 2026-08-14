@@ -1,5 +1,6 @@
 import type {
   FlowStateV2,
+  GateDeclineV2,
   PendingFrameSnapshotV2,
 } from './conversationalV2/contracts';
 import { normalizeCustomerReplyStyle } from './customerReplyGuard';
@@ -111,7 +112,20 @@ export class RescheduleCancellationEvidenceStore {
 
 export type BookingConfirmationDecision =
   | { ok: true; consumesCancellationEvidence: boolean }
-  | { ok: false; hintMessage: string };
+  | { ok: false; hintMessage: string; reason: BookingConfirmationDeclineReason };
+
+export type BookingConfirmationDeclineReason =
+  | 'duplicate_resolution_not_licensed'
+  | 'explicit_confirmation_missing'
+  | 'scoped_modal_not_modal'
+  | 'scoped_modal_context_missing'
+  | 'scoped_modal_duplicate_pending'
+  | 'scoped_modal_draft_invalid'
+  | 'scoped_modal_booking_mismatch'
+  | 'scoped_modal_delivery_missing'
+  | 'scoped_modal_delivery_not_current_pending'
+  | 'scoped_modal_expired'
+  | 'scoped_modal_payload_mismatch';
 
 export type CancellationIntentDecision =
   | { ok: true }
@@ -141,6 +155,7 @@ export interface V2BookingConfirmationContext {
   catalog: PendingQuestionCatalogV2;
   lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
   now: Date;
+  onGateDecline?: (decline: GateDeclineV2) => void;
 }
 
 function normalize(value: string): string {
@@ -355,36 +370,49 @@ function normalizedModalEcho(message: string): boolean {
  * A função é pura para o smoke; o gate só a consulta quando a constante acima
  * estiver ativa.
  */
-export function matchesScopedV2ModalEchoConfirmation(input: {
+export function diagnoseScopedV2ModalEchoConfirmation(input: {
   currentUserMessage: string;
   history: ConversationMessage[];
   expectedBooking?: BookingProposal;
   context?: V2BookingConfirmationContext;
-}): boolean {
-  if (!normalizedModalEcho(input.currentUserMessage)) return false;
+}): { ok: true } | { ok: false; reason: BookingConfirmationDeclineReason } {
+  if (!normalizedModalEcho(input.currentUserMessage)) {
+    return { ok: false, reason: 'scoped_modal_not_modal' };
+  }
   const pending = input.context?.pending;
   const flowState = input.context?.flowState;
   const catalog = input.context?.catalog;
   if (!pending || !flowState?.flowId || !catalog || !input.context) {
-    return false;
+    return { ok: false, reason: 'scoped_modal_context_missing' };
+  }
+  if (
+    pending.options.some((option) =>
+      option.entityId.startsWith('duplicate-resolution:')
+    )
+  ) {
+    return { ok: false, reason: 'scoped_modal_duplicate_pending' };
   }
   const draft = validatedBookingDraftForPendingV2({
     pending,
     flowState,
     catalog,
   });
+  if (!draft) {
+    return { ok: false, reason: 'scoped_modal_draft_invalid' };
+  }
   if (
-    !draft ||
     draft.date !== input.expectedBooking?.date ||
     draft.time !== input.expectedBooking?.time
   ) {
-    return false;
+    return { ok: false, reason: 'scoped_modal_booking_mismatch' };
   }
 
   const delivery = input.context.lastAcceptedDelivery;
   const transition = delivery?.transition;
+  if (!delivery) {
+    return { ok: false, reason: 'scoped_modal_delivery_missing' };
+  }
   if (
-    !delivery ||
     delivery.conversationCommitOutcome !== 'committed' ||
     delivery.pendingCommitOutcome !== 'opened' ||
     transition?.kind !== 'open' ||
@@ -404,7 +432,10 @@ export function matchesScopedV2ModalEchoConfirmation(input: {
       );
     })
   ) {
-    return false;
+    return {
+      ok: false,
+      reason: 'scoped_modal_delivery_not_current_pending',
+    };
   }
 
   const nowMs = input.context.now.getTime();
@@ -421,17 +452,26 @@ export function matchesScopedV2ModalEchoConfirmation(input: {
     askedAge > PENDING_FAST_PATH_MAX_AGE_MS ||
     terminalAge > PENDING_FAST_PATH_MAX_AGE_MS
   ) {
-    return false;
+    return { ok: false, reason: 'scoped_modal_expired' };
   }
 
   const canonicalCopy = buildCanonicalBookingSummaryV2({
     draft,
     services: catalog,
   });
-  return (
-    normalizeCustomerReplyStyle(delivery.payload) ===
+  return normalizeCustomerReplyStyle(delivery.payload) ===
     normalizeCustomerReplyStyle(canonicalCopy)
-  );
+    ? { ok: true }
+    : { ok: false, reason: 'scoped_modal_payload_mismatch' };
+}
+
+export function matchesScopedV2ModalEchoConfirmation(input: {
+  currentUserMessage: string;
+  history: ConversationMessage[];
+  expectedBooking?: BookingProposal;
+  context?: V2BookingConfirmationContext;
+}): boolean {
+  return diagnoseScopedV2ModalEchoConfirmation(input).ok;
 }
 
 function isExplicitConfirmationForGate(input: {
@@ -502,6 +542,7 @@ function isConfirmedDuplicateDecision(message: string): boolean {
   const normalized = normalize(message);
   return (
     /\bmanter (?:os )?dois\b/.test(normalized) ||
+    /\b(?:e |um |marcar )?outro atendimento\b/.test(normalized) ||
     /\bremarcar\b/.test(normalized) ||
     /\bcancel(?:e|ar).{0,50}(?:anterior|antigo).{0,80}(?:marc|agend)/.test(
       normalized
@@ -516,7 +557,43 @@ function isRemarriageDecision(message: string): boolean {
 }
 
 function isKeepBothDecision(message: string): boolean {
-  return /\bmanter (?:os )?dois\b/.test(normalize(message));
+  return /\b(?:manter (?:os )?dois|(?:e |um |marcar )?outro atendimento)\b/.test(
+    normalize(message)
+  );
+}
+
+export function hasTypedKeepBothEvidenceV2(
+  context?: V2BookingConfirmationContext
+): boolean {
+  const pending = context?.pending;
+  const flowState = context?.flowState;
+  const evidence = flowState?.duplicateResolution;
+  const draft = flowState?.bookingDraft;
+  if (
+    !context ||
+    !pending ||
+    pending.kind !== 'CONFIRMATION' ||
+    pending.flowId !== flowState?.flowId ||
+    pending.options.length !== 1 ||
+    pending.options[0]?.entityId !== `booking-confirmation:${pending.flowId}` ||
+    evidence?.kind !== 'keep_both' ||
+    !evidence.readEvidenceTurnId.trim() ||
+    evidence.sourcePendingVersion >= pending.version ||
+    !draft ||
+    evidence.serviceId !== draft.serviceId ||
+    evidence.professionalId !== draft.professionalId ||
+    evidence.date !== draft.date ||
+    evidence.time !== draft.time
+  ) {
+    return false;
+  }
+  return Boolean(
+    validatedBookingDraftForPendingV2({
+      pending,
+      flowState,
+      catalog: context.catalog,
+    })
+  );
 }
 
 export function priorUserSelectedDuplicateAction(
@@ -555,10 +632,17 @@ export function bookingConfirmationGate(input: {
   currentUserMessageIndex?: number;
   v2ConfirmationContext?: V2BookingConfirmationContext;
 }): BookingConfirmationDecision {
+  const typedKeepBoth = hasTypedKeepBothEvidenceV2(
+    input.v2ConfirmationContext
+  );
   const isSameTurnRemarriageAfterCancellation =
     input.duplicateCancellationSucceeded === true &&
     isRemarriageDecision(input.currentUserMessage);
-  if (input.confirmedDuplicate || isSameTurnRemarriageAfterCancellation) {
+  if (
+    input.confirmedDuplicate ||
+    typedKeepBoth ||
+    isSameTurnRemarriageAfterCancellation
+  ) {
     const previousAssistant = latestAssistantMessage(input.history);
     const duplicateWasPresented = historyContainsDuplicateChoice(input.history);
     const proposalWasPresented = historyContainsConfirmedProposal(
@@ -577,7 +661,7 @@ export function bookingConfirmationGate(input: {
             assistantAskedWhichDuplicate(previousAssistant))
       ) && currentDecision;
     const confirmedAfterPriorChoice =
-      isExplicitBookingConfirmation(input.currentUserMessage) &&
+      isExplicitConfirmationForGate(input) &&
       previousAssistantRequestedConfirmation(
         input.history,
         input.expectedBooking
@@ -587,7 +671,9 @@ export function bookingConfirmationGate(input: {
         input.currentUserMessageIndex ?? input.history.length
       );
 
-    const canKeepBoth = keepBoth && choiceIsCurrent;
+    const canKeepBoth =
+      (keepBoth && choiceIsCurrent) ||
+      (typedKeepBoth && confirmedAfterPriorChoice);
     const canRemarry =
       (remarriage || confirmedAfterPriorChoice) &&
       input.duplicateCancellationSucceeded === true;
@@ -603,7 +689,11 @@ export function bookingConfirmationGate(input: {
       };
     }
 
-    return { ok: false, hintMessage: DUPLICATE_CONFIRMATION_HINT };
+    return {
+      ok: false,
+      hintMessage: DUPLICATE_CONFIRMATION_HINT,
+      reason: 'duplicate_resolution_not_licensed',
+    };
   }
 
   if (
@@ -616,7 +706,19 @@ export function bookingConfirmationGate(input: {
     return { ok: true, consumesCancellationEvidence: false };
   }
 
-  return { ok: false, hintMessage: CONFIRMATION_HINT };
+  const modalDiagnostic = diagnoseScopedV2ModalEchoConfirmation({
+    currentUserMessage: input.currentUserMessage,
+    history: input.history,
+    expectedBooking: input.expectedBooking,
+    context: input.v2ConfirmationContext,
+  });
+  return {
+    ok: false,
+    hintMessage: CONFIRMATION_HINT,
+    reason: modalDiagnostic.ok
+      ? 'explicit_confirmation_missing'
+      : modalDiagnostic.reason,
+  };
 }
 
 /**

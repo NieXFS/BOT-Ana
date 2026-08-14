@@ -1746,6 +1746,14 @@ async function main(): Promise<void> {
     confirmationLoopPrepared.planReceipt.toolEffects[0]?.outcome,
     'blocked'
   );
+  assert.deepEqual(
+    confirmationLoopPrepared.planReceipt.gateDecline,
+    {
+      gate: 'booking_confirmation',
+      reason: 'scoped_modal_delivery_missing',
+    },
+    'recibo explica por que o léxico "pode" declinou neste turno'
+  );
   assert.equal(confirmationLoopPrepared.payload, canonicalConfirmationSummary);
   assert.equal(
     confirmationLoopPrepared.planReceipt.boundaryAttempts
@@ -1844,6 +1852,207 @@ async function main(): Promise<void> {
     true,
     'o sim seguinte ao fallback-resumo licencia a escrita e encerra o loop'
   );
+
+  // Rodada 9c: um booking nu com progresso velho abre continuar|novo antes do
+  // reset/modelo; continuar restaura a pendência operacional com recap.
+  const reentryStore = new MemoryConversationalV2StateStore();
+  const reentryPhone = '5511000000024';
+  const reentryKey = `${config.phoneNumberId}:${reentryPhone}`;
+  const reentryTimePending = pending({
+    kind: 'TIME',
+    askedAt: '2026-08-13T08:00:00.000Z',
+    options: [
+      { position: 1, entityId: '14:00', displayName: '14:00' },
+      { position: 2, entityId: '15:00', displayName: '15:00' },
+    ],
+  });
+  const reentryFlowState = {
+    flowId: reentryTimePending.flowId,
+    lastOperationalAt: '2026-08-13T08:00:00.000Z',
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-reentry-slots',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['14:00', '15:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  } as const;
+  seedPending(
+    reentryStore,
+    reentryKey,
+    reentryTimePending,
+    reentryFlowState
+  );
+  reentryStore.setInputSequence(reentryKey, 1);
+  const reentryOffer = await getReceptionistReplyV2({
+    phone: reentryPhone,
+    userMessage: 'quero agendar',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'quero agendar' }),
+    deps: {
+      ...baseDeps(reentryStore),
+      runModelLoop: async () => {
+        throw new Error('reentrada determinística não chama modelo');
+      },
+    },
+  });
+  assert.equal(reentryOffer.planReceipt.route, 'fast_path');
+  assert.equal(
+    reentryOffer.payload,
+    'A gente estava marcando Drenagem Linfática para 14/08/2026 — quer continuar esse agendamento ou marcar outro?'
+  );
+  assert.equal(reentryOffer.transition.kind, 'open');
+  if (reentryOffer.transition.kind !== 'open') {
+    throw new Error('reentrada não abriu escolha');
+  }
+  assert.deepEqual(
+    reentryOffer.transition.frame.options.map((option) => option.entityId),
+    ['booking-reentry:continue', 'booking-reentry:new']
+  );
+  await deliverPreparedReceptionistTurnV2(reentryOffer, {
+    store: reentryStore,
+    id: nextId,
+    now: () => now,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  reentryStore.setInputSequence(reentryKey, 2);
+  const reentryContinue = await getReceptionistReplyV2({
+    phone: reentryPhone,
+    userMessage: 'continuar',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'continuar', sequence: 2 }),
+    deps: {
+      ...baseDeps(reentryStore),
+      runModelLoop: async () => {
+        throw new Error('continuação determinística não chama modelo');
+      },
+    },
+  });
+  assert.equal(reentryContinue.planReceipt.route, 'fast_path');
+  assert.equal(
+    reentryContinue.payload,
+    'A gente estava marcando Drenagem Linfática para 14/08/2026 — qual horário você prefere?'
+  );
+  assert.equal(reentryContinue.transition.kind, 'open');
+  if (reentryContinue.transition.kind !== 'open') {
+    throw new Error('continuação não reabriu TIME');
+  }
+  assert.equal(reentryContinue.transition.frame.kind, 'TIME');
+  assert.deepEqual(
+    reentryContinue.transition.frame.options.map((option) => option.entityId),
+    ['14:00', '15:00']
+  );
+
+  // "segunda opção" é ordinal: nunca vira segunda-feira nem dispara slots.
+  const ordinalDateVetoStore = new MemoryConversationalV2StateStore();
+  const ordinalDateVetoPhone = '5511000000025';
+  const ordinalDateVetoKey = `${config.phoneNumberId}:${ordinalDateVetoPhone}`;
+  const ordinalDateVetoPending = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '14:00', displayName: '14:00' },
+      { position: 2, entityId: '15:00', displayName: '15:00' },
+    ],
+  });
+  seedPending(ordinalDateVetoStore, ordinalDateVetoKey, ordinalDateVetoPending, {
+    flowId: ordinalDateVetoPending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-ordinal-date-veto',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['14:00', '15:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  ordinalDateVetoStore.setInputSequence(ordinalDateVetoKey, 1);
+  let ordinalUpcomingReads = 0;
+  const ordinalDateVeto = await getReceptionistReplyV2({
+    phone: ordinalDateVetoPhone,
+    userMessage: 'segunda opção',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'segunda opção' }),
+    deps: {
+      ...baseDeps(ordinalDateVetoStore),
+      executeProactiveDuplicateRead: async () => {
+        ordinalUpcomingReads += 1;
+        return JSON.stringify({ success: true, appointments: [] });
+      },
+      executeTool: async (name) => {
+        throw new Error(`tool inesperada após veto temporal: ${name}`);
+      },
+      runModelLoop: async () => {
+        throw new Error('ordinal TIME inequívoco não chama modelo');
+      },
+    },
+  });
+  assert.equal(ordinalUpcomingReads, 1, 'somente o preflight de duplicidade lê');
+  assert.equal(ordinalDateVeto.planReceipt.route, 'fast_path');
+  assert.match(ordinalDateVeto.payload ?? '', /às 15h/u);
+
+  // Intenção existente explícita é entitlement v2 e ignora o gate genérico.
+  const cancelReadStore = new MemoryConversationalV2StateStore();
+  const cancelReadPhone = '5511000000026';
+  const cancelReadKey = `${config.phoneNumberId}:${cancelReadPhone}`;
+  cancelReadStore.setInputSequence(cancelReadKey, 1);
+  let cancelReadCalls = 0;
+  const entitledCancelRead = await getReceptionistReplyV2({
+    phone: cancelReadPhone,
+    userMessage: 'quero cancelar',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'quero cancelar' }),
+    deps: {
+      ...baseDeps(cancelReadStore),
+      executeProactiveDuplicateRead: async () => {
+        cancelReadCalls += 1;
+        return JSON.stringify({
+          success: true,
+          appointments: [
+            {
+              id: 'appointment-not-exposed',
+              startTime: '2026-08-15T17:00:00.000Z',
+              endTime: '2026-08-15T18:00:00.000Z',
+              serviceName: 'Drenagem Linfática',
+              professionalName: 'Júlia',
+              status: 'CONFIRMED',
+            },
+          ],
+        });
+      },
+      runModelLoop: async () => {
+        throw new Error('read entitlement explícito não chama modelo');
+      },
+    },
+  });
+  assert.equal(cancelReadCalls, 1);
+  assert.equal(entitledCancelRead.planReceipt.route, 'fast_path');
+  assert.match(entitledCancelRead.payload ?? '', /Encontrei este agendamento/u);
+  assert.equal(entitledCancelRead.planReceipt.gateDecline, undefined);
 
   // Replay canário T1/T2: pedido genérico supersede pendência velha sem modelo,
   // entrega SERVICE OPEN e ancora a resposta ordinal seguinte.

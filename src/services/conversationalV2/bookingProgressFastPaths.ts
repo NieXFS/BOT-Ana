@@ -21,6 +21,7 @@ import {
   resolvePendingOptionProofV2,
 } from './fastPaths';
 import {
+  buildCanonicalBookingSummaryV2,
   displayDateV2,
   reduceToolLifecycleV2,
 } from './lifecycleReducer';
@@ -297,7 +298,7 @@ function appointmentConflicts(input: {
 }): boolean {
   const start = localDateTimeParts(input.appointment.startTime, input.timezone);
   const end = localDateTimeParts(input.appointment.endTime, input.timezone);
-  if (!start || !end || start.date !== input.date) return false;
+  if (!start || !end) return false;
   const serviceResolution = resolveUniqueCatalogEntityFromCurrentMessage(
     input.appointment.serviceName,
     input.services.services ?? [],
@@ -312,12 +313,175 @@ function appointmentConflicts(input: {
   ) {
     return true;
   }
+  if (start.date !== input.date) return false;
   const match = /^(\d{2}):(\d{2})$/u.exec(input.time);
   if (!match) return false;
   const newStart = Number(match[1]) * 60 + Number(match[2]);
   const newEnd = newStart + input.durationMinutes;
   const existingEnd = end.date === start.date ? end.minutes : 24 * 60;
   return newStart < existingEnd && start.minutes < newEnd;
+}
+
+function validUpcomingAppointmentsV2(
+  parsed: Record<string, unknown> | null
+): UpcomingAppointment[] | null {
+  if (parsed?.success !== true || !Array.isArray(parsed.appointments)) {
+    return null;
+  }
+  const appointments = parsed.appointments.filter(
+    (entry): entry is UpcomingAppointment =>
+      Boolean(
+        entry &&
+          typeof entry === 'object' &&
+          !Array.isArray(entry) &&
+          typeof (entry as UpcomingAppointment).startTime === 'string' &&
+          typeof (entry as UpcomingAppointment).endTime === 'string' &&
+          typeof (entry as UpcomingAppointment).serviceName === 'string'
+      )
+  );
+  return appointments.length === parsed.appointments.length
+    ? appointments
+    : null;
+}
+
+function conflictsForDraftV2(input: {
+  appointments: readonly UpcomingAppointment[];
+  flowState: FlowStateV2;
+  servicesResult: ServicesResult;
+  config: TenantBotConfig;
+}): UpcomingAppointment[] | null {
+  const draft = input.flowState.bookingDraft;
+  if (!draft) return null;
+  const service = input.servicesResult.services?.find(
+    (entry) => entry.id === draft.serviceId
+  );
+  if (!service) return null;
+  return input.appointments.filter((appointment) =>
+    appointmentConflicts({
+      appointment,
+      serviceId: draft.serviceId,
+      date: draft.date,
+      time: draft.time,
+      durationMinutes: service.durationMinutes,
+      services: input.servicesResult,
+      timezone: input.config.timezone,
+    })
+  );
+}
+
+/**
+ * A escolha keep-both nunca licencia write diretamente. Releitura autoritativa,
+ * evidência tipada e novo resumo canônico formam uma confirmação normal nova.
+ */
+export async function resolveDuplicateKeepBothFastPathV2(input: {
+  frame: TurnFrameV2;
+  proof: ResolutionProof | null;
+  servicesResult: ServicesResult;
+  config: TenantBotConfig;
+  executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
+}): Promise<BookingProgressFastPathV2> {
+  if (
+    input.frame.pending?.kind !== 'CONFIRMATION' ||
+    input.frame.pending.flowId !== input.frame.flowState.flowId ||
+    input.proof?.kind !== 'pending_option' ||
+    input.proof.entityId !== 'duplicate-resolution:keep-both' ||
+    !input.frame.pending.options.every((option) =>
+      option.entityId.startsWith('duplicate-resolution:')
+    )
+  ) {
+    return { kind: 'continue_model', reason: 'keep_both_not_evidenced' };
+  }
+  const read = await safeTool({
+    name: 'getUpcomingAppointments',
+    args: {},
+    executeTool: input.executeTool,
+  });
+  const trace: ReceptionistToolTraceEntry = {
+    round: 0,
+    name: 'getUpcomingAppointments',
+    args: {},
+    argumentsValidJson: true,
+    result: read.raw,
+  };
+  const loop = loopForReads([trace]);
+  const reason = readReason(read.parsed);
+  if (
+    read.parsed?.success !== true &&
+    (reason === 'customer_identity_ambiguous' ||
+      reason === 'customer_identity_mismatch')
+  ) {
+    return {
+      kind: 'resolved',
+      result: {
+        schemaVersion: 2,
+        reply: canonicalReadFailureCopyV2('upcoming', reason),
+        replyPurpose: 'OPERATIONAL_ANSWER',
+        pendingTransitionCandidate: { kind: 'preserve' },
+        resolutionCandidate: null,
+        unknownServiceEvidence: null,
+      },
+      loop,
+      proof: null,
+      nextFlowState: input.frame.flowState,
+    };
+  }
+  const appointments = validUpcomingAppointmentsV2(read.parsed);
+  const conflicts = appointments
+    ? conflictsForDraftV2({
+        appointments,
+        flowState: input.frame.flowState,
+        servicesResult: input.servicesResult,
+        config: input.config,
+      })
+    : null;
+  const draft = input.frame.flowState.bookingDraft;
+  if (!appointments || !conflicts || !draft) {
+    return { kind: 'continue_model', reason: 'keep_both_read_failed', loop };
+  }
+  const nextFlowState: FlowStateV2 = conflicts.length > 0
+    ? {
+        ...input.frame.flowState,
+        duplicateResolution: {
+          kind: 'keep_both',
+          readEvidenceTurnId: input.frame.turnId,
+          sourcePendingVersion: input.frame.pending.version,
+          serviceId: draft.serviceId,
+          ...(draft.professionalId
+            ? { professionalId: draft.professionalId }
+            : {}),
+          date: draft.date,
+          time: draft.time,
+        },
+      }
+    : (() => {
+        const { duplicateResolution: _duplicateResolution, ...rest } =
+          input.frame.flowState;
+        return rest;
+      })();
+  return {
+    kind: 'resolved',
+    result: {
+      schemaVersion: 2,
+      reply: buildCanonicalBookingSummaryV2({
+        draft,
+        services: input.servicesResult,
+      }),
+      replyPurpose: 'WRITE_CONFIRMATION',
+      pendingTransitionCandidate: {
+        kind: 'open',
+        pendingKind: 'CONFIRMATION',
+        flowId: input.frame.flowState.flowId,
+        optionEntityIds: [
+          `booking-confirmation:${input.frame.flowState.flowId}`,
+        ],
+      },
+      resolutionCandidate: null,
+      unknownServiceEvidence: null,
+    },
+    loop,
+    proof: input.proof,
+    nextFlowState,
+  };
 }
 
 function duplicateQuestion(
@@ -406,7 +570,8 @@ export async function resolveTimeDuplicatePreflightV2(input: {
       nextFlowState: input.frame.flowState,
     };
   }
-  if (read.parsed?.success !== true || !Array.isArray(read.parsed.appointments)) {
+  const appointments = validUpcomingAppointmentsV2(read.parsed);
+  if (!appointments) {
     return { kind: 'continue_model', reason: 'preflight_read_failed', loop };
   }
   const draft = followUp.nextFlowState.bookingDraft;
@@ -414,26 +579,15 @@ export async function resolveTimeDuplicatePreflightV2(input: {
     (entry) => entry.id === draft.serviceId
   );
   if (!service) return { kind: 'continue_model', reason: 'draft_service_missing', loop };
-  const conflicts = read.parsed.appointments.filter(
-    (entry): entry is UpcomingAppointment =>
-      Boolean(
-        entry &&
-          typeof entry === 'object' &&
-          !Array.isArray(entry) &&
-          typeof (entry as UpcomingAppointment).startTime === 'string' &&
-          typeof (entry as UpcomingAppointment).endTime === 'string' &&
-          typeof (entry as UpcomingAppointment).serviceName === 'string'
-      ) &&
-      appointmentConflicts({
-        appointment: entry as UpcomingAppointment,
-        serviceId: draft.serviceId,
-        date: draft.date,
-        time: draft.time,
-        durationMinutes: service.durationMinutes,
-        services: input.servicesResult,
-        timezone: input.config.timezone,
-      })
-  );
+  const conflicts = conflictsForDraftV2({
+    appointments,
+    flowState: followUp.nextFlowState,
+    servicesResult: input.servicesResult,
+    config: input.config,
+  });
+  if (!conflicts) {
+    return { kind: 'continue_model', reason: 'draft_conflict_unavailable', loop };
+  }
   if (conflicts.length === 0) {
     return { kind: 'continue_model', reason: 'no_duplicate_conflict', loop };
   }

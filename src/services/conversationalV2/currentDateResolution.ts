@@ -75,6 +75,10 @@ function mentionsForInbound(input: {
   timezone: string;
 }): DateMentionV2[] {
   const normalized = normalize(input.text);
+  // "segunda opção" pertence ao domínio ordinal. O token explícito opção veta
+  // TODA leitura civil deste inbound para impedir que weekday ganhe precedência
+  // sobre a escolha ancorada no PendingFrame.
+  if (/\bopcao\b/u.test(normalized)) return [];
   const mentions: DateMentionV2[] = [];
   for (const match of normalized.matchAll(DATE_TOKEN_RE)) {
     const token = match[0];

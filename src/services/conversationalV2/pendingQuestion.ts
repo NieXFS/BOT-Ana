@@ -35,6 +35,66 @@ export interface PendingQuestionCatalogV2 {
   professionals?: readonly { id: string; name: string }[];
 }
 
+const BOOKING_REENTRY_CONTINUE_ID = 'booking-reentry:continue';
+const BOOKING_REENTRY_NEW_ID = 'booking-reentry:new';
+
+export const BOOKING_REENTRY_OPTION_IDS_V2 = [
+  BOOKING_REENTRY_CONTINUE_ID,
+  BOOKING_REENTRY_NEW_ID,
+] as const;
+
+function displayTimeV2(value: string): string {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/u.exec(value);
+  if (!match) return value;
+  return match[2] === '00'
+    ? `${Number(match[1])}h`
+    : `${Number(match[1])}h${match[2]}`;
+}
+
+function serviceForFlowV2(
+  flowState: FlowStateV2,
+  catalog: PendingQuestionCatalogV2
+): { id: string; name: string } | null {
+  return catalog.services?.find(
+    (entry) => entry.id === flowState.fixedServiceId
+  ) ?? null;
+}
+
+export function buildBookingReentryQuestionV2(input: {
+  flowState: FlowStateV2;
+  catalog: PendingQuestionCatalogV2;
+}): string | null {
+  const service = serviceForFlowV2(input.flowState, input.catalog);
+  if (!service || !input.flowState.resolvedDate) return null;
+  const time = input.flowState.bookingDraft?.time;
+  return `A gente estava marcando ${service.name} para ${displayDateV2(
+    input.flowState.resolvedDate
+  )}${time ? ` às ${displayTimeV2(time)}` : ''} — quer continuar esse agendamento ou marcar outro?`;
+}
+
+export function buildBookingContinuationQuestionV2(input: {
+  pending: PendingFrameSnapshotV2;
+  flowState: FlowStateV2;
+  catalog: PendingQuestionCatalogV2;
+}): string | null {
+  const service = serviceForFlowV2(input.flowState, input.catalog);
+  if (!service) return null;
+  if (input.pending.kind === 'DATE') {
+    return `A gente estava marcando ${service.name} — qual dia você prefere?`;
+  }
+  if (input.pending.kind === 'PROFESSIONAL') {
+    const names = input.pending.options
+      .map((option) => option.displayName.trim())
+      .filter(Boolean);
+    return `A gente estava marcando ${service.name} — qual profissional você prefere${
+      names.length > 0 ? `: ${names.join(', ')}` : ''}?`;
+  }
+  return buildPendingQuestionV2({
+    ...input,
+    reanchor: input.pending.kind === 'TIME',
+  });
+}
+
 export function validatedBookingDraftForPendingV2(input: {
   pending: PendingFrameSnapshotV2;
   flowState: FlowStateV2;
@@ -96,6 +156,16 @@ export function buildPendingQuestionV2(input: {
   const names = pending.options
     .map((option) => option.displayName.trim())
     .filter(Boolean);
+  if (
+    pending.kind === 'CONFIRMATION' &&
+    pending.options.length === BOOKING_REENTRY_OPTION_IDS_V2.length &&
+    pending.options.every(
+      (option, index) =>
+        option.entityId === BOOKING_REENTRY_OPTION_IDS_V2[index]
+    )
+  ) {
+    return buildBookingReentryQuestionV2(input);
+  }
   switch (pending.kind) {
     case 'SERVICE':
       return names.length > 0

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   bookingConfirmationGate,
   cancellationIntentGate,
+  diagnoseScopedV2ModalEchoConfirmation,
   ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION,
   isExplicitBookingConfirmation,
   matchesScopedV2ModalEchoConfirmation,
@@ -267,6 +268,16 @@ assert.equal(
   false,
   'duplicate-resolution nunca usa o eco modal de booking normal'
 );
+assert.deepEqual(
+  diagnoseScopedV2ModalEchoConfirmation({
+    currentUserMessage: 'pode',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    expectedBooking,
+    context: duplicateScopedContext,
+  }),
+  { ok: false, reason: 'scoped_modal_duplicate_pending' },
+  'instrumentação explica por que o léxico modal declinou'
+);
 assert.equal(
   bookingConfirmationGate({
     currentUserMessage: 'pode',
@@ -286,6 +297,56 @@ assert.equal(
   }).ok,
   false,
   '"pode" em CONFIRMATION de duplicate-resolution não licencia write'
+);
+
+const afterKeepBothPending = {
+  ...scopedPending,
+  questionId: 'question-after-keep-both',
+  version: 4,
+};
+const afterKeepBothFlowState = {
+  ...scopedFlowState,
+  duplicateResolution: {
+    kind: 'keep_both' as const,
+    readEvidenceTurnId: 'turn-authoritative-duplicate-read',
+    sourcePendingVersion: 3,
+    serviceId: 'svc-cleaning',
+    professionalId: 'prof-julia',
+    date: '2026-08-04',
+    time: '15:00',
+  },
+};
+const afterKeepBothContext = {
+  ...scopedContext,
+  pending: afterKeepBothPending,
+  flowState: afterKeepBothFlowState,
+  lastAcceptedDelivery: {
+    ...scopedContext.lastAcceptedDelivery,
+    transition: {
+      ...scopedContext.lastAcceptedDelivery.transition,
+      frame: afterKeepBothPending,
+      nextFlowState: afterKeepBothFlowState,
+    },
+  },
+};
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage: 'pode',
+    history: [
+      {
+        role: 'assistant',
+        content:
+          'Vi que você já tem outro agendamento futuro. Quer manter os dois, remarcar, só cancelar o anterior ou pensar depois?',
+      },
+      { role: 'user', content: 'outro atendimento' },
+      { role: 'assistant', content: scopedCanonicalSummary },
+    ],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: afterKeepBothContext,
+  }),
+  { ok: true, consumesCancellationEvidence: false },
+  'releitura tipada + keep-both + novo resumo fazem o pode licenciar o write'
 );
 
 const confirmationHistory = [

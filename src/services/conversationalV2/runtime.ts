@@ -30,6 +30,7 @@ import {
   type BoundaryReasonCodeV2,
   type DeliveryPreemptionV2,
   type FlowStateV2,
+  type GateDeclineV2,
   type ModelTurnResultV2,
   type PendingFrameSnapshotV2,
   type PendingTransitionCandidate,
@@ -42,11 +43,20 @@ import {
   resolvePendingOptionProofV2,
   resolveSelectionFastPathV2,
 } from './fastPaths';
-import { resolveReadFastPathV2 } from './readFastPaths';
+import {
+  hasExplicitAvailabilityReadRequestV2,
+  hasExplicitUpcomingReadRequestV2,
+  resolveReadFastPathV2,
+} from './readFastPaths';
 import {
   resolveDateSlotsFastPathV2,
+  resolveDuplicateKeepBothFastPathV2,
   resolveTimeDuplicatePreflightV2,
 } from './bookingProgressFastPaths';
+import {
+  resolveBookingReentryFastPathV2,
+  shouldOfferBookingReentryV2,
+} from './bookingReentryFastPath';
 import { resolveCurrentInboundDateV2 } from './currentDateResolution';
 import {
   adjustTransitionForFlowResetV2,
@@ -87,6 +97,7 @@ import {
 } from './regenerator';
 import { reduceToolLifecycleV2 } from './lifecycleReducer';
 import {
+  BOOKING_REENTRY_OPTION_IDS_V2,
   buildPendingQuestionV2,
   shouldReanchorPendingQuestionV2,
 } from './pendingQuestion';
@@ -234,6 +245,26 @@ function optionsForTransition(
   services: ServicesResult,
   duplicateResolutionFlow = false
 ): PendingFrameSnapshotV2['options'] {
+  if (
+    candidate.pendingKind === 'CONFIRMATION' &&
+    candidate.optionEntityIds.length === BOOKING_REENTRY_OPTION_IDS_V2.length &&
+    candidate.optionEntityIds.every(
+      (entityId, index) => entityId === BOOKING_REENTRY_OPTION_IDS_V2[index]
+    )
+  ) {
+    return [
+      {
+        position: 1,
+        entityId: 'booking-reentry:continue',
+        displayName: 'continuar esse agendamento',
+      },
+      {
+        position: 2,
+        entityId: 'booking-reentry:new',
+        displayName: 'marcar outro',
+      },
+    ];
+  }
   if (
     candidate.pendingKind === 'CONFIRMATION' &&
     (duplicateResolutionFlow ||
@@ -672,14 +703,26 @@ export async function getReceptionistReplyV2(input: {
     pendingRecord?.snapshot.flowId === storedFlowState.flowId
       ? { ...storedFlowState, lastOperationalAt: pendingRecord.updatedAt }
       : storedFlowState;
-  const flowResetReason = decideFlowResetV2({
-    flowState: hydratedStoredFlowState,
-    pending: pendingRecord?.snapshot ?? null,
-    inboundText: currentInboundBatchText,
-    dateResolution,
-    catalog: services,
-    now: startedAt,
-  });
+  const deferResetToBookingReentry = Boolean(
+    hydratedStoredFlowState &&
+      shouldOfferBookingReentryV2({
+        pending: pendingRecord?.snapshot ?? null,
+        flowState: hydratedStoredFlowState,
+        inboundText: currentInboundBatchText,
+        currentDateResolution: dateResolution,
+        catalog: services,
+      })
+  );
+  const flowResetReason = deferResetToBookingReentry
+    ? null
+    : decideFlowResetV2({
+        flowState: hydratedStoredFlowState,
+        pending: pendingRecord?.snapshot ?? null,
+        inboundText: currentInboundBatchText,
+        dateResolution,
+        catalog: services,
+        now: startedAt,
+      });
   const flowState = flowResetReason
     ? newFlowStateV2(id(), startedAt)
     : hydratedStoredFlowState ?? newFlowStateV2(id(), startedAt);
@@ -707,6 +750,7 @@ export async function getReceptionistReplyV2(input: {
   });
   let copyVariant: CopyVariantIdV2 = 'canonical';
   let variedPrimaryReply: string | null = null;
+  let selectedGateDecline: GateDeclineV2 | undefined;
 
   const makePlan = (args: {
     route: TurnPlanReceiptV2['route'];
@@ -736,6 +780,7 @@ export async function getReceptionistReplyV2(input: {
     boundaryAttempts: args.boundaryAttempts ?? [],
     recoveryKind: args.recoveryKind,
     copyVariant,
+    ...(selectedGateDecline ? { gateDecline: selectedGateDecline } : {}),
     result: 'accepted_for_delivery',
   });
 
@@ -814,6 +859,9 @@ export async function getReceptionistReplyV2(input: {
           catalog: services,
           lastAcceptedDelivery: stored.lastAcceptedDelivery,
           now: startedAt,
+          onGateDecline: (decline) => {
+            selectedGateDecline = decline;
+          },
         }
       ));
   // Entitlement v2 deliberadamente separado do executor compartilhado: ele
@@ -836,6 +884,9 @@ export async function getReceptionistReplyV2(input: {
             await getCustomerUpcomingAppointmentsV2(input.phone, input.config)
           );
         };
+  // Mesmo executor server-owned, mas só alcançado depois que o read fast-path
+  // v2 provou classifyExistingAppointmentIntent != none. Não amplia o gate v1.
+  const executeEntitledUpcomingRead = executeDuplicatePreflightRead;
 
   let primary: ModelTurnResultV2ParseResult;
   let loop = emptyLoopResult();
@@ -986,15 +1037,27 @@ export async function getReceptionistReplyV2(input: {
     ...modelHistory,
   ];
 
-  const dateSlotsFastPath = await resolveDateSlotsFastPathV2({
+  const bookingReentryFastPath = resolveBookingReentryFastPathV2({
     frame,
-    dateResolution,
-    currentInboundText: currentInboundBatchText,
-    servicesResult: services,
-    config: input.config,
+    inboundId,
+    inboundText: currentInboundText,
+    currentDateResolution: dateResolution,
+    catalog: services,
     now: startedAt,
-    executeTool,
+    newFlowId: id,
+    lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
   });
+  const dateSlotsFastPath = bookingReentryFastPath.kind === 'continue_model'
+    ? await resolveDateSlotsFastPathV2({
+        frame,
+        dateResolution,
+        currentInboundText: currentInboundBatchText,
+        servicesResult: services,
+        config: input.config,
+        now: startedAt,
+        executeTool,
+      })
+    : { kind: 'continue_model' as const, reason: 'booking_reentry_resolved' };
   const pendingReadProof = resolvePendingOptionProofV2({
     frame,
     inboundId,
@@ -1002,8 +1065,22 @@ export async function getReceptionistReplyV2(input: {
     now: startedAt,
     lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
   });
-  const readFastPath = dateSlotsFastPath.kind === 'continue_model'
-    ? await resolveReadFastPathV2({
+  const duplicateResolutionFastPath =
+    bookingReentryFastPath.kind === 'continue_model' &&
+    dateSlotsFastPath.kind === 'continue_model'
+      ? await resolveDuplicateKeepBothFastPathV2({
+          frame,
+          proof: pendingReadProof,
+          servicesResult: services,
+          config: input.config,
+          executeTool: executeDuplicatePreflightRead,
+        })
+      : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
+  const readFastPath =
+    bookingReentryFastPath.kind === 'continue_model' &&
+    dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model'
+      ? await resolveReadFastPathV2({
         frame,
         inboundText: currentInboundText,
         servicesResult: services,
@@ -1011,11 +1088,16 @@ export async function getReceptionistReplyV2(input: {
         duplicateResolutionProof: pendingReadProof,
         forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
         now: startedAt,
-        executeTool,
+        executeTool: async (name, args) =>
+          name === 'getUpcomingAppointments'
+            ? executeEntitledUpcomingRead(name, args)
+            : executeTool(name, args),
       })
     : { kind: 'continue_model' as const, reason: 'date_slots_resolved' };
   const duplicatePreflight =
+    bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model'
       ? await resolveTimeDuplicatePreflightV2({
           frame,
@@ -1030,7 +1112,9 @@ export async function getReceptionistReplyV2(input: {
         })
       : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
   const initialServiceQuestionFastPath =
+    bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model'
       ? resolveInitialServiceQuestionFastPathV2({
@@ -1041,7 +1125,9 @@ export async function getReceptionistReplyV2(input: {
         })
       : null;
   const selectionFastPath =
+    bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved'
@@ -1056,7 +1142,82 @@ export async function getReceptionistReplyV2(input: {
         })
       : null;
 
-  if (dateSlotsFastPath.kind === 'resolved') {
+  const noFastPathResolved =
+    bookingReentryFastPath.kind === 'continue_model' &&
+    dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model' &&
+    readFastPath.kind === 'continue_model' &&
+    duplicatePreflight.kind === 'continue_model' &&
+    initialServiceQuestionFastPath?.kind !== 'resolved' &&
+    selectionFastPath?.kind !== 'resolved';
+  if (noFastPathResolved) {
+    if (
+      frame.flowState.bookingReentry ||
+      (frame.pending &&
+        hasPositiveExplicitBookingVerbV2(currentInboundBatchText))
+    ) {
+      selectedGateDecline = {
+        gate: 'booking_reentry',
+        reason: bookingReentryFastPath.reason,
+      };
+    } else if (
+      frame.pending &&
+      ['DATE', 'TIME'].includes(frame.pending.kind) &&
+      dateResolution.kind !== 'none'
+    ) {
+      selectedGateDecline = {
+        gate: 'date_slots',
+        reason: dateSlotsFastPath.reason,
+      };
+    } else if (
+      frame.pending?.options.some((option) =>
+        option.entityId.startsWith('duplicate-resolution:')
+      )
+    ) {
+      selectedGateDecline = {
+        gate: 'duplicate_resolution',
+        reason: duplicateResolutionFastPath.reason,
+      };
+    } else if (
+      hasExplicitUpcomingReadRequestV2(currentInboundText) ||
+      hasExplicitAvailabilityReadRequestV2(currentInboundText)
+    ) {
+      selectedGateDecline = {
+        gate: 'existing_appointment_read',
+        reason: readFastPath.reason,
+      };
+    } else if (frame.pending?.kind === 'TIME') {
+      selectedGateDecline = {
+        gate: 'duplicate_preflight',
+        reason: duplicatePreflight.reason,
+      };
+    } else if (
+      initialServiceQuestionFastPath?.kind === 'continue_model' &&
+      hasPositiveExplicitBookingVerbV2(currentInboundBatchText)
+    ) {
+      selectedGateDecline = {
+        gate: 'initial_service_question',
+        reason: initialServiceQuestionFastPath.reason,
+      };
+    } else if (selectionFastPath?.kind === 'continue_model' && frame.pending) {
+      selectedGateDecline = {
+        gate: 'selection',
+        reason: selectionFastPath.reason,
+      };
+    }
+  }
+
+  if (bookingReentryFastPath.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    proof = bookingReentryFastPath.proof;
+    selectionNextFlowState = bookingReentryFastPath.nextFlowState;
+    primary = {
+      ok: true,
+      value: bookingReentryFastPath.result,
+      resolutionProof: bookingReentryFastPath.proof,
+      resolutionProofRejections: [],
+    };
+  } else if (dateSlotsFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = dateSlotsFastPath.loop;
     proof = dateSlotsFastPath.proof;
@@ -1065,6 +1226,17 @@ export async function getReceptionistReplyV2(input: {
       ok: true,
       value: dateSlotsFastPath.result,
       resolutionProof: dateSlotsFastPath.proof,
+      resolutionProofRejections: [],
+    };
+  } else if (duplicateResolutionFastPath.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    loop = duplicateResolutionFastPath.loop;
+    proof = duplicateResolutionFastPath.proof;
+    selectionNextFlowState = duplicateResolutionFastPath.nextFlowState;
+    primary = {
+      ok: true,
+      value: duplicateResolutionFastPath.result,
+      resolutionProof: duplicateResolutionFastPath.proof,
       resolutionProofRejections: [],
     };
   } else if (readFastPath.kind === 'resolved') {

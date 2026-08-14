@@ -112,6 +112,7 @@ async function main(): Promise<void> {
     providerModule,
     receiptModule,
     boundaryModule,
+    reentryModule,
   ] = await Promise.all([
     import('../src/services/conversationalV2/currentDateResolution'),
     import('../src/services/conversationalV2/flowSession'),
@@ -122,6 +123,7 @@ async function main(): Promise<void> {
     import('../src/services/receptionistLlmProvider'),
     import('../src/services/conversationalV2/receipts'),
     import('../src/services/conversationalV2/boundary'),
+    import('../src/services/conversationalV2/bookingReentryFastPath'),
   ]);
 
   const corrected = dateModule.resolveCurrentInboundDateV2({
@@ -144,6 +146,16 @@ async function main(): Promise<void> {
     }).kind,
     'ambiguous',
     'duas datas sem correção falham fechadas'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-ordinal'],
+      inboundTextsById: { 'in-ordinal': 'segunda opção' },
+      now,
+      timezone,
+    }),
+    { kind: 'none', mentions: [] },
+    'opção veta leitura de weekday/data no mesmo inbound'
   );
 
   const datePending = pending({ kind: 'DATE' });
@@ -506,6 +518,201 @@ async function main(): Promise<void> {
     noConflict.kind,
     'continue_model',
     'serviço diferente sem sobreposição não expõe nem abre duplicidade'
+  );
+  const sameServiceOtherDay = await progressModule.resolveTimeDuplicatePreflightV2({
+    frame: timeFrame,
+    inboundId: 'in-1',
+    inboundText: '14h',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async () =>
+      JSON.stringify({
+        success: true,
+        appointments: [
+          {
+            id: 'typed-same-service-other-day',
+            startTime: '2026-08-15T17:00:00.000Z',
+            endTime: '2026-08-15T18:00:00.000Z',
+            serviceName: 'Drenagem Linfática',
+            professionalName: 'Carla Mendes',
+            status: 'CONFIRMED',
+          },
+        ],
+      }),
+  });
+  assert.equal(
+    sameServiceOtherDay.kind,
+    'resolved',
+    'mesmo serviço conflita mesmo em outra data, conforme filtro tipado'
+  );
+
+  const duplicatePending = pending({
+    kind: 'CONFIRMATION',
+    options: [
+      { position: 1, entityId: 'duplicate-resolution:keep-both', displayName: 'manter os dois' },
+      { position: 2, entityId: 'duplicate-resolution:reschedule', displayName: 'remarcar' },
+      { position: 3, entityId: 'duplicate-resolution:cancel-only', displayName: 'só cancelar o anterior' },
+      { position: 4, entityId: 'duplicate-resolution:decide-later', displayName: 'decidir depois' },
+    ],
+  });
+  const duplicateFrame = frame({
+    pending: duplicatePending,
+    flowState: {
+      ...timeFrame.flowState,
+      flowId: duplicatePending.flowId,
+      bookingDraft: {
+        serviceId: 'svc-drenagem',
+        professionalId: 'prof-carla',
+        date: '2026-08-14',
+        time: '14:00',
+        slotEvidenceTurnId: 'turn-slots',
+      },
+    },
+  });
+  const keepBothProof = fastPaths.resolvePendingOptionProofV2({
+    frame: duplicateFrame,
+    inboundId: 'in-1',
+    inboundText: 'outro atendimento',
+    now,
+    catalog: services,
+  });
+  assert.equal(keepBothProof?.kind, 'pending_option');
+  assert.equal(
+    keepBothProof?.kind === 'pending_option' ? keepBothProof.entityId : null,
+    'duplicate-resolution:keep-both',
+    'outro atendimento resolve somente a opção keep-both tipada'
+  );
+  const keepBoth = await progressModule.resolveDuplicateKeepBothFastPathV2({
+    frame: duplicateFrame,
+    proof: keepBothProof,
+    servicesResult: services,
+    config,
+    executeTool: async (name) => {
+      assert.equal(name, 'getUpcomingAppointments');
+      return JSON.stringify({
+        success: true,
+        appointments: [
+          {
+            id: 'typed-keep-both',
+            startTime: '2026-08-15T17:00:00.000Z',
+            endTime: '2026-08-15T18:00:00.000Z',
+            serviceName: 'Drenagem Linfática',
+            professionalName: 'Carla Mendes',
+            status: 'CONFIRMED',
+          },
+        ],
+      });
+    },
+  });
+  assert.equal(keepBoth.kind, 'resolved');
+  if (keepBoth.kind !== 'resolved') throw new Error('keep-both não resolveu');
+  assert.match(keepBoth.result.reply, /^Confirmando:/u);
+  assert.equal(keepBoth.nextFlowState.duplicateResolution?.kind, 'keep_both');
+  assert.deepEqual(
+    keepBoth.result.pendingTransitionCandidate,
+    {
+      kind: 'open',
+      pendingKind: 'CONFIRMATION',
+      flowId: duplicatePending.flowId,
+      optionEntityIds: [`booking-confirmation:${duplicatePending.flowId}`],
+    },
+    'keep-both volta ao resumo e abre confirmação normal nova'
+  );
+
+  const reentryPending = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '14:00', displayName: '14:00' },
+      { position: 2, entityId: '15:00', displayName: '15:00' },
+    ],
+  });
+  const reentryFrame = frame({
+    pending: reentryPending,
+    flowState: {
+      flowId: reentryPending.flowId,
+      fixedServiceId: 'svc-drenagem',
+      fixedProfessionalId: 'prof-carla',
+      resolvedDate: '2026-08-14',
+      slotEvidence: {
+        turnId: 'turn-reentry-slots',
+        serviceId: 'svc-drenagem',
+        professionalId: 'prof-carla',
+        date: '2026-08-14',
+        slots: ['14:00', '15:00'],
+      },
+      fixedByProofVersion: {
+        fixedServiceId: 1,
+        fixedProfessionalId: 1,
+        resolvedDate: 1,
+      },
+    },
+  });
+  const reentry = reentryModule.resolveBookingReentryFastPathV2({
+    frame: reentryFrame,
+    inboundId: 'in-1',
+    inboundText: 'quero agendar',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    catalog: services,
+    now,
+    newFlowId: () => 'flow-new-reentry',
+  });
+  assert.equal(reentry.kind, 'resolved');
+  if (reentry.kind !== 'resolved') throw new Error('reentrada não resolveu');
+  assert.equal(
+    reentry.result.reply,
+    'A gente estava marcando Drenagem Linfática para 14/08/2026 — quer continuar esse agendamento ou marcar outro?'
+  );
+  assert.deepEqual(
+    reentry.result.pendingTransitionCandidate,
+    {
+      kind: 'open',
+      pendingKind: 'CONFIRMATION',
+      flowId: reentryPending.flowId,
+      optionEntityIds: ['booking-reentry:continue', 'booking-reentry:new'],
+    },
+    'reentrada abre somente continuar|novo sem chamar modelo'
+  );
+  const reentryChoicePending = pending({
+    kind: 'CONFIRMATION',
+    options: [
+      { position: 1, entityId: 'booking-reentry:continue', displayName: 'continuar esse agendamento' },
+      { position: 2, entityId: 'booking-reentry:new', displayName: 'marcar outro' },
+    ],
+  });
+  const reentryNew = reentryModule.resolveBookingReentryFastPathV2({
+    frame: frame({
+      pending: reentryChoicePending,
+      flowState: {
+        ...reentryFrame.flowState,
+        flowId: reentryChoicePending.flowId,
+        bookingReentry: {
+          pendingKind: 'TIME',
+          optionEntityIds: ['14:00', '15:00'],
+        },
+      },
+    }),
+    inboundId: 'in-1',
+    inboundText: 'marcar outro',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    catalog: services,
+    now,
+    newFlowId: () => 'flow-new-reentry',
+  });
+  assert.equal(reentryNew.kind, 'resolved');
+  if (reentryNew.kind !== 'resolved') throw new Error('novo não resolveu');
+  assert.equal(reentryNew.nextFlowState.flowId, 'flow-new-reentry');
+  assert.equal(reentryNew.nextFlowState.fixedServiceId, undefined);
+  assert.deepEqual(
+    reentryNew.result.pendingTransitionCandidate,
+    {
+      kind: 'open',
+      pendingKind: 'SERVICE',
+      flowId: 'flow-new-reentry',
+      optionEntityIds: ['svc-drenagem', 'svc-limpeza'],
+    },
+    'novo aplica o reset estreito e abre SERVICE no novo flow'
   );
 
   const identityBlocked = await progressModule.resolveTimeDuplicatePreflightV2({

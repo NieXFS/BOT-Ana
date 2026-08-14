@@ -8,6 +8,7 @@ import type {
   UpcomingAppointment,
 } from '../calendarService';
 import { professionalSelectionGate } from '../professional-selection-gate';
+import { classifyExistingAppointmentIntent } from '../receptionistTurnGrounding';
 import type {
   ModelTurnResultV2,
   ResolutionProof,
@@ -55,7 +56,10 @@ function normalize(value: string): string {
 }
 
 export function hasExplicitUpcomingReadRequestV2(value: string): boolean {
-  return hasPositiveClauseMatchV2(value, UPCOMING_READ_REQUEST_RE);
+  return (
+    classifyExistingAppointmentIntent(value) !== 'none' ||
+    hasPositiveClauseMatchV2(value, UPCOMING_READ_REQUEST_RE)
+  );
 }
 
 export function hasExplicitAvailabilityReadRequestV2(value: string): boolean {
