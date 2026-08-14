@@ -1,0 +1,689 @@
+import assert from 'node:assert/strict';
+import type { TenantBotConfig } from '../src/configProvider';
+import type { ServicesResult } from '../src/services/calendarService';
+import type {
+  FlowStateV2,
+  PendingFrameSnapshotV2,
+  TurnFrameV2,
+} from '../src/services/conversationalV2/contracts';
+
+process.env.NODE_ENV = 'test';
+process.env.DATABASE_URL =
+  'postgresql://smoke:smoke@127.0.0.1:1/ana-v2-wave1';
+process.env.OPENAI_API_KEY = 'sk-smoke-invalid';
+process.env.ERP_API_TOKEN = 'smoke-invalid';
+
+const now = new Date('2026-08-12T15:00:00.000Z');
+const timezone = 'America/Sao_Paulo';
+const services: ServicesResult = {
+  success: true,
+  services: [
+    {
+      id: 'svc-drenagem',
+      name: 'Drenagem Linfática',
+      durationMinutes: 60,
+      price: 160,
+      priceFormatted: 'R$ 160,00',
+      professionalIds: ['prof-carla'],
+    },
+    {
+      id: 'svc-limpeza',
+      name: 'Limpeza de Pele Profunda',
+      durationMinutes: 60,
+      price: 180,
+      priceFormatted: 'R$ 180,00',
+      professionalIds: ['prof-carla'],
+    },
+  ],
+  professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
+};
+const config = {
+  tenantSlug: 'fixture-wave1',
+  botName: 'Ana',
+  botRole: 'receptionist',
+  systemPrompt: 'Atenda bem.',
+  greetingMessage: null,
+  fallbackMessage: null,
+  aiProvider: 'openai',
+  aiModel: 'gpt-4o-mini',
+  aiTemperature: 0.2,
+  aiMaxTokens: 900,
+  openaiApiKey: 'sk-smoke-invalid',
+  botIsAlwaysActive: true,
+  botActiveStart: '08:00',
+  botActiveEnd: '20:00',
+  timezone,
+  waAccessToken: 'fixture',
+  waApiVersion: 'v21.0',
+  phoneNumberId: 'PN-WAVE1',
+  isActive: true,
+  authoritativeCatalog: {
+    tenant: { name: 'Clínica Fixture', address: 'Rua Fixture, 1' },
+    services: [],
+    professionals: [],
+  },
+} as TenantBotConfig;
+
+function pending(input: {
+  kind: PendingFrameSnapshotV2['kind'];
+  flowId?: string;
+  askedAt?: string;
+  options?: PendingFrameSnapshotV2['options'];
+}): PendingFrameSnapshotV2 {
+  return {
+    questionId: `q-${input.kind}`,
+    askedAt: input.askedAt ?? now.toISOString(),
+    kind: input.kind,
+    flowId: input.flowId ?? 'flow-wave1',
+    version: 1,
+    options: input.options ?? [],
+  };
+}
+
+function frame(input: {
+  pending: PendingFrameSnapshotV2;
+  flowState?: FlowStateV2;
+}): TurnFrameV2 {
+  return {
+    schemaVersion: 2,
+    turnId: 'turn-wave1',
+    inputSequence: 1,
+    catalogSnapshotHash: 'a'.repeat(64),
+    catalogState: 'available',
+    humanControl: 'NO_ACTIVE_TAKEOVER',
+    currentInboundIds: ['in-1'],
+    pending: input.pending,
+    flowState: input.flowState ?? {
+      flowId: input.pending.flowId,
+      lastOperationalAt: now.toISOString(),
+      fixedByProofVersion: {},
+    },
+  };
+}
+
+async function main(): Promise<void> {
+  const [
+    dateModule,
+    flowModule,
+    progressModule,
+    fastPaths,
+    copyModule,
+    stateModule,
+    providerModule,
+    receiptModule,
+    boundaryModule,
+  ] = await Promise.all([
+    import('../src/services/conversationalV2/currentDateResolution'),
+    import('../src/services/conversationalV2/flowSession'),
+    import('../src/services/conversationalV2/bookingProgressFastPaths'),
+    import('../src/services/conversationalV2/fastPaths'),
+    import('../src/services/conversationalV2/copyVariants'),
+    import('../src/services/conversationalV2/stateStore'),
+    import('../src/services/receptionistLlmProvider'),
+    import('../src/services/conversationalV2/receipts'),
+    import('../src/services/conversationalV2/boundary'),
+  ]);
+
+  const corrected = dateModule.resolveCurrentInboundDateV2({
+    currentInboundIds: ['in-1', 'in-2'],
+    inboundTextsById: { 'in-1': 'amanhã', 'in-2': 'não, sexta' },
+    now,
+    timezone,
+  });
+  assert.deepEqual(corrected, {
+    kind: 'resolved',
+    date: '2026-08-14',
+    mentions: ['2026-08-13', '2026-08-14'],
+  });
+  assert.equal(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-1'],
+      inboundTextsById: { 'in-1': 'amanhã ou sexta' },
+      now,
+      timezone,
+    }).kind,
+    'ambiguous',
+    'duas datas sem correção falham fechadas'
+  );
+
+  const datePending = pending({ kind: 'DATE' });
+  const liveState: FlowStateV2 = {
+    flowId: datePending.flowId,
+    lastOperationalAt: now.toISOString(),
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-carla',
+    fixedByProofVersion: { fixedServiceId: 1, fixedProfessionalId: 1 },
+  };
+  assert.equal(
+    flowModule.decideFlowResetV2({
+      flowState: liveState,
+      pending: datePending,
+      inboundText: 'quero agendar amanhã',
+      dateResolution: dateModule.resolveCurrentInboundDateV2({
+        currentInboundIds: ['in-1'],
+        inboundTextsById: { 'in-1': 'quero agendar amanhã' },
+        now,
+        timezone,
+      }),
+      catalog: services,
+      now,
+    }),
+    null,
+    'progresso DATE fresco nunca é apagado pelo verbo de agendamento'
+  );
+  assert.equal(
+    flowModule.decideFlowResetV2({
+      flowState: liveState,
+      pending: datePending,
+      inboundText: 'quero agendar',
+      dateResolution: { kind: 'none', mentions: [] },
+      catalog: services,
+      now,
+    }),
+    null,
+    'DATE fresca é soberana mesmo sem data no novo lote'
+  );
+  const servicePending = pending({ kind: 'SERVICE' });
+  assert.equal(
+    flowModule.decideFlowResetV2({
+      flowState: { ...liveState, flowId: servicePending.flowId },
+      pending: servicePending,
+      inboundText: 'quero agendar',
+      dateResolution: { kind: 'none', mentions: [] },
+      catalog: services,
+      now,
+    }),
+    'explicit_restart'
+  );
+  assert.equal(
+    flowModule.flowStateIdleV2(
+      {
+        ...liveState,
+        lastOperationalAt: new Date(now.getTime() - 5 * 60 * 60 * 1_000).toISOString(),
+      },
+      now
+    ),
+    true,
+    'TTL operacional é quatro horas'
+  );
+  assert.deepEqual(
+    flowModule.adjustTransitionForFlowResetV2(
+      { kind: 'preserve' },
+      datePending,
+      'idle_timeout'
+    ),
+    {
+      kind: 'invalidate',
+      questionId: datePending.questionId,
+      reason: 'flow_session_reset:idle_timeout',
+    },
+    'reset + copy PRESERVE invalida a pergunta velha no mesmo commit'
+  );
+  assert.deepEqual(
+    flowModule.adjustTransitionForFlowResetV2(
+      {
+        kind: 'open',
+        pendingKind: 'SERVICE',
+        flowId: 'flow-new',
+        optionEntityIds: ['svc-drenagem', 'svc-limpeza'],
+      },
+      datePending,
+      'idle_timeout'
+    ),
+    {
+      kind: 'open',
+      pendingKind: 'SERVICE',
+      flowId: 'flow-new',
+      optionEntityIds: ['svc-drenagem', 'svc-limpeza'],
+    },
+    'novo OPEN continua supersedendo a pendência velha pela CAS normal'
+  );
+
+  const dateFrame = frame({ pending: datePending, flowState: liveState });
+  const slots = await progressModule.resolveDateSlotsFastPathV2({
+    frame: dateFrame,
+    dateResolution: corrected,
+    currentInboundText: 'não, sexta',
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async (name, args) => {
+      assert.equal(name, 'getAvailableSlots');
+      assert.equal(args.date, '2026-08-14');
+      return JSON.stringify({
+        success: true,
+        slots: ['14:00', '15:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(slots.kind, 'resolved');
+  if (slots.kind !== 'resolved') throw new Error('P1 não resolveu slots');
+  assert.match(slots.result.reply, /14\/08\/2026/u, 'oferta cita a data legível');
+  assert.equal(slots.result.pendingTransitionCandidate.kind, 'open');
+  assert.equal(
+    slots.nextFlowState.slotEvidence?.date,
+    '2026-08-14',
+    'slotEvidence carrega a data de origem'
+  );
+  assert.equal(
+    (
+      await progressModule.resolveDateSlotsFastPathV2({
+        frame: dateFrame,
+        dateResolution: { kind: 'none', mentions: [] },
+        currentInboundText: 'quais horários?',
+        servicesResult: services,
+        config,
+        now,
+        executeTool: async () => {
+          throw new Error('não pode reler a ISO antiga sem data no lote');
+        },
+      })
+    ).kind,
+    'continue_model',
+    'P1 nunca dispara a partir de resolvedDate residual'
+  );
+  const noSlots = await progressModule.resolveDateSlotsFastPathV2({
+    frame: dateFrame,
+    dateResolution: { kind: 'resolved', date: '2026-08-14', mentions: ['2026-08-14'] },
+    currentInboundText: 'sexta',
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async () => JSON.stringify({ success: true, slots: [] }),
+  });
+  assert.equal(noSlots.kind, 'resolved');
+  if (noSlots.kind !== 'resolved') throw new Error('grade vazia não foi reduzida');
+  assert.deepEqual(
+    noSlots.result.pendingTransitionCandidate,
+    {
+      kind: 'open',
+      pendingKind: 'DATE',
+      flowId: dateFrame.flowState.flowId,
+      optionEntityIds: ['date-freeform'],
+    },
+    'grade vazia reabre DATE, nunca TIME vazio'
+  );
+
+  const oldTimePending = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '14:00', displayName: '14:00' },
+      { position: 2, entityId: '15:00', displayName: '15:00' },
+    ],
+  });
+  const oldTimeFrame = frame({
+    pending: oldTimePending,
+    flowState: {
+      ...liveState,
+      resolvedDate: '2026-08-13',
+      slotEvidence: {
+        turnId: 'turn-old',
+        serviceId: 'svc-drenagem',
+        professionalId: 'prof-carla',
+        date: '2026-08-13',
+        slots: ['14:00', '15:00'],
+      },
+      fixedByProofVersion: {
+        ...liveState.fixedByProofVersion,
+        resolvedDate: 1,
+      },
+    },
+  });
+  const newDateText = 'na verdade sexta às 15h';
+  const newDateResolution = dateModule.resolveCurrentInboundDateV2({
+    currentInboundIds: ['in-1'],
+    inboundTextsById: { 'in-1': newDateText },
+    now,
+    timezone,
+  });
+  assert.equal(
+    fastPaths.resolveSelectionFastPathV2({
+      frame: oldTimeFrame,
+      inboundId: 'in-1',
+      inboundText: newDateText,
+      catalog: services,
+      now,
+      currentDateResolution: newDateResolution,
+    }).kind,
+    'continue_model',
+    'data nova veta fill do TIME antigo'
+  );
+  const superseded = await progressModule.resolveDateSlotsFastPathV2({
+    frame: oldTimeFrame,
+    dateResolution: newDateResolution,
+    currentInboundText: newDateText,
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async () =>
+      JSON.stringify({
+        success: true,
+        slots: ['09:00', '11:00'],
+        professionalId: 'prof-carla',
+      }),
+  });
+  assert.equal(superseded.kind, 'resolved');
+  if (superseded.kind !== 'resolved') throw new Error('TIME não foi superseded');
+  assert.deepEqual(
+    superseded.result.pendingTransitionCandidate,
+    {
+      kind: 'open',
+      pendingKind: 'TIME',
+      flowId: oldTimeFrame.flowState.flowId,
+      optionEntityIds: ['09:00', '11:00'],
+    },
+    'TIME novo substitui integralmente as opções antigas'
+  );
+
+  const timeFrame = frame({
+    pending: oldTimePending,
+    flowState: {
+      ...oldTimeFrame.flowState,
+      resolvedDate: '2026-08-14',
+      slotEvidence: {
+        turnId: 'turn-slots',
+        serviceId: 'svc-drenagem',
+        professionalId: 'prof-carla',
+        date: '2026-08-14',
+        slots: ['14:00', '15:00'],
+      },
+    },
+  });
+  const conflict = await progressModule.resolveTimeDuplicatePreflightV2({
+    frame: timeFrame,
+    inboundId: 'in-1',
+    inboundText: '14h',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async (name) => {
+      assert.equal(name, 'getUpcomingAppointments');
+      return JSON.stringify({
+        success: true,
+        appointments: [
+          {
+            id: 'appointment-must-not-leak',
+            startTime: '2026-08-14T17:00:00.000Z',
+            endTime: '2026-08-14T18:00:00.000Z',
+            serviceName: 'Drenagem Linfática',
+            professionalName: 'Carla Mendes',
+            status: 'CONFIRMED',
+          },
+        ],
+      });
+    },
+  });
+  assert.equal(conflict.kind, 'resolved');
+  if (conflict.kind !== 'resolved') throw new Error('P3 não detectou conflito');
+  assert.match(conflict.result.reply, /manter os dois, remarcar, só cancelar o anterior ou decidir depois/u);
+  assert.doesNotMatch(conflict.result.reply, /appointment-must-not-leak/u);
+  assert.deepEqual(
+    conflict.result.pendingTransitionCandidate.kind === 'open'
+      ? conflict.result.pendingTransitionCandidate.optionEntityIds
+      : [],
+    [
+      'duplicate-resolution:keep-both',
+      'duplicate-resolution:reschedule',
+      'duplicate-resolution:cancel-only',
+      'duplicate-resolution:decide-later',
+    ],
+    'displayNames/opções de duplicidade permanecem canônicos'
+  );
+  const conflictBoundary = boundaryModule.evaluateBoundaryV2({
+    rawCandidate: conflict.result.reply,
+    servicesResult: services,
+    toolTrace: conflict.loop.toolTrace,
+    sourceInboundText: '14h',
+    currentInboundIds: ['in-1'],
+    inboundTextsById: { 'in-1': '14h' },
+    flowState: conflict.nextFlowState,
+    pendingTransitionCandidate: conflict.result.pendingTransitionCandidate,
+    replyPurpose: conflict.result.replyPurpose,
+    route: 'model',
+    pendingAnaOpen: true,
+    pendingSnapshot: timeFrame.pending,
+  });
+  assert.equal(
+    conflictBoundary.safe && conflictBoundary.originalAccepted,
+    true,
+    `copy de duplicidade com leitura autoritativa deve passar: ${conflictBoundary.reasonCodes.join(',')}`
+  );
+
+  const overlapOtherService = await progressModule.resolveTimeDuplicatePreflightV2({
+    frame: timeFrame,
+    inboundId: 'in-1',
+    inboundText: '14h',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async () =>
+      JSON.stringify({
+        success: true,
+        appointments: [
+          {
+            id: 'typed-overlap',
+            startTime: '2026-08-14T17:30:00.000Z',
+            endTime: '2026-08-14T18:15:00.000Z',
+            serviceName: 'Limpeza de Pele Profunda',
+            professionalName: 'Carla Mendes',
+            status: 'CONFIRMED',
+          },
+        ],
+      }),
+  });
+  assert.equal(
+    overlapOtherService.kind,
+    'resolved',
+    'serviço diferente com sobreposição no mesmo dia é conflito'
+  );
+  const noConflict = await progressModule.resolveTimeDuplicatePreflightV2({
+    frame: timeFrame,
+    inboundId: 'in-1',
+    inboundText: '14h',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async () =>
+      JSON.stringify({
+        success: true,
+        appointments: [
+          {
+            id: 'typed-no-overlap',
+            startTime: '2026-08-14T19:00:00.000Z',
+            endTime: '2026-08-14T20:00:00.000Z',
+            serviceName: 'Limpeza de Pele Profunda',
+            professionalName: 'Carla Mendes',
+            status: 'CONFIRMED',
+          },
+        ],
+      }),
+  });
+  assert.equal(
+    noConflict.kind,
+    'continue_model',
+    'serviço diferente sem sobreposição não expõe nem abre duplicidade'
+  );
+
+  const identityBlocked = await progressModule.resolveTimeDuplicatePreflightV2({
+    frame: timeFrame,
+    inboundId: 'in-1',
+    inboundText: '14h',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async () =>
+      JSON.stringify({
+        success: false,
+        reason: 'customer_identity_ambiguous',
+        appointments: [{ serviceName: 'Segredo' }],
+      }),
+  });
+  assert.equal(identityBlocked.kind, 'resolved');
+  if (identityBlocked.kind !== 'resolved') throw new Error('identidade não bloqueou');
+  assert.doesNotMatch(identityBlocked.result.reply, /Segredo|agendamento de/u);
+  assert.match(identityBlocked.result.reply, /identificar com segurança/u);
+  const identityMismatch = await progressModule.resolveTimeDuplicatePreflightV2({
+    frame: timeFrame,
+    inboundId: 'in-1',
+    inboundText: '14h',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    servicesResult: services,
+    config,
+    now,
+    executeTool: async () =>
+      JSON.stringify({
+        success: false,
+        reason: 'customer_identity_mismatch',
+        appointments: [{ serviceName: 'Outro segredo' }],
+      }),
+  });
+  assert.equal(identityMismatch.kind, 'resolved');
+  if (identityMismatch.kind !== 'resolved') throw new Error('mismatch não bloqueou');
+  assert.doesNotMatch(identityMismatch.result.reply, /Outro segredo|agendamento de/u);
+  assert.match(identityMismatch.result.reply, /identificar com segurança/u);
+
+  const serviceQuestion = {
+    schemaVersion: 2 as const,
+    reply: 'Claro! Para qual serviço você gostaria de agendar? Temos Drenagem Linfática e Limpeza de Pele Profunda. Qual você prefere?',
+    replyPurpose: 'SERVICE_QUESTION' as const,
+    pendingTransitionCandidate: {
+      kind: 'open' as const,
+      pendingKind: 'SERVICE' as const,
+      flowId: 'flow-wave1',
+      optionEntityIds: ['svc-drenagem', 'svc-limpeza'],
+    },
+    resolutionCandidate: null,
+    unknownServiceEvidence: null,
+  };
+  const firstVariant = copyModule.varyUnanchoredServerCopyV2({
+    result: serviceQuestion,
+    seed: 1,
+  });
+  const secondVariant = copyModule.varyUnanchoredServerCopyV2({
+    result: serviceQuestion,
+    lastVariant: firstVariant.variant,
+    seed: 1,
+  });
+  assert.notEqual(firstVariant.variant, secondVariant.variant, 'variante não repete seguida');
+  const confirmation = {
+    ...serviceQuestion,
+    reply: 'Confirmando: Drenagem Linfática, em 14/08/2026, às 14h, com Carla Mendes. Posso marcar?',
+    replyPurpose: 'WRITE_CONFIRMATION' as const,
+    pendingTransitionCandidate: {
+      kind: 'open' as const,
+      pendingKind: 'CONFIRMATION' as const,
+      flowId: 'flow-wave1',
+      optionEntityIds: ['booking-confirmation:flow-wave1'],
+    },
+  };
+  const frozen = copyModule.varyUnanchoredServerCopyV2({
+    result: confirmation,
+    seed: 2,
+  });
+  assert.equal(frozen.variant, 'canonical');
+  assert.equal(frozen.result.reply, confirmation.reply, 'âncora de confirmação é byte-idêntica');
+
+  const store = new stateModule.MemoryConversationalV2StateStore();
+  store.pending.set('conversation-idle-not-expired', [
+    {
+      conversationKey: 'conversation-idle-not-expired',
+      state: 'OPEN',
+      snapshot: pending({
+        kind: 'DATE',
+        flowId: 'flow-idle',
+        askedAt: new Date(now.getTime() - 5 * 60 * 60 * 1_000).toISOString(),
+      }),
+      flowState: {
+        flowId: 'flow-idle',
+        lastOperationalAt: new Date(now.getTime() - 5 * 60 * 60 * 1_000).toISOString(),
+        fixedServiceId: 'svc-drenagem',
+        fixedByProofVersion: { fixedServiceId: 1 },
+      },
+      updatedAt: new Date(now.getTime() - 5 * 60 * 60 * 1_000).toISOString(),
+    },
+  ]);
+  const idlePhysical = await store.loadLatestState(
+    'conversation-idle-not-expired',
+    now
+  );
+  assert.ok(idlePhysical.pending, 'TTL operacional de 4h não apaga a linha física de 24h');
+  assert.ok(idlePhysical.flowState, 'runtime recebe o estado idle para criar novo flowId');
+  assert.equal(
+    store.pending.get('conversation-idle-not-expired')?.[0]?.state,
+    'OPEN',
+    'linha de 5h permanece auditável e OPEN até o teto físico'
+  );
+  store.pending.set('conversation-expired', [
+    {
+      conversationKey: 'conversation-expired',
+      state: 'OPEN',
+      snapshot: pending({
+        kind: 'SERVICE',
+        askedAt: new Date(now.getTime() - 25 * 60 * 60 * 1_000).toISOString(),
+      }),
+      flowState: {
+        flowId: 'flow-expired',
+        lastOperationalAt: new Date(now.getTime() - 25 * 60 * 60 * 1_000).toISOString(),
+        fixedServiceId: 'svc-drenagem',
+        fixedByProofVersion: { fixedServiceId: 1 },
+      },
+      updatedAt: new Date(now.getTime() - 25 * 60 * 60 * 1_000).toISOString(),
+    },
+  ]);
+  assert.equal(
+    (await store.loadLatestState('conversation-expired', now)).flowState,
+    null,
+    'linha física EXPIRED não ressuscita flowState'
+  );
+  assert.equal(
+    store.pending.get('conversation-expired')?.length,
+    1,
+    'histórico físico da pendência expirada não foi deletado'
+  );
+
+  const openaiRuntime = providerModule.resolveReceptionistAiRuntime(config);
+  assert.equal(openaiRuntime.provider, 'openai');
+  const openaiRequest = providerModule.buildReceptionistCompletionRequest(
+    openaiRuntime,
+    {
+      messages: [{ role: 'user', content: 'fixture' }],
+      tools: [],
+      temperature: 0.2,
+      maxTokens: 128,
+      responseFormat: 'json_object',
+    }
+  );
+  assert.equal(openaiRequest.model, 'gpt-4o-mini');
+  assert.equal(openaiRequest.tool_choice, 'auto');
+  assert.deepEqual(openaiRequest.response_format, { type: 'json_object' });
+
+  receiptModule.assertReceiptRedactedV2({
+    schemaVersion: 2,
+    planReceiptId: 'plan-wave1',
+    turnId: 'turn-wave1',
+    frameHash: 'b'.repeat(64),
+    inputSequence: 1,
+    route: 'fast_path',
+    primaryModelRounds: 0,
+    primaryProviderCalls: 0,
+    regenProviderCalls: 0,
+    pendingTransitionCandidate: { kind: 'preserve' },
+    toolEffects: [],
+    boundaryAttempts: [],
+    recoveryKind: 'none',
+    copyVariant: firstVariant.variant,
+    result: 'accepted_for_delivery',
+  });
+
+  console.log('smoke-ana-conversational-v2-wave1: PASS');
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

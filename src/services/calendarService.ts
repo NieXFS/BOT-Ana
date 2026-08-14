@@ -838,9 +838,10 @@ export async function getAvailableSlots(
   }
 }
 
-export async function getCustomerUpcomingAppointments(
+async function getCustomerUpcomingAppointmentsWithPolicy(
   phone: string,
-  config: TenantBotConfig
+  config: TenantBotConfig,
+  identityMismatchFailsClosed: boolean
 ): Promise<UpcomingAppointmentsResult> {
   try {
     const response = await erpApi.get<UpcomingAppointmentsResponse>(
@@ -867,7 +868,11 @@ export async function getCustomerUpcomingAppointments(
     const responseReason = axios.isAxiosError(err)
       ? (err.response?.data as { reason?: unknown } | undefined)?.reason
       : undefined;
-    if (responseReason === 'customer_identity_ambiguous') {
+    if (
+      responseReason === 'customer_identity_ambiguous' ||
+      (identityMismatchFailsClosed &&
+        responseReason === 'customer_identity_mismatch')
+    ) {
       return {
         success: false,
         reason: 'customer_identity_ambiguous',
@@ -883,6 +888,22 @@ export async function getCustomerUpcomingAppointments(
         'Tive um problema ao verificar seus agendamentos existentes agora. Pode tentar novamente em instantes?',
     };
   }
+}
+
+/** Contrato legado/v1 preservado: só a ambiguidade já conhecida é tipada. */
+export async function getCustomerUpcomingAppointments(
+  phone: string,
+  config: TenantBotConfig
+): Promise<UpcomingAppointmentsResult> {
+  return getCustomerUpcomingAppointmentsWithPolicy(phone, config, false);
+}
+
+/** Entitlement v2: titular divergente também falha fechado, sem fatos de agenda. */
+export async function getCustomerUpcomingAppointmentsV2(
+  phone: string,
+  config: TenantBotConfig
+): Promise<UpcomingAppointmentsResult> {
+  return getCustomerUpcomingAppointmentsWithPolicy(phone, config, true);
 }
 
 interface CancelAppointmentPayload {

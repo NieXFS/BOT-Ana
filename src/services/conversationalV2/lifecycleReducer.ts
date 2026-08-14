@@ -196,9 +196,9 @@ export function reduceToolLifecycleV2(input: {
     nextFlowState: fixedStateForSlots(input.frame, evidence),
     result: {
       schemaVersion: 2,
-      reply: `${socialAcknowledgement}Encontrei estes horários: ${joinedTimes(
-        evidence.slots
-      )}. Qual você prefere?`,
+      reply: `${socialAcknowledgement}Encontrei horários para ${displayDateV2(
+        evidence.date
+      )}: ${joinedTimes(evidence.slots)}. Qual você prefere?`,
       replyPurpose: 'DATE_TIME_QUESTION',
       pendingTransitionCandidate: {
         kind: 'open',
@@ -212,7 +212,7 @@ export function reduceToolLifecycleV2(input: {
   };
 }
 
-function displayDate(date: string): string {
+export function displayDateV2(date: string): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(date);
   return match ? `${match[3]}/${match[2]}/${match[1]}` : date;
 }
@@ -233,7 +233,7 @@ export function buildCanonicalBookingSummaryV2(input: {
       )
     : null;
   const professionalPart = professional ? `, com ${professional.name}` : '';
-  return `Confirmando: ${service?.name ?? 'o serviço escolhido'}, em ${displayDate(
+  return `Confirmando: ${service?.name ?? 'o serviço escolhido'}, em ${displayDateV2(
     input.draft.date
   )}, às ${displayTime(input.draft.time)}${professionalPart}. Posso marcar?`;
 }

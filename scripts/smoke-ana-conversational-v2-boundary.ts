@@ -440,6 +440,29 @@ const enumerationServices: ServicesResult = {
   ],
   professionals: [{ id: 'prof-carla-enum', name: 'Carla Mendes' }],
 };
+const realR41FaithfulOffer = boundary(
+  'Boa tarde! Sim, fazemos drenagem linfática, que dura 50 minutos e custa R$ 160,00. Gostaria de agendar?',
+  { servicesResult: enumerationServices }
+);
+assert.equal(
+  realR41FaithfulOffer.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  false,
+  'R4.1 real: oração relativa de duração/preço não vira resíduo do nome'
+);
+assert.equal(
+  realR41FaithfulOffer.safe,
+  true,
+  `R4.1 real fiel ao catálogo deve atravessar: ${realR41FaithfulOffer.reasonCodes.join(',')}`
+);
+const pricedUnknownServiceR41 = boundary(
+  'Fazemos drenagem a vapor por R$ 90,00.',
+  { servicesResult: enumerationServices }
+);
+assert.equal(
+  pricedUnknownServiceR41.reasonCodes.includes('UNKNOWN_SERVICE_OFFER'),
+  true,
+  'preço removido da cauda não lava o modificador desconhecido a vapor'
+);
 for (const knownCatalogSequence of [
   'Fazemos drenajem e posso te ajudar a agendar.',
   'Temos Drenagem, Limpeza e Peeling.',

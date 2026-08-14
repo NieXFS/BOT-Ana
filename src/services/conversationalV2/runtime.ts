@@ -8,7 +8,11 @@ import {
   runReceptionistModelLoop,
   type ReceptionistModelLoopResult,
 } from '../brainService';
-import { getServices, type ServicesResult } from '../calendarService';
+import {
+  getCustomerUpcomingAppointmentsV2,
+  getServices,
+  type ServicesResult,
+} from '../calendarService';
 import {
   buildConversationKey,
   currentSourceInboundMessageIds,
@@ -39,6 +43,21 @@ import {
   resolveSelectionFastPathV2,
 } from './fastPaths';
 import { resolveReadFastPathV2 } from './readFastPaths';
+import {
+  resolveDateSlotsFastPathV2,
+  resolveTimeDuplicatePreflightV2,
+} from './bookingProgressFastPaths';
+import { resolveCurrentInboundDateV2 } from './currentDateResolution';
+import {
+  adjustTransitionForFlowResetV2,
+  decideFlowResetV2,
+  newFlowStateV2,
+  stampFlowOperationalActivityV2,
+} from './flowSession';
+import {
+  varyUnanchoredServerCopyV2,
+  type CopyVariantIdV2,
+} from './copyVariants';
 import {
   coerceEquivalentOpenTransitionV2,
   parseModelTurnResultV2,
@@ -103,6 +122,8 @@ export interface ReceptionistV2RuntimeDeps {
     name: string,
     args: Record<string, unknown>
   ) => Promise<string>;
+  /** Read v2 entitlement já escopada ao preflight TIME; útil para fixtures. */
+  executeProactiveDuplicateRead?: () => Promise<string>;
   regenerate?: (
     reasonCodes: readonly BoundaryReasonCodeV2[],
     input: {
@@ -209,7 +230,14 @@ function optionsForTransition(
   services: ServicesResult,
   duplicateResolutionFlow = false
 ): PendingFrameSnapshotV2['options'] {
-  if (duplicateResolutionFlow && candidate.pendingKind === 'CONFIRMATION') {
+  if (
+    candidate.pendingKind === 'CONFIRMATION' &&
+    (duplicateResolutionFlow ||
+      (candidate.optionEntityIds.length > 0 &&
+        candidate.optionEntityIds.every((entityId) =>
+          entityId.startsWith('duplicate-resolution:')
+        )))
+  ) {
     return [
       { position: 1, entityId: 'duplicate-resolution:keep-both', displayName: 'manter os dois' },
       { position: 2, entityId: 'duplicate-resolution:reschedule', displayName: 'remarcar' },
@@ -433,6 +461,9 @@ function canonicalPendingQuestion(
   frame: TurnFrameV2,
   catalog: ServicesResult
 ): string | null {
+  if (frame.pending && frame.pending.flowId !== frame.flowState.flowId) {
+    return null;
+  }
   return buildPendingQuestionV2({
     pending: frame.pending,
     flowState: frame.flowState,
@@ -616,11 +647,36 @@ export async function getReceptionistReplyV2(input: {
       : guard.kind === 'clear'
         ? guard.pending
         : null;
-  const flowState = pendingRecord?.flowState ?? stored.flowState ?? {
-    flowId: id(),
-    fixedByProofVersion: {},
-  };
   const services = await loadServices(input.config);
+  const currentInboundBatchText = currentInboundIds
+    .map((inboundId) => inboundTextsById[inboundId] ?? '')
+    .filter(Boolean)
+    .join(' ')
+    .trim() || input.userMessage;
+  const dateResolution = resolveCurrentInboundDateV2({
+    currentInboundIds,
+    inboundTextsById,
+    now: startedAt,
+    timezone: input.config.timezone,
+  });
+  const storedFlowState = pendingRecord?.flowState ?? stored.flowState;
+  const hydratedStoredFlowState =
+    storedFlowState &&
+    !storedFlowState.lastOperationalAt &&
+    pendingRecord?.snapshot.flowId === storedFlowState.flowId
+      ? { ...storedFlowState, lastOperationalAt: pendingRecord.updatedAt }
+      : storedFlowState;
+  const flowResetReason = decideFlowResetV2({
+    flowState: hydratedStoredFlowState,
+    pending: pendingRecord?.snapshot ?? null,
+    inboundText: currentInboundBatchText,
+    dateResolution,
+    catalog: services,
+    now: startedAt,
+  });
+  const flowState = flowResetReason
+    ? newFlowStateV2(id(), startedAt)
+    : hydratedStoredFlowState ?? newFlowStateV2(id(), startedAt);
   const frame: TurnFrameV2 = {
     schemaVersion: 2,
     turnId,
@@ -636,6 +692,8 @@ export async function getReceptionistReplyV2(input: {
     pending: pendingRecord?.snapshot ?? null,
     flowState,
   };
+  let copyVariant: CopyVariantIdV2 = 'canonical';
+  let variedPrimaryReply: string | null = null;
 
   const makePlan = (args: {
     route: TurnPlanReceiptV2['route'];
@@ -664,6 +722,7 @@ export async function getReceptionistReplyV2(input: {
     toolEffects: toolEffects(args.loop),
     boundaryAttempts: args.boundaryAttempts ?? [],
     recoveryKind: args.recoveryKind,
+    copyVariant,
     result: 'accepted_for_delivery',
   });
 
@@ -694,6 +753,7 @@ export async function getReceptionistReplyV2(input: {
       hasCommittedWrite: hasCommittedWrite(loop),
       canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
       elicitationVariant,
+      copyVariant,
     };
   };
 
@@ -743,6 +803,26 @@ export async function getReceptionistReplyV2(input: {
           now: startedAt,
         }
       ));
+  // Entitlement v2 deliberadamente separado do executor compartilhado: ele
+  // só é usado depois que o fast-path provou uma opção TIME autoritativa. O
+  // modelo continua sujeito ao upcomingAppointmentReadGate da rota legada.
+  const executeDuplicatePreflightRead = deps.executeProactiveDuplicateRead
+    ? async (name: string) => {
+        if (name !== 'getUpcomingAppointments') {
+          throw new Error('Tool não autorizada no preflight de duplicidade v2.');
+        }
+        return deps.executeProactiveDuplicateRead!();
+      }
+    : deps.executeTool
+      ? deps.executeTool
+      : async (name: string) => {
+          if (name !== 'getUpcomingAppointments') {
+            throw new Error('Tool não autorizada no preflight de duplicidade v2.');
+          }
+          return JSON.stringify(
+            await getCustomerUpcomingAppointmentsV2(input.phone, input.config)
+          );
+        };
 
   let primary: ModelTurnResultV2ParseResult;
   let loop = emptyLoopResult();
@@ -856,6 +936,7 @@ export async function getReceptionistReplyV2(input: {
       hasCommittedWrite: false,
       canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
       elicitationVariant,
+      copyVariant,
     };
   }
 
@@ -892,32 +973,62 @@ export async function getReceptionistReplyV2(input: {
     ...modelHistory,
   ];
 
+  const dateSlotsFastPath = await resolveDateSlotsFastPathV2({
+    frame,
+    dateResolution,
+    currentInboundText: currentInboundBatchText,
+    servicesResult: services,
+    config: input.config,
+    now: startedAt,
+    executeTool,
+  });
   const pendingReadProof = resolvePendingOptionProofV2({
     frame,
     inboundId,
     inboundText: currentInboundText,
     now: startedAt,
   });
-  const readFastPath = await resolveReadFastPathV2({
-    frame,
-    inboundText: currentInboundText,
-    servicesResult: services,
-    config: input.config,
-    duplicateResolutionProof: pendingReadProof,
-    forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
-    executeTool,
-  });
-  const initialServiceQuestionFastPath =
+  const readFastPath = dateSlotsFastPath.kind === 'continue_model'
+    ? await resolveReadFastPathV2({
+        frame,
+        inboundText: currentInboundText,
+        servicesResult: services,
+        config: input.config,
+        duplicateResolutionProof: pendingReadProof,
+        forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
+        now: startedAt,
+        executeTool,
+      })
+    : { kind: 'continue_model' as const, reason: 'date_slots_resolved' };
+  const duplicatePreflight =
+    dateSlotsFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model'
+      ? await resolveTimeDuplicatePreflightV2({
+          frame,
+          inboundId,
+          inboundText: currentInboundText,
+          currentDateResolution: dateResolution,
+          servicesResult: services,
+          config: input.config,
+          now: startedAt,
+          executeTool: executeDuplicatePreflightRead,
+        })
+      : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
+  const initialServiceQuestionFastPath =
+    dateSlotsFastPath.kind === 'continue_model' &&
+    readFastPath.kind === 'continue_model' &&
+    duplicatePreflight.kind === 'continue_model'
       ? resolveInitialServiceQuestionFastPathV2({
           frame,
-          inboundText: currentInboundText,
+          inboundText: currentInboundBatchText,
           catalog: services,
           now: startedAt,
         })
       : null;
   const selectionFastPath =
+    dateSlotsFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
+    duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved'
       ? resolveSelectionFastPathV2({
           frame,
@@ -925,10 +1036,22 @@ export async function getReceptionistReplyV2(input: {
           inboundText: currentInboundText,
           catalog: services,
           now: startedAt,
+          currentDateResolution: dateResolution,
         })
       : null;
 
-  if (readFastPath.kind === 'resolved') {
+  if (dateSlotsFastPath.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    loop = dateSlotsFastPath.loop;
+    proof = dateSlotsFastPath.proof;
+    selectionNextFlowState = dateSlotsFastPath.nextFlowState;
+    primary = {
+      ok: true,
+      value: dateSlotsFastPath.result,
+      resolutionProof: dateSlotsFastPath.proof,
+      resolutionProofRejections: [],
+    };
+  } else if (readFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = readFastPath.loop;
     proof = readFastPath.proof;
@@ -936,6 +1059,17 @@ export async function getReceptionistReplyV2(input: {
       ok: true,
       value: readFastPath.result,
       resolutionProof: readFastPath.proof,
+      resolutionProofRejections: [],
+    };
+  } else if (duplicatePreflight.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    loop = duplicatePreflight.loop;
+    proof = duplicatePreflight.proof;
+    selectionNextFlowState = duplicatePreflight.nextFlowState;
+    primary = {
+      ok: true,
+      value: duplicatePreflight.result,
+      resolutionProof: duplicatePreflight.proof,
       resolutionProofRejections: [],
     };
   } else if (initialServiceQuestionFastPath?.kind === 'resolved') {
@@ -950,6 +1084,7 @@ export async function getReceptionistReplyV2(input: {
     };
   } else if (selectionFastPath?.kind === 'resolved') {
     nominalRoute = 'fast_path';
+    if (duplicatePreflight.loop) loop = duplicatePreflight.loop;
     proof = selectionFastPath.proof;
     selectionNextFlowState = selectionFastPath.nextFlowState;
     primary = {
@@ -1015,6 +1150,17 @@ export async function getReceptionistReplyV2(input: {
     selectionNextFlowState = lifecycleOverride.nextFlowState;
   }
 
+  if (primary.ok && nominalRoute === 'fast_path') {
+    const varied = varyUnanchoredServerCopyV2({
+      result: primary.value,
+      lastVariant: stored.lastAcceptedDelivery?.copyVariant,
+      seed: frame.inputSequence,
+    });
+    primary = { ...primary, value: varied.result };
+    copyVariant = varied.variant;
+    variedPrimaryReply = varied.result.reply;
+  }
+
   const primaryRace = await checkRace('during_primary');
   if (primaryRace) {
     emitRouteComparisonShadow({
@@ -1044,7 +1190,9 @@ export async function getReceptionistReplyV2(input: {
       currentInboundIds,
       inboundTextsById,
       route: 'model',
-      pendingAnaOpen: frame.pending !== null,
+      pendingAnaOpen:
+        frame.pending !== null &&
+        frame.pending.flowId === frame.flowState.flowId,
     },
     toolTrace: loop.toolTrace as ToolTraceLike[],
     canonicalPendingQuestion:
@@ -1100,6 +1248,10 @@ export async function getReceptionistReplyV2(input: {
     return preparedPreemption(recovery.preemption, successorTurnId, loop);
   }
 
+  if (copyVariant !== 'canonical' && recovery.payload !== variedPrimaryReply) {
+    copyVariant = 'canonical';
+  }
+
   const recoveredFlowState = recovery.resolutionProof
     ? flowStateWithProof(
         { ...frame, flowState: nextFlowState },
@@ -1107,15 +1259,23 @@ export async function getReceptionistReplyV2(input: {
         services
       )
     : nextFlowState;
-  const candidate = coerceEquivalentOpenTransitionV2(
-    recovery.pendingTransitionCandidate,
-    frame,
-    recoveredFlowState
+  const candidate = adjustTransitionForFlowResetV2(
+    coerceEquivalentOpenTransitionV2(
+      recovery.pendingTransitionCandidate,
+      frame,
+      recoveredFlowState
+    ),
+    frame.pending,
+    flowResetReason
+  );
+  const committedFlowState = stampFlowOperationalActivityV2(
+    recoveredFlowState,
+    startedAt
   );
   const transition = materializeTransition(
     candidate,
     frame,
-    recoveredFlowState,
+    committedFlowState,
     services,
     nowFn(),
     id,
@@ -1138,7 +1298,7 @@ export async function getReceptionistReplyV2(input: {
   });
   return {
     kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
-    frame: { ...frame, flowState: recoveredFlowState },
+    frame: { ...frame, flowState: committedFlowState },
     conversationKey,
     phoneNumberId: input.config.phoneNumberId,
     customerPhone: input.phone,
@@ -1157,10 +1317,11 @@ export async function getReceptionistReplyV2(input: {
     successorTurnId,
     hasCommittedWrite: writeCommitted,
     canonicalPendingQuestion: canonicalPendingQuestion(
-      { ...frame, flowState: recoveredFlowState },
+      { ...frame, flowState: committedFlowState },
       services
     ),
     elicitationVariant,
+    copyVariant,
   };
 }
 

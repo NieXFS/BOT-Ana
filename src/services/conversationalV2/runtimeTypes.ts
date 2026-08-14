@@ -6,6 +6,7 @@ import type {
 } from './contracts';
 import type { MaterializedPendingTransitionV2 } from './stateStore';
 import type { ElicitationVariantV2 } from './elicitation';
+import type { CopyVariantIdV2 } from './copyVariants';
 
 export const ANA_CONVERSATIONAL_V2_PREPARED_KIND =
   'ana_conversational_v2_prepared' as const;
@@ -51,6 +52,7 @@ export interface PreparedReceptionistTurnV2 {
   hasCommittedWrite: boolean;
   canonicalPendingQuestion: string | null;
   elicitationVariant: ElicitationVariantV2;
+  copyVariant?: CopyVariantIdV2;
 }
 
 export function isPreparedReceptionistTurnV2(

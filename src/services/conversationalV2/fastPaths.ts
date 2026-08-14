@@ -14,6 +14,8 @@ import type {
 import { PENDING_FAST_PATH_MAX_AGE_MS } from './modelResultParser';
 import { buildCanonicalBookingSummaryV2 } from './lifecycleReducer';
 import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
+import { hasPositiveExplicitBookingVerbV2 } from './flowSession';
+import type { CurrentDateResolutionV2 } from './currentDateResolution';
 
 export type FastPathResultV2 =
   | { kind: 'continue_model'; reason: string }
@@ -67,6 +69,7 @@ function pendingFresh(frame: TurnFrameV2, now: Date): boolean {
   if (!frame.pending) return false;
   const askedAt = Date.parse(frame.pending.askedAt);
   return (
+    frame.pending.flowId === frame.flowState.flowId &&
     Number.isFinite(askedAt) &&
     now.getTime() - askedAt <= PENDING_FAST_PATH_MAX_AGE_MS
   );
@@ -238,26 +241,6 @@ export type InitialServiceQuestionFastPathV2 =
       nextFlowState: FlowStateV2;
     };
 
-function hasPositiveExplicitBookingVerbV2(inboundText: string): boolean {
-  const text = normalize(inboundText);
-  const matcher = /\b(?:agendar|marcar)\b/gu;
-  for (const match of text.matchAll(matcher)) {
-    const prefix = text.slice(Math.max(0, (match.index ?? 0) - 40), match.index);
-    if (/\b(?:nao|nunca)\b(?:\s+[a-z0-9]+){0,3}\s*$/u.test(prefix)) {
-      continue;
-    }
-    if (
-      /\b(?:quero|queria|gostaria de|preciso|desejo|posso|podemos|pode|vamos|vou)\s*$/u.test(
-        prefix
-      ) ||
-      /^(?:agendar|marcar)\b/u.test(text.slice(match.index ?? 0))
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 /**
  * Abertura determinística de um novo agendamento sem serviço. É allow-only:
  * verbo explícito positivo + 2+ serviços + nenhuma resolução unívoca atual.
@@ -414,7 +397,7 @@ function serviceFollowUp(
   };
 }
 
-function timeFollowUp(
+export function buildTimeSelectionFollowUpV2(
   time: string,
   frame: TurnFrameV2,
   catalog: ServicesResult
@@ -526,6 +509,7 @@ export function resolveSelectionFastPathV2(input: {
   catalog: ServicesResult;
   now: Date;
   proofVersion?: number;
+  currentDateResolution?: CurrentDateResolutionV2;
 }): FastPathResultV2 {
   const { frame, inboundId, inboundText, catalog, now } = input;
   const proofVersion = input.proofVersion ?? 1;
@@ -533,6 +517,18 @@ export function resolveSelectionFastPathV2(input: {
     return { kind: 'continue_model', reason: 'pending_older_than_4h' };
   }
   if (frame.pending?.kind === 'TIME') {
+    const dateResolution = input.currentDateResolution;
+    if (
+      dateResolution &&
+      dateResolution.kind !== 'none' &&
+      (dateResolution.kind !== 'resolved' ||
+        dateResolution.date !== frame.flowState.slotEvidence?.date)
+    ) {
+      return {
+        kind: 'continue_model',
+        reason: 'current_date_correction_preempts_time_selection',
+      };
+    }
     const pendingProof = resolvePendingOptionProofV2({
       frame,
       inboundId,
@@ -544,7 +540,7 @@ export function resolveSelectionFastPathV2(input: {
     if (pendingProof?.kind !== 'pending_option') {
       return { kind: 'continue_model', reason: 'time_option_not_evidenced' };
     }
-    const followUp = timeFollowUp(
+    const followUp = buildTimeSelectionFollowUpV2(
       pendingProof.entityId,
       frame,
       catalog

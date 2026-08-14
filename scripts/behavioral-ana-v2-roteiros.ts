@@ -7,7 +7,7 @@
  * - banco, ERP, WhatsApp e Sentry são neutralizados antes dos imports do runtime;
  * - fixtures de catálogo, agenda, transporte e estado são totalmente sintéticas;
  * - --mock-provider usa o loop nativo de tools, sem rede;
- * - --real é a única modalidade que pode chamar o DeepSeek.
+ * - --real é a única modalidade que pode chamar o provider selecionado.
  */
 
 import { mkdir, readdir, readFile, writeFile } from 'fs/promises';
@@ -50,6 +50,7 @@ import {
 } from './benchmarks/ana-v2-roteiros/scenarios';
 
 type ProviderMode = 'mock' | 'real';
+type HarnessProvider = 'deepseek' | 'openai';
 type CheckStatus = 'PASS' | 'FAIL' | 'REVIEW';
 
 interface CliOptions {
@@ -59,9 +60,11 @@ interface CliOptions {
   maxCostUsd: number | null;
   thinking: boolean;
   elicitation: ElicitationVariantV2;
+  provider: HarnessProvider;
 }
 
 interface ProviderCallMetric {
+  provider: HarnessProvider;
   kind: 'brain' | 'social' | 'regen' | 'resume_thinking';
   scenarioId: string;
   stepId: string;
@@ -230,9 +233,16 @@ interface RunContext {
 }
 
 const PRICE_PER_MILLION = {
-  promptCacheHit: 0.0028,
-  promptCacheMiss: 0.14,
-  completion: 0.28,
+  deepseek: {
+    promptCacheHit: 0.0028,
+    promptCacheMiss: 0.14,
+    completion: 0.28,
+  },
+  openai: {
+    promptCacheHit: 0.075,
+    promptCacheMiss: 0.15,
+    completion: 0.6,
+  },
 } as const;
 
 const OLD_DRY_DENIAL =
@@ -277,6 +287,7 @@ function parseArgs(argv: string[]): CliOptions {
   let scenarioIds: Set<string> | null = null;
   let maxCostUsd: number | null = null;
   let thinking = false;
+  let provider: HarnessProvider = 'deepseek';
   let elicitation: ElicitationVariantV2 = 'v1';
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
@@ -300,6 +311,16 @@ function parseArgs(argv: string[]): CliOptions {
       maxCostUsd = Number(argv[++index]);
     } else if (arg === '--thinking') {
       thinking = true;
+    } else if (arg === '--provider') {
+      const value = (argv[++index] ?? '').toLowerCase();
+      if (value === 'gpt-4o-mini') provider = 'openai';
+      else if (value === 'deepseek' || value === 'openai') provider = value;
+      else throw new Error('--provider deve ser deepseek, openai ou gpt-4o-mini.');
+    } else if (arg.startsWith('--provider=')) {
+      const value = arg.slice('--provider='.length).toLowerCase();
+      if (value === 'gpt-4o-mini') provider = 'openai';
+      else if (value === 'deepseek' || value === 'openai') provider = value;
+      else throw new Error('--provider deve ser deepseek, openai ou gpt-4o-mini.');
     } else if (arg === '--elicitation') {
       const value = (argv[++index] ?? '').toLowerCase();
       if (!['v1', 'v2', 'v3', 'v4'].includes(value)) {
@@ -314,7 +335,7 @@ function parseArgs(argv: string[]): CliOptions {
       elicitation = value as ElicitationVariantV2;
     } else if (arg === '--help' || arg === '-h') {
       console.log(
-        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
+        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--provider deepseek|openai|gpt-4o-mini] [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
       );
       process.exit(0);
     } else {
@@ -323,6 +344,9 @@ function parseArgs(argv: string[]): CliOptions {
   }
   if (!mode) {
     throw new Error('Informe obrigatoriamente --mock-provider ou --real.');
+  }
+  if (provider === 'openai' && thinking) {
+    throw new Error('--thinking é exclusivo do braço DeepSeek.');
   }
   if (!Number.isInteger(repeats) || repeats < 1 || repeats > 20) {
     throw new Error('--repeats deve ser inteiro entre 1 e 20.');
@@ -339,14 +363,21 @@ function parseArgs(argv: string[]): CliOptions {
       throw new Error(`Roteiro desconhecido em --ids: ${id}`);
     }
   }
-  return { mode, repeats, scenarioIds, maxCostUsd, thinking, elicitation };
+  return {
+    mode,
+    repeats,
+    scenarioIds,
+    maxCostUsd,
+    thinking,
+    elicitation,
+    provider,
+  };
 }
 
 function neutralizeEnvironment(options: CliOptions): void {
   process.env.NODE_ENV = 'test';
   process.env.DATABASE_URL =
     'postgresql://fixture:fixture@127.0.0.1:1/ana_v2_roteiros';
-  process.env.OPENAI_API_KEY ||= 'sk-fixture-no-openai-network';
   process.env.ERP_API_TOKEN = 'fixture-no-erp-token';
   process.env.RECEPS_INTERNAL_API_URL = 'http://127.0.0.1:1';
   process.env.RECEPS_IA_INTERNAL_API_URL = 'http://127.0.0.1:1';
@@ -357,9 +388,22 @@ function neutralizeEnvironment(options: CliOptions): void {
   process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS = ROTEIROS_TENANT_SLUG;
   process.env.ANA_CONVERSATIONAL_V2_ELICITATION = options.elicitation;
   if (options.mode === 'mock') {
+    process.env.OPENAI_API_KEY = 'sk-mock-provider-no-network';
     process.env.DEEPSEEK_API_KEY = 'mock-provider-no-network';
-  } else if (!process.env.DEEPSEEK_API_KEY?.trim()) {
-    throw new Error('--real exige DEEPSEEK_API_KEY no ambiente.');
+  } else if (options.provider === 'deepseek') {
+    process.env.OPENAI_API_KEY ||= 'sk-fixture-no-openai-network';
+    if (!process.env.DEEPSEEK_API_KEY?.trim()) {
+      throw new Error('--real --provider deepseek exige DEEPSEEK_API_KEY.');
+    }
+  } else {
+    if (!process.env.OPENAI_API_KEY?.trim()) {
+      throw new Error('--real --provider openai exige OPENAI_API_KEY.');
+    }
+    const includesR10 =
+      !options.scenarioIds || options.scenarioIds.has('R10');
+    if (includesR10 && !process.env.DEEPSEEK_API_KEY?.trim()) {
+      throw new Error('R10 real mantém o chefe Thinking e exige DEEPSEEK_API_KEY.');
+    }
   }
 }
 
@@ -414,16 +458,18 @@ function estimatedCost(input: {
   completionTokens: number;
   cachedPromptTokens: number | null;
   cacheMissPromptTokens: number | null;
+  provider: HarnessProvider;
 }): number {
   const cached = Math.max(0, input.cachedPromptTokens ?? 0);
   const miss = Math.max(
     0,
     input.cacheMissPromptTokens ?? input.promptTokens - cached
   );
+  const pricing = PRICE_PER_MILLION[input.provider];
   return (
-    (cached * PRICE_PER_MILLION.promptCacheHit +
-      miss * PRICE_PER_MILLION.promptCacheMiss +
-      Math.max(0, input.completionTokens) * PRICE_PER_MILLION.completion) /
+    (cached * pricing.promptCacheHit +
+      miss * pricing.promptCacheMiss +
+      Math.max(0, input.completionTokens) * pricing.completion) /
     1_000_000
   );
 }
@@ -434,7 +480,8 @@ function metricFromCompletion(
   kind: ProviderCallMetric['kind'],
   scenarioId: string,
   stepId: string,
-  repetition: number
+  repetition: number,
+  provider: HarnessProvider = 'deepseek'
 ): ProviderCallMetric {
   const usage = completion.usage as
     | (NonNullable<OpenAI.Chat.Completions.ChatCompletion['usage']> & {
@@ -449,6 +496,7 @@ function metricFromCompletion(
     usage?.prompt_tokens_details?.cached_tokens ??
     null;
   const metric: ProviderCallMetric = {
+    provider,
     kind,
     scenarioId,
     stepId,
@@ -1169,6 +1217,24 @@ function mockCompletionForBehavior(
       ...(thinking ? { reasoningContent: MOCK_REASONING_SENTINEL } : {}),
     });
   }
+  if (behavior === 'R4_DRAINAGE_TYPO' && repetition === 2) {
+    const faithful = mockModelResult(behavior, data);
+    const structured = mockStructuredOutput(
+      flatMockResult(
+        {
+          ...faithful,
+          reply:
+            'Boa tarde! Sim, fazemos drenagem linfática, que dura 50 minutos e custa R$ 160,00. Gostaria de agendar?',
+        },
+        data
+      ),
+      repetition
+    );
+    return syntheticCompletion({
+      content: structured.raw,
+      ...(thinking ? { reasoningContent: MOCK_REASONING_SENTINEL } : {}),
+    });
+  }
   if (behavior === 'R10_SATURDAY' && repetition === 1) {
     observedVariants.add('safe_primary_prose_preserve');
     if (elicitation === 'v3') {
@@ -1208,6 +1274,11 @@ function mockSocialReply(step: RoteiroStep): string {
 
 function buildArmConfig(options: CliOptions) {
   const config = buildRoteirosConfig();
+  if (options.provider === 'openai') {
+    config.aiProvider = 'openai';
+    config.aiModel = 'gpt-4o-mini';
+    config.openaiApiKey = null;
+  }
   if (options.thinking) config.aiMaxTokens = 8_192;
   return config;
 }
@@ -1335,7 +1406,8 @@ async function trackedCompletion(
     kind,
     session.scenarioId,
     step.id,
-    session.repetition
+    session.repetition,
+    kind === 'resume_thinking' ? 'deepseek' : ctx.options.provider
   );
   ctx.calls.push(metric);
   return response;
@@ -1387,7 +1459,8 @@ async function resolveTurnControlForStep(
             'resume_thinking',
             session.scenarioId,
             step.id,
-            session.repetition
+            session.repetition,
+            'deepseek'
           );
           ctx.calls.push(metric);
           return raw;
@@ -1729,7 +1802,14 @@ function deterministicChecks(input: {
       checks.push(pass('weekday_not_service', pendingAfter?.flowState?.fixedServiceId !== ROTEIROS_IDS.service.limpeza, 'segunda nua não fixou a segunda opção'));
       break;
     case 'R4.1':
-      checks.push(pass('typo_drainage_fixed', pendingAfter?.flowState?.fixedServiceId === ROTEIROS_IDS.service.drenagem, 'typo distância 1 fixou Drenagem'));
+      checks.push(
+        review(
+          'semantic:typo_drainage_state',
+          pendingAfter?.flowState?.fixedServiceId === ROTEIROS_IDS.service.drenagem
+            ? 'pergunta informacional com typo também fixou Drenagem; revisar continuidade'
+            : 'fixação de serviço não é requisito determinístico para responder à pergunta informacional; revisar continuidade'
+        )
+      );
       break;
     case 'R4.2':
       checks.push(pass('partial_peeling_fixed', pendingAfter?.flowState?.fixedServiceId === ROTEIROS_IDS.service.peeling, 'token peeling fixou Peeling'));
@@ -1738,7 +1818,12 @@ function deterministicChecks(input: {
       const money = payload.match(/R\$\s*\d+(?:[.,]\d{2})?/g) ?? [];
       checks.push(
         pass('cleaning_price', money.length === 1 && /R\$\s*180(?:[.,]00)?/.test(money[0]!), 'preço fixture de Limpeza sem outro valor'),
-        pass('price_service_fixed', pendingAfter?.flowState?.fixedServiceId === ROTEIROS_IDS.service.limpeza, 'consulta de preço fixou Limpeza')
+        review(
+          'semantic:price_service_state',
+          pendingAfter?.flowState?.fixedServiceId === ROTEIROS_IDS.service.limpeza
+            ? 'consulta de preço também fixou Limpeza; revisar naturalidade'
+            : 'fixação de serviço não é requisito determinístico para responder preço; revisar continuidade humana'
+        )
       );
       break;
     }
@@ -1962,7 +2047,8 @@ async function runCustomerTurn(
               'brain',
               session.scenarioId,
               step.id,
-              session.repetition
+              session.repetition,
+              ctx.options.provider
             )
           );
           recordModelOutput(session, {
@@ -2044,7 +2130,8 @@ async function runCustomerTurn(
               'social',
               session.scenarioId,
               step.id,
-              session.repetition
+              session.repetition,
+              ctx.options.provider
             )
           );
           recordModelOutput(session, {
@@ -2168,7 +2255,8 @@ async function runCustomerTurn(
               'regen',
               session.scenarioId,
               step.id,
-              session.repetition
+              session.repetition,
+              ctx.options.provider
             )
           );
         } else {
@@ -2496,8 +2584,8 @@ function markdownReport(input: {
 
 - Início: ${input.startedAt}
 - Fim: ${input.finishedAt}
-- Provider: ${input.options.mode === 'mock' ? 'mock offline' : 'DeepSeek real'}
-- Braço: ${input.options.thinking ? 'Thinking enabled' : 'Flash non-thinking'}
+- Provider: ${input.options.mode === 'mock' ? `mock offline (${input.options.provider})` : `${input.options.provider} real`}
+- Braço: ${input.options.provider === 'openai' ? 'gpt-4o-mini' : input.options.thinking ? 'Thinking enabled' : 'Flash non-thinking'}
 - Elicitação: ${input.options.elicitation}
 - Repetições: ${input.options.repeats}
 - Chamadas: ${input.calls.length}
@@ -2605,6 +2693,7 @@ async function findComparableArmReport(
       );
       if (
         parsed.mode === current.mode &&
+        (parsed.provider ?? 'deepseek') === current.provider &&
         parsed.schemaVersion === current.schemaVersion &&
         parsed.repeats === current.repeats &&
         parsed.elicitationVariant === current.elicitationVariant &&
@@ -2711,7 +2800,10 @@ async function main(): Promise<void> {
     console.info = originalInfo;
   }
   const summaries = summarizeSteps(runs);
-  if (options.mode === 'mock') {
+  // As meta-provas de variantes pertencem à matriz inteira. `--ids` continua
+  // útil para sondas focadas sem fingir que um subconjunto exerceu cenários
+  // que deliberadamente não foram selecionados.
+  if (options.mode === 'mock' && selected.length === ANA_V2_ROTEIROS.length) {
     const expectedVariants = new Set<MockUnwrapVariant>(['plain_json']);
     expectedVariants.add('safe_primary_prose_preserve');
     expectedVariants.add('canonical_write_over_unparsed_prose');
@@ -2778,7 +2870,11 @@ async function main(): Promise<void> {
   }
   const finishedAt = new Date().toISOString();
   const timestamp = startedAt.replace(/[:.]/g, '-');
-  const arm = options.thinking ? 'thinking' : 'flash';
+  const arm = options.provider === 'openai'
+    ? 'gpt-4o-mini'
+    : options.thinking
+      ? 'thinking'
+      : 'flash';
   const outputParent = path.resolve(
     process.cwd(),
     'benchmark-results',
@@ -2804,6 +2900,7 @@ async function main(): Promise<void> {
   if (
     options.mode === 'mock' &&
     options.thinking &&
+    ctx.calls.some((call) => call.kind !== 'resume_thinking') &&
     !ctx.calls.some(
       (call) => call.kind !== 'resume_thinking' && (call.reasoningTokens ?? 0) > 0
     )
@@ -2816,13 +2913,14 @@ async function main(): Promise<void> {
     startedAt,
     finishedAt,
     mode: options.mode,
+    provider: options.provider,
     arm,
     elicitationVariant: options.elicitation,
     thinkingMode: options.thinking ? 'enabled' : 'disabled',
     repeats: options.repeats,
     selectedScenarioIds: selected.map((scenario) => scenario.id),
     syntheticFixture: true,
-    pricingUsdPerMillionTokens: PRICE_PER_MILLION,
+    pricingUsdPerMillionTokens: PRICE_PER_MILLION[options.provider],
     ...(options.mode === 'mock'
       ? { mockUnwrapVariants: [...ctx.mockUnwrapVariants].sort() }
       : {}),
@@ -2871,11 +2969,13 @@ async function main(): Promise<void> {
     'utf8'
   );
   const oppositeArm = arm === 'flash' ? 'thinking' : 'flash';
-  const counterpart = await findComparableArmReport(
-    outputParent,
-    oppositeArm,
-    rawReport
-  );
+  const counterpart = options.provider === 'deepseek'
+    ? await findComparableArmReport(
+        outputParent,
+        oppositeArm,
+        rawReport
+      )
+    : null;
   let comparisonPath: string | null = null;
   if (counterpart) {
     const flash = arm === 'flash' ? rawReport : counterpart;

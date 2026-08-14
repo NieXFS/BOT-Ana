@@ -261,6 +261,8 @@ const baseDeps = (store: MemoryConversationalV2StateStore) => ({
   loadServices: async () => services,
   loadHistory: async () => [],
   isPaused: async () => false,
+  executeProactiveDuplicateRead: async () =>
+    JSON.stringify({ success: true, appointments: [] }),
 });
 
 async function main(): Promise<void> {
@@ -647,7 +649,11 @@ async function main(): Promise<void> {
     'TIME'
   );
   assert.deepEqual(reducerSlots?.nextFlowState.slotEvidence?.slots, ['14:00', '15:00']);
-  assert.match(reducerSlots?.result.reply ?? '', /^Obrigada! Encontrei estes horários:/);
+  assert.match(
+    reducerSlots?.result.reply ?? '',
+    /^Obrigada! Encontrei horários para 14\/08\/2026:/,
+    'oferta canônica inclui a data civil legível'
+  );
 
   // A3 kill: TIME de hoje nunca pode sobreviver a uma leitura nova de amanhã.
   const todayTimePending = pending({

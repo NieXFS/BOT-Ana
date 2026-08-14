@@ -47,6 +47,7 @@
     "smoke:ana-conversational-v2-persistence": "DATABASE_URL=${ANA_CONVERSATIONAL_V2_SMOKE_DATABASE_URL:-postgresql://smoke:smoke@127.0.0.1:1/smoke} OPENAI_API_KEY=sk-smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-persistence.ts",
     "smoke:ana-conversational-v2-route": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-route.ts",
     "smoke:ana-conversational-v2-social-reads": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-social-reads.ts",
+    "smoke:ana-conversational-v2-wave1": "ts-node -T scripts/smoke-ana-conversational-v2-wave1.ts",
     "smoke:ana-technical-maintenance": "npx tsx scripts/smoke-ana-technical-maintenance.ts",
     "smoke:listen-while-paused": "npx tsx scripts/smoke-listen-while-paused.ts",
     "smoke:conversation-activity": "npx tsx scripts/smoke-conversation-activity.ts",

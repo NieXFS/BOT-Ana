@@ -14,6 +14,7 @@ import type {
   TurnFrameV2,
 } from './contracts';
 import { hasPositiveClauseMatchV2 } from './polarity';
+import { displayDateV2 } from './lifecycleReducer';
 
 const UPCOMING_READ_REQUEST_RE =
   /\b(?:(?:ver|consultar|conferir|mostrar|mostra|lembrar|lembra)\b(?:\s+\w+){0,7}\b(?:agendamentos?|horarios?|marcacoes?)|(?:meus?|minhas?)\s+(?:agendamentos?|horarios?|marcacoes?)|(?:quando|qual\s+dia|que\s+dia|que\s+horario)\b(?:\s+\w+){0,6}\b(?:agendamento|horario|marcado)|(?:tenho|tem)\b(?:\s+\w+){0,5}\b(?:agendamento|horario)\b|(?:remarcar|reagendar|cancelar|desmarcar)\b)/gu;
@@ -22,6 +23,7 @@ const AVAILABILITY_READ_REQUEST_RE =
 
 export type ReadFastPathReasonV2 =
   | 'customer_identity_ambiguous'
+  | 'customer_identity_mismatch'
   | 'service_not_resolved'
   | 'date_not_resolved'
   | 'professional_selection'
@@ -98,6 +100,7 @@ function reasonFromResult(
   if (
     [
       'customer_identity_ambiguous',
+      'customer_identity_mismatch',
       'service_not_resolved',
       'date_not_resolved',
       'professional_selection',
@@ -119,7 +122,10 @@ export function canonicalReadFailureCopyV2(
   read: 'upcoming' | 'availability',
   reason: ReadFastPathReasonV2
 ): string {
-  if (reason === 'customer_identity_ambiguous') {
+  if (
+    reason === 'customer_identity_ambiguous' ||
+    reason === 'customer_identity_mismatch'
+  ) {
     return 'Não consegui identificar com segurança qual cadastro consultar. Confira os dados e tente novamente.';
   }
   if (reason === 'rate_limited') {
@@ -207,7 +213,8 @@ function validSlots(parsed: Record<string, unknown>): string[] | null {
 
 function availabilitySuccessResult(
   parsed: Record<string, unknown>,
-  frame: TurnFrameV2
+  frame: TurnFrameV2,
+  date: string
 ): ModelTurnResultV2 | null {
   const slots = validSlots(parsed);
   if (!slots) return null;
@@ -228,7 +235,7 @@ function availabilitySuccessResult(
   }
   return {
     schemaVersion: 2,
-    reply: `Tenho estes horários disponíveis: ${slots.join(', ')}. Qual você prefere?`,
+    reply: `Tenho estes horários disponíveis para ${displayDateV2(date)}: ${slots.join(', ')}. Qual você prefere?`,
     replyPurpose: 'DATE_TIME_QUESTION',
     pendingTransitionCandidate: {
       kind: 'open',
@@ -277,6 +284,7 @@ export async function resolveReadFastPathV2(input: {
   config: TenantBotConfig;
   duplicateResolutionProof?: ResolutionProof | null;
   forceUpcomingRead?: boolean;
+  now?: Date;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<ReadFastPathResultV2> {
   const explicitUpcoming = hasExplicitUpcomingReadRequestV2(input.inboundText);
@@ -332,6 +340,17 @@ export async function resolveReadFastPathV2(input: {
   if (!date) {
     return { kind: 'continue_model', reason: 'date_not_resolved' };
   }
+  const today = input.now
+    ? new Intl.DateTimeFormat('en-CA', {
+        timeZone: input.config.timezone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(input.now)
+    : null;
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(date) || (today !== null && date < today)) {
+    return { kind: 'continue_model', reason: 'past_or_invalid_state_date' };
+  }
   const professionalGate = professionalSelectionGate({
     serviceId,
     professionalId: input.frame.flowState.fixedProfessionalId,
@@ -360,7 +379,7 @@ export async function resolveReadFastPathV2(input: {
   };
   const successResult =
     read.parsed?.success === true
-      ? availabilitySuccessResult(read.parsed, input.frame)
+      ? availabilitySuccessResult(read.parsed, input.frame, date)
       : null;
   const result: ModelTurnResultV2 = successResult ?? {
     schemaVersion: 2,

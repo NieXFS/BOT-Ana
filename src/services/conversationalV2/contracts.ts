@@ -1,4 +1,5 @@
 import type { HumanControlDisposition } from '../receptionistTurnDecision';
+import type { CopyVariantIdV2 } from './copyVariants';
 
 export const MODEL_REPLY_PURPOSES_V2 = [
   'SOCIAL',
@@ -94,6 +95,8 @@ export interface SlotEvidenceV2 {
 
 export interface FlowStateV2 {
   readonly flowId: string;
+  /** Relógio server-owned do último avanço operacional commitado. */
+  readonly lastOperationalAt?: string;
   readonly fixedServiceId?: string;
   readonly fixedProfessionalId?: string;
   readonly resolvedDate?: string;
@@ -307,6 +310,8 @@ export interface TurnPlanReceiptV2 {
     | 'regen'
     | 'canonical_write_confirmation'
     | 'direct_fallback';
+  /** Proveniência técnica da copy; nunca contém texto da conversa. */
+  copyVariant?: CopyVariantIdV2;
   result: 'accepted_for_delivery';
 }
 

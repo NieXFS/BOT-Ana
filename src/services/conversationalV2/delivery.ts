@@ -308,6 +308,7 @@ export async function deliverPreparedReceptionistTurnV2(
     assistantText: payload,
     transition: prepared.transition,
     deliveryReceipt: acceptedReceipt,
+    copyVariant: prepared.copyVariant ?? 'canonical',
   };
 
   try {

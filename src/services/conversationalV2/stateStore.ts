@@ -6,6 +6,7 @@ import type {
   TurnDeliveryReceiptV2,
   TurnPlanReceiptV2,
 } from './contracts';
+import type { CopyVariantIdV2 } from './copyVariants';
 
 export const PENDING_FRAME_TTL_MS_V2 = 24 * 60 * 60 * 1_000;
 export const OUTBOX_TRANSPORT_STALE_MS_V2 = 2 * 60 * 1_000;
@@ -78,6 +79,7 @@ export interface AcceptedCommitPayloadV2 {
   assistantText: string;
   transition: MaterializedPendingTransitionV2;
   deliveryReceipt: TurnDeliveryReceiptV2;
+  copyVariant?: CopyVariantIdV2;
 }
 
 export interface OutboundOutboxRecordV2 {
@@ -111,6 +113,7 @@ export interface AcceptedDeliveryEvidenceV2 {
   readonly transition: MaterializedPendingTransitionV2;
   readonly conversationCommitOutcome: TurnDeliveryReceiptV2['conversationCommitOutcome'];
   readonly pendingCommitOutcome: TurnDeliveryReceiptV2['pendingCommitOutcome'];
+  readonly copyVariant: CopyVariantIdV2;
 }
 
 export interface DurableSuccessorBatchV2 {
@@ -307,7 +310,10 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
       })[0];
     return {
       pending: open ? clone(open) : null,
-      flowState: latest ? clone(latest.flowState) : null,
+      // Uma linha EXPIRED continua física por auditoria, mas nunca ressuscita
+      // o flowState operacional da sessão encerrada.
+      flowState:
+        latest && latest.state !== 'EXPIRED' ? clone(latest.flowState) : null,
       lastAcceptedDelivery: lastAccepted?.commitPayload
         ? {
             payload: lastAccepted.payload,
@@ -318,6 +324,7 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
                 .conversationCommitOutcome,
             pendingCommitOutcome:
               lastAccepted.commitPayload.deliveryReceipt.pendingCommitOutcome,
+            copyVariant: lastAccepted.commitPayload.copyVariant ?? 'canonical',
           }
         : null,
     };
@@ -1199,7 +1206,10 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
       : null;
     return {
       pending: open,
-      flowState: latest.rows[0]?.flow_state_json ?? null,
+      flowState:
+        latest.rows[0] && latest.rows[0].state !== 'EXPIRED'
+          ? latest.rows[0].flow_state_json
+          : null,
       lastAcceptedDelivery: lastAccepted?.commitPayload
         ? {
             payload: lastAccepted.payload,
@@ -1210,6 +1220,7 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
                 .conversationCommitOutcome,
             pendingCommitOutcome:
               lastAccepted.commitPayload.deliveryReceipt.pendingCommitOutcome,
+            copyVariant: lastAccepted.commitPayload.copyVariant ?? 'canonical',
           }
         : null,
     };

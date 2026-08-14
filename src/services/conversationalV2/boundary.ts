@@ -545,8 +545,6 @@ export function isCatalogOnlyServiceOfferSpanV2(
       /\b(?:e\s+)?(?:(?:se|caso)\s+(?:voce\s+)?(?:quiser|preferir)\s+)?(?:(?:podemos|posso)\s+(?:te\s+)?(?:ajudar\s+a\s+)?|(?:voce\s+)?(?:quer|deseja|gostaria\s+de)\s+)(?:agendar|marcar|verificar)(?:\s+(?:os?|um|uma)\s+)?(?:horarios?|dia|data)?\b[\s\S]*$/gu,
       ' '
     )
-    .replace(/\b\d+\s*(?:min|minutos?)\b/gu, ' ')
-    .replace(/\br\s*\$?\s*\d+(?:[.,]\d{1,2})?\b/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim();
   if (/^(?:sim|claro|certamente|com certeza)$/u.test(remainder)) {
@@ -577,15 +575,54 @@ export function isCatalogOnlyServiceOfferSpanV2(
     'servico', 'servicos', 'procedimento', 'procedimentos', 'sim', 'claro',
     'tambem', 'certamente', 'por', 'favor',
   ]);
+  const stripTypedMetadataAfterResolution = (segment: string): string =>
+    segment
+      // Orações de duração. A entidade já foi resolvida antes deste limpador;
+      // portanto estes fatos deixam de participar apenas do nome do serviço.
+      .replace(
+        /\s*,?\s*(?:que\s+)?(?:dura|leva|demora)\s+\d+(?:[.,]\d+)?\s*(?:min(?:uto)?s?|h|horas?)\b/gu,
+        ' '
+      )
+      .replace(
+        /\s*,?\s*(?:com\s+)?duracao\s+(?:de\s+)?\d+(?:[.,]\d+)?\s*(?:min(?:uto)?s?|h|horas?)\b/gu,
+        ' '
+      )
+      // Orações de preço. UNKNOWN_PRICE continua validando o valor no
+      // candidato integral; aqui só retiramos a cauda do span de serviço.
+      .replace(
+        /\s*,?\s*(?:e\s+)?(?:custa|sai\s+por)\s+(?:r\s*\$\s*)?\d+(?:[.,]\d{1,2})?(?:\s*reais?)?\b/gu,
+        ' '
+      )
+      .replace(
+        /\s*,?\s*(?:e\s+)?(?:por|a\s+partir\s+de)\s+r\s*\$\s*\d+(?:[.,]\d{1,2})?\b/gu,
+        ' '
+      )
+      // Formas parentéticas/telegráficas já usadas nas copies canônicas.
+      .replace(/\b\d+(?:[.,]\d+)?\s*(?:min(?:uto)?s?|h|horas?)\b/gu, ' ')
+      .replace(/\br\s*\$\s*\d+(?:[.,]\d{1,2})?\b/gu, ' ')
+      .replace(/(?:^|\s)[,()]+|[,()]+(?:\s|$)/gu, ' ')
+      .replace(/\s+/gu, ' ')
+      .trim();
   const isKnownSegment = (segment: string): boolean => {
-    const tokens = segment.split(/[^a-z0-9]+/gu).filter(Boolean);
+    const canonical = resolveCatalogEntityV2(segment, catalogEntities);
+    if (canonical.kind !== 'resolved') return false;
+    const cleanedSegment = stripTypedMetadataAfterResolution(segment);
+    const cleanedResolution = resolveCatalogEntityV2(
+      cleanedSegment,
+      catalogEntities
+    );
+    if (
+      cleanedResolution.kind !== 'resolved' ||
+      cleanedResolution.entity.id !== canonical.entity.id
+    ) {
+      return false;
+    }
+    const tokens = cleanedSegment.split(/[^a-z0-9]+/gu).filter(Boolean);
     const substantiveTokens = tokens.filter((token) => !allowed.has(token));
     if (substantiveTokens.length === 0) return false;
 
-    const canonical = resolveCatalogEntityV2(segment, catalogEntities);
-    if (canonical.kind !== 'resolved') return false;
     const baseResolution = resolveUniqueCatalogEntityFromCurrentMessage(
-      segment,
+      cleanedSegment,
       catalogEntities,
       { allowRestrictedDistanceTwo: false }
     );
