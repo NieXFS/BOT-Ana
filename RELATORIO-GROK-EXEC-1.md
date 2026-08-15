@@ -939,3 +939,55 @@ Sem deploy. Sem push. Sem chamada real. Behavioral/roteiros não foram alterados
 - O protocolo e a recuperação estão provados por builders/factories sem rede; só o run `--real` autorizado pelo coordenador confirma o eco concreto atual da Luna.
 - No próximo `--real`, `judge_call_failed` produzirá JSON completo e exit `1`; o coordenador deve guardar/analisar o JSON antes de rerodar. `judged` mantém exit `0`.
 - A matriz viva continua sendo o próximo gate; nenhuma conclusão de tom foi inferida destes smokes.
+
+## Exec IA-2 — adendo D-DESC congelado e fallback por ato de fala
+
+**Status:** implementado e validado localmente sobre `ca3b595`; sem deploy, push, `--real` ou alteração no ERP. Executor: **GPT-5.6 Sol**, pela exceção de executor autorizada pelo Victor durante a indisponibilidade do transporte Grok/Cursor. O checkout permaneceu no `HEAD` destacado recebido; nenhuma branch foi trocada.
+
+### Escopo entregue
+
+1. **Revisão 5 do contrato.** O pacote D-DESC-1..4 convergido foi registrado, incluindo a emenda vinculante do Victor: `LicensedServiceDescriptionV2` usa aceite versionado do Termo de Responsabilidade do Estabelecimento em vez de policiamento lexical; PII/limites/neutralização estrutural permanecem; D-DESC-1, D-DESC-2 e D-DESC-4 continuam sem runtime nesta exec.
+2. **Classificação tipada.** Novo `RecoveryFallbackIntentV2 = ANSWER_TO_PENDING | INFORMATION_QUESTION | TRANSACTION_REQUEST | OTHER`. A função pura recebe o batch completo, tenta primeiro a prova/matcher fechado de `PendingFrame`, impede que pergunta informacional com nome de catálogo seja promovida a seleção e distingue pedido transacional explícito de `?` genérico.
+3. **Integração no runtime.** `currentInboundBatchText` é classificado imediatamente antes de `coordinateRecoveryV2`; `boundaryContext.sourceInboundText` não é usado para essa decisão.
+4. **Precedência do recovery.** Identidade e write canônico permanecem soberanos. Pendência só é repetida para `ANSWER_TO_PENDING` ou `OTHER` genuinamente ambíguo; pergunta/transação nova usa sua copy própria e preserva a pendência no estado. Catálogo indisponível só preempta quando material ao intent/pending.
+5. **Quatro copies canônicas.** A antiga moldura de escolha foi mantida somente em `ANSWER_TO_PENDING`; pergunta, transação e `OTHER` receberam exatamente as copies convergidas. Todas continuam `CANONICAL`, passam pela mesma `BoundaryEvaluation` e não habilitam voz em recovery.
+
+### Fixtures e regressões
+
+Nova suíte `smoke:ana-conversational-v2-fallback-intent`: pergunta com e sem `?`; transcript real `Como funciona a Drenagem(`; candidato bloqueado por `FALSE_WRITE_CLAIM` + regen falha ⇒ copy `INFORMATION_QUESTION`; `pode ser drenagem?` em SERVICE; `15h?` em TIME; ordinal interrogativo; pergunta nova com pendência preservada e não repetida; `Quero agendar` com pendência sem falso slot-fill; pergunta de preço com serviço sem falso slot-fill; pedido de remarcação após regen falha; anti-repetição da pergunta pendente.
+
+### Arquivos
+
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md`
+- `src/services/conversationalV2/recoveryFallbackIntent.ts` (novo)
+- `src/services/conversationalV2/recoveryCoordinator.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `scripts/smoke-ana-conversational-v2-fallback-intent.ts` (novo)
+- `scripts/smoke-ana-conversational-v2-recovery.ts`
+- `package.json`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validações (exit real)
+
+| Comando | exit | resultado |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | tipo obrigatório propagado ao runtime/coordinator |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | regressões D-DESC-3 verdes |
+| `npm run smoke:ana-conversational-v2-recovery` | 0 | recovery existente adaptado |
+| `npm run smoke:ana-conversational-v2-contracts` | 0 | contratos v2 intactos |
+| `npm run smoke:ana-conversational-v2-boundary` | 0 | copies CANONICAL aceitas |
+| `npm run smoke:ana-conversational-v2-route` | 0 | integração runtime/delivery verde |
+| `npm run smoke:ana-conversational-v2-social-reads` | 0 | social/read recovery intacto |
+| `npm run smoke:ana-conversational-v2-voice` | 0 | recovery continua sem voz/proveniência indevida |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | fast-paths/PendingFrame intactos |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 e `recoveryKind` intactos |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; juiz `mock_harness/not_run` |
+
+### Riscos e gates restantes
+
+- D-DESC-1, D-DESC-2 e D-DESC-4 foram apenas congelados no contrato; não existe payload ERP, decisor procedural, cláusula licenciada ou promoção nova nesta exec.
+- O classificador é intencionalmente determinístico e conservador. Linguagem não testemunhada cai em `OTHER`; com pendência OPEN isso reancora, sem transformar texto aberto em escolha.
+- O texto jurídico do termo continua pendente na fila de `/termos` e qualquer troca exigirá nova versão/hash.
+- A lente adversarial retroativa do Grok continua gate obrigatório antes do deploy destas features. Nenhum deploy foi executado.

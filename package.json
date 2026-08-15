@@ -48,6 +48,7 @@
     "smoke:ana-conversational-v2-contracts": "ts-node -T scripts/smoke-ana-conversational-v2-contracts.ts",
     "smoke:ana-conversational-v2-boundary": "ts-node -T scripts/smoke-ana-conversational-v2-boundary.ts",
     "smoke:ana-conversational-v2-recovery": "ts-node -T scripts/smoke-ana-conversational-v2-recovery.ts",
+    "smoke:ana-conversational-v2-fallback-intent": "ts-node -T scripts/smoke-ana-conversational-v2-fallback-intent.ts",
     "smoke:ana-conversational-v2-persistence": "DATABASE_URL=${ANA_CONVERSATIONAL_V2_SMOKE_DATABASE_URL:-postgresql://smoke:smoke@127.0.0.1:1/smoke} OPENAI_API_KEY=sk-smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-persistence.ts",
     "smoke:ana-conversational-v2-route": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-route.ts",
     "smoke:ana-conversational-v2-social-reads": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-social-reads.ts",

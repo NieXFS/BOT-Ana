@@ -103,6 +103,7 @@ import {
   redactPendingTransitionCandidateV2,
 } from './receipts';
 import { coordinateRecoveryV2 } from './recoveryCoordinator';
+import { classifyRecoveryFallbackIntentV2 } from './recoveryFallbackIntent';
 import {
   regenerateReceptionistCopyV2,
   type RegenerationResultV2,
@@ -2042,8 +2043,17 @@ export async function getReceptionistReplyV2(input: {
     regenerationSystemFingerprint = regenerated.systemFingerprint ?? null;
     return regenerated;
   };
+  const recoveryFrame = { ...frame, flowState: nextFlowState };
+  const recoveryFallbackIntent = classifyRecoveryFallbackIntentV2({
+    frame: recoveryFrame,
+    inboundId,
+    inboundText: currentInboundBatchText,
+    servicesResult: services,
+    now: startedAt,
+    lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
+  });
   const recovery = await coordinateRecoveryV2({
-    frame: { ...frame, flowState: nextFlowState },
+    frame: recoveryFrame,
     primaryResult: primary,
     unparsedCandidate: primary.ok ? undefined : loop.rawReply ?? undefined,
     boundaryContext: {
@@ -2061,6 +2071,7 @@ export async function getReceptionistReplyV2(input: {
         : [],
     },
     toolTrace: loop.toolTrace as ToolTraceLike[],
+    fallbackIntent: recoveryFallbackIntent,
     canonicalPendingQuestion:
       canonicalPendingQuestion(
         { ...frame, flowState: nextFlowState },

@@ -320,6 +320,7 @@ function parsed(result: ModelTurnResultV2): ModelTurnResultV2ParseResult {
 
 const baseInput = {
   frame,
+  fallbackIntent: 'TRANSACTION_REQUEST',
   boundaryContext: {
     servicesResult,
     sourceInboundText: 'Quero agendar amanhã',
@@ -328,7 +329,7 @@ const baseInput = {
   },
 } satisfies Pick<
   RecoveryCoordinatorInputV2,
-  'frame' | 'boundaryContext'
+  'frame' | 'fallbackIntent' | 'boundaryContext'
 >;
 
 const invalidEnvelope = {
@@ -521,6 +522,7 @@ const parsePersonal = (result: ModelTurnResultV2): ModelTurnResultV2ParseResult 
 let personalRegenCalls = 0;
 const personalDriftRecovery = await coordinateRecoveryV2({
   frame: personalFrame,
+  fallbackIntent: 'OTHER',
   boundaryContext: {
     servicesResult,
     route: 'model',
@@ -631,6 +633,7 @@ const pendingFrame: TurnFrameV2 = {
 const pendingFallback = await coordinateRecoveryV2({
   ...baseInput,
   frame: pendingFrame,
+  fallbackIntent: 'OTHER',
   primaryResult: {
     ok: false,
     issues: [{ code: 'INVALID_JSON', path: '$' }],
