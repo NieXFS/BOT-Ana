@@ -9,11 +9,12 @@ import type {
   ReceptionistModelLoopResult,
   ReceptionistToolTraceEntry,
 } from '../brainService';
-import type { ServicesResult, UpcomingAppointment } from '../calendarService';
+import { filterSlotsAtOrAfterNow, type ServicesResult, type UpcomingAppointment } from '../calendarService';
 import { professionalSelectionGate } from '../professional-selection-gate';
 import {
   ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
   resolveUniqueCatalogEntityFromCurrentMessage,
+  resolveUniqueCatalogEntityFromCurrentMessageForRead,
 } from '../service-gate';
 import type {
   FlowStateV2,
@@ -33,8 +34,11 @@ import {
 } from './lifecycleReducer';
 import {
   canonicalReadFailureCopyV2,
+  hasExplicitAvailabilityReadRequestV2,
   type ReadFastPathReasonV2,
 } from './readFastPaths';
+import { hasPositiveExplicitBookingVerbV2 } from './flowSession';
+import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
 import { validatedBookingDraftForPendingV2 } from './pendingQuestion';
 
 export type BookingProgressFastPathV2 =
@@ -84,13 +88,23 @@ function readReason(parsed: Record<string, unknown> | null): ReadFastPathReasonV
     : 'other';
 }
 
-function validSlots(parsed: Record<string, unknown> | null): string[] | null {
+function validSlots(
+  parsed: Record<string, unknown> | null,
+  now?: Date,
+  timezone?: string,
+  date?: string
+): string[] | null {
   if (!Array.isArray(parsed?.slots)) return null;
   const slots = parsed.slots.filter(
     (slot): slot is string =>
       typeof slot === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(slot)
   );
-  return slots.length === parsed.slots.length ? [...new Set(slots)] : null;
+  if (slots.length !== parsed.slots.length) return null;
+  const unique = [...new Set(slots)];
+  if (now && timezone && date) {
+    return filterSlotsAtOrAfterNow({ date, slots: unique, now, timezone });
+  }
+  return unique;
 }
 
 function loopForReads(trace: readonly ReceptionistToolTraceEntry[]): ReceptionistModelLoopResult {
@@ -285,7 +299,144 @@ function civilToday(now: Date, timezone: string): string {
   }).format(now);
 }
 
-/** DATE atual ou correção de TIME → read tipado de slots → reducer canônico. */
+function inboundCatalogResolutionForReadV2(
+  inboundText: string,
+  services: ServicesResult
+) {
+  return resolveUniqueCatalogEntityFromCurrentMessageForRead(
+    inboundText,
+    services.services ?? [],
+    {
+      allowRestrictedDistanceTwo: ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+    }
+  );
+}
+
+function inboundUniqueServiceIdV2(
+  inboundText: string,
+  services: ServicesResult
+): string | undefined {
+  const resolution = inboundCatalogResolutionForReadV2(inboundText, services);
+  return resolution.kind === 'resolved' ? resolution.entity.id : undefined;
+}
+
+function uniqueEligibleProfessionalIdV2(
+  serviceId: string,
+  services: ServicesResult
+): string | undefined {
+  const service = services.services?.find((entry) => entry.id === serviceId);
+  if (!service) return undefined;
+  const active = services.professionals ?? [];
+  const eligible =
+    service.professionalIds === undefined
+      ? active
+      : active.filter((entry) => service.professionalIds!.includes(entry.id));
+  return eligible.length === 1 ? eligible[0]!.id : undefined;
+}
+
+function inboundTimesV2(inboundText: string): string[] {
+  return [
+    ...new Set(
+      normalizeTemporalAssertionsV2(inboundText)
+        .filter((assertion) => assertion.kind === 'time')
+        .map((assertion) => assertion.normalized)
+    ),
+  ];
+}
+
+function withFixedServiceState(
+  flowState: FlowStateV2,
+  serviceId: string,
+  professionalId?: string
+): FlowStateV2 {
+  const serviceChanged = flowState.fixedServiceId !== serviceId;
+  const serviceVersion = serviceChanged
+    ? (flowState.fixedByProofVersion.fixedServiceId ?? 0) + 1
+    : flowState.fixedByProofVersion.fixedServiceId ?? 1;
+  return {
+    ...flowState,
+    fixedServiceId: serviceId,
+    ...(professionalId ? { fixedProfessionalId: professionalId } : {}),
+    fixedByProofVersion: {
+      ...flowState.fixedByProofVersion,
+      fixedServiceId: serviceVersion,
+      ...(professionalId
+        ? {
+            fixedProfessionalId:
+              flowState.fixedProfessionalId === professionalId
+                ? flowState.fixedByProofVersion.fixedProfessionalId ?? serviceVersion
+                : serviceVersion,
+          }
+        : {}),
+    },
+  };
+}
+
+function pendingFreshForDateSlotsV2(frame: TurnFrameV2, now: Date): boolean {
+  if (!frame.pending) return false;
+  if (frame.pending.flowId !== frame.flowState.flowId) return false;
+  const askedAt = Date.parse(frame.pending.askedAt);
+  return (
+    Number.isFinite(askedAt) && now.getTime() - askedAt <= 4 * 60 * 60 * 1_000
+  );
+}
+
+function dateSlotsEntitlementV2(input: {
+  frame: TurnFrameV2;
+  inboundText: string;
+  servicesResult: ServicesResult;
+  now: Date;
+}):
+  | { kind: 'continue'; reason: string }
+  | { kind: 'ready'; serviceId: string; professionalId?: string } {
+  const pending = input.frame.pending;
+  const inboundResolution = inboundCatalogResolutionForReadV2(
+    input.inboundText,
+    input.servicesResult
+  );
+  if (inboundResolution.kind === 'ambiguous') {
+    return { kind: 'continue', reason: 'service_not_resolved' };
+  }
+  const inboundServiceId = inboundUniqueServiceIdV2(
+    input.inboundText,
+    input.servicesResult
+  );
+  const serviceId = input.frame.flowState.fixedServiceId ?? inboundServiceId;
+  const dateTimePending =
+    pending &&
+    ['DATE', 'TIME'].includes(pending.kind) &&
+    pendingFreshForDateSlotsV2(input.frame, input.now);
+  const servicePending =
+    pending?.kind === 'SERVICE' &&
+    pendingFreshForDateSlotsV2(input.frame, input.now) &&
+    inboundServiceId !== undefined &&
+    pending.options.some((option) => option.entityId === inboundServiceId);
+  const openGrounded =
+    !pending &&
+    serviceId !== undefined &&
+    (hasPositiveExplicitBookingVerbV2(input.inboundText) ||
+      hasExplicitAvailabilityReadRequestV2(input.inboundText));
+  if (!dateTimePending && !servicePending && !openGrounded) {
+    if (pending && ['DATE', 'TIME'].includes(pending.kind)) {
+      if (pending.flowId !== input.frame.flowState.flowId) {
+        return { kind: 'continue', reason: 'pending_from_other_flow' };
+      }
+      if (!pendingFreshForDateSlotsV2(input.frame, input.now)) {
+        return { kind: 'continue', reason: 'pending_older_than_4h' };
+      }
+    }
+    return { kind: 'continue', reason: 'pending_not_date_or_time' };
+  }
+  if (!serviceId) return { kind: 'continue', reason: 'service_not_resolved' };
+  const professionalId =
+    input.frame.flowState.fixedProfessionalId ??
+    uniqueEligibleProfessionalIdV2(serviceId, input.servicesResult);
+  return professionalId
+    ? { kind: 'ready', serviceId, professionalId }
+    : { kind: 'ready', serviceId };
+}
+
+/** DATE atual, correção de TIME, ou weekday/data no inbound → read de slots. */
 export async function resolveDateSlotsFastPathV2(input: {
   frame: TurnFrameV2;
   dateResolution: CurrentDateResolutionV2;
@@ -295,35 +446,47 @@ export async function resolveDateSlotsFastPathV2(input: {
   now: Date;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<BookingProgressFastPathV2> {
-  if (!input.frame.pending || !['DATE', 'TIME'].includes(input.frame.pending.kind)) {
-    return { kind: 'continue_model', reason: 'pending_not_date_or_time' };
+  const entitlement = dateSlotsEntitlementV2({
+    frame: input.frame,
+    inboundText: input.currentInboundText,
+    servicesResult: input.servicesResult,
+    now: input.now,
+  });
+  if (entitlement.kind === 'continue') {
+    return { kind: 'continue_model', reason: entitlement.reason };
   }
-  if (input.frame.pending.flowId !== input.frame.flowState.flowId) {
-    return { kind: 'continue_model', reason: 'pending_from_other_flow' };
-  }
-  const askedAt = Date.parse(input.frame.pending.askedAt);
-  if (!Number.isFinite(askedAt) || input.now.getTime() - askedAt > 4 * 60 * 60 * 1_000) {
-    return { kind: 'continue_model', reason: 'pending_older_than_4h' };
+  if (input.dateResolution.kind === 'ambiguous') {
+    return {
+      kind: 'resolved',
+      result: dateQuestionResult(
+        input.frame,
+        'Qual dia você prefere?'
+      ),
+      loop: loopForReads([]),
+      proof: null,
+      nextFlowState: withFixedServiceState(
+        clearTemporalState(input.frame.flowState),
+        entitlement.serviceId,
+        entitlement.professionalId
+      ),
+    };
   }
   if (input.dateResolution.kind !== 'resolved') {
-    return {
-      kind: 'continue_model',
-      reason:
-        input.dateResolution.kind === 'ambiguous'
-          ? 'current_date_ambiguous'
-          : 'current_date_absent',
-    };
+    return { kind: 'continue_model', reason: 'current_date_absent' };
   }
   const date = input.dateResolution.date;
   if (
-    input.frame.pending.kind === 'TIME' &&
+    input.frame.pending?.kind === 'TIME' &&
     input.frame.flowState.slotEvidence?.date === date
   ) {
     return { kind: 'continue_model', reason: 'same_date_as_time_evidence' };
   }
-  const serviceId = input.frame.flowState.fixedServiceId;
-  if (!serviceId) return { kind: 'continue_model', reason: 'service_not_resolved' };
-  const baseState = clearTemporalState(input.frame.flowState);
+  const serviceId = entitlement.serviceId;
+  const baseState = withFixedServiceState(
+    clearTemporalState(input.frame.flowState),
+    serviceId,
+    entitlement.professionalId
+  );
   if (date < civilToday(input.now, input.config.timezone)) {
     return {
       kind: 'resolved',
@@ -338,10 +501,10 @@ export async function resolveDateSlotsFastPathV2(input: {
   }
   const professionalGate = professionalSelectionGate({
     serviceId,
-    professionalId: input.frame.flowState.fixedProfessionalId,
+    professionalId: entitlement.professionalId,
     servicesResult: input.servicesResult,
     userMessages: [input.currentInboundText],
-    trustedFlowState: input.frame.flowState,
+    trustedFlowState: baseState,
   });
   if (!professionalGate.ok) {
     return {
@@ -366,19 +529,80 @@ export async function resolveDateSlotsFastPathV2(input: {
     result: read.raw,
   };
   const loop = loopForReads([trace]);
-  const slots = read.parsed?.success === true ? validSlots(read.parsed) : null;
+  const slots =
+    read.parsed?.success === true
+      ? validSlots(
+          read.parsed,
+          input.now,
+          input.config.timezone,
+          date
+        )
+      : null;
   if (slots && slots.length > 0) {
+    const filteredTrace: ReceptionistToolTraceEntry = {
+      ...trace,
+      result: JSON.stringify({
+        ...(read.parsed ?? {}),
+        slots,
+      }),
+    };
     const reducer = reduceToolLifecycleV2({
       frame: { ...input.frame, flowState: baseState },
-      toolTrace: [trace],
+      toolTrace: [filteredTrace],
       services: input.servicesResult,
       sourceInboundText: input.currentInboundText,
     });
     if (reducer?.kind === 'canonical_slots') {
+      if (reducer.result.replyPurpose === 'WRITE_CONFIRMATION') {
+        return {
+          kind: 'resolved',
+          result: reducer.result,
+          loop: loopForReads([filteredTrace]),
+          proof: null,
+          nextFlowState: reducer.nextFlowState,
+        };
+      }
+      const inboundTimes = inboundTimesV2(input.currentInboundText);
+      const matchingTime =
+        inboundTimes.length === 1 && slots.includes(inboundTimes[0]!)
+          ? inboundTimes[0]!
+          : null;
+      if (matchingTime) {
+        const timeFrame: TurnFrameV2 = {
+          ...input.frame,
+          pending: {
+            questionId: input.frame.pending?.questionId ?? 'time-after-date',
+            askedAt: input.now.toISOString(),
+            kind: 'TIME',
+            flowId: input.frame.flowState.flowId,
+            version: (input.frame.pending?.version ?? 0) + 1,
+            options: slots.map((slot, index) => ({
+              position: index + 1,
+              entityId: slot,
+              displayName: slot,
+            })),
+          },
+          flowState: reducer.nextFlowState,
+        };
+        const followUp = buildTimeSelectionFollowUpV2(
+          matchingTime,
+          timeFrame,
+          input.servicesResult
+        );
+        if (followUp) {
+          return {
+            kind: 'resolved',
+            result: followUp.result,
+            loop: loopForReads([filteredTrace]),
+            proof: null,
+            nextFlowState: followUp.nextFlowState,
+          };
+        }
+      }
       return {
         kind: 'resolved',
         result: reducer.result,
-        loop,
+        loop: loopForReads([filteredTrace]),
         proof: null,
         nextFlowState: reducer.nextFlowState,
       };

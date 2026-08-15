@@ -1620,6 +1620,7 @@ export async function getReceptionistReplyV2(input: {
         config: input.config,
         duplicateResolutionProof: pendingReadProof,
         forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
+        dateResolution,
         now: startedAt,
         executeTool: async (name, args) =>
           name === 'getUpcomingAppointments'

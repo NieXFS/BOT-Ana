@@ -191,6 +191,49 @@ export function reduceToolLifecycleV2(input: {
 
   const evidence = latestSuccessfulSlots(input);
   if (!evidence) return null;
+  const nextFlowState = fixedStateForSlots(input.frame, evidence);
+  const inboundTimes = inboundTimesFromText(input.sourceInboundText);
+  const matchingTime =
+    inboundTimes.length === 1 && evidence.slots.includes(inboundTimes[0]!)
+      ? inboundTimes[0]!
+      : null;
+  if (matchingTime) {
+    const professionalId = nextFlowState.fixedProfessionalId;
+    if (
+      evidence.professionalId === undefined ||
+      evidence.professionalId === professionalId
+    ) {
+      const draft: BookingDraftV2 = {
+        serviceId: evidence.serviceId,
+        ...(professionalId ? { professionalId } : {}),
+        date: evidence.date,
+        time: matchingTime,
+        slotEvidenceTurnId: nextFlowState.slotEvidence!.turnId,
+      };
+      return {
+        kind: 'canonical_slots',
+        nextFlowState: { ...nextFlowState, bookingDraft: draft },
+        result: {
+          schemaVersion: 2,
+          reply: buildCanonicalBookingSummaryV2({
+            draft,
+            services: input.services,
+          }),
+          replyPurpose: 'WRITE_CONFIRMATION',
+          pendingTransitionCandidate: {
+            kind: 'open',
+            pendingKind: 'CONFIRMATION',
+            flowId: input.frame.flowState.flowId,
+            optionEntityIds: [
+              `booking-confirmation:${input.frame.flowState.flowId}`,
+            ],
+          },
+          resolutionCandidate: null,
+          unknownServiceEvidence: null,
+        },
+      };
+    }
+  }
   const socialAcknowledgement = /\bobrigad[ao]s?\b/iu.test(
     input.sourceInboundText ?? ''
   )
@@ -198,7 +241,7 @@ export function reduceToolLifecycleV2(input: {
     : '';
   return {
     kind: 'canonical_slots',
-    nextFlowState: fixedStateForSlots(input.frame, evidence),
+    nextFlowState,
     result: {
       schemaVersion: 2,
       reply: `${socialAcknowledgement}Encontrei horários para ${displayDateV2(
@@ -215,6 +258,17 @@ export function reduceToolLifecycleV2(input: {
       unknownServiceEvidence: null,
     },
   };
+}
+
+function inboundTimesFromText(value: string | undefined): string[] {
+  if (!value) return [];
+  return [
+    ...new Set(
+      normalizeTemporalAssertionsV2(value)
+        .filter((assertion) => assertion.kind === 'time')
+        .map((assertion) => assertion.normalized)
+    ),
+  ];
 }
 
 export function displayDateV2(date: string): string {

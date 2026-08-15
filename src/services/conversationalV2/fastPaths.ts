@@ -18,6 +18,9 @@ import { buildCanonicalBookingSummaryV2 } from './lifecycleReducer';
 import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
 import { hasPositiveExplicitBookingVerbV2 } from './flowSession';
 import type { CurrentDateResolutionV2 } from './currentDateResolution';
+import {
+  clauseMatchHasPositivePolarityV2,
+} from './polarity';
 
 export type FastPathResultV2 =
   | { kind: 'continue_model'; reason: string }
@@ -88,16 +91,114 @@ function pendingFresh(frame: TurnFrameV2, now: Date): boolean {
   );
 }
 
+function courtesyStrippedOptionText(
+  value: string,
+  options: { allowPodeFamilyStrip: boolean }
+): string {
+  let text = value.trim();
+  for (;;) {
+    const intent = text.replace(
+      /^(?:vou querer|acho que|prefiro|quero)\s+/u,
+      ''
+    );
+    if (intent !== text) {
+      text = intent.trim();
+      continue;
+    }
+    if (!options.allowPodeFamilyStrip) break;
+    const pode = text.replace(/^(?:pode ser|pode)\s+/u, '');
+    if (pode !== text) {
+      text = pode.trim();
+      continue;
+    }
+    break;
+  }
+  return text;
+}
+
+function inboundLooksInterrogativeV2(value: string): boolean {
+  return /\?/u.test(value);
+}
+
+/**
+ * "pode <opção>?" / "posso <opção>?" no texto ORIGINAL não é seleção. O
+ * normalizador apagava `?` antes do strip de cortesia.
+ */
+function podeFamilyInterrogativeBlocksSelectionV2(value: string): boolean {
+  const text = value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+  return /^(?:pode(?:\s+ser)?|posso)\b[^?]*\?\s*$/u.test(text);
+}
+
+function splitClausesKeepingInterrogativeV2(
+  inboundText: string
+): Array<{ clause: string; interrogative: boolean }> {
+  const normalized = inboundText
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b(?:mas|porem|contudo|entretanto|so que)\b/gu, '.');
+  const tokens = normalized.split(/([.!?;:\n,]+)/u);
+  const parts: Array<{ clause: string; interrogative: boolean }> = [];
+  for (let index = 0; index < tokens.length; index += 2) {
+    const clause = (tokens[index] ?? '').trim();
+    const delimiter = tokens[index + 1] ?? '';
+    if (!clause) continue;
+    parts.push({
+      clause,
+      interrogative: delimiter.includes('?') || clause.includes('?'),
+    });
+  }
+  return parts;
+}
+
 function exactPendingNamePosition(
   inboundText: string,
   frame: TurnFrameV2
 ): number | null {
   if (!frame.pending) return null;
-  const text = normalize(inboundText);
-  const matches = frame.pending.options.filter(
-    (option) => normalize(option.displayName) === text
-  );
-  return matches.length === 1 ? matches[0]!.position : null;
+  if (podeFamilyInterrogativeBlocksSelectionV2(inboundText)) return null;
+  const matches: number[] = [];
+  for (const option of frame.pending.options) {
+    const optionName = normalize(option.displayName);
+    if (!optionName) continue;
+    let positive = false;
+    let negative = false;
+    const clauses = splitClausesKeepingInterrogativeV2(inboundText);
+    const texts =
+      clauses.length > 0
+        ? clauses
+        : [
+            {
+              clause: inboundText,
+              interrogative: inboundLooksInterrogativeV2(inboundText),
+            },
+          ];
+    for (const part of texts) {
+      const clauseNorm = normalize(part.clause);
+      const stripped = courtesyStrippedOptionText(clauseNorm, {
+        allowPodeFamilyStrip: !part.interrogative,
+      });
+      if (stripped !== optionName && clauseNorm !== optionName) continue;
+      const optionIndex = clauseNorm.lastIndexOf(optionName);
+      if (
+        optionIndex >= 0 &&
+        !clauseMatchHasPositivePolarityV2(clauseNorm, optionIndex)
+      ) {
+        negative = true;
+        continue;
+      }
+      positive = true;
+    }
+    if (positive && !negative) matches.push(option.position);
+  }
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 function typedControlOptionPositionV2(
@@ -105,7 +206,11 @@ function typedControlOptionPositionV2(
   frame: TurnFrameV2
 ): number | null {
   if (frame.pending?.kind !== 'CONFIRMATION') return null;
-  const text = normalize(inboundText);
+  if (podeFamilyInterrogativeBlocksSelectionV2(inboundText)) return null;
+  const text = courtesyStrippedOptionText(normalize(inboundText), {
+    allowPodeFamilyStrip: !inboundLooksInterrogativeV2(inboundText),
+  });
+  if (/\bnao\b/u.test(normalize(inboundText))) return null;
   const aliasId = /^(?:continuar|continuar esse agendamento)$/u.test(text)
     ? 'booking-reentry:continue'
     : /^(?:novo|marcar outro|outro agendamento)$/u.test(text)

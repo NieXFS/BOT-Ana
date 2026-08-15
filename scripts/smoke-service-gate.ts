@@ -8,6 +8,8 @@ import {
   buildServiceAmbiguationHint,
   shouldAskServiceUpfront,
   buildServiceQuestion,
+  uniqueCanonicalMentionGroundsReadSelection,
+  resolveUniqueCatalogEntityFromCurrentMessageForRead,
 } from '../src/services/service-gate.ts';
 
 const corte = { id: 'svc-corte', name: 'Corte de cabelo' };
@@ -93,6 +95,123 @@ expect('S5b: "o corte" → token distintivo (corte) → libera', ok(corte.id, TW
 
 // Ambiguidade real: cliente cita tokens de 2 serviços → BLOQUEIA
 expect('Ambíguo: "corte ou depilação?" → desambigua', ok(corte.id, TWO, ['quero marcar', 'corte ou depilação?']), false);
+
+// F1 — menção canônica unívoca em pergunta de leitura NÃO troca o gate de write.
+expect(
+  'F1 write: "Quais horários tem domingo pra drenagem?" não ancora book',
+  ok(depil.id, TWO, ['Quais horários tem domingo pra depilação?']),
+  false
+);
+expect(
+  'F1 read grounding: menção unívoca ancora somente a leitura',
+  uniqueCanonicalMentionGroundsReadSelection(
+    depil.id,
+    TWO,
+    'Quais horários tem domingo pra depilação?'
+  ),
+  true
+);
+expect(
+  'F1 read grounding: 2+ serviços no inbound não ancora',
+  uniqueCanonicalMentionGroundsReadSelection(
+    corte.id,
+    TWO,
+    'Quais horários tem domingo pra corte ou depilação?'
+  ),
+  false
+);
+
+const DRENAGEM_SIBLINGS = [
+  { id: 'svc-linfatica', name: 'Drenagem Linfática' },
+  { id: 'svc-modeladora', name: 'Drenagem Modeladora' },
+];
+const dualTypoInbound = 'Drenagem Linfática e Drenagem Modelador';
+const dualRead = resolveUniqueCatalogEntityFromCurrentMessageForRead(
+  dualTypoInbound,
+  DRENAGEM_SIBLINGS
+);
+checks.push({
+  name: 'F1 read Q2: dual mention typo-distance é ambiguous',
+  ok:
+    dualRead.kind === 'ambiguous' &&
+    dualRead.entityIds.includes('svc-linfatica') &&
+    dualRead.entityIds.includes('svc-modeladora'),
+});
+console.log(
+  `${checks[checks.length - 1].ok ? '[PASS]' : '[FAIL]'} F1 read Q2: dual mention typo-distance é ambiguous (kind=${dualRead.kind})`
+);
+expect(
+  'F1 read Q2: dual mention não ancora leitura no 1º serviço',
+  uniqueCanonicalMentionGroundsReadSelection(
+    'svc-linfatica',
+    DRENAGEM_SIBLINGS,
+    dualTypoInbound
+  ),
+  false
+);
+expect(
+  'F1 read Q2: dual mention não ancora leitura no 2º serviço',
+  uniqueCanonicalMentionGroundsReadSelection(
+    'svc-modeladora',
+    DRENAGEM_SIBLINGS,
+    dualTypoInbound
+  ),
+  false
+);
+const HIERARCHICAL_DRENAGEM = [
+  { id: 'svc-pai', name: 'Drenagem' },
+  { id: 'svc-filho', name: 'Drenagem Linfática' },
+];
+const hierarchicalRead = resolveUniqueCatalogEntityFromCurrentMessageForRead(
+  'Quais horários tem domingo pra Drenagem Linfática?',
+  HIERARCHICAL_DRENAGEM
+);
+expect(
+  'F1 read: hierarquia real pai⊂filho ainda colapsa no filho',
+  hierarchicalRead.kind === 'resolved' && hierarchicalRead.entity.id === 'svc-filho',
+  true
+);
+const exactSiblingInbound = 'Quais horários tem domingo pra Drenagem Linfática?';
+const exactSiblingRead = resolveUniqueCatalogEntityFromCurrentMessageForRead(
+  exactSiblingInbound,
+  DRENAGEM_SIBLINGS
+);
+expect(
+  'F1 read IA-9: nome completo descarta token do irmão contido no span',
+  exactSiblingRead.kind === 'resolved' && exactSiblingRead.entity.id === 'svc-linfatica',
+  true
+);
+expect(
+  'F1 read IA-9: grounding ancora leitura no nome completo com irmão',
+  uniqueCanonicalMentionGroundsReadSelection(
+    'svc-linfatica',
+    DRENAGEM_SIBLINGS,
+    exactSiblingInbound
+  ),
+  true
+);
+expect(
+  'F1 read IA-9: grounding não ancora o irmão no nome completo',
+  uniqueCanonicalMentionGroundsReadSelection(
+    'svc-modeladora',
+    DRENAGEM_SIBLINGS,
+    exactSiblingInbound
+  ),
+  false
+);
+const CORTE_NESTED = [
+  { id: 'n-corte', name: 'Corte' },
+  { id: 'n-cb', name: 'Corte e Barba' },
+];
+const nestedChildRead = resolveUniqueCatalogEntityFromCurrentMessageForRead(
+  'Quais horários tem domingo pra Corte e Barba?',
+  CORTE_NESTED
+);
+expect(
+  'F1 read IA-9: Corte e Barba vs Corte resolve o filho',
+  nestedChildRead.kind === 'resolved' && nestedChildRead.entity.id === 'n-cb',
+  true
+);
 
 // Serviço escolhido NÃO citado (modelo assumiu corte, cliente falou de depil) → BLOQUEIA
 expect('Assumido errado: cliente falou depil, modelo escolheu corte → desambigua', ok(corte.id, TWO, [

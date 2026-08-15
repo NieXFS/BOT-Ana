@@ -1282,3 +1282,170 @@ HEAD permaneceu `333f599` destacado. Sem commit.
 - O hash não impede um escritor com acesso ao banco de gravar `visibleText` arbitrário **fora** dos segmentos e recalcular o digest; a projeção só substitui os intervalos licenciados. O placeholder fechado impede que `serviceName`/`clauseId` venenosos vazem mesmo nesse caso.
 - Envelope no `ana_conversation_history` continua JSON após o prefixo. O painel descasca `visibleText` (e ainda lê `visibleText` estrutural se o parse estrito falhar). A cliente no WhatsApp não vê o marcador.
 - Nenhum deploy, `--real`, escrita de ERP ou mudança de tenant. Conferência final do Sol na sequência.
+
+## Exec IA-7 — naturalidade do fluxo de agendamento (5 achados do E2E canário)
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `2fcb88b`; árvore suja só com este pacote. Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Allow-only: nenhum caminho novo de negação.
+
+Canário ~2026-08-15 14h32 BRT. Instante civil no TZ do processo (`America/Sao_Paulo`): **sábado 15/08**, domingo **16/08**, segunda **17/08**. Os rótulos do E2E (“hoje=sexta”, “16/08=sábado”, “domingo=17/08”) estavam deslocados 1 dia; o conserto segue a data civil, não o rótulo.
+
+### F2/F3 — dia da semana por extenso + polaridade “X, não Y”
+
+Ponto único: `temporalNormalizer.ts` (`resolveCivilDateTokenV2` / `contrastWinningCivilDateV2`), consumido por `currentDateResolution.ts` e `receptionistTurnGrounding.ts`.
+
+- Weekday com/sem acento, com/sem `-feira`; `próximo X` / `X que vem` = mesma ocorrência ≥ hoje; se hoje já é X, +7.
+- `"Domingo, não sábado!"` / `"X e não Y"`: X vence, Y descartado. Não cai em hoje. `"não, sexta"` (marcador de correção, sem X à esquerda) permanece o ramo conservador antigo.
+- Sem resolução: pergunta `"Qual dia você prefere?"` (DATE), nunca lista de hoje.
+- Fast-path de slots também dispara **sem** pendência DATE quando o inbound tem serviço unívoco + verbo de agendar ou pedido de horários — era isso que mandava `"pra domingo"` no 1º contato para o modelo adivinhar sábado.
+
+### F3b — slots do passado + achado ERP (despacho)
+
+`GET /api/v1/agenda/availability` devolve a grade do dia inteiro, inclusive 08:00/08:30/09:00 às 14h32. **Conserto Ana:** `filterSlotsAtOrAfterNow` em `getAvailableSlots` e nas listas v2 de apresentação (`slot ≥ agora` no TZ do processo). Dia futuro não perde a manhã. **Book não filtra** a ocupação bruta do ERP — sem negação nova de escrita.
+
+**Para o coordenador despachar no Receps:** filtrar `availableTimes` de `/api/v1/agenda/availability` (e o eco em alternativas de book) para não emitir horários já passados no TZ do tenant. A Ana agora é defensiva; a fonte continua suja.
+
+### F1 — menção canônica ancora leitura
+
+`uniqueCanonicalMentionGroundsReadSelection` usa o matcher canônico de pendings (token distintivo / plural conservador / distance-1). 1 serviço no inbound → libera só `getAvailableSlots` (preço/duração continuam pelo catálogo, sem tool). 0 ou 2+ inalterado. `bookAppointment` segue exigindo o fluxo completo.
+
+### F4 — data+hora na mesma mensagem
+
+Depois da releitura, hora unívoca presente na lista nova → resumo `Confirmando:`. Ausente/ambígua → pergunta TIME. O reducer de lifecycle (`reduceToolLifecycleV2`) faz o mesmo follow-up; senão o override pós-fast-path reescrevia o resumo de volta na lista de slots.
+
+### F5 — prefixo educado no matcher de opções
+
+Strip da família `pode` / `pode ser` / `quero` / `prefiro` / `acho que` / `vou querer` quando o restante casa exatamente uma opção. `"Pode manter os dois"` resolve; `"não quero manter os dois"` nunca resolve a opção afirmativa.
+
+### Fixtures
+
+Transcript real em `smoke-ana-conversational-v2-wave1.ts` (canário 14h32 BRT) e rota `getReceptionistReplyV2` em `smoke-ana-conversational-v2-route.ts`. Também `smoke-service-gate`, `smoke-booking-reasons`, `smoke-receptionist-turn-grounding`.
+
+### Validações finais (exit real)
+
+| Comando | exit | resultado |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:booking-reasons` | 0 | F3b 08:00/08:30/09:00 → 15:00/16:00 às 14h32 |
+| `npx ts-node -T scripts/smoke-service-gate.ts` | 0 | F1 read ancora; write não |
+| `npx ts-node -T scripts/smoke-receptionist-turn-grounding.ts` | 0 | domingo civil 16/08; contraste elege domingo |
+| `npm run smoke:ana-conversational-v2-contracts` | 0 | |
+| `npm run smoke:ana-conversational-v2-boundary` | 0 | |
+| `npm run smoke:ana-conversational-v2-recovery` | 0 | |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `npm run smoke:ana-conversational-v2-persistence` | 0 | |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | |
+| `npm run smoke:ana-conversational-v2-route` | 0 | F1/F2/F3/F4/F5 no `getReceptionistReplyV2` |
+| `npm run smoke:ana-conversational-v2-social-reads` | 0 | |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | transcript canário por achado |
+| `npm run smoke:ana-conversational-v2-voice` | 0 | |
+| `npm run smoke:ana-conversational-v2-voice-fidelity` | 0 | |
+| `npm run smoke:ana-conversational-v2-escalation` | 0 | |
+| `npm run smoke:ana-conversational-v2-interpreter` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `2fcb88b` destacado. Sem commit.
+
+### Riscos e gates restantes
+
+- Filtro de slots passados é só apresentação. Um book com horário já passado ainda depende do ERP (proposital: sem negação nova no lado Ana).
+- Weekday “hoje é X” sem “que vem” resolve para hoje; “X que vem” no próprio X avança +7.
+- Conferência do Sol na sequência. Deploy só depois dela.
+
+## Exec IA-7→IA-8 — correções bloqueantes da conferência do Sol
+
+**Status:** implementado e validado localmente por cima do working tree IA-7 em `HEAD` destacado `2fcb88b`. Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Q1/Q3/Q4/Q6 do Sol permaneceram aceitos e não foram reabertos.
+
+### Q2/F1 — menção dupla com typo-distance não colapsa em serviço único
+
+Causa: `collapseHierarchicalMatches` (`service-gate.ts`) devolvia o único `full` e descartava irmãos token/typo-1/typo-2. Inbound `Drenagem Linfática e Drenagem Modelador` (2º catálogo `Drenagem Modeladora`, distância 1) virava `resolved` no 1º; `inboundUniqueServiceIdV2` persistia `fixedServiceId` e o fast-path chamava `getAvailableSlots`.
+
+Correção: resolvedor F1 de **leitura** `resolveUniqueCatalogEntityFromCurrentMessageForRead`. Preserva todo candidato raw não-hierárquico (full/token/typo-1/typo-2). Só colapsa pai→filho quando o nome do catálogo do pai é substring real do filho (`Drenagem` ⊂ `Drenagem Linfática`). 2+ candidatos ⇒ `ambiguous` ⇒ pré-F1 (sem grounding, sem tool). Write (`resolveUniqueCatalogEntityFromCurrentMessage`) permanece com o early-return de full único.
+
+Aplicado nos três usos F1: `uniqueCanonicalMentionGroundsReadSelection`, `inboundUniqueServiceIdV2` e `resolveReadFastPathV2`. Inbound ambíguo no entitlement de slots também falha fechado (não recicla `fixedServiceId`).
+
+### Q5/F5 — `pode <opção>?` interrogativo não é seleção
+
+Causa: `normalize()` e `splitClausesV2` apagavam `?` antes de `courtesyStrippedOptionText` tirar o prefixo `pode`. `pode remarcar?` virava a opção `remarcar`.
+
+Correção: o sinal interrogativo vem do texto/cláusula **original**. `pode <opção>?` / `posso <opção>?` não sofrem strip de seleção. `quero`/`prefiro`/`acho que`/`vou querer` continuam. Polaridade negativa continua sem resolver.
+
+### Ressalva não-bloqueante
+
+`resolveRelativeCalendarDate("não sábado, domingo")` ganhava o primeiro token (sábado). Barato: `contrastWinningCivilDateV2` agora casa `não X, Y` (vírgula) e elege Y. `"não, sexta"` (marcador sem X) continua fora. Paridade no helper legado e no lote v2.
+
+### Fixtures obrigatórias
+
+- `Drenagem Linfática e Drenagem Modelador` → `ambiguous`; `uniqueCanonicalMentionGroundsReadSelection` false nos dois ids; `resolveDateSlotsFastPathV2` + `resolveReadFastPathV2` + rota `getReceptionistReplyV2` com catálogo irmão: **zero** `getAvailableSlots`, sem `fixedServiceId` do 1º.
+- `pode remarcar?` / `posso remarcar?` / `não quero remarcar` → `resolvePendingOptionProofV2` null.
+- `Pode manter os dois` → `duplicate-resolution:keep-both` (IA-7 intacto).
+- `não sábado, domingo` em 15/08 → domingo 16/08.
+
+### Validações finais (exit real)
+
+| Comando | exit | resultado |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `./node_modules/.bin/tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `./node_modules/.bin/ts-node -T scripts/smoke-service-gate.ts` | 0 | dual mention `ambiguous`; hierarquia pai⊂filho ok |
+| `./node_modules/.bin/ts-node -T scripts/smoke-receptionist-turn-grounding.ts` | 0 | `não sábado, domingo` → 16/08 |
+| `npm run smoke:booking-reasons` | 0 | F3b intacto |
+| `./node_modules/.bin/ts-node -T scripts/smoke-ana-conversational-v2-wave1.ts` | 0 | Q2 zero slots; Q5 interrogativo null |
+| route (ts-node local + env dummy) | 0 | Q2 rota sem `getAvailableSlots`; F5 afirmativo intacto |
+| `smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `2fcb88b` destacado. Sem commit.
+
+### Riscos que permanecem
+
+- Write ainda colapsa full único e descarta irmãos fuzzy. Só a leitura F1 foi corrigida (escopo vinculante do Sol).
+- Catálogo com irmãos que compartilham token (`Drenagem Linfática` + `Drenagem Modeladora`): menção do nome completo do 1º também fica `ambiguous` na leitura, porque o 2º casa o token compartilhado. Fail-closed para o modelo, proposital. **Corrigido em IA-9.**
+- `pode remarcar?` pode ainda acionar o read de `getUpcomingAppointments` (`remarcar` no matcher de upcoming). Isso não é seleção da opção pendente; o matcher de opção devolve null.
+
+## Exec IA-8→IA-9 — proveniência/span no resolvedor F1 de leitura
+
+**Status:** implementado e validado localmente por cima do working tree IA-7/IA-8 em `HEAD` destacado `2fcb88b`. Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Q2, Q5 e o helper legado permaneceram aceitos e não foram reabertos.
+
+### 1 (bloqueante) — token compartilhado de irmão absorvido pelo span do nome completo
+
+Causa: `matchedServices` (`service-gate.ts:517` na IA-8) não guardava posição. Inbound EXATO `Quais horários … Drenagem Linfática?` com catálogo `Drenagem Linfática` + `Drenagem Modeladora` gerava `full` no 1º e `token` no 2º pelo token compartilhado `drenagem`. `collapseHierarchicalMatchesForRead` só colapsava pai⊂filho de catálogo, então a leitura ficava `ambiguous`, o gate negava e o modelo recebia “cliente ainda não escolheu o serviço”.
+
+Correção (instrução vinculante do Sol): o matcher F1 agora emite cada match com span no texto normalizado. Quando há nome completo, descarta **somente** o match de token do irmão cujo token está inteiramente contido nesse span; fuzzy/token independente (fora do span) permanece. Hierarquia real pai⊂filho (`Drenagem` ⊂ `Drenagem Linfática`, `Corte` ⊂ `Corte e Barba`) continua no colapso de catálogo. Write (`resolveUniqueCatalogEntityFromCurrentMessage`) segue com early-return de full único.
+
+### 2 (trivial) — `git diff --check`
+
+Removida a linha em branco final de `RELATORIO-GROK-EXEC-1.md` (falha em `:1410`).
+
+### Fixtures obrigatórias (helper + rota `getReceptionistReplyV2`)
+
+- `Quais horários tem domingo pra Drenagem Linfática?` + irmã Modeladora → `resolved` Linfática; grounding true; fast-path lê slots; `fixedServiceId` do 1º.
+- `Drenagem Linfática e Drenagem Modelador` → `ambiguous`; zero `getAvailableSlots`; sem `fixedServiceId` do 1º (Q2 intacto).
+- `Quais horários tem domingo pra Corte e Barba?` vs catálogo `Corte` + `Corte e Barba` → resolve o filho; rota lê slots com `svc-corte-barba`.
+
+### Validações finais (exit real)
+
+| Comando | exit | resultado |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `./node_modules/.bin/tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `./node_modules/.bin/ts-node -T scripts/smoke-service-gate.ts` | 0 | 80 checks; nome completo resolve; dual `ambiguous`; filho `Corte e Barba` |
+| `npm run smoke:booking-reasons` | 0 | F3b intacto |
+| `./node_modules/.bin/ts-node -T scripts/smoke-ana-conversational-v2-wave1.ts` | 0 | exact sibling lê slots; Q2 zero tool; filho resolve |
+| `npm run smoke:ana-conversational-v2-route` | 0 | as três fixtures em `getReceptionistReplyV2` |
+| `smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `2fcb88b` destacado. Sem commit.
+
+### Riscos que permanecem
+
+- Write ainda colapsa full único e descarta irmãos fuzzy. Só a leitura F1 absorve token de irmão por span (escopo vinculante do Sol).
+- `pode remarcar?` pode ainda acionar o read de `getUpcomingAppointments` (`remarcar` no matcher de upcoming). Isso não é seleção da opção pendente; o matcher de opção devolve null.

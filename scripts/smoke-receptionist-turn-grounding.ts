@@ -115,6 +115,39 @@ async function main() {
     '2026-08-13'
   );
   assert.equal(
+    resolveRelativeCalendarDate(
+      'Quero agendar uma drenagem pra domingo',
+      new Date('2026-08-15T17:32:00.000Z'),
+      TZ
+    ),
+    '2026-08-16'
+  );
+  assert.equal(
+    resolveRelativeCalendarDate(
+      'Domingo, não sábado!',
+      new Date('2026-08-15T17:32:00.000Z'),
+      TZ
+    ),
+    '2026-08-16'
+  );
+  assert.equal(
+    resolveRelativeCalendarDate(
+      'domingo que vem',
+      new Date('2026-08-16T18:00:00.000Z'),
+      TZ
+    ),
+    '2026-08-23'
+  );
+  assert.equal(
+    resolveRelativeCalendarDate(
+      'não sábado, domingo',
+      new Date('2026-08-15T17:32:00.000Z'),
+      TZ
+    ),
+    '2026-08-16',
+    'não X, Y (vírgula) elege Y — paridade com X, não Y'
+  );
+  assert.equal(
     namedServiceAvailabilityIntent(
       'Quais horários vocês têm amanhã para Calosidades e Fissuras?',
       catalog.services ?? [],

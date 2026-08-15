@@ -1,4 +1,9 @@
-import { resolveRelativeCalendarDate } from '../receptionistTurnGrounding';
+import {
+  CIVIL_DATE_TOKEN_RE,
+  contrastWinningCivilDateV2,
+  matchCivilDateTokensV2,
+  resolveCivilDateTokenV2,
+} from './temporalNormalizer';
 
 export type CurrentDateResolutionV2 =
   | { kind: 'none'; mentions: readonly [] }
@@ -13,8 +18,6 @@ interface DateMentionV2 {
   corrected: boolean;
 }
 
-const DATE_TOKEN_RE =
-  /\b(?:depois\s+de\s+amanha|hoje|amanha|segunda(?:\s+feira)?|terca(?:\s+feira)?|quarta(?:\s+feira)?|quinta(?:\s+feira)?|sexta(?:\s+feira)?|sabado|domingo)\b|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/gu;
 const CORRECTION_RE =
   /\b(?:nao|na\s+verdade|melhor|quer\s+dizer|corrigindo|pera(?:i)?|alias)\b/gu;
 
@@ -23,44 +26,6 @@ function normalize(value: string): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
-}
-
-function civilToday(now: Date, timezone: string): string {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(now);
-}
-
-function validCivilDate(year: number, month: number, day: number): string | null {
-  const instant = new Date(Date.UTC(year, month - 1, day));
-  if (
-    instant.getUTCFullYear() !== year ||
-    instant.getUTCMonth() !== month - 1 ||
-    instant.getUTCDate() !== day
-  ) {
-    return null;
-  }
-  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-}
-
-function absoluteDate(token: string, now: Date, timezone: string): string | null {
-  const iso = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(token);
-  if (iso) {
-    return validCivilDate(Number(iso[1]), Number(iso[2]), Number(iso[3]));
-  }
-  const br = /^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/u.exec(token);
-  if (!br) return null;
-  const currentYear = Number(civilToday(now, timezone).slice(0, 4));
-  const rawYear = br[3];
-  const year = rawYear
-    ? rawYear.length === 2
-      ? 2000 + Number(rawYear)
-      : Number(rawYear)
-    : currentYear;
-  return validCivilDate(year, Number(br[2]), Number(br[1]));
 }
 
 function correctionBefore(text: string, start: number): boolean {
@@ -80,12 +45,10 @@ function mentionsForInbound(input: {
   // sobre a escolha ancorada no PendingFrame.
   if (/\bopcao\b/u.test(normalized)) return [];
   const mentions: DateMentionV2[] = [];
-  for (const match of normalized.matchAll(DATE_TOKEN_RE)) {
+  for (const match of matchCivilDateTokensV2(normalized)) {
     const token = match[0];
     const start = match.index ?? 0;
-    const date =
-      absoluteDate(token, input.now, input.timezone) ??
-      resolveRelativeCalendarDate(token, input.now, input.timezone);
+    const date = resolveCivilDateTokenV2(token, input.now, input.timezone);
     if (!date) continue;
     mentions.push({
       date,
@@ -99,8 +62,10 @@ function mentionsForInbound(input: {
 }
 
 /**
- * Resolve a data somente a partir do lote atual. Se houver duas datas, a última
- * só vence quando a própria oração traz um marcador conservador de correção.
+ * Resolve a data somente a partir do lote atual. "X, não Y" / "X e não Y"
+ * elege X e descarta Y. "não X, Y" (vírgula) elege Y. Sem contraste, duas
+ * datas só se resolvem quando a última oração traz um marcador conservador
+ * de correção.
  */
 export function resolveCurrentInboundDateV2(input: {
   currentInboundIds: readonly string[];
@@ -108,7 +73,7 @@ export function resolveCurrentInboundDateV2(input: {
   now: Date;
   timezone: string;
 }): CurrentDateResolutionV2 {
-  const mentions = input.currentInboundIds.flatMap((inboundId, inboundIndex) =>
+  let mentions = input.currentInboundIds.flatMap((inboundId, inboundIndex) =>
     mentionsForInbound({
       text: input.inboundTextsById[inboundId] ?? '',
       inboundIndex,
@@ -116,6 +81,21 @@ export function resolveCurrentInboundDateV2(input: {
       timezone: input.timezone,
     })
   );
+  const joined = input.currentInboundIds
+    .map((inboundId) => input.inboundTextsById[inboundId] ?? '')
+    .filter(Boolean)
+    .join(' ');
+  const contrastWinner = contrastWinningCivilDateV2(
+    joined,
+    input.now,
+    input.timezone
+  );
+  if (contrastWinner) {
+    const contrasted = mentions.filter(
+      (mention) => mention.date === contrastWinner
+    );
+    if (contrasted.length > 0) mentions = contrasted;
+  }
   if (mentions.length === 0) return { kind: 'none', mentions: [] };
   const dates = [...new Set(mentions.map((mention) => mention.date))];
   if (dates.length === 1) {
@@ -129,6 +109,6 @@ export function resolveCurrentInboundDateV2(input: {
 }
 
 export const __currentDateResolutionForSmokeV2 = {
-  DATE_TOKEN_RE,
+  DATE_TOKEN_RE: CIVIL_DATE_TOKEN_RE,
   CORRECTION_RE,
 };

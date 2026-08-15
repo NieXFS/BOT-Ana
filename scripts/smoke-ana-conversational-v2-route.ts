@@ -3242,6 +3242,399 @@ async function main(): Promise<void> {
     'Tive um probleminha aqui. Pode repetir sua última mensagem?',
   ]);
 
+  // Exec IA-7 — transcript canário 2026-08-15 14h32 BRT. Civil: 15/08=sábado,
+  // domingo=16/08. O rótulo "sexta/sábado/domingo" do E2E estava deslocado 1 dia.
+  const ia7Now = new Date('2026-08-15T17:32:00.000Z');
+  const ia7Slots = (date: string) => async (name: string, args: Record<string, unknown>) => {
+    assert.equal(name, 'getAvailableSlots');
+    assert.equal(args.date, date);
+    assert.equal(args.serviceId, 'svc-drenagem');
+    return JSON.stringify({
+      success: true,
+      slots: date === '2026-08-17' ? ['10:00', '11:00', '14:00'] : ['10:00', '11:00'],
+      professionalId: 'prof-julia',
+    });
+  };
+
+  const ia7F2Store = new MemoryConversationalV2StateStore();
+  const ia7F2Phone = '5511000000917';
+  const ia7F2Key = `${config.phoneNumberId}:${ia7F2Phone}`;
+  ia7F2Store.setInputSequence(ia7F2Key, 1);
+  const ia7F2 = await getReceptionistReplyV2({
+    phone: ia7F2Phone,
+    userMessage: 'Quero agendar uma drenagem pra domingo',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Quero agendar uma drenagem pra domingo' }),
+    deps: {
+      ...baseDeps(ia7F2Store),
+      now: () => ia7Now,
+      executeTool: ia7Slots('2026-08-16'),
+      runModelLoop: async () => {
+        throw new Error('F2 aberto não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia7F2.planReceipt.route, 'fast_path');
+  assert.match(ia7F2.payload ?? '', /16\/08\/2026/);
+  assert.doesNotMatch(ia7F2.payload ?? '', /15\/08\/2026/);
+
+  const ia7F3Store = new MemoryConversationalV2StateStore();
+  const ia7F3Phone = '5511000000918';
+  const ia7F3Key = `${config.phoneNumberId}:${ia7F3Phone}`;
+  const ia7F3Pending = pending({
+    kind: 'TIME',
+    askedAt: ia7Now.toISOString(),
+    options: [
+      { position: 1, entityId: '09:00', displayName: '09:00' },
+      { position: 2, entityId: '11:00', displayName: '11:00' },
+    ],
+  });
+  seedPending(ia7F3Store, ia7F3Key, ia7F3Pending, {
+    flowId: ia7F3Pending.flowId,
+    lastOperationalAt: ia7Now.toISOString(),
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-15',
+    slotEvidence: {
+      turnId: 'turn-ia7-sabado',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-15',
+      slots: ['09:00', '11:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  ia7F3Store.setInputSequence(ia7F3Key, 1);
+  const ia7F3 = await getReceptionistReplyV2({
+    phone: ia7F3Phone,
+    userMessage: 'Domingo, não sábado!',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Domingo, não sábado!' }),
+    deps: {
+      ...baseDeps(ia7F3Store),
+      now: () => ia7Now,
+      executeTool: ia7Slots('2026-08-16'),
+      runModelLoop: async () => {
+        throw new Error('F3 correção não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia7F3.planReceipt.route, 'fast_path');
+  assert.match(ia7F3.payload ?? '', /16\/08\/2026/);
+  assert.doesNotMatch(ia7F3.payload ?? '', /15\/08\/2026/);
+
+  const ia7F1Store = new MemoryConversationalV2StateStore();
+  const ia7F1Phone = '5511000000919';
+  const ia7F1Key = `${config.phoneNumberId}:${ia7F1Phone}`;
+  ia7F1Store.setInputSequence(ia7F1Key, 1);
+  const ia7F1 = await getReceptionistReplyV2({
+    phone: ia7F1Phone,
+    userMessage: 'Quais horários tem domingo pra drenagem?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({
+      text: 'Quais horários tem domingo pra drenagem?',
+    }),
+    deps: {
+      ...baseDeps(ia7F1Store),
+      now: () => ia7Now,
+      executeTool: ia7Slots('2026-08-16'),
+      runModelLoop: async () => {
+        throw new Error('F1 leitura ancorada não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia7F1.planReceipt.route, 'fast_path');
+  assert.match(ia7F1.payload ?? '', /16\/08\/2026/);
+  assert.equal(ia7F1.frame.flowState.fixedServiceId, 'svc-drenagem');
+
+  const ia8DualServices: ServicesResult = {
+    success: true,
+    services: [
+      ...services.services!,
+      {
+        id: 'svc-modeladora',
+        name: 'Drenagem Modeladora',
+        durationMinutes: 60,
+        price: 120,
+        priceFormatted: 'R$ 120,00',
+        professionalIds: ['prof-julia'],
+      },
+    ],
+    professionals: services.professionals,
+  };
+  const ia8DualStore = new MemoryConversationalV2StateStore();
+  const ia8DualPhone = '5511000000922';
+  const ia8DualKey = `${config.phoneNumberId}:${ia8DualPhone}`;
+  ia8DualStore.setInputSequence(ia8DualKey, 1);
+  let ia8DualSlotCalls = 0;
+  const ia8DualInbound =
+    'Quais horários tem domingo pra Drenagem Linfática e Drenagem Modelador';
+  const ia8Dual = await getReceptionistReplyV2({
+    phone: ia8DualPhone,
+    userMessage: ia8DualInbound,
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: ia8DualInbound }),
+    deps: {
+      ...baseDeps(ia8DualStore),
+      now: () => ia7Now,
+      loadServices: async () => ia8DualServices,
+      executeTool: async (name) => {
+        if (name === 'getAvailableSlots') {
+          ia8DualSlotCalls += 1;
+          throw new Error('F1 Q2 dual mention não chama getAvailableSlots');
+        }
+        throw new Error(`tool inesperada: ${name}`);
+      },
+      runModelLoop: async () => ({
+        rawReply: JSON.stringify(
+          flatResult({
+            reply:
+              'Qual serviço você prefere: Drenagem Linfática ou Drenagem Modeladora?',
+            nextPending: 'SERVICE',
+            chosenOptionText: null,
+          })
+        ),
+        exhausted: false,
+        provider: 'openai' as const,
+        model: 'gpt-4o-mini',
+        providerReportedModels: ['gpt-4o-mini'],
+        rounds: 1,
+        messages: [],
+        toolTrace: [],
+        usage: [],
+      }),
+    },
+  });
+  assert.equal(ia8DualSlotCalls, 0, 'F1 Q2 rota: zero getAvailableSlots');
+  assert.notEqual(ia8Dual.planReceipt.route, 'fast_path');
+  assert.notEqual(
+    ia8Dual.frame.flowState.fixedServiceId,
+    'svc-drenagem',
+    'F1 Q2 não persiste fixedServiceId do 1º match'
+  );
+
+  const ia9ExactSiblingInbound =
+    'Quais horários tem domingo pra Drenagem Linfática?';
+  const ia9ExactStore = new MemoryConversationalV2StateStore();
+  const ia9ExactPhone = '5511000000923';
+  const ia9ExactKey = `${config.phoneNumberId}:${ia9ExactPhone}`;
+  ia9ExactStore.setInputSequence(ia9ExactKey, 1);
+  const ia9Exact = await getReceptionistReplyV2({
+    phone: ia9ExactPhone,
+    userMessage: ia9ExactSiblingInbound,
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: ia9ExactSiblingInbound }),
+    deps: {
+      ...baseDeps(ia9ExactStore),
+      now: () => ia7Now,
+      loadServices: async () => ia8DualServices,
+      executeTool: ia7Slots('2026-08-16'),
+      runModelLoop: async () => {
+        throw new Error('F1 IA-9 nome completo com irmão não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia9Exact.planReceipt.route, 'fast_path');
+  assert.match(ia9Exact.payload ?? '', /16\/08\/2026/);
+  assert.equal(ia9Exact.frame.flowState.fixedServiceId, 'svc-drenagem');
+
+  const ia9NestedServices: ServicesResult = {
+    success: true,
+    services: [
+      {
+        id: 'svc-corte',
+        name: 'Corte',
+        durationMinutes: 30,
+        price: 80,
+        priceFormatted: 'R$ 80,00',
+        professionalIds: ['prof-julia'],
+      },
+      {
+        id: 'svc-corte-barba',
+        name: 'Corte e Barba',
+        durationMinutes: 45,
+        price: 100,
+        priceFormatted: 'R$ 100,00',
+        professionalIds: ['prof-julia'],
+      },
+    ],
+    professionals: services.professionals,
+  };
+  const ia9NestedInbound = 'Quais horários tem domingo pra Corte e Barba?';
+  const ia9NestedStore = new MemoryConversationalV2StateStore();
+  const ia9NestedPhone = '5511000000924';
+  const ia9NestedKey = `${config.phoneNumberId}:${ia9NestedPhone}`;
+  ia9NestedStore.setInputSequence(ia9NestedKey, 1);
+  const ia9Nested = await getReceptionistReplyV2({
+    phone: ia9NestedPhone,
+    userMessage: ia9NestedInbound,
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: ia9NestedInbound }),
+    deps: {
+      ...baseDeps(ia9NestedStore),
+      now: () => ia7Now,
+      loadServices: async () => ia9NestedServices,
+      executeTool: async (name, args) => {
+        assert.equal(name, 'getAvailableSlots');
+        assert.equal(args.date, '2026-08-16');
+        assert.equal(args.serviceId, 'svc-corte-barba');
+        return JSON.stringify({
+          success: true,
+          slots: ['10:00', '11:00'],
+          professionalId: 'prof-julia',
+        });
+      },
+      runModelLoop: async () => {
+        throw new Error('F1 IA-9 Corte e Barba não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia9Nested.planReceipt.route, 'fast_path');
+  assert.match(ia9Nested.payload ?? '', /16\/08\/2026/);
+  assert.equal(ia9Nested.frame.flowState.fixedServiceId, 'svc-corte-barba');
+
+  const ia7F4Store = new MemoryConversationalV2StateStore();
+  const ia7F4Phone = '5511000000920';
+  const ia7F4Key = `${config.phoneNumberId}:${ia7F4Phone}`;
+  const ia7F4Pending = pending({
+    kind: 'TIME',
+    askedAt: ia7Now.toISOString(),
+    options: [
+      { position: 1, entityId: '09:00', displayName: '09:00' },
+      { position: 2, entityId: '11:00', displayName: '11:00' },
+    ],
+  });
+  seedPending(ia7F4Store, ia7F4Key, ia7F4Pending, {
+    flowId: ia7F4Pending.flowId,
+    lastOperationalAt: ia7Now.toISOString(),
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-16',
+    slotEvidence: {
+      turnId: 'turn-ia7-f4-old',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-16',
+      slots: ['09:00', '11:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  ia7F4Store.setInputSequence(ia7F4Key, 1);
+  const ia7F4 = await getReceptionistReplyV2({
+    phone: ia7F4Phone,
+    userMessage: 'Pode ser dia 17/08 as 10h',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Pode ser dia 17/08 as 10h' }),
+    deps: {
+      ...baseDeps(ia7F4Store),
+      now: () => ia7Now,
+      executeTool: ia7Slots('2026-08-17'),
+      executeProactiveDuplicateRead: async () =>
+        JSON.stringify({ success: true, appointments: [] }),
+      runModelLoop: async () => {
+        throw new Error('F4 data+hora não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia7F4.planReceipt.route, 'fast_path');
+  assert.match(ia7F4.payload ?? '', /^Confirmando:/u);
+  assert.equal(ia7F4.transition.kind, 'open');
+  assert.equal(
+    ia7F4.transition.kind === 'open' && ia7F4.transition.frame.kind,
+    'CONFIRMATION'
+  );
+  assert.equal(ia7F4.transition.nextFlowState.bookingDraft?.time, '10:00');
+  assert.equal(ia7F4.transition.nextFlowState.bookingDraft?.date, '2026-08-17');
+
+  const ia7F5Store = new MemoryConversationalV2StateStore();
+  const ia7F5Phone = '5511000000921';
+  const ia7F5Key = `${config.phoneNumberId}:${ia7F5Phone}`;
+  const ia7F5Pending = pending({
+    kind: 'CONFIRMATION',
+    askedAt: ia7Now.toISOString(),
+    options: [
+      { position: 1, entityId: 'duplicate-resolution:keep-both', displayName: 'manter os dois' },
+      { position: 2, entityId: 'duplicate-resolution:reschedule', displayName: 'remarcar' },
+      { position: 3, entityId: 'duplicate-resolution:cancel-only', displayName: 'só cancelar o anterior' },
+      { position: 4, entityId: 'duplicate-resolution:decide-later', displayName: 'decidir depois' },
+    ],
+  });
+  seedPending(ia7F5Store, ia7F5Key, ia7F5Pending, {
+    flowId: ia7F5Pending.flowId,
+    lastOperationalAt: ia7Now.toISOString(),
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-16',
+    bookingDraft: {
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-16',
+      time: '10:00',
+      slotEvidenceTurnId: 'turn-ia7-f5',
+    },
+    slotEvidence: {
+      turnId: 'turn-ia7-f5',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-16',
+      slots: ['10:00', '11:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  ia7F5Store.setInputSequence(ia7F5Key, 1);
+  const ia7F5 = await getReceptionistReplyV2({
+    phone: ia7F5Phone,
+    userMessage: 'Pode manter os dois',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Pode manter os dois' }),
+    deps: {
+      ...baseDeps(ia7F5Store),
+      now: () => ia7Now,
+      executeProactiveDuplicateRead: async () =>
+        JSON.stringify({
+          success: true,
+          appointments: [
+            {
+              id: 'appointment-existing',
+              startTime: '2026-08-16T13:00:00.000Z',
+              endTime: '2026-08-16T14:00:00.000Z',
+              serviceName: 'Drenagem Linfática',
+              professionalName: 'Júlia',
+            },
+          ],
+        }),
+      runModelLoop: async () => {
+        throw new Error('F5 prefixo educado não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia7F5.planReceipt.route, 'fast_path');
+  assert.match(ia7F5.payload ?? '', /^Confirmando:/u);
+  assert.equal(
+    ia7F5.transition.nextFlowState.duplicateResolution?.kind,
+    'keep_both'
+  );
+
   console.log('smoke ana conversational v2 route: OK');
 }
 

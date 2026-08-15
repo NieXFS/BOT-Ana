@@ -369,8 +369,41 @@ function formatDateTimeBR(isoDateTime: string, timezone: string): { date: string
   };
 }
 
-function getTodayStr(timezone: string): string {
-  return new Intl.DateTimeFormat('sv-SE', { timeZone: timezone }).format(new Date());
+function getTodayStr(timezone: string, now: Date = new Date()): string {
+  return new Intl.DateTimeFormat('sv-SE', { timeZone: timezone }).format(now);
+}
+
+/**
+ * Filtro defensivo de apresentação: a API do ERP pode devolver a grade do dia
+ * inteiro, inclusive horários já passados. Nunca oferece slot < agora no fuso.
+ * Não altera a checagem de ocupação do book (não é caminho novo de negação).
+ */
+export function filterSlotsAtOrAfterNow(input: {
+  date: string;
+  slots: readonly string[];
+  now: Date;
+  timezone: string;
+}): string[] {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(input.date)) return [...input.slots];
+  const today = getTodayStr(input.timezone, input.now);
+  if (input.date > today) return [...input.slots];
+  if (input.date < today) return [];
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: input.timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(input.now);
+  const hour = Number(parts.find((part) => part.type === 'hour')?.value ?? '0');
+  const minute = Number(parts.find((part) => part.type === 'minute')?.value ?? '0');
+  const nowMinutes = hour * 60 + minute;
+  return input.slots.filter((slot) => {
+    const match = /^(?:[01]\d|2[0-3]):([0-5]\d)$/u.exec(slot);
+    if (!match) return true;
+    const slotHour = Number(slot.slice(0, 2));
+    const slotMinute = Number(match[1]);
+    return slotHour * 60 + slotMinute >= nowMinutes;
+  });
 }
 
 function getCurrentYear(timezone: string): number {
@@ -790,9 +823,16 @@ export async function getAvailableSlots(
         },
       });
 
-    const slots = Array.isArray(response.data?.availableTimes)
-      ? response.data.availableTimes.filter((slot): slot is string => typeof slot === 'string')
-      : [];
+    const slots = filterSlotsAtOrAfterNow({
+      date: normalizedDate,
+      slots: Array.isArray(response.data?.availableTimes)
+        ? response.data.availableTimes.filter(
+            (slot): slot is string => typeof slot === 'string'
+          )
+        : [],
+      now: new Date(),
+      timezone: config.timezone,
+    });
 
     const availabilityProfessionalId =
       response.data?.professionalId == null

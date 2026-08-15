@@ -21,6 +21,11 @@ import {
 import {
   uniqueCatalogServiceFromCurrentMessage,
 } from './service-gate';
+import {
+  contrastWinningCivilDateV2,
+  matchCivilDateTokensV2,
+  resolveCivilDateTokenV2,
+} from './conversationalV2/temporalNormalizer';
 import { upcomingAppointmentReadGate } from './upcomingAppointmentGate';
 import {
   classifyReceptionistTurnPermission,
@@ -99,48 +104,11 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function civilDateInTimezone(now: Date, timezone: string): string {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(now);
-}
-
-function addCivilDays(ymd: string, days: number): string {
-  const [year, month, day] = ymd.split('-').map(Number);
-  const utc = new Date(Date.UTC(year, (month ?? 1) - 1, (day ?? 1) + days));
-  return utc.toISOString().slice(0, 10);
-}
-
-function weekdayInTimezone(now: Date, timezone: string): number {
-  const weekday = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    weekday: 'short',
-  }).format(now);
-  const map: Record<string, number> = {
-    Sun: 0,
-    Mon: 1,
-    Tue: 2,
-    Wed: 3,
-    Thu: 4,
-    Fri: 5,
-    Sat: 6,
-  };
-  return map[weekday] ?? 0;
-}
-
-const WEEKDAY_INDEX: Record<string, number> = {
-  domingo: 0,
-  segunda: 1,
-  terca: 2,
-  quarta: 3,
-  quinta: 4,
-  sexta: 5,
-  sabado: 6,
-};
-
+/**
+ * Atalho legado de data relativa. O runtime v2 resolve pelo lote em
+ * resolveCurrentInboundDateV2. "X, não Y" e "não X, Y" (vírgula) delegam a
+ * contrastWinningCivilDateV2; sem contraste, o primeiro token civil vence.
+ */
 export function resolveRelativeCalendarDate(
   message: string,
   now: Date,
@@ -148,16 +116,11 @@ export function resolveRelativeCalendarDate(
 ): string | null {
   const text = normalize(message);
   if (!text) return null;
-  const today = civilDateInTimezone(now, timezone);
-  if (/\bhoje\b/.test(text)) return today;
-  if (/\bdepois\s+de\s+amanha\b/.test(text)) return addCivilDays(today, 2);
-  if (/\bamanha\b/.test(text)) return addCivilDays(today, 1);
-
-  for (const [name, target] of Object.entries(WEEKDAY_INDEX)) {
-    if (!new RegExp(`\\b${name}\\b`).test(text)) continue;
-    const current = weekdayInTimezone(now, timezone);
-    const delta = (target - current + 7) % 7;
-    return addCivilDays(today, delta);
+  const contrast = contrastWinningCivilDateV2(text, now, timezone);
+  if (contrast) return contrast;
+  for (const match of matchCivilDateTokensV2(text)) {
+    const date = resolveCivilDateTokenV2(match[0], now, timezone);
+    if (date) return date;
   }
   return null;
 }

@@ -81,7 +81,7 @@ function pending(input: {
 }
 
 function frame(input: {
-  pending: PendingFrameSnapshotV2;
+  pending: PendingFrameSnapshotV2 | null;
   flowState?: FlowStateV2;
 }): TurnFrameV2 {
   return {
@@ -94,7 +94,7 @@ function frame(input: {
     currentInboundIds: ['in-1'],
     pending: input.pending,
     flowState: input.flowState ?? {
-      flowId: input.pending.flowId,
+      flowId: input.pending?.flowId ?? 'flow-wave1',
       lastOperationalAt: now.toISOString(),
       fixedByProofVersion: {},
     },
@@ -116,6 +116,7 @@ async function main(): Promise<void> {
     canaryModule,
     workflowModule,
     voiceModule,
+    readModule,
   ] = await Promise.all([
     import('../src/services/conversationalV2/currentDateResolution'),
     import('../src/services/conversationalV2/flowSession'),
@@ -130,6 +131,7 @@ async function main(): Promise<void> {
     import('../src/services/conversationalV2/linguisticCanary'),
     import('../src/services/conversationalV2/workflowLanguage'),
     import('../src/services/conversationalV2/voice'),
+    import('../src/services/conversationalV2/readFastPaths'),
   ]);
 
   const corrected = dateModule.resolveCurrentInboundDateV2({
@@ -393,6 +395,686 @@ async function main(): Promise<void> {
     },
     'TIME novo substitui integralmente as opções antigas'
   );
+
+  const canaryNow = new Date('2026-08-15T17:32:00.000Z');
+  const canaryTz = 'America/Sao_Paulo';
+  const sundayNow = new Date('2026-08-16T18:00:00.000Z');
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-domingo'],
+      inboundTextsById: { 'in-domingo': 'Quero agendar uma drenagem pra domingo' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-16', mentions: ['2026-08-16'] },
+    'F2: domingo por extenso é o próximo domingo civil (15/08/2026=sábado → 16/08)'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-segunda-feira'],
+      inboundTextsById: { 'in-segunda-feira': 'segunda-feira' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-17', mentions: ['2026-08-17'] },
+    'F2: segunda-feira com hífen'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-terca'],
+      inboundTextsById: { 'in-terca': 'terca' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-18', mentions: ['2026-08-18'] },
+    'F2: terca sem acento'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-sabado'],
+      inboundTextsById: { 'in-sabado': 'sábado' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-15', mentions: ['2026-08-15'] },
+    'F2: sábado hoje permanece hoje (≥ hoje)'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-sabado-vem'],
+      inboundTextsById: { 'in-sabado-vem': 'sábado que vem' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-22', mentions: ['2026-08-22'] },
+    'F2: X que vem no próprio X avança +7'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-que-vem'],
+      inboundTextsById: { 'in-que-vem': 'domingo que vem' },
+      now: sundayNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-23', mentions: ['2026-08-23'] },
+    'F2: domingo que vem no próprio domingo avança +7'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-correcao'],
+      inboundTextsById: { 'in-correcao': 'Domingo, não sábado!' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-16', mentions: ['2026-08-16'] },
+    'F3: Domingo, não sábado elege domingo e descarta sábado'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-e-nao'],
+      inboundTextsById: { 'in-e-nao': 'domingo e não sábado' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-16', mentions: ['2026-08-16'] },
+    'F3: X e não Y'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-nao-sexta'],
+      inboundTextsById: { 'in-nao-sexta': 'não, sexta' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    { kind: 'resolved', date: '2026-08-21', mentions: ['2026-08-21'] },
+    'F3: "não, sexta" continua correção conservadora, não contraste X-não-Y'
+  );
+
+  const canaryDatePending = pending({
+    kind: 'DATE',
+    askedAt: canaryNow.toISOString(),
+  });
+  const canaryDateFrame = frame({
+    pending: canaryDatePending,
+    flowState: {
+      flowId: canaryDatePending.flowId,
+      lastOperationalAt: canaryNow.toISOString(),
+      fixedServiceId: 'svc-drenagem',
+      fixedProfessionalId: 'prof-carla',
+      fixedByProofVersion: { fixedServiceId: 1, fixedProfessionalId: 1 },
+    },
+  });
+  let domingoArgs: Record<string, unknown> | null = null;
+  const domingoSlots = await progressModule.resolveDateSlotsFastPathV2({
+    frame: canaryDateFrame,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-1'],
+      inboundTextsById: { 'in-1': 'Quero agendar uma drenagem pra domingo' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: 'Quero agendar uma drenagem pra domingo',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async (name, args) => {
+      assert.equal(name, 'getAvailableSlots');
+      domingoArgs = args;
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '11:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(domingoSlots.kind, 'resolved');
+  assert.equal(domingoArgs?.date, '2026-08-16', 'F2: fetch de domingo, não sábado');
+  if (domingoSlots.kind === 'resolved') {
+    assert.doesNotMatch(domingoSlots.result.reply, /15\/08\/2026/);
+    assert.match(domingoSlots.result.reply, /16\/08\/2026/);
+  }
+
+  const openBookingDomingo = await progressModule.resolveDateSlotsFastPathV2({
+    frame: frame({
+      pending: null,
+      flowState: {
+        flowId: 'flow-open-domingo',
+        lastOperationalAt: canaryNow.toISOString(),
+        fixedByProofVersion: {},
+      },
+    }),
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-open'],
+      inboundTextsById: {
+        'in-open': 'Quero agendar uma drenagem pra domingo',
+      },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: 'Quero agendar uma drenagem pra domingo',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async (_name, args) => {
+      assert.equal(args.date, '2026-08-16');
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(
+    openBookingDomingo.kind,
+    'resolved',
+    'F2: sem pendência DATE ainda busca o domingo citado'
+  );
+
+  const correcaoDomingo = await progressModule.resolveDateSlotsFastPathV2({
+    frame: {
+      ...canaryDateFrame,
+      pending: pending({
+        kind: 'TIME',
+        askedAt: canaryNow.toISOString(),
+        options: [
+          { position: 1, entityId: '09:00', displayName: '09:00' },
+          { position: 2, entityId: '11:00', displayName: '11:00' },
+        ],
+      }),
+      flowState: {
+        ...canaryDateFrame.flowState,
+        resolvedDate: '2026-08-15',
+        slotEvidence: {
+          turnId: 'turn-sabado',
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-carla',
+          date: '2026-08-15',
+          slots: ['09:00', '11:00'],
+        },
+        fixedByProofVersion: {
+          ...canaryDateFrame.flowState.fixedByProofVersion,
+          resolvedDate: 1,
+        },
+      },
+    },
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-fix'],
+      inboundTextsById: { 'in-fix': 'Domingo, não sábado!' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: 'Domingo, não sábado!',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async (_name, args) => {
+      assert.equal(args.date, '2026-08-16', 'F3: correção não cai em hoje/sábado');
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '14:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(correcaoDomingo.kind, 'resolved');
+  if (correcaoDomingo.kind === 'resolved') {
+    assert.match(correcaoDomingo.result.reply, /16\/08\/2026/);
+    assert.doesNotMatch(correcaoDomingo.result.reply, /15\/08\/2026/);
+  }
+
+  const ambiguousDay = await progressModule.resolveDateSlotsFastPathV2({
+    frame: canaryDateFrame,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-amb'],
+      inboundTextsById: { 'in-amb': 'domingo ou sábado' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: 'domingo ou sábado',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async () => {
+      throw new Error('ambíguo não lista hoje');
+    },
+  });
+  assert.equal(ambiguousDay.kind, 'resolved');
+  if (ambiguousDay.kind === 'resolved') {
+    assert.equal(ambiguousDay.result.reply, 'Qual dia você prefere?');
+    assert.deepEqual(ambiguousDay.result.pendingTransitionCandidate, {
+      kind: 'open',
+      pendingKind: 'DATE',
+      flowId: canaryDateFrame.flowState.flowId,
+      optionEntityIds: ['date-freeform'],
+    });
+  }
+
+  const pastMorning = await progressModule.resolveDateSlotsFastPathV2({
+    frame: canaryDateFrame,
+    dateResolution: {
+      kind: 'resolved',
+      date: '2026-08-15',
+      mentions: ['2026-08-15'],
+    },
+    currentInboundText: 'hoje',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async () =>
+      JSON.stringify({
+        success: true,
+        slots: ['08:00', '08:30', '09:00', '15:00'],
+        professionalId: 'prof-carla',
+      }),
+  });
+  assert.equal(pastMorning.kind, 'resolved');
+  if (pastMorning.kind === 'resolved') {
+    assert.deepEqual(
+      pastMorning.result.pendingTransitionCandidate.kind === 'open'
+        ? pastMorning.result.pendingTransitionCandidate.optionEntityIds
+        : [],
+      ['15:00'],
+      'F3b: 8h/8h30/9h de hoje não são oferecidos às 14h32'
+    );
+    assert.doesNotMatch(pastMorning.result.reply, /08:00|8h|09:00|9h/);
+  }
+
+  const f1Read = await progressModule.resolveDateSlotsFastPathV2({
+    frame: frame({
+      pending: null,
+      flowState: {
+        flowId: 'flow-f1',
+        lastOperationalAt: canaryNow.toISOString(),
+        fixedByProofVersion: {},
+      },
+    }),
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-f1'],
+      inboundTextsById: {
+        'in-f1': 'Quais horários tem domingo pra drenagem?',
+      },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: 'Quais horários tem domingo pra drenagem?',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async (name, args) => {
+      assert.equal(name, 'getAvailableSlots');
+      assert.equal(args.serviceId, 'svc-drenagem');
+      assert.equal(args.date, '2026-08-16');
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '11:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(f1Read.kind, 'resolved', 'F1: menção canônica ancora leitura de slots');
+  if (f1Read.kind === 'resolved') {
+    assert.equal(
+      f1Read.nextFlowState.fixedServiceId,
+      'svc-drenagem'
+    );
+  }
+
+  const dualTypoServices: ServicesResult = {
+    success: true,
+    services: [
+      {
+        id: 'svc-drenagem',
+        name: 'Drenagem Linfática',
+        durationMinutes: 60,
+        price: 160,
+        priceFormatted: 'R$ 160,00',
+        professionalIds: ['prof-carla'],
+      },
+      {
+        id: 'svc-modeladora',
+        name: 'Drenagem Modeladora',
+        durationMinutes: 60,
+        price: 160,
+        priceFormatted: 'R$ 160,00',
+        professionalIds: ['prof-carla'],
+      },
+    ],
+    professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
+  };
+  const dualTypoInbound =
+    'Quais horários tem domingo pra Drenagem Linfática e Drenagem Modelador';
+  const dualTypoFrame = frame({
+    pending: null,
+    flowState: {
+      flowId: 'flow-f1-dual',
+      lastOperationalAt: canaryNow.toISOString(),
+      fixedByProofVersion: {},
+    },
+  });
+  let dualTypoSlotCalls = 0;
+  const dualTypoDateSlots = await progressModule.resolveDateSlotsFastPathV2({
+    frame: dualTypoFrame,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-f1-dual'],
+      inboundTextsById: { 'in-f1-dual': dualTypoInbound },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: dualTypoInbound,
+    servicesResult: dualTypoServices,
+    config,
+    now: canaryNow,
+    executeTool: async (name) => {
+      dualTypoSlotCalls += 1;
+      throw new Error(`F1 Q2 dual mention não chama ${name}`);
+    },
+  });
+  assert.equal(dualTypoDateSlots.kind, 'continue_model');
+  assert.equal(dualTypoSlotCalls, 0, 'F1 Q2: zero getAvailableSlots no dual typo-distance');
+  const dualTypoRead = await readModule.resolveReadFastPathV2({
+    frame: dualTypoFrame,
+    inboundText: dualTypoInbound,
+    servicesResult: dualTypoServices,
+    config,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-f1-dual-read'],
+      inboundTextsById: { 'in-f1-dual-read': dualTypoInbound },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    now: canaryNow,
+    executeTool: async (name) => {
+      dualTypoSlotCalls += 1;
+      throw new Error(`F1 Q2 read-fast-path não chama ${name}`);
+    },
+  });
+  assert.equal(dualTypoRead.kind, 'continue_model');
+  assert.equal(dualTypoSlotCalls, 0, 'F1 Q2: read-fast-path também zero getAvailableSlots');
+
+  const exactSiblingInbound =
+    'Quais horários tem domingo pra Drenagem Linfática?';
+  const exactSiblingFrame = frame({
+    pending: null,
+    flowState: {
+      flowId: 'flow-f1-exact-sibling',
+      lastOperationalAt: canaryNow.toISOString(),
+      fixedByProofVersion: {},
+    },
+  });
+  const exactSiblingDateSlots = await progressModule.resolveDateSlotsFastPathV2({
+    frame: exactSiblingFrame,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-f1-exact-sibling'],
+      inboundTextsById: { 'in-f1-exact-sibling': exactSiblingInbound },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: exactSiblingInbound,
+    servicesResult: dualTypoServices,
+    config,
+    now: canaryNow,
+    executeTool: async (name, args) => {
+      assert.equal(name, 'getAvailableSlots');
+      assert.equal(args.serviceId, 'svc-drenagem');
+      assert.equal(args.date, '2026-08-16');
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '11:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(
+    exactSiblingDateSlots.kind,
+    'resolved',
+    'F1 IA-9: nome completo com irmão ancora leitura'
+  );
+  if (exactSiblingDateSlots.kind === 'resolved') {
+    assert.equal(
+      exactSiblingDateSlots.nextFlowState.fixedServiceId,
+      'svc-drenagem'
+    );
+  }
+
+  const nestedCatalogServices: ServicesResult = {
+    success: true,
+    services: [
+      {
+        id: 'svc-corte',
+        name: 'Corte',
+        durationMinutes: 30,
+        price: 80,
+        priceFormatted: 'R$ 80,00',
+        professionalIds: ['prof-carla'],
+      },
+      {
+        id: 'svc-corte-barba',
+        name: 'Corte e Barba',
+        durationMinutes: 45,
+        price: 100,
+        priceFormatted: 'R$ 100,00',
+        professionalIds: ['prof-carla'],
+      },
+    ],
+    professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
+  };
+  const nestedChildInbound = 'Quais horários tem domingo pra Corte e Barba?';
+  const nestedChildFrame = frame({
+    pending: null,
+    flowState: {
+      flowId: 'flow-f1-nested-child',
+      lastOperationalAt: canaryNow.toISOString(),
+      fixedByProofVersion: {},
+    },
+  });
+  const nestedChildDateSlots = await progressModule.resolveDateSlotsFastPathV2({
+    frame: nestedChildFrame,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-f1-nested-child'],
+      inboundTextsById: { 'in-f1-nested-child': nestedChildInbound },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: nestedChildInbound,
+    servicesResult: nestedCatalogServices,
+    config,
+    now: canaryNow,
+    executeTool: async (name, args) => {
+      assert.equal(name, 'getAvailableSlots');
+      assert.equal(args.serviceId, 'svc-corte-barba');
+      assert.equal(args.date, '2026-08-16');
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '11:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(
+    nestedChildDateSlots.kind,
+    'resolved',
+    'F1 IA-9: Corte e Barba vs Corte resolve o filho'
+  );
+  if (nestedChildDateSlots.kind === 'resolved') {
+    assert.equal(
+      nestedChildDateSlots.nextFlowState.fixedServiceId,
+      'svc-corte-barba'
+    );
+  }
+
+  const f4TimePending = pending({
+    kind: 'TIME',
+    askedAt: canaryNow.toISOString(),
+    options: [
+      { position: 1, entityId: '09:00', displayName: '09:00' },
+      { position: 2, entityId: '11:00', displayName: '11:00' },
+    ],
+  });
+  const f4Frame = frame({
+    pending: f4TimePending,
+    flowState: {
+      flowId: f4TimePending.flowId,
+      lastOperationalAt: canaryNow.toISOString(),
+      fixedServiceId: 'svc-drenagem',
+      fixedProfessionalId: 'prof-carla',
+      resolvedDate: '2026-08-16',
+      slotEvidence: {
+        turnId: 'turn-f4-old',
+        serviceId: 'svc-drenagem',
+        professionalId: 'prof-carla',
+        date: '2026-08-16',
+        slots: ['09:00', '11:00'],
+      },
+      fixedByProofVersion: {
+        fixedServiceId: 1,
+        fixedProfessionalId: 1,
+        resolvedDate: 1,
+      },
+    },
+  });
+  const f4Present = await progressModule.resolveDateSlotsFastPathV2({
+    frame: f4Frame,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-f4'],
+      inboundTextsById: { 'in-f4': 'Pode ser dia 17/08 as 10h' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: 'Pode ser dia 17/08 as 10h',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async (_name, args) => {
+      assert.equal(args.date, '2026-08-17');
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '11:00', '14:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(f4Present.kind, 'resolved');
+  if (f4Present.kind === 'resolved') {
+    assert.equal(
+      f4Present.result.pendingTransitionCandidate.kind === 'open' &&
+        f4Present.result.pendingTransitionCandidate.pendingKind,
+      'CONFIRMATION',
+      'F4: 10h na lista nova segue ao resumo'
+    );
+    assert.equal(f4Present.nextFlowState.bookingDraft?.time, '10:00');
+    assert.equal(f4Present.nextFlowState.bookingDraft?.date, '2026-08-17');
+    assert.match(f4Present.result.reply, /^Confirmando:/);
+  }
+
+  const f4Missing = await progressModule.resolveDateSlotsFastPathV2({
+    frame: f4Frame,
+    dateResolution: dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-f4b'],
+      inboundTextsById: { 'in-f4b': 'Pode ser dia 17/08 as 10h' },
+      now: canaryNow,
+      timezone: canaryTz,
+    }),
+    currentInboundText: 'Pode ser dia 17/08 as 10h',
+    servicesResult: services,
+    config,
+    now: canaryNow,
+    executeTool: async () =>
+      JSON.stringify({
+        success: true,
+        slots: ['11:00', '14:00'],
+        professionalId: 'prof-carla',
+      }),
+  });
+  assert.equal(f4Missing.kind, 'resolved');
+  if (f4Missing.kind === 'resolved') {
+    assert.equal(
+      f4Missing.result.pendingTransitionCandidate.kind === 'open' &&
+        f4Missing.result.pendingTransitionCandidate.pendingKind,
+      'TIME',
+      'F4: 10h ausente da lista nova pergunta de novo'
+    );
+  }
+
+  const ia7DuplicatePending = pending({
+    kind: 'CONFIRMATION',
+    askedAt: canaryNow.toISOString(),
+    options: [
+      { position: 1, entityId: 'duplicate-resolution:keep-both', displayName: 'manter os dois' },
+      { position: 2, entityId: 'duplicate-resolution:reschedule', displayName: 'remarcar' },
+      { position: 3, entityId: 'duplicate-resolution:cancel-only', displayName: 'só cancelar o anterior' },
+      { position: 4, entityId: 'duplicate-resolution:decide-later', displayName: 'decidir depois' },
+    ],
+  });
+  const ia7DuplicateFrame = frame({
+    pending: ia7DuplicatePending,
+    flowState: {
+      flowId: ia7DuplicatePending.flowId,
+      lastOperationalAt: canaryNow.toISOString(),
+      fixedByProofVersion: {},
+    },
+  });
+  const politeKeep = fastPaths.resolvePendingOptionProofV2({
+    frame: ia7DuplicateFrame,
+    inboundId: 'in-keep',
+    inboundText: 'Pode manter os dois',
+    now: canaryNow,
+  });
+  assert.equal(politeKeep?.entityId, 'duplicate-resolution:keep-both', 'F5: prefixo pode resolve');
+  const bareKeep = fastPaths.resolvePendingOptionProofV2({
+    frame: ia7DuplicateFrame,
+    inboundId: 'in-keep-bare',
+    inboundText: 'manter os dois',
+    now: canaryNow,
+  });
+  assert.equal(bareKeep?.entityId, 'duplicate-resolution:keep-both');
+  const negatedKeep = fastPaths.resolvePendingOptionProofV2({
+    frame: ia7DuplicateFrame,
+    inboundId: 'in-keep-nao',
+    inboundText: 'não quero manter os dois',
+    now: canaryNow,
+  });
+  assert.equal(negatedKeep, null, 'F5: polaridade negativa não resolve a opção afirmativa');
+  const queroRemarcar = fastPaths.resolvePendingOptionProofV2({
+    frame: ia7DuplicateFrame,
+    inboundId: 'in-rem',
+    inboundText: 'quero remarcar',
+    now: canaryNow,
+  });
+  assert.equal(queroRemarcar?.entityId, 'duplicate-resolution:reschedule');
+  for (const inbound of [
+    'prefiro manter os dois',
+    'acho que manter os dois',
+    'pode ser manter os dois',
+    'vou querer remarcar',
+  ] as const) {
+    const polite = fastPaths.resolvePendingOptionProofV2({
+      frame: ia7DuplicateFrame,
+      inboundId: `in-${inbound}`,
+      inboundText: inbound,
+      now: canaryNow,
+    });
+    assert.ok(polite, `F5: ${inbound} resolve`);
+    assert.match(
+      polite?.entityId ?? '',
+      inbound.includes('remarcar')
+        ? /reschedule/
+        : /keep-both/,
+      inbound
+    );
+  }
+  for (const inbound of [
+    'pode remarcar?',
+    'posso remarcar?',
+    'não quero remarcar',
+  ] as const) {
+    const blocked = fastPaths.resolvePendingOptionProofV2({
+      frame: ia7DuplicateFrame,
+      inboundId: `in-ia8-${inbound}`,
+      inboundText: inbound,
+      now: canaryNow,
+    });
+    assert.equal(blocked, null, `F5 Q5: ${inbound} não resolve seleção`);
+  }
 
   const timeFrame = frame({
     pending: oldTimePending,

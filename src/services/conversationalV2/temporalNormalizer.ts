@@ -4,6 +4,40 @@ export interface NormalizedTemporalAssertionV2 {
   raw: string;
 }
 
+const WEEKDAY_INDEX: Record<string, number> = {
+  domingo: 0,
+  segunda: 1,
+  terca: 2,
+  quarta: 3,
+  quinta: 4,
+  sexta: 5,
+  sabado: 6,
+};
+
+const WEEKDAY_CORE_PATTERN =
+  '(?:segunda|terca|quarta|quinta|sexta)(?:[\\s-]+feira)?|sabado|domingo';
+const WEEKDAY_WITH_MODIFIER_PATTERN = `(?:proxim[oa]\\s+)?(?:${WEEKDAY_CORE_PATTERN})(?:\\s+que\\s+vem)?`;
+const RELATIVE_DATE_PATTERN = `depois\\s+de\\s+amanha|hoje|amanha|${WEEKDAY_WITH_MODIFIER_PATTERN}`;
+
+/** Token civil único: relativo, weekday (com hífen/feira/que vem) ou data absoluta. */
+export const CIVIL_DATE_TOKEN_RE = new RegExp(
+  `\\b(?:${RELATIVE_DATE_PATTERN})\\b|\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?\\b`,
+  'gu'
+);
+
+export function matchCivilDateTokensV2(text: string): RegExpMatchArray[] {
+  return [...text.matchAll(new RegExp(CIVIL_DATE_TOKEN_RE.source, 'gu'))];
+}
+
+const DATE_CONTRAST_RE = new RegExp(
+  `\\b(${RELATIVE_DATE_PATTERN}|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?)\\s*(?:,|e)?\\s+nao\\s+(?:e\\s+)?(${RELATIVE_DATE_PATTERN}|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?)\\b`,
+  'u'
+);
+const DATE_CONTRAST_LEADING_NEGATION_RE = new RegExp(
+  `\\bnao\\s+(${RELATIVE_DATE_PATTERN}|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?)\\s*,\\s+(${RELATIVE_DATE_PATTERN}|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?)\\b`,
+  'u'
+);
+
 const HOUR_WORDS: Record<string, number> = {
   zero: 0,
   uma: 1,
@@ -45,6 +79,132 @@ function normalize(value: string): string {
 
 function formatHour(hour: number, minute = 0): string {
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+export function civilTodayV2(now: Date, timezone: string): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(now);
+}
+
+function addCivilDays(ymd: string, days: number): string {
+  const [year, month, day] = ymd.split('-').map(Number);
+  const utc = new Date(Date.UTC(year, (month ?? 1) - 1, (day ?? 1) + days));
+  return utc.toISOString().slice(0, 10);
+}
+
+function weekdayInTimezone(now: Date, timezone: string): number {
+  const weekday = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    weekday: 'short',
+  }).format(now);
+  const map: Record<string, number> = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+  return map[weekday] ?? 0;
+}
+
+function validCivilDate(year: number, month: number, day: number): string | null {
+  const instant = new Date(Date.UTC(year, month - 1, day));
+  if (
+    instant.getUTCFullYear() !== year ||
+    instant.getUTCMonth() !== month - 1 ||
+    instant.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function absoluteCivilDate(
+  token: string,
+  now: Date,
+  timezone: string
+): string | null {
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(token);
+  if (iso) {
+    return validCivilDate(Number(iso[1]), Number(iso[2]), Number(iso[3]));
+  }
+  const br = /^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/u.exec(token);
+  if (!br) return null;
+  const currentYear = Number(civilTodayV2(now, timezone).slice(0, 4));
+  const rawYear = br[3];
+  const year = rawYear
+    ? rawYear.length === 2
+      ? 2000 + Number(rawYear)
+      : Number(rawYear)
+    : currentYear;
+  return validCivilDate(year, Number(br[2]), Number(br[1]));
+}
+
+function parseWeekdayToken(
+  token: string
+): { index: number; nextWeek: boolean } | null {
+  const text = normalize(token);
+  const nextWeek =
+    /^(?:proxim[oa]\s+)/u.test(text) || /\s+que\s+vem$/u.test(text);
+  const core = text
+    .replace(/^(?:proxim[oa]\s+)/u, '')
+    .replace(/\s+que\s+vem$/u, '')
+    .replace(/[\s-]+feira$/u, '');
+  const index = WEEKDAY_INDEX[core];
+  if (index === undefined) return null;
+  return { index, nextWeek };
+}
+
+/**
+ * Ponto único de resolução civil: weekday por extenso (com/sem acento, com/sem
+ * "-feira"), "X que vem"/"próximo X" (hoje=X ⇒ +7) e hoje/amanhã. Sempre no
+ * fuso informado, nunca weekday UTC cru.
+ */
+export function resolveCivilDateTokenV2(
+  token: string,
+  now: Date,
+  timezone: string
+): string | null {
+  const text = normalize(token);
+  if (!text) return null;
+  const today = civilTodayV2(now, timezone);
+  if (text === 'hoje') return today;
+  if (text === 'depois de amanha') return addCivilDays(today, 2);
+  if (text === 'amanha') return addCivilDays(today, 1);
+  const absolute = absoluteCivilDate(text, now, timezone);
+  if (absolute) return absolute;
+  const weekday = parseWeekdayToken(text);
+  if (!weekday) return null;
+  const current = weekdayInTimezone(now, timezone);
+  let delta = (weekday.index - current + 7) % 7;
+  if (weekday.nextWeek && delta === 0) delta = 7;
+  return addCivilDays(today, delta);
+}
+
+/**
+ * "X, não Y" / "X e não Y": X vence e Y é descartado. "não X, Y" (vírgula)
+ * elege Y. "não, sexta" (marcador sem X à esquerda) não casa. Ausente o
+ * padrão, null.
+ */
+export function contrastWinningCivilDateV2(
+  value: string,
+  now: Date,
+  timezone: string
+): string | null {
+  const text = normalize(value);
+  const forward = DATE_CONTRAST_RE.exec(text);
+  if (forward?.[1]) return resolveCivilDateTokenV2(forward[1], now, timezone);
+  const leadingNegation = DATE_CONTRAST_LEADING_NEGATION_RE.exec(text);
+  if (leadingNegation?.[2]) {
+    return resolveCivilDateTokenV2(leadingNegation[2], now, timezone);
+  }
+  return null;
 }
 
 export function normalizeTemporalAssertionsV2(
@@ -111,8 +271,13 @@ export function normalizeTemporalAssertionsV2(
     add({ kind: 'time', normalized: formatHour(hour), raw: match[0].trim() });
   }
 
-  for (const match of text.matchAll(/\b(?:hoje|amanha|segunda(?: feira)?|terca(?: feira)?|quarta(?: feira)?|quinta(?: feira)?|sexta(?: feira)?|sabado|domingo)\b/gu)) {
-    add({ kind: 'date', normalized: match[0].replace(/ feira$/u, ''), raw: match[0] });
+  const dateMatcher = new RegExp(`\\b(?:${RELATIVE_DATE_PATTERN})\\b`, 'gu');
+  for (const match of text.matchAll(dateMatcher)) {
+    const normalizedDate = match[0]
+      .replace(/^(?:proxim[oa]\s+)/u, '')
+      .replace(/\s+que\s+vem$/u, '')
+      .replace(/[\s-]+feira$/u, '');
+    add({ kind: 'date', normalized: normalizedDate, raw: match[0] });
   }
   return assertions;
 }

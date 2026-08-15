@@ -25,6 +25,7 @@ import {
   shouldAskServiceUpfront,
   buildServiceQuestion,
   SERVICE_SELECTION_HINT_PREFIX,
+  uniqueCanonicalMentionGroundsReadSelection,
   type ServiceLike,
 } from './service-gate';
 import { professionalSelectionGate } from './professional-selection-gate';
@@ -719,14 +720,23 @@ export async function executeReceptionistFunction(
           conversationHistory
         );
         if (!gate.ok) {
-          v2Grounding?.onGateDecline?.({
-            gate: 'selection',
-            reason: 'service_selection_not_grounded',
-          });
-          console.log(
-            `🚧 Receptionist gate de serviço bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId}`
-          );
-          return JSON.stringify({ success: false, message: gate.hintMessage });
+          const readGrounded =
+            functionName === 'getAvailableSlots' &&
+            uniqueCanonicalMentionGroundsReadSelection(
+              String(args.serviceId ?? ''),
+              servicesResult.services,
+              currentUserMessage
+            );
+          if (!readGrounded) {
+            v2Grounding?.onGateDecline?.({
+              gate: 'selection',
+              reason: 'service_selection_not_grounded',
+            });
+            console.log(
+              `🚧 Receptionist gate de serviço bloqueou ${functionName} | phoneNumberId=${config.phoneNumberId}`
+            );
+            return JSON.stringify({ success: false, message: gate.hintMessage });
+          }
         }
       }
     }

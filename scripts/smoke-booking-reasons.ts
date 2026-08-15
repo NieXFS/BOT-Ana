@@ -30,6 +30,7 @@ import {
   getAvailableSlots,
   bookAppointment,
   cancelAppointment,
+  filterSlotsAtOrAfterNow,
   CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
   type BookFailureReason,
 } from "../src/services/calendarService.ts";
@@ -229,6 +230,34 @@ async function main() {
     calSrc.indexOf("if (reason === 'customer_identity_ambiguous')") >= 0 &&
       calSrc.indexOf("if (reason === 'customer_identity_ambiguous')") <
         calSrc.indexOf("if (reason === 'blocked' || reason === 'conflict' || reason === 'outside_hours')"),
+  );
+
+  const canaryNow = new Date("2026-08-15T17:32:00.000Z");
+  record(
+    "F3b: slots de hoje anteriores a agora são filtrados no fuso do processo",
+    JSON.stringify(
+      filterSlotsAtOrAfterNow({
+        date: "2026-08-15",
+        slots: ["08:00", "08:30", "09:00", "15:00", "16:00"],
+        now: canaryNow,
+        timezone: "America/Sao_Paulo",
+      })
+    ) === JSON.stringify(["15:00", "16:00"])
+  );
+  record(
+    "F3b: dia futuro não perde a grade da manhã",
+    JSON.stringify(
+      filterSlotsAtOrAfterNow({
+        date: "2026-08-17",
+        slots: ["08:00", "15:00"],
+        now: canaryNow,
+        timezone: "America/Sao_Paulo",
+      })
+    ) === JSON.stringify(["08:00", "15:00"])
+  );
+  record(
+    "F3b: getAvailableSlots filtra a resposta do ERP antes de apresentar",
+    calSrc.includes("filterSlotsAtOrAfterNow")
   );
 
   const failed = checks.filter((c) => !c.ok);

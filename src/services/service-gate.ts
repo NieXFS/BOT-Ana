@@ -420,27 +420,93 @@ function computeWindow(userMessages: string[]): {
 
 type MatchKind = 'full' | 'token' | 'typo';
 
-/** Serviços citados na janela, com o tipo de match (nome completo vs token distintivo). */
-function matchedServices(
+type CatalogMatchSpan = { start: number; end: number };
+
+type SpannedCatalogMatch = {
+  id: string;
+  kind: MatchKind;
+  span: CatalogMatchSpan;
+};
+
+const MATCH_KIND_RANK: Record<MatchKind, number> = {
+  full: 3,
+  token: 2,
+  typo: 1,
+};
+
+function locateSubstringSpans(haystack: string, needle: string): CatalogMatchSpan[] {
+  const spans: CatalogMatchSpan[] = [];
+  if (needle.length < 3) return spans;
+  let from = 0;
+  while (from <= haystack.length - needle.length) {
+    const start = haystack.indexOf(needle, from);
+    if (start < 0) break;
+    spans.push({ start, end: start + needle.length });
+    from = start + 1;
+  }
+  return spans;
+}
+
+function inboundTokenSpans(
+  text: string
+): Array<{ token: string; span: CatalogMatchSpan }> {
+  const out: Array<{ token: string; span: CatalogMatchSpan }> = [];
+  for (const match of text.matchAll(/[a-z0-9]+/g)) {
+    const token = match[0]!;
+    if (token.length < 3 || STOPWORDS.has(token)) continue;
+    const start = match.index ?? 0;
+    out.push({ token, span: { start, end: start + token.length } });
+  }
+  return out;
+}
+
+function spanFullyContains(
+  outer: CatalogMatchSpan,
+  inner: CatalogMatchSpan
+): boolean {
+  return inner.start >= outer.start && inner.end <= outer.end;
+}
+
+function uniqueMatchesById(
+  matches: Array<{ id: string; kind: MatchKind }>
+): Array<{ id: string; kind: MatchKind }> {
+  const byId = new Map<string, MatchKind>();
+  for (const match of matches) {
+    const previous = byId.get(match.id);
+    if (!previous || MATCH_KIND_RANK[match.kind] > MATCH_KIND_RANK[previous]) {
+      byId.set(match.id, match.kind);
+    }
+  }
+  return [...byId.entries()].map(([id, kind]) => ({ id, kind }));
+}
+
+/**
+ * Matcher canônico com proveniência/posição. Cada match carrega o span no
+ * texto normalizado: nome completo ou o token inbound que casou.
+ */
+function matchedServicesWithSpans(
   windowText: string,
   services: ServiceLike[],
   options: CatalogEntityMatchOptions = {}
-): Array<{ id: string; kind: MatchKind }> {
-  const inboundTokens = windowText
-    .split(/[^a-z0-9]+/)
-    .filter((token) => token.length >= 3 && !STOPWORDS.has(token));
-  const out: Array<{ id: string; kind: MatchKind }> = [];
-  const forcedDistanceTwoAmbiguity = new Set<string>();
+): SpannedCatalogMatch[] {
+  const inbound = inboundTokenSpans(windowText);
+  const out: SpannedCatalogMatch[] = [];
+  const forcedDistanceTwoAmbiguity = new Map<string, CatalogMatchSpan>();
   for (const service of services) {
     const name = normalizeServiceText(service.name);
-    if (name.length >= 3 && windowText.includes(name)) {
-      out.push({ id: service.id, kind: 'full' });
+    const fullSpans =
+      name.length >= 3 ? locateSubstringSpans(windowText, name) : [];
+    if (fullSpans.length > 0) {
+      for (const span of fullSpans) {
+        out.push({ id: service.id, kind: 'full', span });
+      }
       continue;
     }
-    let best: Exclude<MatchKind, 'full'> | null = null;
-    for (const catalogToken of tokensOf(service.name)) {
-      for (const candidate of inboundTokens) {
-        const kind = tokenMatchKind(candidate, catalogToken, options);
+    const catalogTokens = tokensOf(service.name);
+    for (const inboundToken of inbound) {
+      let best: Exclude<MatchKind, 'full'> | null = null;
+      for (const catalogToken of catalogTokens) {
+        const kind = tokenMatchKind(inboundToken.token, catalogToken, options);
         if (kind === 'token') {
           best = 'token';
           break;
@@ -448,30 +514,91 @@ function matchedServices(
         if (kind === 'typo1') best ??= 'typo';
         if (kind === 'typo2') {
           best ??= 'typo';
-          const nearby = entityIdsWithinRawDistanceTwo(candidate, services);
+          const nearby = entityIdsWithinRawDistanceTwo(
+            inboundToken.token,
+            services
+          );
           if (nearby.size > 1) {
             for (const entityId of nearby) {
-              forcedDistanceTwoAmbiguity.add(entityId);
+              if (!forcedDistanceTwoAmbiguity.has(entityId)) {
+                forcedDistanceTwoAmbiguity.set(entityId, inboundToken.span);
+              }
             }
           }
         }
       }
-      if (best === 'token') break;
+      if (best) {
+        out.push({
+          id: service.id,
+          kind: best,
+          span: inboundToken.span,
+        });
+      }
     }
-    if (best) out.push({ id: service.id, kind: best });
   }
-  for (const entityId of forcedDistanceTwoAmbiguity) {
+  for (const [entityId, span] of forcedDistanceTwoAmbiguity) {
     if (!out.some((match) => match.id === entityId)) {
-      out.push({ id: entityId, kind: 'typo' });
+      out.push({ id: entityId, kind: 'typo', span });
     }
   }
   return out;
+}
+
+/** Serviços citados na janela, com o tipo de match (nome completo vs token distintivo). */
+function matchedServices(
+  windowText: string,
+  services: ServiceLike[],
+  options: CatalogEntityMatchOptions = {}
+): Array<{ id: string; kind: MatchKind }> {
+  return uniqueMatchesById(
+    matchedServicesWithSpans(windowText, services, options)
+  );
+}
+
+/**
+ * F1 leitura: com match de nome completo, descarta só o token do irmão cujo
+ * span está inteiramente contido no span desse nome. Fuzzy/token independente
+ * (fora do span) permanece.
+ */
+function discardSiblingTokensContainedInFullNameSpans(
+  matches: SpannedCatalogMatch[]
+): SpannedCatalogMatch[] {
+  const full = matches.filter((match) => match.kind === 'full');
+  if (full.length === 0) return matches;
+  return matches.filter((candidate) => {
+    if (candidate.kind !== 'token') return true;
+    return !full.some(
+      (fullMatch) =>
+        fullMatch.id !== candidate.id &&
+        spanFullyContains(fullMatch.span, candidate.span)
+    );
+  });
+}
+
+function isCatalogParentOfFullMatch(
+  candidate: { id: string },
+  full: Array<{ id: string }>,
+  services: ServiceLike[]
+): boolean {
+  const candidateService = services.find((service) => service.id === candidate.id);
+  if (!candidateService) return false;
+  const candidateName = normalizeServiceText(candidateService.name);
+  return full.some((other) => {
+    if (other.id === candidate.id) return false;
+    const otherService = services.find((service) => service.id === other.id);
+    if (!otherService) return false;
+    const otherName = normalizeServiceText(otherService.name);
+    return otherName.length > candidateName.length && otherName.includes(candidateName);
+  });
 }
 
 /**
  * Remove o falso match do nome-pai em nomes hierárquicos. Ex.: a mensagem
  * "Corte e Barba" casa também "Corte", mas representa uma única escolha: o
  * full-match mais específico. Matches disjuntos permanecem ambíguos.
+ *
+ * WRITE-only: um full único descarta fuzzy/token irmãos (typo-distance). O
+ * resolvedor F1 de leitura não usa este early-return.
  */
 function collapseHierarchicalMatches(
   matches: Array<{ id: string; kind: MatchKind }>,
@@ -483,46 +610,31 @@ function collapseHierarchicalMatches(
     const token = matches.filter((match) => match.kind === 'token');
     return token.length > 0 ? token : matches;
   }
-
-  return matches.filter((candidate) => {
-    const candidateService = services.find((service) => service.id === candidate.id);
-    if (!candidateService) return true;
-    const candidateName = normalizeServiceText(candidateService.name);
-    return !full.some((other) => {
-      if (other.id === candidate.id) return false;
-      const otherService = services.find((service) => service.id === other.id);
-      if (!otherService) return false;
-      const otherName = normalizeServiceText(otherService.name);
-      return otherName.length > candidateName.length && otherName.includes(candidateName);
-    });
-  });
+  return matches.filter(
+    (candidate) => !isCatalogParentOfFullMatch(candidate, full, services)
+  );
 }
 
-export type CatalogEntityResolution =
-  | { kind: 'resolved'; entity: ServiceLike; matchKind: MatchKind }
-  | { kind: 'ambiguous'; entityIds: string[] }
-  | { kind: 'no_match'; reason: 'empty' | 'naked_weekday' | 'none' };
-
 /**
- * Resolução detalhada pelo matcher canônico da casa. O retorno preserva a
- * distinção entre ambiguidade e ausência de evidência para os validadores v2.
+ * F1 leitura: depois da absorção por span, só colapsa pai→filho quando o
+ * nome do catálogo do pai é substring real do filho ("Drenagem" ⊂
+ * "Drenagem Linfática" / "Corte" ⊂ "Corte e Barba").
  */
-export function resolveUniqueCatalogEntityFromCurrentMessage(
-  message: string,
-  entities: ServiceLike[],
-  options: CatalogEntityMatchOptions = {}
-): CatalogEntityResolution {
-  const normalized = normalizeServiceText(message);
-  if (!normalized || entities.length === 0) {
-    return { kind: 'no_match', reason: 'empty' };
-  }
-  if (NAKED_WEEKDAY_RE.test(normalized)) {
-    return { kind: 'no_match', reason: 'naked_weekday' };
-  }
-  const matches = collapseHierarchicalMatches(
-    matchedServices(normalized, entities, options),
-    entities
+function collapseHierarchicalMatchesForRead(
+  matches: Array<{ id: string; kind: MatchKind }>,
+  services: ServiceLike[]
+): Array<{ id: string; kind: MatchKind }> {
+  const full = matches.filter((match) => match.kind === 'full');
+  if (full.length === 0) return matches;
+  return matches.filter(
+    (candidate) => !isCatalogParentOfFullMatch(candidate, full, services)
   );
+}
+
+function catalogEntityResolutionFromMatches(
+  matches: Array<{ id: string; kind: MatchKind }>,
+  entities: ServiceLike[]
+): CatalogEntityResolution {
   if (matches.length === 0) return { kind: 'no_match', reason: 'none' };
   if (matches.length > 1) {
     return {
@@ -535,6 +647,80 @@ export function resolveUniqueCatalogEntityFromCurrentMessage(
   return entity
     ? { kind: 'resolved', entity, matchKind: match.kind }
     : { kind: 'no_match', reason: 'none' };
+}
+
+export type CatalogEntityResolution =
+  | { kind: 'resolved'; entity: ServiceLike; matchKind: MatchKind }
+  | { kind: 'ambiguous'; entityIds: string[] }
+  | { kind: 'no_match'; reason: 'empty' | 'naked_weekday' | 'none' };
+
+function resolveCatalogEntityFromCurrentMessage(
+  message: string,
+  entities: ServiceLike[],
+  options: CatalogEntityMatchOptions,
+  collapse: (
+    matches: Array<{ id: string; kind: MatchKind }>,
+    services: ServiceLike[]
+  ) => Array<{ id: string; kind: MatchKind }>
+): CatalogEntityResolution {
+  const normalized = normalizeServiceText(message);
+  if (!normalized || entities.length === 0) {
+    return { kind: 'no_match', reason: 'empty' };
+  }
+  if (NAKED_WEEKDAY_RE.test(normalized)) {
+    return { kind: 'no_match', reason: 'naked_weekday' };
+  }
+  return catalogEntityResolutionFromMatches(
+    collapse(matchedServices(normalized, entities, options), entities),
+    entities
+  );
+}
+
+/**
+ * Resolução detalhada pelo matcher canônico da casa. O retorno preserva a
+ * distinção entre ambiguidade e ausência de evidência para os validadores v2.
+ */
+export function resolveUniqueCatalogEntityFromCurrentMessage(
+  message: string,
+  entities: ServiceLike[],
+  options: CatalogEntityMatchOptions = {}
+): CatalogEntityResolution {
+  return resolveCatalogEntityFromCurrentMessage(
+    message,
+    entities,
+    options,
+    collapseHierarchicalMatches
+  );
+}
+
+/**
+ * Resolvedor F1 de LEITURA. Preserva proveniência/posição. Nome completo
+ * absorve só o token de irmão contido no próprio span; fuzzy/token fora do
+ * span permanece. 2+ candidatos restantes ⇒ `ambiguous` (pré-F1: sem
+ * grounding, sem tool). Write continua no early-return de full único.
+ */
+export function resolveUniqueCatalogEntityFromCurrentMessageForRead(
+  message: string,
+  entities: ServiceLike[],
+  options: CatalogEntityMatchOptions = {}
+): CatalogEntityResolution {
+  const normalized = normalizeServiceText(message);
+  if (!normalized || entities.length === 0) {
+    return { kind: 'no_match', reason: 'empty' };
+  }
+  if (NAKED_WEEKDAY_RE.test(normalized)) {
+    return { kind: 'no_match', reason: 'naked_weekday' };
+  }
+  const surviving = discardSiblingTokensContainedInFullNameSpans(
+    matchedServicesWithSpans(normalized, entities, options)
+  );
+  return catalogEntityResolutionFromMatches(
+    collapseHierarchicalMatchesForRead(
+      uniqueMatchesById(surviving),
+      entities
+    ),
+    entities
+  );
 }
 
 const INFORMATIONAL_SERVICE_QUESTION_RE =
@@ -792,6 +978,29 @@ export function uniqueCatalogServiceFromCurrentMessage(
     services
   );
   return resolution.kind === 'resolved' ? resolution.entity : undefined;
+}
+
+/**
+ * Grounding allow-only para LEITURAS: menção canônica unívoca (0 ou 2+
+ * permanece fail-closed) ancora getAvailableSlots/preço/duração. Writes
+ * continuam exigindo o fluxo completo via serviceSelectionGate.
+ */
+export function uniqueCanonicalMentionGroundsReadSelection(
+  serviceId: string,
+  services: ServiceLike[],
+  currentMessage: string
+): boolean {
+  const unique = resolveUniqueCatalogEntityFromCurrentMessageForRead(
+    currentMessage,
+    services,
+    {
+      allowRestrictedDistanceTwo: ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+    }
+  );
+  const chosen = resolveChosen(services, serviceId);
+  return Boolean(
+    unique.kind === 'resolved' && chosen && unique.entity.id === chosen.id
+  );
 }
 
 /**

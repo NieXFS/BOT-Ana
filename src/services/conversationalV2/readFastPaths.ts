@@ -7,7 +7,12 @@ import type {
   ServicesResult,
   UpcomingAppointment,
 } from '../calendarService';
+import { filterSlotsAtOrAfterNow } from '../calendarService';
 import { professionalSelectionGate } from '../professional-selection-gate';
+import {
+  ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+  resolveUniqueCatalogEntityFromCurrentMessageForRead,
+} from '../service-gate';
 import {
   STANDALONE_CANCEL_CUSTOMER_MESSAGE,
   buildExistingAppointmentReply,
@@ -19,6 +24,7 @@ import type {
   ResolutionProof,
   TurnFrameV2,
 } from './contracts';
+import type { CurrentDateResolutionV2 } from './currentDateResolution';
 import { hasPositiveClauseMatchV2 } from './polarity';
 import { displayDateV2 } from './lifecycleReducer';
 import { stripPowerZeroMetalinguisticAssignmentsV2 } from './powerZeroWitness';
@@ -259,21 +265,33 @@ function forcedExistingIntentCopy(
     : buildExistingAppointmentReply('reschedule', appointments, timezone);
 }
 
-function validSlots(parsed: Record<string, unknown>): string[] | null {
+function validSlots(
+  parsed: Record<string, unknown>,
+  now?: Date,
+  timezone?: string,
+  date?: string
+): string[] | null {
   if (!Array.isArray(parsed.slots)) return null;
   const slots = parsed.slots.filter(
     (slot): slot is string =>
       typeof slot === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(slot)
   );
-  return slots.length === parsed.slots.length ? [...new Set(slots)] : null;
+  if (slots.length !== parsed.slots.length) return null;
+  const unique = [...new Set(slots)];
+  if (now && timezone && date) {
+    return filterSlotsAtOrAfterNow({ date, slots: unique, now, timezone });
+  }
+  return unique;
 }
 
 function availabilitySuccessResult(
   parsed: Record<string, unknown>,
   frame: TurnFrameV2,
-  date: string
+  date: string,
+  now?: Date,
+  timezone?: string
 ): ModelTurnResultV2 | null {
-  const slots = validSlots(parsed);
+  const slots = validSlots(parsed, now, timezone, date);
   if (!slots) return null;
   if (slots.length === 0) {
     return {
@@ -344,6 +362,7 @@ export async function resolveReadFastPathV2(input: {
   forcedExistingIntent?: Exclude<ExistingAppointmentIntent, 'none'>;
   /** Recorte somente por data civil unívoca resolvida no lote completo. */
   upcomingDateFilter?: string;
+  dateResolution?: CurrentDateResolutionV2;
   now?: Date;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<ReadFastPathResultV2> {
@@ -403,8 +422,24 @@ export async function resolveReadFastPathV2(input: {
   if (!hasExplicitAvailabilityReadRequestV2(input.inboundText)) {
     return { kind: 'continue_model', reason: 'no_explicit_read_request' };
   }
-  const serviceId = input.frame.flowState.fixedServiceId;
-  const date = input.frame.flowState.resolvedDate;
+  const inboundResolution = resolveUniqueCatalogEntityFromCurrentMessageForRead(
+    input.inboundText,
+    input.servicesResult.services ?? [],
+    {
+      allowRestrictedDistanceTwo: ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+    }
+  );
+  if (inboundResolution.kind === 'ambiguous') {
+    return { kind: 'continue_model', reason: 'service_not_resolved' };
+  }
+  const inboundService =
+    inboundResolution.kind === 'resolved' ? inboundResolution.entity : undefined;
+  const serviceId =
+    input.frame.flowState.fixedServiceId ?? inboundService?.id;
+  const date =
+    input.dateResolution?.kind === 'resolved'
+      ? input.dateResolution.date
+      : input.frame.flowState.resolvedDate;
   if (!serviceId) {
     return { kind: 'continue_model', reason: 'service_not_resolved' };
   }
@@ -422,12 +457,33 @@ export async function resolveReadFastPathV2(input: {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(date) || (today !== null && date < today)) {
     return { kind: 'continue_model', reason: 'past_or_invalid_state_date' };
   }
+  const uniqueProfessional =
+    input.frame.flowState.fixedProfessionalId ??
+    (() => {
+      const service = input.servicesResult.services?.find(
+        (entry) => entry.id === serviceId
+      );
+      const active = input.servicesResult.professionals ?? [];
+      const eligible =
+        service?.professionalIds === undefined
+          ? active
+          : active.filter((entry) =>
+              service.professionalIds!.includes(entry.id)
+            );
+      return eligible.length === 1 ? eligible[0]!.id : undefined;
+    })();
   const professionalGate = professionalSelectionGate({
     serviceId,
-    professionalId: input.frame.flowState.fixedProfessionalId,
+    professionalId: uniqueProfessional,
     servicesResult: input.servicesResult,
     userMessages: [input.inboundText],
-    trustedFlowState: input.frame.flowState,
+    trustedFlowState: uniqueProfessional
+      ? {
+          ...input.frame.flowState,
+          fixedServiceId: serviceId,
+          fixedProfessionalId: uniqueProfessional,
+        }
+      : input.frame.flowState,
   });
   if (!professionalGate.ok) {
     return { kind: 'continue_model', reason: professionalGate.reason };
@@ -450,7 +506,13 @@ export async function resolveReadFastPathV2(input: {
   };
   const successResult =
     read.parsed?.success === true
-      ? availabilitySuccessResult(read.parsed, input.frame, date)
+      ? availabilitySuccessResult(
+          read.parsed,
+          input.frame,
+          date,
+          input.now,
+          input.config.timezone
+        )
       : null;
   const result: ModelTurnResultV2 = successResult ?? {
     schemaVersion: 2,
