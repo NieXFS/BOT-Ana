@@ -848,3 +848,94 @@ Sem deploy. Sem push. Sem escrita na VPS. Sem `--real` (coordenador).
 - Split de custo Luna vs `resume_thinking` DeepSeek da Exec 7 permanece correto; esta exec não mexeu em preços.
 - A matriz viva continua autorização do coordenador.
 
+## Exec 7c — juiz pairwise `missing_credential` com chave viva no env
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada; `--real` continua autorização do coordenador. Esta exec **não** fez chamadas reais.
+
+O coordenador exportou `OPENAI_API_KEY` e `OPENAI_API_KEY_LUNA` vivas (comprimento 164) no mesmo shell em que o adapter Luna dos braços behavioral já tinha rodado. O juiz τ² `--real` mesmo assim saiu `pairwiseTone.status: "not_run"` / `reason: "missing_credential"`.
+
+### Revisão causal final (2026-08-15)
+
+A alegação original de que uma chave viva continha `smoke` no payload estava errada. O coordenador verificou as duas chaves na fonte, sem expor valores: nenhuma contém essa substring, case-insensitive. A fixture “azarada” continua útil como hardening preventivo, mas **não é evidência do incidente**.
+
+A causa compatível com o run foi confirmada pela configuração do coordenador: `ANA_V2_TAU2_JUDGE_PROVIDER=openai`. O branch pré-7d de credencial para `provider:"openai"` lia somente `OPENAI_API_KEY`; ele ignorava a `OPENAI_API_KEY_LUNA` viva. Simultaneamente, o npm fixava `OPENAI_API_KEY=sk-smoke-invalid` e o scrub removia essa fixture. Assim o preflight dos braços Luna passava com `OPENAI_API_KEY_LUNA`, mas o gate do juiz `openai` via apenas a chave clobberada/removida e devolvia `missing_credential`.
+
+Três correções/hardenings foram entregues no 7c:
+
+1. **npm:** deixou de sobrescrever `OPENAI_API_KEY` exportada.
+2. **shape:** passou a reconhecer chaves `sk-proj-` longas antes da denylist textual — prevenção, não causa observada.
+3. **cobertura:** factory com `env` explícito passou a atravessar o gate real de credencial; factory sem `env` continua sendo injeção hermética.
+
+### Conserto
+
+- Detector: `sk-proj-` com comprimento ≥ 80 **nunca** é fixture; `sk-` longa só é fixture se o prefixo for de harness (`sk-smoke-`, `sk-fixture-`, `sk-mock-`, `sk-luna-smoke-`).
+- npm: `OPENAI_API_KEY=${OPENAI_API_KEY:-sk-smoke-invalid}` — export viva vence.
+- Juiz lê `livePairwiseJudgeEnvV2()` (= `process.env` no momento da chamada). Sem spread. Provider `openai` também aceita `OPENAI_API_KEY_LUNA` como fallback da mesma família.
+- Com `env` explícito, a checagem de credencial **roda mesmo com factory**. Factory sem `env` continua sendo injeção de teste.
+
+### Fixture (sem rede)
+
+`sk-proj-` × 164 e uma variante **sintética** com `smoke` no payload: scrub preserva ambas; npm-clobber smoke + Luna viva ⇒ credencial presente; `env` vivo + factory ⇒ `status:"judged"`, 2 chamadas; fixture + factory ⇒ `missing_credential` e zero chamadas.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-v2-tau2` | 0 | env 164 ⇒ `judged`; fixture ⇒ `missing_credential`; mock `not_run` |
+| `smoke:ana-v2-behavioral-receipt` | 0 | latch anti-mock do juiz intacto |
+
+Sem deploy. Sem push. Sem escrita na VPS. Sem `--real` (coordenador).
+
+### Riscos que permanecem
+
+- Com chave viva o juiz `--real` **chama** a Luna. Esta exec só prova o portão; não paga completions.
+- Clone `{...process.env}` feito pelo caller **antes** do export ainda esconde a chave se for passado como `env`. O `--real` do τ² passa a referência viva.
+- A matriz viva continua autorização do coordenador.
+
+## Exec 7d — credencial estrutural, Responses API e relatório indestrutível
+
+**Status:** implementado e validado localmente; sem deploy, push ou `--real`. Executor: **GPT-5.6 Sol**, por exceção pontual autorizada pelo Victor em 2026-08-15 após quatro quedas consecutivas do transporte do Grok/Cursor. A rotação volta ao Grok na próxima tarefa.
+
+### Baseline e aproveitamento do parcial
+
+Baseline observado: `0fd8d35` + Exec 7c completo + parcial não commitado do Grok. O parcial foi preservado e auditado, não descartado. Ele já trazia a direção correta: `PairwiseToneAskFailedV2`, snapshot de contagens brutas, `judge_call_failed`, scaffold de credencial resolvida, tentativa de Responses API e campos de provider/model tentados.
+
+Na auditoria, o parcial ainda tinha quatro lacunas: as fixtures A2/B3 não existiam; o runner `--real` continuava exigindo `nComparisons=0` e `receipts=[]` para todo `not_run`, portanto destruiria um relatório parcial antes do `console.log`; não havia exit não-zero depois da publicação; e `mock_harness` ganhava provider/model default apesar de nenhum juiz ter sido tentado. O Sol completou/corrigiu esses pontos e manteve `pairwiseTone.ts` como núcleo das contagens brutas iniciado pelo Grok.
+
+### Decisões implementadas
+
+1. **Gate e adapter por construção.** `resolvePairwiseJudgeCredentialV2` resolve `OPENAI_API_KEY_LUNA` → `OPENAI_API_KEY` tanto para `luna` quanto para `openai`. O mesmo valor entra em `pairwiseJudgeRuntimeConfigV2.openaiApiKey` e em `ReceptionistAiRuntime.apiKey`; a factory recebe a configuração e o runtime exatos para provar que a chave não ficou só no booleano do gate.
+2. **Protocolo do juiz Luna.** `gpt-5.6-luna` canonicaliza para provider Luna/transport `responses`, mesmo sob o rótulo histórico `JUDGE_PROVIDER=openai`. A chamada reutiliza `buildLunaResponsesRequest` + `createReceptionistChatCompletion`: `max_output_tokens`, `input` e `text.format=json_object`; nunca `max_tokens`. Escolha: Responses API, não `max_completion_tokens`, para manter um único adapter Luna idêntico aos braços.
+3. **Relatório indestrutível.** 4xx/5xx/timeout do juiz vira `status:not_run`, `reason:judge_call_failed`, erro limitado/scrubbed, provider/model tentados, recibos e contagens concluídas até a quebra, `preferenceRate:null` e `inconclusive:true`. Os braços e tasks já executados permanecem no JSON schema-6. O JSON é impresso primeiro; depois o processo marca exit `1`.
+4. **Auditoria de ausência.** `not_run` por credencial/self-judge preserva `attemptedProvider`/`attemptedModel`; `mock_harness` deixa ambos `null`, pois não houve tentativa. Nenhum campo carrega credencial.
+5. **Causalidade do 7c corrigida.** A hipótese de substring `smoke` nas chaves reais foi marcada como refutada. A causa confirmada foi `JUDGE_PROVIDER=openai` lendo apenas a `OPENAI_API_KEY` clobberada/removida e ignorando a `OPENAI_API_KEY_LUNA` viva.
+
+### Fixtures herméticas adicionadas
+
+- `provider=openai` + somente LUNA viva ⇒ `judged`; factory comprova `runtimeConfig.openaiApiKey` e `runtime.apiKey` não nulos.
+- Nenhuma chave ⇒ `missing_credential`, provider/model tentados preservados e zero chamadas.
+- Reprodução exata da divergência 7c (`openai` Chat Completions + somente LUNA) ⇒ duas chamadas de factory e runtime com a credencial resolvida. `gpt-4o-mini` aparece somente nessa regressão histórica, nunca como braço/candidato.
+- Specs `luna/gpt-5.6-luna` e `openai/gpt-5.6-luna` ⇒ transport `responses`, `max_output_tokens:64`, ausência de `max_tokens`/`max_completion_tokens`.
+- Segunda chamada lança 400 sintético ⇒ uma comparação/um recibo preservados, média nula, credencial redigida e envelope schema-6 conserva os cinco braços.
+
+### Validações Ana (exit real)
+
+| Comando | exit | resultado |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | contratos tipados fecham |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-v2-tau2` | 0 | schema 6; fixtures de credencial/protocolo/400; mock `not_run`; FAIL 0 |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5; latch anti-mock das sete camadas intacto |
+| `npm run smoke:provider-protocol` | 0 | nove famílias × 12; PASS hermético |
+
+Sem deploy. Sem push. Sem chamada real. Behavioral/roteiros não foram alterados.
+
+### Riscos e próximo passo
+
+- O protocolo e a recuperação estão provados por builders/factories sem rede; só o run `--real` autorizado pelo coordenador confirma o eco concreto atual da Luna.
+- No próximo `--real`, `judge_call_failed` produzirá JSON completo e exit `1`; o coordenador deve guardar/analisar o JSON antes de rerodar. `judged` mantém exit `0`.
+- A matriz viva continua sendo o próximo gate; nenhuma conclusão de tom foi inferida destes smokes.

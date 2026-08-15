@@ -54,6 +54,24 @@ export interface Tau2PairwiseToneReportV2 {
   readonly judges: readonly string[];
 }
 
+/** Falha de askJudge com contagens brutas até o ponto da quebra. Sem média. */
+export class PairwiseToneAskFailedV2 extends Error {
+  readonly partial: Tau2PairwiseToneReportV2;
+
+  constructor(
+    message: string,
+    partial: Tau2PairwiseToneReportV2,
+    options?: { cause?: unknown }
+  ) {
+    super(message);
+    this.name = 'PairwiseToneAskFailedV2';
+    this.partial = partial;
+    if (options?.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
 export function pairwiseLengthBandV2(text: string): Tau2PairwiseLengthBandV2 {
   const length = text.trim().length;
   if (length < 80) return 'short';
@@ -162,21 +180,33 @@ export async function evaluatePairwiseToneV2(input: {
     nEligible += 1;
     const preferences: Tau2PairwisePreferenceV2[] = [];
     for (const judge of input.config.judges) {
-      const abSide = await input.askJudge({
-        judge,
-        left: item.template,
-        right: item.variant,
-        order: 'ab',
-        itemId: item.id,
-      });
-      const baSide = await input.askJudge({
-        judge,
-        left: item.variant,
-        right: item.template,
-        order: 'ba',
-        itemId: item.id,
-      });
-      nComparisons += 2;
+      let abSide: Tau2PairwiseSideV2;
+      let baSide: Tau2PairwiseSideV2;
+      try {
+        abSide = await input.askJudge({
+          judge,
+          left: item.template,
+          right: item.variant,
+          order: 'ab',
+          itemId: item.id,
+        });
+        nComparisons += 1;
+        baSide = await input.askJudge({
+          judge,
+          left: item.variant,
+          right: item.template,
+          order: 'ba',
+          itemId: item.id,
+        });
+        nComparisons += 1;
+      } catch (error) {
+        if (error instanceof PairwiseToneAskFailedV2) {
+          throw new PairwiseToneAskFailedV2(error.message, snapshotPartial(), {
+            cause: error,
+          });
+        }
+        throw error;
+      }
       const consistent = consistentPairwisePreferenceV2(
         mapPairwiseSideToPreferenceV2('ab', abSide),
         mapPairwiseSideToPreferenceV2('ba', baSide)
@@ -191,6 +221,21 @@ export async function evaluatePairwiseToneV2(input: {
       else variantWins += 1;
     }
     void preferences;
+  }
+
+  function snapshotPartial(): Tau2PairwiseToneReportV2 {
+    return {
+      nComparisons,
+      nEligible,
+      nConsistent,
+      nExcludedFidelity,
+      nExcludedLength,
+      nInconsistent,
+      templateWins,
+      variantWins,
+      preferenceRate: null,
+      judges: input.config.judges.map((judge) => judge.id),
+    };
   }
 
   return {

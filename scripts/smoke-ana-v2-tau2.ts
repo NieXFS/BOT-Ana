@@ -16,6 +16,7 @@ import {
 import {
   TAU2_ARM_IDS,
   TAU2_ARM_VECTORS,
+  TAU2_PAIRWISE_JUDGE_MAX_TOKENS_V2,
   TAU2_PAIRWISE_LENGTH_BAND_MAX_RELATIVE_DELTA_V2,
   TAU2_REPORT_SCHEMA_VERSION,
   aggregatePassKByTaskV2,
@@ -24,6 +25,8 @@ import {
   assertTau2RealVoiceReceiptV2,
   auditSimulatorTranscriptsV2,
   assertToneJudgePanelV2,
+  buildPairwiseJudgeProviderRequestV2,
+  canonicalPairwiseJudgeProviderV2,
   consistentPairwisePreferenceV2,
   defaultPairwiseJudgeSpecV2,
   emptyCanonicalStateV2,
@@ -43,22 +46,30 @@ import {
   passAt1,
   passAt4,
   passAtK,
+  pairwiseJudgeCompletionInputV2,
   pairwiseJudgeCredentialPresentV2,
+  pairwiseJudgeRuntimeConfigV2,
   preflightTau2ArmV2,
   preflightTau2RealRunV2,
   projectSessionStateV2,
   recommendedVoiceBaselineV2,
   replayIncompatibleResultV2,
   requiredSimulatorAuditCountV2,
+  resolvePairwiseJudgeCredentialV2,
+  resolvePairwiseJudgeRuntimeV2,
   resolvePairwiseJudgeSpecV2,
   runPairwiseToneHarnessV2,
   runTau2TrialV2,
+  sanitizePairwiseJudgeErrorV2,
   scrubFixtureLlmCredentialsFromEnvV2,
   summarizeSimulatorAuditV2,
   tau2ArmProviderSpecV2,
+  tau2PairwiseToneFailsProcessV2,
   voicePairingIsValidV2,
   isFixtureLlmCredentialV2,
+  isLiveOpenAiCredentialShapeV2,
   liveLlmCredentialV2,
+  livePairwiseJudgeEnvV2,
   type Tau2ArmId,
   type Tau2CanonicalState,
   type Tau2PairwiseArmTurnV2,
@@ -76,6 +87,19 @@ process.env.OPENAI_API_KEY ||= 'sk-smoke-invalid';
 process.env.ERP_API_TOKEN = 'smoke-invalid';
 
 const SMOKE_LUNA_FIXTURE_KEY = 'sk-smoke-luna-invalid';
+
+function liveProjectKeyV2(length = 164, fill = 'A'): string {
+  const prefix = 'sk-proj-';
+  const key = prefix + fill.repeat(Math.max(0, length - prefix.length));
+  return key.slice(0, length);
+}
+
+function unluckyLiveProjectKeyV2(): string {
+  const prefix = 'sk-proj-';
+  const needle = 'smoke';
+  const fillLen = 164 - prefix.length - needle.length;
+  return `${prefix}${'C'.repeat(fillLen)}${needle}`;
+}
 
 const TASKS_DIR = path.join(
   __dirname,
@@ -635,6 +659,9 @@ async function main(): Promise<void> {
   assert.equal(missingJudge.status, 'not_run');
   assert.equal(missingJudge.reason, 'missing_credential');
   assert.equal(missingJudge.preferenceRate, null);
+  assert.equal(missingJudge.attemptedProvider, 'luna');
+  assert.equal(missingJudge.attemptedModel, OPENAI_LUNA_MODEL);
+  assert.equal(missingJudge.judgeError, null);
 
   assert.equal(isFixtureLlmCredentialV2(SMOKE_LUNA_FIXTURE_KEY), true);
   assert.equal(isFixtureLlmCredentialV2('sk-smoke-invalid'), true);
@@ -678,6 +705,294 @@ async function main(): Promise<void> {
   assert.equal(fixtureJudge.reason, 'missing_credential');
   assert.equal(fixtureJudge.inconclusive, true);
   assert.equal(fixtureJudge.nComparisons, 0);
+
+  const live164 = liveProjectKeyV2(164);
+  const unlucky164 = unluckyLiveProjectKeyV2();
+  assert.equal(live164.length, 164);
+  assert.equal(unlucky164.length, 164);
+  assert.ok(unlucky164.includes('smoke'));
+  assert.equal(isLiveOpenAiCredentialShapeV2(live164), true);
+  assert.equal(isLiveOpenAiCredentialShapeV2(unlucky164), true);
+  assert.equal(isFixtureLlmCredentialV2(live164), false);
+  assert.equal(isFixtureLlmCredentialV2(unlucky164), false);
+
+  const scrubbedLive: NodeJS.ProcessEnv = {
+    OPENAI_API_KEY: live164,
+    OPENAI_API_KEY_LUNA: unlucky164,
+  };
+  scrubFixtureLlmCredentialsFromEnvV2(scrubbedLive);
+  assert.equal(scrubbedLive.OPENAI_API_KEY, live164);
+  assert.equal(scrubbedLive.OPENAI_API_KEY_LUNA, unlucky164);
+
+  const npmClobber: NodeJS.ProcessEnv = {
+    OPENAI_API_KEY: 'sk-smoke-invalid',
+    OPENAI_API_KEY_LUNA: live164,
+  };
+  scrubFixtureLlmCredentialsFromEnvV2(npmClobber);
+  assert.equal('OPENAI_API_KEY' in npmClobber, false);
+  assert.equal(npmClobber.OPENAI_API_KEY_LUNA, live164);
+  assert.equal(pairwiseJudgeCredentialPresentV2('luna', npmClobber), true);
+  assert.equal(
+    pairwiseJudgeCredentialPresentV2('openai', {
+      OPENAI_API_KEY_LUNA: live164,
+    }),
+    true
+  );
+  assert.equal(
+    resolvePairwiseJudgeCredentialV2('openai', {
+      OPENAI_API_KEY_LUNA: live164,
+    }),
+    live164
+  );
+  assert.equal(
+    resolvePairwiseJudgeCredentialV2('openai', {
+      OPENAI_API_KEY: live164,
+    }),
+    live164
+  );
+
+  const lunaJudgeSpec = {
+    id: 'luna',
+    provider: 'luna',
+    model: OPENAI_LUNA_MODEL,
+  } as const;
+  const openaiLunaJudgeSpec = {
+    id: 'openai-luna',
+    provider: 'openai',
+    model: OPENAI_LUNA_MODEL,
+  } as const;
+  const judgeCompletionInput = pairwiseJudgeCompletionInputV2([
+    { role: 'user', content: 'Compare A e B.' },
+  ]);
+  assert.equal(judgeCompletionInput.maxTokens, TAU2_PAIRWISE_JUDGE_MAX_TOKENS_V2);
+  for (const spec of [lunaJudgeSpec, openaiLunaJudgeSpec]) {
+    assert.equal(canonicalPairwiseJudgeProviderV2(spec), 'luna');
+    const providerRequest = buildPairwiseJudgeProviderRequestV2(
+      spec,
+      judgeCompletionInput,
+      live164
+    );
+    assert.equal(providerRequest.transport, 'responses');
+    assert.equal('max_tokens' in providerRequest.request, false);
+    assert.equal('max_completion_tokens' in providerRequest.request, false);
+    assert.equal(
+      providerRequest.request.max_output_tokens,
+      TAU2_PAIRWISE_JUDGE_MAX_TOKENS_V2
+    );
+    assert.equal(providerRequest.request.model, OPENAI_LUNA_MODEL);
+    assert.ok(Array.isArray(providerRequest.request.input));
+    assert.equal(
+      (providerRequest.request.text as { format?: { type?: string } } | undefined)
+        ?.format?.type,
+      'json_object'
+    );
+  }
+
+  const runtimeConfigWithResolvedKey = pairwiseJudgeRuntimeConfigV2(
+    openaiLunaJudgeSpec,
+    live164
+  );
+  assert.equal(runtimeConfigWithResolvedKey.openaiApiKey, live164);
+  assert.equal(runtimeConfigWithResolvedKey.aiProvider, 'luna');
+  const runtimeWithResolvedKey = resolvePairwiseJudgeRuntimeV2(
+    openaiLunaJudgeSpec,
+    live164
+  );
+  assert.equal(runtimeWithResolvedKey.apiKey, live164);
+  assert.equal(runtimeWithResolvedKey.provider, 'luna');
+  assert.equal(runtimeWithResolvedKey.transport, 'responses');
+
+  let openaiLunaCalls = 0;
+  const openaiWithOnlyLuna = await runPairwiseToneHarnessV2({
+    items: [pairwiseItems[0]!],
+    generatorModels: [DEEPSEEK_V4_FLASH_MODEL],
+    env: { OPENAI_API_KEY_LUNA: live164 },
+    judges: [openaiLunaJudgeSpec],
+    completionFactory: async (input) => {
+      openaiLunaCalls += 1;
+      assert.equal(input.resolvedApiKey, live164);
+      assert.equal(input.runtimeConfig?.openaiApiKey, live164);
+      assert.equal(input.runtime?.apiKey, live164);
+      assert.equal(input.runtime?.provider, 'luna');
+      assert.equal(input.runtimeProvider, 'luna');
+      assert.equal(input.runtimeTransport, 'responses');
+      return completionFor(
+        JSON.stringify({ side: input.order === 'ab' ? 'right' : 'left' }),
+        OPENAI_LUNA_MODEL
+      );
+    },
+  });
+  assert.equal(openaiWithOnlyLuna.status, 'judged');
+  assert.equal(openaiWithOnlyLuna.reason, null);
+  assert.equal(openaiWithOnlyLuna.attemptedProvider, 'openai');
+  assert.equal(openaiWithOnlyLuna.attemptedModel, OPENAI_LUNA_MODEL);
+  assert.equal(openaiLunaCalls, 2);
+
+  let noCredentialCalls = 0;
+  const openaiWithoutCredential = await runPairwiseToneHarnessV2({
+    items: [pairwiseItems[0]!],
+    generatorModels: [DEEPSEEK_V4_FLASH_MODEL],
+    env: {},
+    judges: [openaiLunaJudgeSpec],
+    completionFactory: async () => {
+      noCredentialCalls += 1;
+      return completionFor('{"side":"left"}', OPENAI_LUNA_MODEL);
+    },
+  });
+  assert.equal(openaiWithoutCredential.status, 'not_run');
+  assert.equal(openaiWithoutCredential.reason, 'missing_credential');
+  assert.equal(openaiWithoutCredential.attemptedProvider, 'openai');
+  assert.equal(openaiWithoutCredential.attemptedModel, OPENAI_LUNA_MODEL);
+  assert.equal(openaiWithoutCredential.nComparisons, 0);
+  assert.equal(noCredentialCalls, 0);
+
+  // Regressão da sonda 7c: o gate aceitava LUNA para provider openai, mas o
+  // adapter lia só OPENAI_API_KEY. O mesmo runtime agora carrega a chave LUNA.
+  const legacyOpenAiJudgeSpec = {
+    id: 'openai-legacy-probe',
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+  } as const;
+  let legacyProbeCalls = 0;
+  const formerGateAdapterDivergence = await runPairwiseToneHarnessV2({
+    items: [pairwiseItems[0]!],
+    generatorModels: [DEEPSEEK_V4_FLASH_MODEL],
+    env: { OPENAI_API_KEY_LUNA: live164 },
+    judges: [legacyOpenAiJudgeSpec],
+    completionFactory: async (input) => {
+      legacyProbeCalls += 1;
+      assert.equal(input.resolvedApiKey, live164);
+      assert.equal(input.runtimeConfig?.openaiApiKey, live164);
+      assert.equal(input.runtime?.apiKey, live164);
+      assert.equal(input.runtime?.provider, 'openai');
+      assert.equal(input.runtimeTransport, 'chat_completions');
+      return completionFor(
+        JSON.stringify({ side: input.order === 'ab' ? 'right' : 'left' }),
+        legacyOpenAiJudgeSpec.model
+      );
+    },
+  });
+  assert.equal(formerGateAdapterDivergence.status, 'judged');
+  assert.equal(formerGateAdapterDivergence.reason, null);
+  assert.equal(legacyProbeCalls, 2);
+
+  let failingJudgeCalls = 0;
+  const syntheticJudgeFailure = await runPairwiseToneHarnessV2({
+    items: [pairwiseItems[0]!],
+    generatorModels: [DEEPSEEK_V4_FLASH_MODEL],
+    env: { OPENAI_API_KEY_LUNA: live164 },
+    judges: [openaiLunaJudgeSpec],
+    completionFactory: async (input) => {
+      failingJudgeCalls += 1;
+      if (failingJudgeCalls === 1) {
+        return completionFor('{"side":"right"}', OPENAI_LUNA_MODEL);
+      }
+      const error = new Error(
+        `Use 'max_completion_tokens' instead; credential=${live164}`
+      ) as Error & { status: number };
+      error.status = 400;
+      throw error;
+    },
+  });
+  assert.equal(failingJudgeCalls, 2);
+  assert.equal(syntheticJudgeFailure.status, 'not_run');
+  assert.equal(syntheticJudgeFailure.reason, 'judge_call_failed');
+  assert.equal(syntheticJudgeFailure.inconclusive, true);
+  assert.equal(syntheticJudgeFailure.preferenceRate, null);
+  assert.equal(syntheticJudgeFailure.nEligible, 1);
+  assert.equal(syntheticJudgeFailure.nComparisons, 1);
+  assert.equal(syntheticJudgeFailure.nConsistent, 0);
+  assert.equal(syntheticJudgeFailure.receipts.length, 1);
+  assert.equal(syntheticJudgeFailure.cost.totalTokens, 5);
+  assert.deepEqual(syntheticJudgeFailure.judges, ['openai-luna']);
+  assert.equal(syntheticJudgeFailure.attemptedProvider, 'openai');
+  assert.equal(syntheticJudgeFailure.attemptedModel, OPENAI_LUNA_MODEL);
+  assert.match(syntheticJudgeFailure.judgeError ?? '', /^400 /);
+  assert.match(
+    syntheticJudgeFailure.judgeError ?? '',
+    /max_completion_tokens/
+  );
+  assert.equal(
+    syntheticJudgeFailure.judgeError?.includes(live164) ?? false,
+    false
+  );
+  assert.equal(tau2PairwiseToneFailsProcessV2(syntheticJudgeFailure), true);
+  assert.equal(tau2PairwiseToneFailsProcessV2(openaiWithOnlyLuna), false);
+  assert.equal(sanitizePairwiseJudgeErrorV2({ status: 400, message: live164 }), '400 [redacted]');
+
+  const armSnapshotBeforeJudgeFailure = TAU2_ARM_IDS.map((arm) => ({
+    arm,
+    vector: TAU2_ARM_VECTORS[arm],
+    spec: tau2ArmProviderSpecV2(arm),
+  }));
+  const serializedFailureReport = JSON.parse(
+    JSON.stringify({
+      schemaVersion: TAU2_REPORT_SCHEMA_VERSION,
+      arms: armSnapshotBeforeJudgeFailure,
+      pairwiseTone: syntheticJudgeFailure,
+    })
+  ) as {
+    schemaVersion: number;
+    arms: typeof armSnapshotBeforeJudgeFailure;
+    pairwiseTone: Tau2PairwiseToneHarnessReportV2;
+  };
+  assert.equal(serializedFailureReport.schemaVersion, 6);
+  assert.deepEqual(serializedFailureReport.arms, armSnapshotBeforeJudgeFailure);
+  assert.equal(serializedFailureReport.pairwiseTone.reason, 'judge_call_failed');
+
+  const staleClone: NodeJS.Dict<string> = {
+    OPENAI_API_KEY: 'sk-smoke-invalid',
+  };
+  assert.equal(pairwiseJudgeCredentialPresentV2('luna', staleClone), false);
+  assert.equal(
+    pairwiseJudgeCredentialPresentV2('luna', {
+      ...staleClone,
+      OPENAI_API_KEY: live164,
+      OPENAI_API_KEY_LUNA: live164,
+    }),
+    true
+  );
+  assert.equal(livePairwiseJudgeEnvV2(), process.env);
+
+  let liveFactoryCalls = 0;
+  const liveEnvJudge = await runPairwiseToneHarnessV2({
+    items: [pairwiseItems[0]!],
+    generatorModels: [DEEPSEEK_V4_FLASH_MODEL],
+    env: {
+      OPENAI_API_KEY: live164,
+      OPENAI_API_KEY_LUNA: live164,
+    },
+    completionFactory: async (input) => {
+      liveFactoryCalls += 1;
+      return completionFor(
+        JSON.stringify({ side: input.order === 'ab' ? 'right' : 'left' }),
+        OPENAI_LUNA_MODEL
+      );
+    },
+  });
+  assert.equal(liveEnvJudge.status, 'judged', 'env válido presente ⇒ juiz RODA');
+  assert.equal(liveEnvJudge.reason, null);
+  assert.equal(liveFactoryCalls, 2);
+  assert.equal(liveEnvJudge.nComparisons, 2);
+  assert.equal(liveEnvJudge.preferenceRate, 1);
+  assert.equal(liveEnvJudge.inconclusive, false);
+
+  let mustNotCall = 0;
+  const fixtureWithFactory = await runPairwiseToneHarnessV2({
+    items: [pairwiseItems[0]!],
+    generatorModels: [DEEPSEEK_V4_FLASH_MODEL],
+    env: {
+      OPENAI_API_KEY: 'sk-smoke-invalid',
+      OPENAI_API_KEY_LUNA: SMOKE_LUNA_FIXTURE_KEY,
+    },
+    completionFactory: async () => {
+      mustNotCall += 1;
+      return completionFor('{"side":"left"}', OPENAI_LUNA_MODEL);
+    },
+  });
+  assert.equal(fixtureWithFactory.status, 'not_run');
+  assert.equal(fixtureWithFactory.reason, 'missing_credential');
+  assert.equal(mustNotCall, 0);
   assert.equal(armConfig('luna', 'real').openaiApiKey, null);
   assert.equal(armConfig('luna', 'mock').openaiApiKey, SMOKE_LUNA_FIXTURE_KEY);
   assert.equal(
@@ -1033,6 +1348,7 @@ async function main(): Promise<void> {
       ? await runPairwiseToneHarnessV2({
           items: pairwiseItemsFromArms,
           generatorModels,
+          env: livePairwiseJudgeEnvV2(),
         })
       : notRunPairwiseToneReportV2(
           'mock_harness',
@@ -1059,9 +1375,17 @@ async function main(): Promise<void> {
     } else {
       assert.equal(pairwiseTone.status, 'not_run');
       assert.equal(pairwiseTone.preferenceRate, null);
-      assert.equal(pairwiseTone.nComparisons, 0);
-      assert.equal(pairwiseTone.receipts.length, 0);
       assert.equal(pairwiseTone.inconclusive, true);
+      if (pairwiseTone.reason === 'judge_call_failed') {
+        assert.equal(pairwiseTone.nComparisons, pairwiseTone.receipts.length);
+        assert.ok(pairwiseTone.attemptedProvider);
+        assert.ok(pairwiseTone.attemptedModel);
+        assert.ok(pairwiseTone.judgeError);
+      } else {
+        assert.equal(pairwiseTone.nComparisons, 0);
+        assert.equal(pairwiseTone.receipts.length, 0);
+        assert.equal(pairwiseTone.judgeError, null);
+      }
     }
   } else {
     assert.equal(pairwiseTone.status, 'not_run');
@@ -1071,34 +1395,42 @@ async function main(): Promise<void> {
     assert.equal(pairwiseTone.judges.length, 0);
     assert.equal(pairwiseTone.inconclusive, true);
     assert.ok(pairwiseTone.nPairedItems > 0);
+    assert.equal(pairwiseTone.attemptedProvider, null);
+    assert.equal(pairwiseTone.attemptedModel, null);
   }
 
-  console.log(
-    JSON.stringify({
-      schemaVersion: TAU2_REPORT_SCHEMA_VERSION,
-      harness: mode === 'real' ? 'ana-v2-tau2-real' : 'ana-v2-tau2-mock',
-      userMode: 'oracle_user',
-      FAIL: records.filter((record) => record.reward.reward !== 1).length,
-      tasks: perTaskArm,
-      macro,
-      simulator: {
-        ...audit,
-        labeled: audit.labeled.map((entry) => ({
-          taskId: entry.taskId,
-          armId: entry.armId,
-          trialId: entry.trialId,
-          labels: entry.labels,
-        })),
-      },
-      arms: TAU2_ARM_IDS.map((arm) => ({
-        arm,
-        vector: TAU2_ARM_VECTORS[arm],
-        spec: tau2ArmProviderSpecV2(arm),
-        voiceCalls: voiceCallsByArm[arm],
+  const publishedReport = {
+    schemaVersion: TAU2_REPORT_SCHEMA_VERSION,
+    harness: mode === 'real' ? 'ana-v2-tau2-real' : 'ana-v2-tau2-mock',
+    userMode: 'oracle_user',
+    FAIL: records.filter((record) => record.reward.reward !== 1).length,
+    tasks: perTaskArm,
+    macro,
+    simulator: {
+      ...audit,
+      labeled: audit.labeled.map((entry) => ({
+        taskId: entry.taskId,
+        armId: entry.armId,
+        trialId: entry.trialId,
+        labels: entry.labels,
       })),
-      pairwiseTone,
-    })
-  );
+    },
+    arms: TAU2_ARM_IDS.map((arm) => ({
+      arm,
+      vector: TAU2_ARM_VECTORS[arm],
+      spec: tau2ArmProviderSpecV2(arm),
+      voiceCalls: voiceCallsByArm[arm],
+    })),
+    pairwiseTone,
+  };
+  console.log(JSON.stringify(publishedReport));
+  if (mode === 'real' && tau2PairwiseToneFailsProcessV2(pairwiseTone)) {
+    console.error(
+      'smoke-ana-v2-tau2: judge_call_failed; relatório schema-6 publicado antes do exit 1'
+    );
+    process.exitCode = 1;
+    return;
+  }
   console.log('smoke-ana-v2-tau2: ok');
 }
 
