@@ -1,4 +1,5 @@
 import axios from 'axios';
+import type { LicensedServiceDescriptionV2 } from './licensedServiceDescription';
 import * as Sentry from '@sentry/node';
 import type { TenantBotConfig } from '../configProvider';
 import { ERP_API_TOKEN } from '../erpApiToken';
@@ -143,6 +144,8 @@ export interface ServiceSummary {
   // FIX 3: ids (string) dos profissionais habilitados pra este serviço, quando o
   // ERP os informa. undefined = ERP antigo → fallback pra lista global.
   professionalIds?: string[];
+  /** Somente a rota v2 hidrata este campo do catálogo autoritativo da config. */
+  licensedDescription?: LicensedServiceDescriptionV2 | null;
 }
 
 export interface ProfessionalSummary {

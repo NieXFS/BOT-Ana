@@ -11,6 +11,7 @@ import {
   catalogFromServicesResult,
   containsInternalConversationMarker,
   containsUnlicensedHandoffPromise,
+  licensedServiceDescriptionEvidenceValid,
   validateReceptionistOutbound,
   type AuthoritativeOutboundCatalog,
   type OutboundReasonCode,
@@ -281,6 +282,139 @@ function rawLeakReasons(input: BoundaryEvaluationInputV2): BoundaryReasonCodeV2[
     reasons.add('TECHNICAL_ID');
   }
   return [...reasons];
+}
+
+function licensedBoundaryProjectionV2(
+  candidate: string,
+  input: BoundaryEvaluationInputV2,
+  catalog: AuthoritativeOutboundCatalog
+): {
+  factCheckedCandidate: string;
+  blocks: Array<{ source: ReceptionistOutboundSource; text: string }>;
+} {
+  const witness = input.outboundEvidence?.licensedServiceDescription;
+  const source = input.source ?? 'GENERATED';
+  if (!witness?.exactText) {
+    return {
+      factCheckedCandidate: candidate,
+      blocks: [{ source, text: candidate }],
+    };
+  }
+  const first = candidate.indexOf(witness.exactText);
+  const unique = first >= 0 && candidate.indexOf(witness.exactText, first + 1) < 0;
+  const licensedBlock = {
+    source: 'LICENSED_SERVICE_DESCRIPTION' as const,
+    text: witness.exactText,
+  };
+  if (
+    !unique ||
+    !licensedServiceDescriptionEvidenceValid(
+      licensedBlock,
+      input.outboundEvidence,
+      catalog
+    )
+  ) {
+    return {
+      factCheckedCandidate: candidate,
+      blocks: [{ source, text: candidate }, licensedBlock],
+    };
+  }
+  const before = candidate.slice(0, first);
+  const after = candidate.slice(first + witness.exactText.length);
+  return {
+    factCheckedCandidate: `${before}${after}`,
+    blocks: [
+      ...(before ? [{ source, text: before }] : []),
+      licensedBlock,
+      ...(after ? [{ source, text: after }] : []),
+    ],
+  };
+}
+
+const LICENSED_WRITE_CLAIM_RE =
+  /\b(?:agendei|marquei|remarquei|cancelei|(?:agendamento|reserva|horario)\b(?:\s+[a-z0-9]+){0,5}\s+(?:confirmad[oa]|agendad[oa]|marcad[oa]|remarcad[oa]|cancelad[oa]))\b/u;
+const LICENSED_AVAILABILITY_OBJECT_RE =
+  /\b(?:vaga|horario|disponibilidade|disponivel|agenda)\b/u;
+const LICENSED_EXISTING_APPOINTMENT_RE =
+  /\b(?:(?:voce\s+tem|seu|sua)\b(?:\s+[a-z0-9]+){0,4}\s+(?:agendamento|reserva|sessao|horario)|(?:agendamento|reserva)\b(?:\s+[a-z0-9]+){0,5}\s+(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo))\b/u;
+
+/**
+ * O termo licencia conteúdo da descrição, nunca estado operacional. Mantemos
+ * os detectores amplos no texto gerado e usamos objetos transacionais fechados
+ * no bloco exato para não confundir "é realizada" com write de agenda.
+ */
+function licensedDescriptionHardGuardReasonsV2(
+  candidate: string,
+  input: BoundaryEvaluationInputV2,
+  projection: ReturnType<typeof licensedBoundaryProjectionV2>,
+  toolTrace: readonly ToolTraceLike[]
+): CustomerReplyLeakReason[] {
+  const licensedText = projection.blocks
+    .filter((block) => block.source === 'LICENSED_SERVICE_DESCRIPTION')
+    .map((block) => block.text)
+    .join('\n');
+  if (!licensedText) return [];
+  const full = inspectCustomerReply(
+    candidate,
+    input.servicesResult,
+    input.forbiddenAppointmentIds ?? [],
+    [...toolTrace],
+    input.sourceInboundText,
+    input.temporalContext,
+    pendingTimeSlotEvidenceV2(input)?.slots ?? []
+  );
+  const normalizedLicensed = normalize(licensedText);
+  return full.reasons.filter((reason) => {
+    if (
+      reason === 'internal_hint' ||
+      reason === 'service_id' ||
+      reason === 'professional_id' ||
+      reason === 'appointment_id' ||
+      reason === 'technical_id'
+    ) {
+      return true;
+    }
+    if (reason === 'false_write_claim') {
+      return LICENSED_WRITE_CLAIM_RE.test(normalizedLicensed);
+    }
+    if (reason === 'unverified_availability') {
+      return LICENSED_AVAILABILITY_OBJECT_RE.test(normalizedLicensed);
+    }
+    if (reason === 'unverified_appointment_context') {
+      return LICENSED_EXISTING_APPOINTMENT_RE.test(normalizedLicensed);
+    }
+    return false;
+  });
+}
+
+function normalizeCandidatePreservingLicensedDescriptionV2(
+  rawCandidate: string,
+  input: BoundaryEvaluationInputV2,
+  catalog: AuthoritativeOutboundCatalog
+): string {
+  const witness = input.outboundEvidence?.licensedServiceDescription;
+  if (!witness?.exactText) return normalizeCustomerReplyStyle(rawCandidate);
+  const first = rawCandidate.indexOf(witness.exactText);
+  const unique =
+    first >= 0 && rawCandidate.indexOf(witness.exactText, first + 1) < 0;
+  if (
+    !unique ||
+    !licensedServiceDescriptionEvidenceValid(
+      {
+        source: 'LICENSED_SERVICE_DESCRIPTION',
+        text: witness.exactText,
+      },
+      input.outboundEvidence,
+      catalog
+    )
+  ) {
+    return normalizeCustomerReplyStyle(rawCandidate);
+  }
+  const before = normalizeCustomerReplyStyle(rawCandidate.slice(0, first));
+  const after = normalizeCustomerReplyStyle(
+    rawCandidate.slice(first + witness.exactText.length)
+  );
+  return [before, witness.exactText, after].filter(Boolean).join('\n\n');
 }
 
 function customerGuardReason(reason: CustomerReplyLeakReason): BoundaryReasonCodeV2 {
@@ -1370,6 +1504,7 @@ function outboundReason(
     TOO_MANY_EMOJIS: 'TOO_MANY_EMOJIS',
     UNRECORDED_HANDOFF: 'UNRECORDED_HANDOFF',
     UNAUTHORIZED_CLINICAL_PROMISE: 'UNAUTHORIZED_CLINICAL_PROMISE',
+    UNLICENSED_SERVICE_DESCRIPTION: 'UNLICENSED_SERVICE_DESCRIPTION',
     INTERNAL_CONVERSATION_MARKER: 'INTERNAL_CONVERSATION_MARKER',
     UNVERIFIED_APPOINTMENT_CONTEXT: 'UNVERIFIED_APPOINTMENT_CONTEXT',
     SOCIAL_CONTEXT_DRIFT: 'SOCIAL_CONTEXT_DRIFT',
@@ -1392,13 +1527,23 @@ export function evaluateBoundaryV2(
     input.authoritativeCatalog ?? catalogFromServicesResult(input.servicesResult);
   const toolTrace = input.toolTrace ?? [];
   const rawReasons = rawLeakReasons(input);
-  const normalizedCandidate = normalizeCustomerReplyStyle(input.rawCandidate);
+  const normalizedCandidate = normalizeCandidatePreservingLicensedDescriptionV2(
+    input.rawCandidate,
+    input,
+    catalog
+  );
   const normalizationReasons: BoundaryReasonCodeV2[] = normalizedCandidate.trim()
     ? []
     : ['EMPTY_PAYLOAD'];
+  const licensedProjection = licensedBoundaryProjectionV2(
+    normalizedCandidate,
+    input,
+    catalog
+  );
+  const factCheckedCandidate = licensedProjection.factCheckedCandidate;
 
   const inspection = inspectCustomerReply(
-    normalizedCandidate,
+    factCheckedCandidate,
     input.servicesResult,
     input.forbiddenAppointmentIds ?? [],
     toolTrace,
@@ -1414,22 +1559,25 @@ export function evaluateBoundaryV2(
         (reason) => reason !== 'unverified_appointment_context'
       )
     : inspection.reasons;
+  const licensedHardGuardReasons = licensedDescriptionHardGuardReasonsV2(
+    normalizedCandidate,
+    input,
+    licensedProjection,
+    toolTrace
+  );
   const guardReasons = [
     ...effectiveInspectionReasons.map(customerGuardReason),
-    ...v2FactReasons(normalizedCandidate, input, catalog),
-    ...repeatedClarificationReasonsV2(normalizedCandidate, input),
+    ...licensedHardGuardReasons.map(customerGuardReason),
+    ...v2FactReasons(factCheckedCandidate, input, catalog),
+    ...repeatedClarificationReasonsV2(factCheckedCandidate, input),
   ];
 
   const outbound = validateReceptionistOutbound(
     buildReceptionistEnvelope({
+      exactPayload: normalizedCandidate,
       purpose:
         input.replyPurpose === 'SERVICE_QUESTION' ? 'SERVICE_QUESTION' : 'REACTIVE',
-      blocks: [
-        {
-          source: input.source ?? 'GENERATED',
-          text: normalizedCandidate,
-        },
-      ],
+      blocks: licensedProjection.blocks,
       authoritativeCatalog: catalog,
       evidence: {
         ...input.outboundEvidence,

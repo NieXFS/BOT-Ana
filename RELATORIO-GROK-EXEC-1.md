@@ -991,3 +991,61 @@ Nova suíte `smoke:ana-conversational-v2-fallback-intent`: pergunta com e sem `?
 - O classificador é intencionalmente determinístico e conservador. Linguagem não testemunhada cai em `OTHER`; com pendência OPEN isso reancora, sem transformar texto aberto em escolha.
 - O texto jurídico do termo continua pendente na fila de `/termos` e qualquer troca exigirá nova versão/hash.
 - A lente adversarial retroativa do Grok continua gate obrigatório antes do deploy destas features. Nenhum deploy foi executado.
+
+## Exec IA-3 — decisor procedural e descrição licenciada
+
+**Status:** implementado e validado localmente sobre `2b795e2`; sem deploy, push, `--real` ou alteração no ERP. Executor: **GPT-5.6 Sol**, pela exceção de executor autorizada pelo Victor na madrugada de 2026-08-15. O checkout permaneceu no `HEAD` destacado recebido; nenhuma branch foi trocada.
+
+### Entrega
+
+1. **Licença fail-closed.** O payload aditivo `contractVersion:2` agora carrega o aceite versionado e as cláusulas `LicensedServiceDescriptionV2`. A hidratação exige termo válido, SHA-256 em shape 64-hex, policy v1, IDs únicos, texto exato sem PII técnico e a ordem de facetas do ERP (primeira `WHAT_IT_IS`, demais `HOW_PERFORMED`). Qualquer falha torna a descrição inteira `unavailable_for_ana`.
+2. **Decisor server-side.** `ProcedureInfoDecisionV2` só ativa quando coexistem interrogativa procedural positiva, um único serviço resolvido pelo matcher canônico atual ou por anáfora ancorada a `PendingFrame`/`BookingDraft` ativo, e objeto procedural. Objetos de agendamento, pagamento, pacote, cancelamento, remarcação, horário, agenda e sessão temporal retornam `none`.
+3. **Facetas e orçamento.** `o que é` solicita `WHAT_IT_IS`; `como funciona/é feito/em que consiste` solicita `HOW_PERFORMED`. Faceta sem cláusula ou nenhuma sentença que caiba no teto de 700 caracteres escala integralmente. O servidor materializa cláusulas na ordem original e só corta entre sentenças/cláusulas.
+4. **Fronteira exata.** O modelo primário e a regeneração nunca recebem `exactText`. Depois da decisão, o servidor anexa o bloco e a boundary o aceita somente se `serviceId`, policy, hash, IDs únicos/em ordem e texto byte-a-byte coincidirem com o catálogo testemunhado. A licença autoriza o conteúdo clínico exato, mas não estado operacional: claim de write, disponibilidade, agendamento existente, hint ou ID técnico continua bloqueado mesmo dentro do bloco aceito.
+5. **Escalada compatível.** `UNCADASTRED_INFO` passa a enviar `topicCode:"PROCEDURE_INFO"`; erro 400/422 que identifique rejeição do campo faz exatamente um retry sem `topicCode`. Só `questionId` autoritativo licencia a promessa canônica e o pause-ack.
+6. **Mensagem mista.** A descrição/escalada é componente do plano, não short-circuit. O modelo trata apenas os demais componentes; leituras autorizadas podem ocorrer; write de booking/cancel é bloqueado antes do adapter quando uma escalada procedural está planejada. A criação da Pergunta é o efeito final, a transição antiga é preservada e uma única resposta boundary-checked combina leitura/social com o componente autoritativo.
+
+### Arquivos
+
+- `src/services/licensedServiceDescription.ts` (novo)
+- `src/services/conversationalV2/procedureInfo.ts` (novo)
+- `src/services/conversationalV2/runtime.ts`
+- `src/services/conversationalV2/boundary.ts`
+- `src/services/conversationalV2/contracts.ts`
+- `src/services/receptionistOutbound.ts`
+- `src/services/questionEscalation.ts`
+- `src/services/calendarService.ts`
+- `src/configProvider.ts`
+- `scripts/smoke-ana-conversational-v2-procedure-info.ts` (novo)
+- `package.json`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Fixtures novas
+
+- `Como funciona a Drenagem?` com licença ⇒ `HOW_PERFORMED` exato; sem licença/sem termo ⇒ `UNCADASTRED_INFO/PROCEDURE_INFO`.
+- `Como funciona a Drenagem(` preserva a rota procedural; anáfora após serviço fixado exige `PendingFrame` ou `BookingDraft`, e histórico/fixed id solto não basta.
+- `Como funciona o agendamento/pagamento/a sessão de amanhã?` ⇒ `none`.
+- `O que é peeling?` com uma sentença ⇒ `WHAT_IT_IS`; `Como é feito o peeling?` ⇒ escalada por faceta descoberta.
+- Orçamento de 700 caracteres corta entre cláusulas; payload com faceta fora de ordem ou PII fica integralmente indisponível.
+- Mutação de texto/hash/IDs falha na boundary; cláusula clínica exata passa com termo; `Seu agendamento foi confirmado.` continua falhando por `FALSE_WRITE_CLAIM` mesmo se constar na licença.
+- Mista `obrigada! como funciona a drenagem? tem vaga amanhã?` combina leitura + resposta ou escalada; tentativa de write não alcança o adapter e `hasCommittedWrite=false`.
+- Rejeição sintética do `topicCode` ⇒ duas chamadas no máximo, a segunda sem o campo.
+
+### Validações finais (exit real)
+
+| Comando | exit | resultado |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | contratos e integrações tipados |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | decisão, licença, boundary, retry, mix e bloqueio de write verdes |
+| todas as 13 suítes `smoke:ana-conversational-v2-*` | 0 | boundary, contracts, escalation, fallback-intent, interpreter, persistence, procedure-info, recovery, route, social-reads, voice, voice-fidelity e wave1 |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 e latch anti-mock intactos |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `mock_harness/not_run` |
+
+### Riscos e gates restantes
+
+- A integração foi comprovada apenas com payload/ERP injetados; o endpoint real e o efeito real de pausa pertencem ao gate conjunto ERP-3 + revisão adversarial antes de deploy.
+- A taxonomia v1 permanece deliberadamente estreita (`WHAT_IT_IS`/`HOW_PERFORMED`). Perguntas procedurais fora desses atos continuam no fluxo normal; perguntas clínicas continuam sob `CLINICAL_DOUBT`.
+- O retry legado depende de 400/422 cujo corpo identifique `topicCode`/campo desconhecido; outros erros permanecem fail-closed e não geram promessa falsa.
+- Nenhum deploy, chamada real, mudança de tenant ou escrita de ERP foi realizado. A lente adversarial retroativa do Grok continua gate obrigatório.

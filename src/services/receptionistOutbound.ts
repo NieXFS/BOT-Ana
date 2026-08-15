@@ -18,6 +18,14 @@ import {
 } from './customerIdentitySafety';
 import { classifyReceptionistTurnPermission, hasPositiveSocialOrPersonalEvidence } from './receptionistSocialSafety';
 import type { PendingOperationalQuestion } from './receptionistTurnDecision';
+import type {
+  LicensedServiceDescriptionEvidenceV2,
+  LicensedServiceDescriptionV2,
+} from './licensedServiceDescription';
+import {
+  normalizeLicensedServiceDescriptionV2,
+  validDescriptionTermAcceptanceV2,
+} from './licensedServiceDescription';
 
 export { CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE } from './customerIdentitySafety';
 
@@ -32,6 +40,7 @@ export const RECEPTIONIST_OUTBOUND_SOURCES = [
   'APPROVED_RESPONSE',
   'TEAM_REPLY',
   'CANONICAL',
+  'LICENSED_SERVICE_DESCRIPTION',
   'VOICE_REPHRASE',
 ] as const;
 
@@ -82,6 +91,7 @@ export interface OutboundCatalogService {
   priceCents?: number | null;
   durationMinutes?: number | null;
   professionalIds?: string[];
+  licensedDescription?: LicensedServiceDescriptionV2 | null;
 }
 
 export interface OutboundCatalogProfessional {
@@ -127,6 +137,8 @@ export interface ReceptionistOutboundEvidence {
   temporalContext?: AppointmentTemporalContext;
   /** Slots tipados já entregues em PendingFrame TIME; rota v2 somente. */
   verifiedAvailabilitySlots?: readonly string[];
+  /** Bloco exato materializado de cláusulas licenciadas do catálogo. */
+  licensedServiceDescription?: LicensedServiceDescriptionEvidenceV2;
 }
 
 export interface ReceptionistOutboundEnvelope {
@@ -153,6 +165,7 @@ export type OutboundReasonCode =
   | 'TOO_MANY_EMOJIS'
   | 'UNRECORDED_HANDOFF'
   | 'UNAUTHORIZED_CLINICAL_PROMISE'
+  | 'UNLICENSED_SERVICE_DESCRIPTION'
   | 'INTERNAL_CONVERSATION_MARKER'
   | 'UNVERIFIED_APPOINTMENT_CONTEXT'
   | 'SOCIAL_CONTEXT_DRIFT'
@@ -291,6 +304,7 @@ export function catalogFromServicesResult(result: ServicesResult): Authoritative
       price: service.price,
       durationMinutes: service.durationMinutes,
       professionalIds: service.professionalIds,
+      licensedDescription: service.licensedDescription,
     })),
     professionals: (result.professionals ?? []).map((professional) => ({
       id: professional.id,
@@ -371,7 +385,56 @@ function emojiCount(text: string): number {
   return (text.match(/\p{Extended_Pictographic}/gu) ?? []).length;
 }
 
-function clinicalAuthorized(block: ReceptionistOutboundBlock, evidence?: ReceptionistOutboundEvidence): boolean {
+export function licensedServiceDescriptionEvidenceValid(
+  block: ReceptionistOutboundBlock,
+  evidence: ReceptionistOutboundEvidence | undefined,
+  catalog: AuthoritativeOutboundCatalog
+): boolean {
+  if (block.source !== 'LICENSED_SERVICE_DESCRIPTION') return false;
+  const witness = evidence?.licensedServiceDescription;
+  if (
+    !witness ||
+    !validDescriptionTermAcceptanceV2(witness.termAcceptance) ||
+    block.text !== witness.exactText ||
+    witness.policyVersion !== 'licensed-service-description-v1'
+  ) {
+    return false;
+  }
+  const service = catalog.services.find((entry) => entry.id === witness.serviceId);
+  const licensed = normalizeLicensedServiceDescriptionV2(
+    service?.licensedDescription
+  );
+  if (
+    !licensed ||
+    licensed.sourceHash !== witness.sourceHash.toLowerCase() ||
+    licensed.policyVersion !== witness.policyVersion ||
+    witness.clauseIds.length === 0 ||
+    new Set(witness.clauseIds).size !== witness.clauseIds.length
+  ) {
+    return false;
+  }
+  const byId = new Map(
+    licensed.clauses.map((clause, index) => [clause.clauseId, { clause, index }])
+  );
+  const selected = witness.clauseIds.map((clauseId) => byId.get(clauseId));
+  if (selected.some((entry) => !entry)) return false;
+  for (let index = 1; index < selected.length; index += 1) {
+    if (selected[index - 1]!.index >= selected[index]!.index) return false;
+  }
+  return (
+    selected.map((entry) => entry!.clause.exactText).join(' ') ===
+    witness.exactText
+  );
+}
+
+function clinicalAuthorized(
+  block: ReceptionistOutboundBlock,
+  evidence: ReceptionistOutboundEvidence | undefined,
+  catalog: AuthoritativeOutboundCatalog
+): boolean {
+  if (block.source === 'LICENSED_SERVICE_DESCRIPTION') {
+    return licensedServiceDescriptionEvidenceValid(block, evidence, catalog);
+  }
   if (block.source === 'TEAM_REPLY') {
     const team = evidence?.teamReplyAuthorization;
     return Boolean(
@@ -435,6 +498,18 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   if (joined !== envelope.exactPayload) reasons.add('PAYLOAD_BLOCK_MISMATCH');
 
   const text = typeof envelope.exactPayload === 'string' ? envelope.exactPayload : '';
+  const factCheckedText = blocks
+    .filter((block) => block.source !== 'LICENSED_SERVICE_DESCRIPTION')
+    .map((block) => block.text)
+    .join('');
+  for (const block of blocks) {
+    if (
+      block.source === 'LICENSED_SERVICE_DESCRIPTION' &&
+      !licensedServiceDescriptionEvidenceValid(block, envelope.evidence, catalog)
+    ) {
+      reasons.add('UNLICENSED_SERVICE_DESCRIPTION');
+    }
+  }
   if (
     traceHasCustomerIdentityAmbiguity(envelope.evidence) &&
     text.trim() !== CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE
@@ -442,13 +517,13 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
     reasons.add('UNSAFE_CUSTOMER_IDENTITY_RESPONSE');
   }
   const prices = knownPrices(catalog);
-  for (const match of text.matchAll(MONEY_RE)) {
+  for (const match of factCheckedText.matchAll(MONEY_RE)) {
     const rawValue = match.groups?.prefixed ?? match.groups?.worded;
     const cents = rawValue ? currencyTextToCents(rawValue) : null;
     if (cents === null || !prices.has(cents)) reasons.add('UNKNOWN_PRICE');
   }
 
-  const normalizedText = normalize(text);
+  const normalizedText = normalize(factCheckedText);
   if (containsInternalConversationMarker(text)) {
     reasons.add('INTERNAL_CONVERSATION_MARKER');
   }
@@ -494,7 +569,7 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
     reasons.add('UNVERIFIED_APPOINTMENT_CONTEXT');
   }
   const mentionedServices = catalog.services.filter((service) => normalizedText.includes(normalize(service.name)));
-  const serviceOffer = text.match(/\b(?:temos|oferecemos|fazemos|realizamos|trabalhamos\s+com)\s+(?:o\s+servi[cç]o\s+de\s+|a\s+)?([^.!?\n]+)/iu)?.[1];
+  const serviceOffer = factCheckedText.match(/\b(?:temos|oferecemos|fazemos|realizamos|trabalhamos\s+com)\s+(?:o\s+servi[cç]o\s+de\s+|a\s+)?([^.!?\n]+)/iu)?.[1];
   if (
     serviceOffer &&
     mentionedServices.length === 0 &&
@@ -504,7 +579,7 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
       normalize(serviceOffer).includes(normalize(service.name))
     )
   ) reasons.add('UNKNOWN_SERVICE');
-  const appointmentServiceClaim = text.match(
+  const appointmentServiceClaim = factCheckedText.match(
     /\b(?:para|pra)\s+(?:a|o)\s+([\p{L}'-]+(?:\s+[\p{L}'-]+){0,4})(?=[.!?,]|$)/iu
   )?.[1];
   if (
@@ -519,13 +594,13 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   ) reasons.add('UNKNOWN_SERVICE');
 
   const slots = offeredSlots(envelope.evidence);
-  for (const match of text.matchAll(TIME_OFFER_RE)) {
+  for (const match of factCheckedText.matchAll(TIME_OFFER_RE)) {
     const slot = `${String(match[1]).padStart(2, '0')}:${match[2]}`;
     if (!slots.has(slot)) reasons.add('UNVERIFIED_AVAILABILITY');
   }
 
   const mentionedProfessionals = catalog.professionals.filter((professional) => normalizedText.includes(normalize(professional.name)));
-  const textWithoutServices = textWithoutKnownServiceNames(text, catalog);
+  const textWithoutServices = textWithoutKnownServiceNames(factCheckedText, catalog);
   if (/\b(?:com|pela?|profissional|especialista|dra?\.?|doutor(?:a)?)\s+(?:(?:a|o)\s+)?[A-ZÀ-ÖØ-öø-ÿ][\p{L}'-]+/u.test(textWithoutServices) && mentionedProfessionals.length === 0) reasons.add('UNKNOWN_PROFESSIONAL');
   const leadingProfessionalClaim = textWithoutServices.match(
     /\b(?:a|o)\s+([A-ZÀ-ÖØ-öø-ÿ][\p{L}'-]+(?:\s+[A-ZÀ-ÖØ-öø-ÿ][\p{L}'-]+)?)\s+(?:atende|recebe|realiza|estar[aá]|ficar[aá]|vai\s+estar)(?=\s|[.,!?]|$)/iu
@@ -549,7 +624,7 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
     reasons.add('UNRECORDED_HANDOFF');
   }
   for (const block of blocks) {
-    if (CLINICAL_RE.test(block.text) && !clinicalAuthorized(block, envelope.evidence)) reasons.add('UNAUTHORIZED_CLINICAL_PROMISE');
+    if (CLINICAL_RE.test(block.text) && !clinicalAuthorized(block, envelope.evidence, catalog)) reasons.add('UNAUTHORIZED_CLINICAL_PROMISE');
   }
 
   const reasonCodes = [...reasons];

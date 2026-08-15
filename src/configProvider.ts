@@ -16,6 +16,7 @@ import type {
   StructuredPreferencesConfig,
 } from './services/structuredPreferences';
 import type { AuthoritativeOutboundCatalog } from './services/receptionistOutbound';
+import type { DescriptionTermAcceptanceV2 } from './services/licensedServiceDescription';
 import {
   observeTechnicalMaintenance,
   parseTechnicalMaintenanceSnapshot,
@@ -121,6 +122,7 @@ export interface TenantBotConfig {
   bookingMenu?: BookingMenuItem[];
   postBookingInstructions?: PostBookingInstruction[];
   authoritativeCatalog?: AuthoritativeOutboundCatalog;
+  descriptionTermAcceptance?: DescriptionTermAcceptanceV2 | null;
   escalationResponsibleName?: string | null;
   technicalMaintenance?: {
     enabled: boolean;
@@ -246,6 +248,11 @@ export async function getTenantConfig(
           raw.authoritativeCatalog && typeof raw.authoritativeCatalog === 'object'
             ? raw.authoritativeCatalog
             : undefined,
+        descriptionTermAcceptance:
+          raw.descriptionTermAcceptance &&
+          typeof raw.descriptionTermAcceptance === 'object'
+            ? raw.descriptionTermAcceptance
+            : null,
         escalationResponsibleName:
           typeof raw.escalationResponsibleName === 'string'
             ? raw.escalationResponsibleName

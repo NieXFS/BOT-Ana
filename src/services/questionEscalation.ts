@@ -19,6 +19,7 @@ export const ESCALATION_REASON_CODES = [
 ] as const;
 
 export type EscalationReasonCode = (typeof ESCALATION_REASON_CODES)[number];
+export type EscalationTopicCode = 'PROCEDURE_INFO';
 
 export function isAnaEscalationEnabled(
   value: string | undefined = process.env.ANA_ESCALATION_ENABLED
@@ -78,6 +79,7 @@ export interface EscalationInput {
   customerPhone: string;
   reasonCode: EscalationReasonCode;
   messageId: string;
+  topicCode?: EscalationTopicCode;
 }
 
 export type EscalationOutcome =
@@ -109,13 +111,61 @@ const defaultDeps: EscalationDeps = {
   },
 };
 
+function validationResponseShape(error: unknown): {
+  status: number | null;
+  data: unknown;
+} {
+  if (!error || typeof error !== 'object') return { status: null, data: null };
+  const response = (error as { response?: unknown }).response;
+  if (!response || typeof response !== 'object') return { status: null, data: null };
+  const status = (response as { status?: unknown }).status;
+  return {
+    status: typeof status === 'number' ? status : null,
+    data: (response as { data?: unknown }).data,
+  };
+}
+
+function isTopicCodeValidationFailure(error: unknown): boolean {
+  const response = validationResponseShape(error);
+  if (response.status !== 400 && response.status !== 422) return false;
+  let marker = '';
+  try {
+    marker = JSON.stringify(response.data ?? '').toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    marker.includes('topiccode') ||
+    marker.includes('topic_code') ||
+    marker.includes('unrecognized') ||
+    marker.includes('unknown field') ||
+    marker.includes('campo desconhecido')
+  );
+}
+
+async function postEscalationWithTopicCompatibility(
+  input: EscalationInput,
+  deps: EscalationDeps
+): Promise<unknown> {
+  try {
+    return await deps.post(input);
+  } catch (error) {
+    if (!input.topicCode || !isTopicCodeValidationFailure(error)) throw error;
+    console.warn(
+      '[ana-procedure-info] ERP rejeitou topicCode; retry compatível sem o campo.'
+    );
+    const { topicCode: _topicCode, ...legacyInput } = input;
+    return deps.post(legacyInput);
+  }
+}
+
 export async function escalateQuestion(
   input: EscalationInput,
   deps: EscalationDeps = defaultDeps
 ): Promise<EscalationOutcome> {
   if (!isEscalationReasonCode(input.reasonCode)) return { kind: 'failed' };
   try {
-    const raw = await deps.post(input);
+    const raw = await postEscalationWithTopicCompatibility(input, deps);
     const data = raw as {
       questionId?: unknown;
       escalation?: unknown;
@@ -152,6 +202,44 @@ export async function escalateQuestion(
     }
     return { kind: 'failed' };
   }
+}
+
+export async function escalateProcedureInfoQuestionV2(
+  input: {
+    phoneNumberId: string;
+    customerPhone: string;
+    messageId: string | null;
+    responsibleName?: string;
+  },
+  deps: EscalationDeps = defaultDeps
+): Promise<ReceptionistEscalationV2Decision> {
+  if (!isAnaEscalationEnabled() || !input.messageId) {
+    const outcome = { kind: 'failed' } as const;
+    return {
+      matched: true,
+      reply: buildEscalationReplyV2(outcome, input.responsibleName),
+      actionRecorded: false,
+      questionId: null,
+      outcome: outcome.kind,
+    };
+  }
+  const outcome = await escalateQuestion(
+    {
+      phoneNumberId: input.phoneNumberId,
+      customerPhone: input.customerPhone,
+      messageId: input.messageId,
+      reasonCode: 'UNCADASTRED_INFO',
+      topicCode: 'PROCEDURE_INFO',
+    },
+    deps
+  );
+  return {
+    matched: true,
+    reply: buildEscalationReplyV2(outcome, input.responsibleName),
+    actionRecorded: outcome.kind === 'created',
+    questionId: outcome.kind === 'created' ? outcome.questionId : null,
+    outcome: outcome.kind,
+  };
 }
 
 /** Uma única fonte determinística de copy; nunca recebe texto livre do provider. */

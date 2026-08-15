@@ -24,7 +24,10 @@ import {
 } from '../contextManager';
 import { toReceptionistModelHistory } from '../humanConversationContext';
 import { isConversationPaused } from '../pauseService';
-import { maybeEscalateReceptionistQuestionV2 } from '../questionEscalation';
+import {
+  escalateProcedureInfoQuestionV2,
+  maybeEscalateReceptionistQuestionV2,
+} from '../questionEscalation';
 import {
   resolveReceptionistTurnDecision,
   resolveTurnControl,
@@ -105,6 +108,14 @@ import {
 import { coordinateRecoveryV2 } from './recoveryCoordinator';
 import { classifyRecoveryFallbackIntentV2 } from './recoveryFallbackIntent';
 import {
+  composeProcedureInfoComponentV2,
+  decideProcedureInfoV2,
+  hydrateLicensedServiceDescriptionsV2,
+  materializeProcedureInfoAnswerV2,
+  procedureInfoModelInstructionV2,
+  type ProcedureInfoDecisionV2,
+} from './procedureInfo';
+import {
   regenerateReceptionistCopyV2,
   type RegenerationResultV2,
 } from './regenerator';
@@ -184,6 +195,7 @@ export interface ReceptionistV2RuntimeDeps {
   ) => Promise<RegenerationResultV2>;
   composeSocial?: typeof composeSocialReplyV2;
   escalate?: typeof maybeEscalateReceptionistQuestionV2;
+  escalateProcedure?: typeof escalateProcedureInfoQuestionV2;
   interpreterEnabled?: boolean;
   runInterpreter?: typeof interpretPowerZeroV2;
   /** Opt-in do braço de voz; produção omite e permanece OFF. */
@@ -199,6 +211,15 @@ export interface ReceptionistV2RuntimeDeps {
 
 function stableHash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function modelVisibleServicesV2(services: ServicesResult): ServicesResult {
+  return {
+    ...services,
+    services: services.services?.map(
+      ({ licensedDescription: _licensedDescription, ...service }) => service
+    ),
+  };
 }
 
 function v2RulesPrompt(
@@ -242,7 +263,9 @@ function v2RulesPrompt(
     turnFrame: frame,
     catalogSnapshot: {
       success: services.success,
-      services: services.services ?? [],
+      // O modelo nunca recebe exactText. A descrição é dado, não instrução:
+      // ele só chega à boundary depois de materialização server-side.
+      services: modelVisibleServicesV2(services).services ?? [],
       professionals: services.professionals ?? [],
     },
     currentInbounds: frame.currentInboundIds.map((inboundId) => ({
@@ -805,7 +828,12 @@ export async function getReceptionistReplyV2(input: {
       : guard.kind === 'clear'
         ? guard.pending
         : null;
-  const services = await loadServices(input.config);
+  const services = hydrateLicensedServiceDescriptionsV2({
+    servicesResult: await loadServices(input.config),
+    authoritativeCatalog: input.config.authoritativeCatalog,
+    termAcceptance: input.config.descriptionTermAcceptance,
+    contractVersion: input.config.contractVersion,
+  });
   const currentInboundBatchText = currentInboundIds
     .map((inboundId) => inboundTextsById[inboundId] ?? '')
     .filter(Boolean)
@@ -862,6 +890,35 @@ export async function getReceptionistReplyV2(input: {
     pending: pendingRecord?.snapshot ?? null,
     flowState,
   };
+  let procedureInfoPlan = decideProcedureInfoV2({
+    inboundText: currentInboundBatchText,
+    frame,
+    servicesResult: services,
+  });
+  let procedureInfoAnswer =
+    procedureInfoPlan.decision.kind === 'answer_from_license'
+      ? materializeProcedureInfoAnswerV2({
+          decision: procedureInfoPlan.decision,
+          servicesResult: services,
+          termAcceptance: input.config.descriptionTermAcceptance,
+        })
+      : null;
+  if (
+    procedureInfoPlan.decision.kind === 'answer_from_license' &&
+    !procedureInfoAnswer
+  ) {
+    const failedDecision = procedureInfoPlan.decision;
+    const failClosedDecision: ProcedureInfoDecisionV2 = {
+      kind: 'escalate',
+      reasonCode: 'UNCADASTRED_INFO',
+      topicCode: 'PROCEDURE_INFO',
+      serviceId: failedDecision.serviceId,
+      requestedFacets: [...failedDecision.requestedFacets],
+      uncoveredFacets: [...failedDecision.requestedFacets],
+    };
+    procedureInfoPlan = { ...procedureInfoPlan, decision: failClosedDecision };
+    procedureInfoAnswer = null;
+  }
   const shouldReanchorPendingQuestion = shouldReanchorPendingQuestionV2({
     pending: frame.pending,
     flowState: frame.flowState,
@@ -976,31 +1033,49 @@ export async function getReceptionistReplyV2(input: {
   const inboundId = currentInboundIds.at(-1)!;
   const currentInboundText =
     inboundTextsById[inboundId] ?? input.userMessage;
-  const executeToolForFrame = (groundingFrame: TurnFrameV2) =>
-    deps.executeTool ??
-    ((functionName: string, args: Record<string, unknown>) =>
-      executeReceptionistFunction(
-        functionName,
-        args,
-        input.phone,
-        input.userName,
-        input.config,
-        input.userMessage,
-        userMessages,
-        modelHistory,
-        services,
-        conversationKey,
-        {
-          flowState: groundingFrame.flowState,
-          pending: groundingFrame.pending,
-          catalog: services,
-          lastAcceptedDelivery: stored.lastAcceptedDelivery,
-          now: startedAt,
-          onGateDecline: (decline) => {
-            selectedGateDecline = decline;
-          },
-        }
-      ));
+  const procedureEscalationPlanned =
+    procedureInfoPlan.decision.kind === 'escalate';
+  const executeToolForFrame = (groundingFrame: TurnFrameV2) => {
+    const baseExecute =
+      deps.executeTool ??
+      ((functionName: string, args: Record<string, unknown>) =>
+        executeReceptionistFunction(
+          functionName,
+          args,
+          input.phone,
+          input.userName,
+          input.config,
+          input.userMessage,
+          userMessages,
+          modelHistory,
+          services,
+          conversationKey,
+          {
+            flowState: groundingFrame.flowState,
+            pending: groundingFrame.pending,
+            catalog: services,
+            lastAcceptedDelivery: stored.lastAcceptedDelivery,
+            now: startedAt,
+            onGateDecline: (decline) => {
+              selectedGateDecline = decline;
+            },
+          }
+        ));
+    return async (functionName: string, args: Record<string, unknown>) => {
+      if (
+        procedureEscalationPlanned &&
+        (functionName === 'bookAppointment' || functionName === 'cancelAppointment')
+      ) {
+        return JSON.stringify({
+          success: false,
+          reason: 'blocked',
+          message:
+            'INTERNAL_HINT: escrita bloqueada porque uma escalada procedural será registrada neste turno.',
+        });
+      }
+      return baseExecute(functionName, args);
+    };
+  };
   const executeTool = executeToolForFrame(frame);
   // Entitlement v2 deliberadamente separado do executor compartilhado: ele
   // só é usado depois que o fast-path provou uma opção TIME autoritativa. O
@@ -1057,6 +1132,8 @@ export async function getReceptionistReplyV2(input: {
   };
 
   const escalate = deps.escalate ?? maybeEscalateReceptionistQuestionV2;
+  const escalateProcedure =
+    deps.escalateProcedure ?? escalateProcedureInfoQuestionV2;
   const professionalCatalogMention = hasCurrentProfessionalCatalogEntityV2({
     inboundText: currentInboundBatchText,
     servicesResult: services,
@@ -1143,6 +1220,115 @@ export async function getReceptionistReplyV2(input: {
       copyVariant,
       ...(escalation.actionRecorded && escalation.questionId
         ? { authoritativeEscalationQuestionId: escalation.questionId }
+        : {}),
+    };
+  }
+
+  if (
+    procedureInfoPlan.decision.kind !== 'none' &&
+    !procedureInfoPlan.requiresOperationalContinuation
+  ) {
+    const race = await checkRace('before_transport');
+    if (race) return preparedPreemption(race, successorTurnId);
+    let componentText: string;
+    let actionRecorded = false;
+    let questionId: string | null = null;
+    if (procedureInfoPlan.decision.kind === 'answer_from_license') {
+      if (!procedureInfoAnswer) {
+        throw new Error('Decisão procedural licenciada sem materialização exata.');
+      }
+      componentText = procedureInfoAnswer.text;
+    } else {
+      const outcome = await escalateProcedure({
+        phoneNumberId: input.config.phoneNumberId,
+        customerPhone: input.phone,
+        messageId: inboundId,
+        responsibleName: input.config.escalationResponsibleName ?? undefined,
+      });
+      if (!outcome.matched) {
+        throw new Error('Escalada procedural não produziu decisão de compliance.');
+      }
+      componentText = outcome.reply;
+      actionRecorded = outcome.actionRecorded;
+      questionId = outcome.questionId;
+    }
+    const payload = composeProcedureInfoComponentV2({
+      componentText,
+      courtesyAcknowledgement:
+        procedureInfoPlan.hasCourtesyAcknowledgement,
+    });
+    const candidate = { kind: 'preserve' } as const;
+    const evaluation = evaluateBoundaryV2({
+      rawCandidate: payload,
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: frame.flowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER',
+      source: 'CANONICAL',
+      actionRecorded,
+      outboundEvidence: {
+        ...(questionId
+          ? { authoritativeEscalationQuestionId: questionId }
+          : {}),
+        ...(procedureInfoAnswer
+          ? { licensedServiceDescription: procedureInfoAnswer.evidence }
+          : {}),
+      },
+      route: 'model',
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    });
+    if (
+      !evaluation.safe ||
+      !evaluation.originalAccepted ||
+      !evaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Componente procedural canônico rejeitado pela boundary.');
+    }
+    const procedureLoop = emptyLoopResult();
+    procedureLoop.thinkingMode = thinkingMode;
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route:
+        procedureInfoPlan.decision.kind === 'answer_from_license'
+          ? 'fast_path_procedure_info'
+          : 'fast_path_procedure_escalation',
+    });
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame,
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: evaluation.acceptedPayload,
+      transition: { kind: 'preserve' },
+      planReceipt: makePlan({
+        route: 'fast_path',
+        loop: procedureLoop,
+        candidate,
+        recoveryKind: 'none',
+        regenCalls: 0,
+        boundaryAttempts: [
+          {
+            index: 0,
+            candidateHash: opaqueReceiptHashV2(payload),
+            reasonCodes: evaluation.reasonCodes,
+          },
+        ],
+      }),
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: false,
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
+      elicitationVariant,
+      copyVariant,
+      ...(actionRecorded && questionId
+        ? { authoritativeEscalationQuestionId: questionId }
         : {}),
     };
   }
@@ -1271,6 +1457,16 @@ export async function getReceptionistReplyV2(input: {
       ),
     },
     ...modelHistory,
+    ...(procedureInfoPlan.decision.kind !== 'none'
+      ? [
+          {
+            role: 'system' as const,
+            content: procedureInfoModelInstructionV2(
+              procedureInfoPlan.decision
+            ),
+          },
+        ]
+      : []),
   ];
 
   const bookingReentryFastPath = resolveBookingReentryFastPathV2({
@@ -1355,6 +1551,7 @@ export async function getReceptionistReplyV2(input: {
         }
       : frame;
   const bookingConfirmationFastPath =
+    !procedureEscalationPlanned &&
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
@@ -2022,7 +2219,7 @@ export async function getReceptionistReplyV2(input: {
           snapshot: {
             frame: { ...frame, flowState: nextFlowState },
             catalogSnapshot: {
-              services: services.services ?? [],
+              services: modelVisibleServicesV2(services).services ?? [],
               professionals: services.professionals ?? [],
             },
             messages,
@@ -2126,7 +2323,7 @@ export async function getReceptionistReplyV2(input: {
     candidate: recovery.pendingTransitionCandidate,
     writeCommitted,
   });
-  const candidate = adjustTransitionForFlowResetV2(
+  let candidate = adjustTransitionForFlowResetV2(
     coerceEquivalentOpenTransitionV2(
       recoveredCandidate,
       frame,
@@ -2182,7 +2379,120 @@ export async function getReceptionistReplyV2(input: {
     return preparedPreemption(voiceLayer.preemption, successorTurnId, loop);
   }
   voiceReceipt = voiceLayer.receipt ?? undefined;
-  const deliveredPayload = voiceLayer.payload;
+  let deliveredPayload = voiceLayer.payload;
+  let procedureEscalationQuestionId: string | null = null;
+  const procedureBoundaryAttempts: Array<{
+    candidateHash: string;
+    reasonCodes: BoundaryReasonCodeV2[];
+  }> = [];
+  if (procedureInfoPlan.decision.kind !== 'none') {
+    let componentText: string;
+    let actionRecorded = false;
+    if (procedureInfoPlan.decision.kind === 'answer_from_license') {
+      if (!procedureInfoAnswer) {
+        throw new Error('Composição procedural sem materialização licenciada.');
+      }
+      componentText = procedureInfoAnswer.text;
+    } else {
+      if (writeCommitted) {
+        throw new Error('Invariante violado: escalada procedural após write commitado.');
+      }
+      const race = await checkRace('before_transport');
+      if (race) return preparedPreemption(race, successorTurnId, loop);
+      const outcome = await escalateProcedure({
+        phoneNumberId: input.config.phoneNumberId,
+        customerPhone: input.phone,
+        messageId: inboundId,
+        responsibleName: input.config.escalationResponsibleName ?? undefined,
+      });
+      if (!outcome.matched) {
+        throw new Error('Escalada procedural não produziu decisão de compliance.');
+      }
+      componentText = outcome.reply;
+      actionRecorded = outcome.actionRecorded;
+      procedureEscalationQuestionId = outcome.questionId;
+      // A pausa recém-criada congela o fluxo operacional anterior; nenhuma
+      // transição proposta pelo modelo é commitada junto com a escalada.
+      candidate = { kind: 'preserve' };
+    }
+
+    const composed = composeProcedureInfoComponentV2({
+      baseText: deliveredPayload,
+      componentText,
+      courtesyAcknowledgement:
+        procedureInfoPlan.hasCourtesyAcknowledgement,
+    });
+    const boundaryInput = {
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: committedFlowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER' as const,
+      source:
+        nominalRoute === 'model' || recovery.recoveryKind === 'regen'
+          ? ('GENERATED' as const)
+          : ('CANONICAL' as const),
+      actionRecorded,
+      outboundEvidence: {
+        ...(procedureEscalationQuestionId
+          ? {
+              authoritativeEscalationQuestionId:
+                procedureEscalationQuestionId,
+            }
+          : {}),
+        ...(procedureInfoAnswer
+          ? { licensedServiceDescription: procedureInfoAnswer.evidence }
+          : {}),
+      },
+      toolTrace: loop.toolTrace as ToolTraceLike[],
+      route: interpreterResolved ? ('interpreter' as const) : ('model' as const),
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    };
+    let finalEvaluation = evaluateBoundaryV2({
+      ...boundaryInput,
+      rawCandidate: composed,
+    });
+    procedureBoundaryAttempts.push({
+      candidateHash: opaqueReceiptHashV2(composed),
+      reasonCodes: finalEvaluation.reasonCodes,
+    });
+    if (
+      !finalEvaluation.safe ||
+      !finalEvaluation.originalAccepted ||
+      !finalEvaluation.acceptedPayload.trim()
+    ) {
+      // Fallback pós-P6: preserva o componente autoritativo e jamais manda
+      // texto parcialmente validado. A leitura composta é descartada.
+      candidate = { kind: 'preserve' };
+      const componentOnly = composeProcedureInfoComponentV2({
+        componentText,
+        courtesyAcknowledgement:
+          procedureInfoPlan.hasCourtesyAcknowledgement,
+      });
+      finalEvaluation = evaluateBoundaryV2({
+        ...boundaryInput,
+        rawCandidate: componentOnly,
+        pendingTransitionCandidate: candidate,
+        source: 'CANONICAL',
+      });
+      procedureBoundaryAttempts.push({
+        candidateHash: opaqueReceiptHashV2(componentOnly),
+        reasonCodes: finalEvaluation.reasonCodes,
+      });
+    }
+    if (
+      !finalEvaluation.safe ||
+      !finalEvaluation.originalAccepted ||
+      !finalEvaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Fallback procedural canônico rejeitado pela boundary.');
+    }
+    deliveredPayload = finalEvaluation.acceptedPayload;
+  }
 
   const transition = materializeTransition(
     candidate,
@@ -2205,6 +2515,13 @@ export async function getReceptionistReplyV2(input: {
     candidateHash: entry.candidateHash,
     reasonCodes: entry.evaluation.reasonCodes,
   }));
+  for (const attempt of procedureBoundaryAttempts) {
+    boundaryAttempts.push({
+      index: boundaryAttempts.length,
+      candidateHash: attempt.candidateHash,
+      reasonCodes: attempt.reasonCodes,
+    });
+  }
   emitRouteComparisonShadow({
     legacyRoute: legacyShadowRoute,
     v2Route: route,
@@ -2237,9 +2554,16 @@ export async function getReceptionistReplyV2(input: {
     ),
     elicitationVariant,
     copyVariant,
+    ...(procedureEscalationQuestionId
+      ? {
+          authoritativeEscalationQuestionId:
+            procedureEscalationQuestionId,
+        }
+      : {}),
   };
 }
 
 export const __v2RulesPromptForSmoke = v2RulesPrompt;
+export const __modelVisibleServicesForSmokeV2 = modelVisibleServicesV2;
 export const __enforceCanonicalTimeSummaryTransitionForSmokeV2 =
   enforceCanonicalTimeSummaryTransitionV2;
