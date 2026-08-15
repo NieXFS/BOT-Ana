@@ -117,6 +117,52 @@ async function main(): Promise<void> {
   check('list: lastRole preservado (assistant/user)', listed.conversations[0].lastRole === 'assistant' && listed.conversations[1].lastRole === 'user');
   check('list: messageCount numérico', listed.conversations[0].messageCount === 30 && listed.conversations[1].messageCount === 3);
 
+  const humanCtx = await import('../src/services/humanConversationContext');
+  const clauseVisible = 'A drenagem linfática é uma técnica manual suave.';
+  const licensedEnvelope = humanCtx.historyContentForAcceptedAssistant(
+    clauseVisible,
+    [
+      {
+        order: 0,
+        start: 0,
+        end: clauseVisible.length,
+        serviceId: 'svc-drenagem',
+        serviceName: 'Drenagem Linfática',
+        sourceHash: 'a'.repeat(64),
+        clauseIds: ['drenagem-what'],
+        facets: ['WHAT_IT_IS'],
+      },
+    ]
+  );
+  const licensedListQuery = async (text: string) => {
+    if (text.includes('COUNT(DISTINCT')) return { rows: [{ total: 1 }] };
+    return {
+      rows: [
+        {
+          conversationKey: '123456:5511999998888',
+          messageCount: 2,
+          lastActivityAt: new Date('2026-07-22T12:00:00.000Z'),
+          lastRole: 'assistant',
+          lastContent: licensedEnvelope,
+        },
+      ],
+    };
+  };
+  const licensedListed = await listConversations(
+    '123456',
+    20,
+    0,
+    licensedListQuery
+  );
+  check(
+    'list: preview de catálogo licenciado mostra a cláusula, não o envelope',
+    licensedListed.conversations[0].lastPreview === clauseVisible
+  );
+  check(
+    'list: preview não vaza JSON de proveniência',
+    !licensedListed.conversations[0].lastPreview.includes('"visibleText"')
+  );
+
   // listConversations com LIKE metachar no phoneNumberId → escapado no pattern.
   const listCalls2: { text: string; params: unknown[] }[] = [];
   const fakeEmptyList = async (text: string, params: unknown[]) => {

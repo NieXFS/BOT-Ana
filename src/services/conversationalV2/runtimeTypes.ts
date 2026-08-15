@@ -1,4 +1,5 @@
 import type { TenantBotConfig } from '../../configProvider';
+import type { LicensedCatalogSegmentV2 } from '../humanConversationContext';
 import type {
   DeliveryPreemptionV2,
   TurnFrameV2,
@@ -56,6 +57,11 @@ export interface PreparedReceptionistTurnV2 {
   copyVariant?: CopyVariantIdV2;
   /** Única entrega que pode atravessar a pausa recém-criada pela própria escalada. */
   authoritativeEscalationQuestionId?: string;
+  /**
+   * Segmentos de catálogo no payload visível. O commit persiste visibleText +
+   * offsets; a projeção para LLM troca só esses intervalos por placeholder.
+   */
+  licensedCatalogSegments?: LicensedCatalogSegmentV2[];
 }
 
 export function isPreparedReceptionistTurnV2(

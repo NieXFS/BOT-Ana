@@ -221,11 +221,14 @@ function isEmojiOnly(value: string): boolean {
   return leftover.length === 0;
 }
 
-function isAffirmativeCompact(value: string): boolean {
+export function isAffirmativeCompact(value: string): boolean {
   const stripped = value
     .replace(/\p{Extended_Pictographic}/gu, ' ')
     .replace(/[\uFE0F]/gu, ' ');
-  const text = normalize(stripped).replace(/\b(?:por favor|pf)\b/g, '').trim();
+  const text = normalize(stripped)
+    .replace(/\b(?:por favor|pf)\b/g, '')
+    .replace(/[\s?？!！.。,，;；:：]+$/gu, '')
+    .trim();
   if (CONFIRMATION_AFFIRM_RE.test(text)) return true;
   if (isEmojiOnly(value) && CONFIRMATION_THUMB_RE.test(value)) return true;
   return false;

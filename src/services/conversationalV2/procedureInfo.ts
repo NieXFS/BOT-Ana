@@ -1,6 +1,10 @@
 import type { ServicesResult } from '../calendarService';
 import type { AuthoritativeOutboundCatalog } from '../receptionistOutbound';
 import {
+  locateLicensedCatalogSegmentsV2,
+  type LicensedCatalogSegmentV2,
+} from '../humanConversationContext';
+import {
   LICENSED_SERVICE_DESCRIPTION_POLICY_V1,
   normalizeLicensedServiceDescriptionV2,
   validDescriptionTermAcceptanceV2,
@@ -62,7 +66,7 @@ const PROCEDURAL_INTERROGATIVE_RE = new RegExp(
 const NEGATED_PROCEDURAL_RE =
   /\bnao\b(?:\s+\w+){0,4}\s+(?:o\s+que\s+(?:e|eh)|como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\b/u;
 const OPERATIONAL_OBJECT_RE =
-  /\b(?:o\s+que\s+(?:e|eh)|como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\s+(?:(?:o|a|os|as|um|uma)\s+)?(?:agendamento|pagamento|pacote|cancelamento|remarcacao|horario|agenda)\b/u;
+  /\b(?:o\s+que\s+(?:e|eh)|como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\s+(?:(?:o|a|os|as|um|uma|de|dos|das)\s+)?(?:agendamentos?|pagamentos?|pacotes?|cancelamentos?|remarcac(?:ao|oes)|horarios?|agendas?)\b/u;
 const TEMPORAL_SESSION_OBJECT_RE =
   /\b(?:o\s+que\s+(?:e|eh)|como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\s+(?:(?:o|a)\s+)?sessao\s+(?:de\s+)?(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}[/-]\d{1,2})\b/u;
 const ANAPHORIC_PROCEDURE_RE =
@@ -223,7 +227,11 @@ export function materializeProcedureInfoAnswerV2(input: {
   decision: Extract<ProcedureInfoDecisionV2, { kind: 'answer_from_license' }>;
   servicesResult: ServicesResult;
   termAcceptance?: DescriptionTermAcceptanceV2 | null;
-}): { text: string; evidence: LicensedServiceDescriptionEvidenceV2 } | null {
+}): {
+  text: string;
+  evidence: LicensedServiceDescriptionEvidenceV2;
+  facets: LicensedServiceDescriptionFacetV2[];
+} | null {
   if (!validDescriptionTermAcceptanceV2(input.termAcceptance)) return null;
   const service = input.servicesResult.services?.find(
     (entry) => entry.id === input.decision.serviceId
@@ -248,6 +256,10 @@ export function materializeProcedureInfoAnswerV2(input: {
   if (!exactText || exactText.length > PROCEDURE_INFO_MAX_EXACT_TEXT_CHARS_V2) {
     return null;
   }
+  const facets: LicensedServiceDescriptionFacetV2[] = [];
+  for (const clause of selected) {
+    if (clause && !facets.includes(clause.facet)) facets.push(clause.facet);
+  }
   return {
     text: exactText,
     evidence: {
@@ -261,18 +273,45 @@ export function materializeProcedureInfoAnswerV2(input: {
         acceptedAt: input.termAcceptance.acceptedAt,
       },
     },
+    facets,
   };
+}
+
+export function licensedCatalogSegmentsForAcceptedPayloadV2(input: {
+  payload: string;
+  answer: {
+    evidence: LicensedServiceDescriptionEvidenceV2;
+    facets: readonly LicensedServiceDescriptionFacetV2[];
+  };
+  serviceName: string;
+}): LicensedCatalogSegmentV2[] {
+  const segments = locateLicensedCatalogSegmentsV2({
+    visibleText: input.payload,
+    serviceId: input.answer.evidence.serviceId,
+    serviceName: input.serviceName,
+    sourceHash: input.answer.evidence.sourceHash,
+    clauseIds: input.answer.evidence.clauseIds,
+    facets: input.answer.facets,
+    exactText: input.answer.evidence.exactText,
+  });
+  if (!segments) {
+    throw new Error('Payload aceito sem segmento de catálogo localizável.');
+  }
+  return segments;
 }
 
 export function composeProcedureInfoComponentV2(input: {
   baseText?: string | null;
   componentText: string;
   courtesyAcknowledgement?: boolean;
+  socialGreeting?: string | null;
 }): string {
   const parts: string[] = [];
+  const greeting = input.socialGreeting?.trim();
+  if (greeting) parts.push(greeting);
   const base = input.baseText?.trim();
-  if (base) parts.push(base);
-  if (!base && input.courtesyAcknowledgement) parts.push('Imagina!');
+  if (base && !parts.some((part) => part.includes(base))) parts.push(base);
+  if (!base && !greeting && input.courtesyAcknowledgement) parts.push('Imagina!');
   const component = input.componentText.trim();
   if (component && !parts.some((part) => part.includes(component))) {
     parts.push(component);

@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { isAmbiguousWhatsAppTransportError } from '../../whatsappCloudService';
 import { containsUnlicensedHandoffPromise } from '../receptionistOutbound';
+import { historyContentForAcceptedAssistant } from '../humanConversationContext';
 import type {
   DeliveryPreemptionV2,
   TurnDeliveryReceiptV2,
@@ -332,7 +333,10 @@ export async function deliverPreparedReceptionistTurnV2(
     deliveryAttemptId,
   };
   const commitPayload = {
-    assistantText: payload,
+    assistantText: historyContentForAcceptedAssistant(
+      payload,
+      prepared.licensedCatalogSegments
+    ),
     transition: prepared.transition,
     deliveryReceipt: acceptedReceipt,
     copyVariant: prepared.copyVariant ?? 'canonical',

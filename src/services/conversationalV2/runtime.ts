@@ -22,7 +22,7 @@ import {
   currentSourceInboundMessageIds,
   getHistory,
 } from '../contextManager';
-import { toReceptionistModelHistory } from '../humanConversationContext';
+import { toReceptionistModelHistory, isHumanEchoContent, customerVisibleAssistantContent } from '../humanConversationContext';
 import { isConversationPaused } from '../pauseService';
 import {
   escalateProcedureInfoQuestionV2,
@@ -33,6 +33,7 @@ import {
   resolveTurnControl,
   type ReceptionistTurnControl,
 } from '../receptionistTurnDecision';
+import { buildSocialReceptionistReply } from '../receptionistSocialSafety';
 import type { ToolTraceLike } from '../customerReplyGuard';
 import {
   type BoundaryReasonCodeV2,
@@ -111,6 +112,7 @@ import {
   composeProcedureInfoComponentV2,
   decideProcedureInfoV2,
   hydrateLicensedServiceDescriptionsV2,
+  licensedCatalogSegmentsForAcceptedPayloadV2,
   materializeProcedureInfoAnswerV2,
   procedureInfoModelInstructionV2,
   type ProcedureInfoDecisionV2,
@@ -130,6 +132,7 @@ import {
 } from './pendingQuestion';
 import {
   composeSocialReplyV2,
+  detectLeadingSocialComponentV2,
   detectStrictSocialRouteV2,
   resolveSocialTurnV2,
 } from './social';
@@ -219,6 +222,27 @@ function modelVisibleServicesV2(services: ServicesResult): ServicesResult {
     services: services.services?.map(
       ({ licensedDescription: _licensedDescription, ...service }) => service
     ),
+  };
+}
+
+function licensedCatalogProvenanceForPayloadV2(
+  payload: string,
+  answer: Parameters<typeof licensedCatalogSegmentsForAcceptedPayloadV2>[0]['answer'],
+  services: ServicesResult
+): {
+  licensedCatalogSegments: ReturnType<
+    typeof licensedCatalogSegmentsForAcceptedPayloadV2
+  >;
+} {
+  const serviceName =
+    services.services?.find((service) => service.id === answer.evidence.serviceId)
+      ?.name ?? '';
+  return {
+    licensedCatalogSegments: licensedCatalogSegmentsForAcceptedPayloadV2({
+      payload,
+      answer,
+      serviceName,
+    }),
   };
 }
 
@@ -1224,6 +1248,105 @@ export async function getReceptionistReplyV2(input: {
     };
   }
 
+  const socialDetection = detectStrictSocialRouteV2({
+    inboundId,
+    inboundText: currentInboundText,
+    servicesResult: services,
+  });
+  const leadingSocial = detectLeadingSocialComponentV2(currentInboundBatchText);
+  const socialGreeting =
+    leadingSocial.matched &&
+    (leadingSocial.kind === 'greeting' || leadingSocial.kind === 'smalltalk')
+      ? buildSocialReceptionistReply(currentInboundBatchText)
+      : undefined;
+  if (socialDetection.matched) {
+    const social = await resolveSocialTurnV2({
+      config: input.config,
+      frame,
+      servicesResult: services,
+      inboundText: currentInboundText,
+      inboundTextsById,
+      detection: socialDetection,
+      thinkingMode,
+      recentAssistantReplies: history
+        .filter(
+          (message) =>
+            message.role === 'assistant' &&
+            !isHumanEchoContent(message.content)
+        )
+        .slice(-8)
+        .map((message) => customerVisibleAssistantContent(message.content)),
+      ...(deps.composeSocial ? { compose: deps.composeSocial } : {}),
+      afterPrimary: () => checkRace('during_primary'),
+      beforeRegenerate: () => checkRace('before_regen'),
+      afterRegenerate: () => checkRace('during_regen'),
+      onRejectedBoundaryCandidate: deps.onRejectedBoundaryCandidate,
+    });
+    if (social.status === 'preempted') {
+      const accountingLoop = emptyLoopResult();
+      accountingLoop.thinkingMode = thinkingMode;
+      accountingLoop.providerReportedModels = social.providerReportedModels;
+      accountingLoop.systemFingerprints = social.systemFingerprints;
+      accountingLoop.rounds =
+        social.primaryProviderCalls + social.regenProviderCalls;
+      emitRouteComparisonShadow({
+        legacyRoute: legacyShadowRoute,
+        v2Route: 'preempted',
+      });
+      return preparedPreemption(
+        social.preemption,
+        successorTurnId,
+        accountingLoop
+      );
+    }
+    const candidate = { kind: 'preserve' } as const;
+    const socialLoop = emptyLoopResult();
+    socialLoop.thinkingMode = thinkingMode;
+    socialLoop.providerReportedModels = social.providerReportedModels;
+    socialLoop.systemFingerprints = social.systemFingerprints;
+    socialLoop.rounds = social.primaryProviderCalls;
+    const route: TurnPlanReceiptV2['route'] =
+      social.recoveryKind === 'regen'
+        ? 'regen'
+        : social.recoveryKind === 'direct_fallback'
+          ? 'fallback'
+          : 'model';
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: `social_${route}`,
+    });
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame,
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: social.payload,
+      transition: { kind: 'preserve' },
+      planReceipt: makePlan({
+        route,
+        loop: socialLoop,
+        candidate,
+        recoveryKind: social.recoveryKind,
+        regenCalls: social.regenProviderCalls,
+        primaryModelRounds: social.primaryProviderCalls,
+        primaryProviderCalls: social.primaryProviderCalls,
+        boundaryAttempts: social.boundaryAttempts.map((attempt) => ({
+          index: attempt.index,
+          candidateHash: attempt.candidateHash,
+          reasonCodes: attempt.evaluation.reasonCodes,
+        })),
+      }),
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: false,
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
+      elicitationVariant,
+      copyVariant,
+    };
+  }
+
   if (
     procedureInfoPlan.decision.kind !== 'none' &&
     !procedureInfoPlan.requiresOperationalContinuation
@@ -1256,6 +1379,7 @@ export async function getReceptionistReplyV2(input: {
       componentText,
       courtesyAcknowledgement:
         procedureInfoPlan.hasCourtesyAcknowledgement,
+      ...(socialGreeting ? { socialGreeting } : {}),
     });
     const candidate = { kind: 'preserve' } as const;
     const evaluation = evaluateBoundaryV2({
@@ -1330,99 +1454,13 @@ export async function getReceptionistReplyV2(input: {
       ...(actionRecorded && questionId
         ? { authoritativeEscalationQuestionId: questionId }
         : {}),
-    };
-  }
-
-  const socialDetection = detectStrictSocialRouteV2({
-    inboundId,
-    inboundText: currentInboundText,
-    servicesResult: services,
-  });
-  if (socialDetection.matched) {
-    const social = await resolveSocialTurnV2({
-      config: input.config,
-      frame,
-      servicesResult: services,
-      inboundText: currentInboundText,
-      inboundTextsById,
-      detection: socialDetection,
-      thinkingMode,
-      recentAssistantReplies: history
-        .filter(
-          (message) =>
-            message.role === 'assistant' &&
-            !message.content.startsWith('[atendente] ')
-        )
-        .slice(-8)
-        .map((message) => message.content),
-      ...(deps.composeSocial ? { compose: deps.composeSocial } : {}),
-      afterPrimary: () => checkRace('during_primary'),
-      beforeRegenerate: () => checkRace('before_regen'),
-      afterRegenerate: () => checkRace('during_regen'),
-      onRejectedBoundaryCandidate: deps.onRejectedBoundaryCandidate,
-    });
-    if (social.status === 'preempted') {
-      const accountingLoop = emptyLoopResult();
-      accountingLoop.thinkingMode = thinkingMode;
-      accountingLoop.providerReportedModels = social.providerReportedModels;
-      accountingLoop.systemFingerprints = social.systemFingerprints;
-      accountingLoop.rounds =
-        social.primaryProviderCalls + social.regenProviderCalls;
-      emitRouteComparisonShadow({
-        legacyRoute: legacyShadowRoute,
-        v2Route: 'preempted',
-      });
-      return preparedPreemption(
-        social.preemption,
-        successorTurnId,
-        accountingLoop
-      );
-    }
-    const candidate = { kind: 'preserve' } as const;
-    const socialLoop = emptyLoopResult();
-    socialLoop.thinkingMode = thinkingMode;
-    socialLoop.providerReportedModels = social.providerReportedModels;
-    socialLoop.systemFingerprints = social.systemFingerprints;
-    socialLoop.rounds = social.primaryProviderCalls;
-    const route: TurnPlanReceiptV2['route'] =
-      social.recoveryKind === 'regen'
-        ? 'regen'
-        : social.recoveryKind === 'direct_fallback'
-          ? 'fallback'
-          : 'model';
-    emitRouteComparisonShadow({
-      legacyRoute: legacyShadowRoute,
-      v2Route: `social_${route}`,
-    });
-    return {
-      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
-      frame,
-      conversationKey,
-      phoneNumberId: input.config.phoneNumberId,
-      customerPhone: input.phone,
-      config: input.config,
-      payload: social.payload,
-      transition: { kind: 'preserve' },
-      planReceipt: makePlan({
-        route,
-        loop: socialLoop,
-        candidate,
-        recoveryKind: social.recoveryKind,
-        regenCalls: social.regenProviderCalls,
-        primaryModelRounds: social.primaryProviderCalls,
-        primaryProviderCalls: social.primaryProviderCalls,
-        boundaryAttempts: social.boundaryAttempts.map((attempt) => ({
-          index: attempt.index,
-          candidateHash: attempt.candidateHash,
-          reasonCodes: attempt.evaluation.reasonCodes,
-        })),
-      }),
-      preemption: null,
-      successorTurnId,
-      hasCommittedWrite: false,
-      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
-      elicitationVariant,
-      copyVariant,
+      ...(procedureInfoAnswer
+        ? licensedCatalogProvenanceForPayloadV2(
+            evaluation.acceptedPayload,
+            procedureInfoAnswer,
+            services
+          )
+        : {}),
     };
   }
 
@@ -2465,22 +2503,26 @@ export async function getReceptionistReplyV2(input: {
       !finalEvaluation.originalAccepted ||
       !finalEvaluation.acceptedPayload.trim()
     ) {
-      // Fallback pós-P6: preserva o componente autoritativo e jamais manda
-      // texto parcialmente validado. A leitura composta é descartada.
+      // Fallback pós-P6: preserva o componente autoritativo. Com pedido
+      // operacional adicional, o último payload operacional já boundary-checked
+      // permanece; sem ele, só o componente canônico.
       candidate = { kind: 'preserve' };
-      const componentOnly = composeProcedureInfoComponentV2({
+      const fallbackPayload = composeProcedureInfoComponentV2({
+        ...(procedureInfoPlan.requiresOperationalContinuation
+          ? { baseText: deliveredPayload }
+          : {}),
         componentText,
         courtesyAcknowledgement:
           procedureInfoPlan.hasCourtesyAcknowledgement,
       });
       finalEvaluation = evaluateBoundaryV2({
         ...boundaryInput,
-        rawCandidate: componentOnly,
+        rawCandidate: fallbackPayload,
         pendingTransitionCandidate: candidate,
         source: 'CANONICAL',
       });
       procedureBoundaryAttempts.push({
-        candidateHash: opaqueReceiptHashV2(componentOnly),
+        candidateHash: opaqueReceiptHashV2(fallbackPayload),
         reasonCodes: finalEvaluation.reasonCodes,
       });
     }
@@ -2559,6 +2601,13 @@ export async function getReceptionistReplyV2(input: {
           authoritativeEscalationQuestionId:
             procedureEscalationQuestionId,
         }
+      : {}),
+    ...(procedureInfoAnswer
+      ? licensedCatalogProvenanceForPayloadV2(
+          deliveredPayload,
+          procedureInfoAnswer,
+          services
+        )
       : {}),
   };
 }

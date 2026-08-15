@@ -4,9 +4,12 @@ import type { TenantBotConfig } from '../configProvider';
 import { scrubText } from '../observability/scrub';
 import {
   HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
-  HUMAN_ECHO_PREFIX,
   type TimestampedMessage,
 } from './contextManager';
+import {
+  humanEchoBody,
+  projectAssistantContentForLlm,
+} from './humanConversationContext';
 import {
   createAnaResumeClassifierCompletion,
   DEEPSEEK_V4_FLASH_MODEL,
@@ -109,11 +112,13 @@ export function buildAnaResumeTimeline(input: {
   customerName?: string | null;
 }): AnaResumeTimelineEvent[] {
   const all = input.history.map((message, index, messages) => {
-    const human =
-      message.role === 'assistant' && message.content.startsWith(HUMAN_ECHO_PREFIX);
+    const humanBody = humanEchoBody(message.content);
+    const human = message.role === 'assistant' && humanBody !== null;
     const rawText = human
-      ? message.content.slice(HUMAN_ECHO_PREFIX.length)
-      : message.content;
+      ? humanBody
+      : message.role === 'assistant'
+        ? projectAssistantContentForLlm(message.content)
+        : message.content;
     return {
       speaker: (message.role === 'user'
         ? 'CUSTOMER'

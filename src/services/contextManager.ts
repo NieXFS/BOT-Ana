@@ -4,6 +4,7 @@ import { customerPhoneVariants } from './conversationActivity';
 import { Sentry } from '../observability/sentry';
 import { runtimeErrorKind } from '../observability/safeRuntime';
 import { canonicalConversationKey } from './conversationOrder';
+import { panelVisibleConversationContent } from './humanConversationContext';
 export {
   HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
   HUMAN_ECHO_PREFIX,
@@ -528,7 +529,9 @@ export async function listConversations(
       lastActivityAt: toIsoString(row.lastActivityAt),
       lastRole: row.lastRole === 'assistant' ? 'assistant' : 'user',
       messageCount: Number(row.messageCount),
-      lastPreview: truncatePreview(row.lastContent ?? ''),
+      lastPreview: truncatePreview(
+        panelVisibleConversationContent(row.lastRole, row.lastContent ?? '')
+      ),
     })
   );
 

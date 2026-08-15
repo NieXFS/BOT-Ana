@@ -6,6 +6,9 @@ import {
   HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
   HUMAN_ECHO_PREFIX,
   HUMAN_MODEL_CONTEXT_PREFIX,
+  LICENSED_CATALOG_HISTORY_PREFIX,
+  LICENSED_CATALOG_LLM_PLACEHOLDER_HEAD,
+  LICENSED_CATALOG_MODEL_CONTEXT_PREFIX,
 } from './humanConversationContext';
 import {
   hasUnverifiedExistingAppointmentContext,
@@ -227,6 +230,13 @@ export function containsInternalConversationMarker(text: string): boolean {
     normalizedCompact.includes(normalize(HUMAN_ECHO_PREFIX.trim())) ||
     normalizedCompact.includes(normalize(HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE)) ||
     normalizedCompact.includes(normalize(HUMAN_MODEL_CONTEXT_PREFIX.trim())) ||
+    normalizedCompact.includes(normalize(LICENSED_CATALOG_HISTORY_PREFIX.trim())) ||
+    normalizedCompact.includes(
+      normalize(LICENSED_CATALOG_MODEL_CONTEXT_PREFIX.trim())
+    ) ||
+    normalizedCompact.includes(
+      normalize(LICENSED_CATALOG_LLM_PLACEHOLDER_HEAD)
+    ) ||
     normalizedCompact.includes('conteudo serializado:') ||
     /\b(?:a\s+)?atendente\s+(?:humana\s+)?(?:enviou|mandou)\s+(?:um|uma)\s+(?:audio|mensagem de voz)\b/.test(
       normalizedCompact

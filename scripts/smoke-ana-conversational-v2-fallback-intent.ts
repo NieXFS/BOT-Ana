@@ -284,6 +284,46 @@ if (repeatedPendingFallback.status === 'accepted') {
   );
 }
 
+const confirmationPendingFrame = frameWithPending('CONFIRMATION', [
+  {
+    position: 1,
+    entityId: 'booking-confirmation:flow-fallback-intent',
+    displayName: 'Confirmar Drenagem amanhã às 15h',
+  },
+]);
+
+assert.equal(
+  classify('sim?', confirmationPendingFrame),
+  'ANSWER_TO_PENDING',
+  'afirmativo compacto com ? na CONFIRMATION não vira pergunta informacional'
+);
+assert.equal(
+  classify('pode ser?', confirmationPendingFrame),
+  'ANSWER_TO_PENDING'
+);
+assert.equal(
+  classify('ok?', confirmationPendingFrame),
+  'ANSWER_TO_PENDING'
+);
+
+const answeredConfirmation = await recover({
+  inboundText: 'sim?',
+  frame: confirmationPendingFrame,
+  primaryResult: invalidEnvelope,
+});
+assert.equal(answeredConfirmation.status, 'accepted');
+if (answeredConfirmation.status === 'accepted') {
+  assert.equal(
+    answeredConfirmation.payload,
+    'Você confirma essa opção?',
+    'CONFIRMATION + sim? reancora a moldura, não a copy de pergunta'
+  );
+  assert.notEqual(
+    answeredConfirmation.payload,
+    INFORMATION_QUESTION_FALLBACK_V2
+  );
+}
+
 console.log('smoke ana conversational v2 fallback intent: OK');
 }
 

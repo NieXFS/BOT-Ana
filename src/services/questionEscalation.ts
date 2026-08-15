@@ -125,6 +125,15 @@ function validationResponseShape(error: unknown): {
   };
 }
 
+function isEmptyObject(value: unknown): boolean {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      Object.keys(value as Record<string, unknown>).length === 0
+  );
+}
+
 function isTopicCodeValidationFailure(error: unknown): boolean {
   const response = validationResponseShape(error);
   if (response.status !== 400 && response.status !== 422) return false;
@@ -134,13 +143,20 @@ function isTopicCodeValidationFailure(error: unknown): boolean {
   } catch {
     return false;
   }
-  return (
-    marker.includes('topiccode') ||
-    marker.includes('topic_code') ||
-    marker.includes('unrecognized') ||
-    marker.includes('unknown field') ||
-    marker.includes('campo desconhecido')
-  );
+  if (marker.includes('topiccode') || marker.includes('topic_code')) return true;
+
+  const data = response.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+  const body = data as Record<string, unknown>;
+  if (body.code !== 'ANA_QUESTION_INVALID_INPUT') return false;
+  const errorText =
+    typeof body.error === 'string'
+      ? body.error
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase()
+      : '';
+  return errorText.includes('body invalido') || isEmptyObject(body.details);
 }
 
 async function postEscalationWithTopicCompatibility(

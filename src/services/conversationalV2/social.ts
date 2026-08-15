@@ -160,6 +160,44 @@ export function detectStrictSocialRouteV2(input: {
   return { matched: true, kind: matchedKind, temporalEvidence };
 }
 
+export type LeadingSocialComponentV2 =
+  | { matched: false }
+  | {
+      matched: true;
+      kind: StrictSocialKindV2;
+    };
+
+/**
+ * Consome saudação/cortesia no prefixo mesmo quando o restante é operacional
+ * ou procedural. Rota social-only continua exigindo consumo total.
+ */
+export function detectLeadingSocialComponentV2(
+  inboundText: string
+): LeadingSocialComponentV2 {
+  if (!inboundText.trim()) return { matched: false };
+  let remaining = normalize(inboundText);
+  let matchedKind: StrictSocialKindV2 | null = null;
+  let consumedFarewell = false;
+  for (let pass = 0; pass < 8 && remaining; pass += 1) {
+    const before = remaining;
+    remaining = remaining.replace(SOCIAL_JOINER_RE, '').trim();
+    for (const fragment of SOCIAL_FRAGMENTS) {
+      const next = remaining.replace(fragment.matcher, '').trim();
+      if (next === remaining) continue;
+      matchedKind ??= fragment.kind;
+      consumedFarewell ||= fragment.kind === 'farewell';
+      remaining = next;
+      break;
+    }
+    if (consumedFarewell) {
+      remaining = remaining.replace(FAREWELL_TEMPORAL_RE, '').trim();
+    }
+    if (remaining === before) break;
+  }
+  if (!matchedKind || !remaining) return { matched: false };
+  return { matched: true, kind: matchedKind };
+}
+
 export interface SocialCompletionResultV2 {
   ok: boolean;
   candidate: string;

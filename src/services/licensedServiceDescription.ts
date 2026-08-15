@@ -41,9 +41,12 @@ export interface LicensedServiceDescriptionEvidenceV2 {
 }
 
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/iu;
-const EMAIL_RE = /\b[^\s@]+@[^\s@]+\.[^\s@]+\b/iu;
+const EMAIL_RE = /\b[^\s@＠]+[@＠][^\s@＠]+\.[^\s@＠]+\b/iu;
+const EMAIL_OBFUSCATION_RE = /(?:\(\s*at\s*\)|\[\s*at\s*\]|\barroba\b)/iu;
 const CPF_RE = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/u;
 const PHONE_RE = /(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?9?\d{4}[-\s]?\d{4}/u;
+const INTL_PHONE_334_RE =
+  /\+\d{1,3}[\s.-]*\d{3}[\s.-]*\d{3}[\s.-]*\d{4}\b/u;
 
 export function validDescriptionTermAcceptanceV2(
   value: unknown
@@ -59,7 +62,13 @@ export function validDescriptionTermAcceptanceV2(
 }
 
 export function descriptionContainsTechnicalPiiV2(text: string): boolean {
-  return EMAIL_RE.test(text) || CPF_RE.test(text) || PHONE_RE.test(text);
+  return (
+    EMAIL_RE.test(text) ||
+    EMAIL_OBFUSCATION_RE.test(text) ||
+    CPF_RE.test(text) ||
+    PHONE_RE.test(text) ||
+    INTL_PHONE_334_RE.test(text)
+  );
 }
 
 /** Runtime fail-closed para payload legado, importado ou adulterado. */

@@ -35,6 +35,7 @@ import {
   listConversations,
   getHistoryWithTimestamps,
 } from './services/contextManager';
+import { panelVisibleConversationContent } from './services/humanConversationContext';
 import { decideConversationActivity } from './services/conversationActivity';
 import { ERP_API_TOKEN } from './erpApiToken';
 import { isEchoChange, handleSmbMessageEchoes } from './echoHandler';
@@ -745,7 +746,12 @@ app.get('/internal/conversation-messages', (req: Request, res: Response) => {
 
   getHistoryWithTimestamps(phoneNumberId, customerPhone)
     .then((messages) => {
-      res.json({ messages });
+      res.json({
+        messages: messages.map((message) => ({
+          ...message,
+          content: panelVisibleConversationContent(message.role, message.content),
+        })),
+      });
     })
     .catch((err) => {
       Sentry.captureException(new Error('conversation messages lookup failed'), {

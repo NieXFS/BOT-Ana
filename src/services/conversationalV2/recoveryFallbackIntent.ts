@@ -1,6 +1,7 @@
 import type { ServicesResult } from '../calendarService';
 import {
   matchInboundToExpectedSlot,
+  isAffirmativeCompact,
   type PendingOperationalQuestion,
 } from '../receptionistTurnDecision';
 import type { TurnFrameV2 } from './contracts';
@@ -127,10 +128,8 @@ function hasInformationLexicalCueV2(normalized: string): boolean {
 }
 
 function isInformationQuestionV2(raw: string, normalized: string): boolean {
-  return (
-    /[?？]/u.test(raw) ||
-    hasInformationLexicalCueV2(normalized)
-  );
+  if (isAffirmativeCompact(raw)) return false;
+  return /[?？]/u.test(raw) || hasInformationLexicalCueV2(normalized);
 }
 
 /** Classificação pura usada exclusivamente pelo fallback final do recovery. */
