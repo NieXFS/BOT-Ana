@@ -131,7 +131,7 @@ async function main(): Promise<void> {
   const pauseService = await import('../src/services/pauseService');
   const order = await import('../src/services/conversationOrder');
   const statusHandler = await import('../src/services/whatsappStatusHandler');
-  const { technicalHash } = await import('../src/observability/safeRuntime');
+  const { technicalHash, runtimeErrorDetail } = await import('../src/observability/safeRuntime');
 
   const secretPhone = '5511987654321';
   const secretPhoneE164 = `+${secretPhone}`;
@@ -318,6 +318,18 @@ async function main(): Promise<void> {
     'status usa hashes técnicos consistentes para provider e phoneNumberId',
     joined.includes(`providerMessageHash=${technicalHash(secretProviderMessageId)}`) &&
       joined.includes(`phoneNumberHash=${technicalHash(secretPhoneNumberId)}`)
+  );
+
+  const detailed = runtimeErrorDetail(
+    new Error(`flush failed ${secretPhoneE164}`)
+  );
+  check(
+    'runtimeErrorDetail redige E.164 no stack',
+    !detailed.includes(secretPhoneE164) && !detailed.includes(secretPhone)
+  );
+  check(
+    'runtimeErrorDetail preserva name+message',
+    detailed.includes('Error') && detailed.includes('flush failed')
   );
 
   const failed = checks.filter((entry) => !entry.ok);

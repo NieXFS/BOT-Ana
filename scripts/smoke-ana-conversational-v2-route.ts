@@ -8,6 +8,7 @@ import type {
   PendingFrameSnapshotV2,
 } from '../src/services/conversationalV2/contracts';
 import { deliverPreparedReceptionistTurnV2 } from '../src/services/conversationalV2/delivery';
+import { serializeTurnPlanReceiptV2 } from '../src/services/conversationalV2/receipts';
 import {
   __strictOrdinalForSmokeV2,
   resolveInitialServiceQuestionFastPathV2,
@@ -3634,6 +3635,283 @@ async function main(): Promise<void> {
     ia7F5.transition.nextFlowState.duplicateResolution?.kind,
     'keep_both'
   );
+
+  // Exec IA-10 — canário 2026-08-15 22:32 UTC. TIME aberto (23 slots de
+  // domingo 16/08) + "10h" + upcoming do mesmo serviço em OUTRO dia (17/08)
+  // abre a pergunta de duplicidade no mesmo turno. O plano era aceito; o
+  // crash era serializeTurnPlanReceiptV2 tratar UUID técnico como telefone.
+  const ia10Origin = new Date('2026-08-15T22:32:00.000Z');
+  const ia10Now = (step: number) =>
+    new Date(ia10Origin.getTime() + step * 1_000);
+  const ia10UnluckyUuid = 'ea75666d-e51a-4408-8f41-041115543015';
+  const ia10SundaySlots = [
+    '08:00', '08:30', '09:00', '09:30', '10:00', '10:30', '11:00', '11:30',
+    '12:00', '12:30', '13:00', '13:30', '14:00', '14:30', '15:00', '15:30',
+    '16:00', '16:30', '17:00', '17:30', '18:00', '18:30', '19:00',
+  ];
+  const ia10Store = new MemoryConversationalV2StateStore();
+  const ia10Phone = '5511000000109';
+  const ia10Key = `${config.phoneNumberId}:${ia10Phone}`;
+  const ia10TimePending = pending({
+    kind: 'TIME',
+    askedAt: ia10Now(0).toISOString(),
+    options: ia10SundaySlots.map((slot, index) => ({
+      position: index + 1,
+      entityId: slot,
+      displayName: slot,
+    })),
+  });
+  seedPending(ia10Store, ia10Key, ia10TimePending, {
+    flowId: ia10TimePending.flowId,
+    lastOperationalAt: ia10Now(0).toISOString(),
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-16',
+    slotEvidence: {
+      turnId: 'turn-ia10-108-slots',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-16',
+      slots: ia10SundaySlots,
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  ia10Store.setInputSequence(ia10Key, 109);
+  const ia10Upcoming = JSON.stringify({
+    success: true,
+    appointments: [
+      {
+        id: 'appointment-existing-17',
+        startTime: '2026-08-17T13:00:00.000Z',
+        endTime: '2026-08-17T14:00:00.000Z',
+        serviceName: 'Drenagem Linfática',
+        professionalName: 'Júlia',
+        status: 'CONFIRMED',
+      },
+    ],
+  });
+  const ia10Prepared = await getReceptionistReplyV2({
+    phone: ia10Phone,
+    userMessage: '10h',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: '10h', sequence: 109 }),
+    deps: {
+      ...baseDeps(ia10Store),
+      now: () => ia10Now(1),
+      executeProactiveDuplicateRead: async () => ia10Upcoming,
+      executeTool: async (name) => {
+        throw new Error(`IA-10 turno 109 não chama ${name}`);
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-10 duplicidade TIME→CONFIRMATION não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia10Prepared.planReceipt.route, 'fast_path');
+  assert.equal(ia10Prepared.planReceipt.result, 'accepted_for_delivery');
+  assert.deepEqual(
+    ia10Prepared.planReceipt.toolEffects.map((effect) => ({
+      tool: effect.tool,
+      outcome: effect.outcome,
+    })),
+    [{ tool: 'getUpcomingAppointments', outcome: 'success' }]
+  );
+  assert.equal(ia10Prepared.planReceipt.pendingTransitionCandidate.kind, 'open');
+  if (ia10Prepared.planReceipt.pendingTransitionCandidate.kind === 'open') {
+    assert.equal(
+      ia10Prepared.planReceipt.pendingTransitionCandidate.pendingKind,
+      'CONFIRMATION'
+    );
+    assert.equal(ia10Prepared.planReceipt.pendingTransitionCandidate.optionCount, 4);
+  }
+  assert.match(ia10Prepared.payload ?? '', /manter os dois/iu);
+  assert.equal(ia10Prepared.transition.kind, 'open');
+  assert.equal(
+    ia10Prepared.transition.kind === 'open' && ia10Prepared.transition.frame.kind,
+    'CONFIRMATION'
+  );
+  assert.deepEqual(
+    ia10Prepared.transition.kind === 'open'
+      ? ia10Prepared.transition.frame.options.map((option) => option.entityId)
+      : [],
+    [
+      'duplicate-resolution:keep-both',
+      'duplicate-resolution:reschedule',
+      'duplicate-resolution:cancel-only',
+      'duplicate-resolution:decide-later',
+    ]
+  );
+  const ia10UnluckyPrepared = {
+    ...ia10Prepared,
+    frame: { ...ia10Prepared.frame, turnId: ia10UnluckyUuid },
+    planReceipt: {
+      ...ia10Prepared.planReceipt,
+      planReceiptId: ia10UnluckyUuid,
+      turnId: ia10UnluckyUuid,
+    },
+  };
+  assert.doesNotThrow(() =>
+    serializeTurnPlanReceiptV2(ia10UnluckyPrepared.planReceipt)
+  );
+  const ia10Delivery = await deliverPreparedReceptionistTurnV2(
+    ia10UnluckyPrepared,
+    {
+      store: ia10Store,
+      id: nextId,
+      now: () => ia10Now(1),
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 109,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    }
+  );
+  assert.equal(ia10Delivery.delivery, 'sent');
+  assert.equal(ia10Delivery.receipt.outboxState, 'accepted_by_provider');
+  assert.equal(ia10Delivery.receipt.pendingCommitOutcome, 'opened');
+  assert.equal(ia10Store.outbox.size, 1);
+  assert.equal(
+    [...ia10Store.outbox.values()][0]?.state,
+    'accepted_by_provider'
+  );
+  const ia10AfterQuestion = await ia10Store.loadLatestState(ia10Key, ia10Now(1));
+  assert.equal(ia10AfterQuestion.pending?.snapshot.kind, 'CONFIRMATION');
+  assert.deepEqual(
+    ia10AfterQuestion.pending?.snapshot.options.map((option) => option.entityId),
+    [
+      'duplicate-resolution:keep-both',
+      'duplicate-resolution:reschedule',
+      'duplicate-resolution:cancel-only',
+      'duplicate-resolution:decide-later',
+    ]
+  );
+
+  ia10Store.setInputSequence(ia10Key, 110);
+  const ia10KeepBoth = await getReceptionistReplyV2({
+    phone: ia10Phone,
+    userMessage: 'Pode manter os dois',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Pode manter os dois', sequence: 110 }),
+    deps: {
+      ...baseDeps(ia10Store),
+      now: () => ia10Now(2),
+      executeProactiveDuplicateRead: async () => ia10Upcoming,
+      executeTool: async (name) => {
+        throw new Error(`IA-10 keep-both não chama ${name} no executor de write`);
+      },
+      loadHistory: async () => [
+        { role: 'user', content: 'Quais horários tem domingo pra drenagem?' },
+        { role: 'assistant', content: ia10Prepared.payload! },
+        { role: 'user', content: '10h' },
+        { role: 'assistant', content: ia10Prepared.payload! },
+        { role: 'user', content: 'Pode manter os dois' },
+      ],
+      runModelLoop: async () => {
+        throw new Error('IA-10 keep-both não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia10KeepBoth.planReceipt.route, 'fast_path');
+  assert.match(ia10KeepBoth.payload ?? '', /^Confirmando:/u);
+  assert.equal(ia10KeepBoth.transition.nextFlowState.duplicateResolution?.kind, 'keep_both');
+  await deliverPreparedReceptionistTurnV2(ia10KeepBoth, {
+    store: ia10Store,
+    id: nextId,
+    now: () => ia10Now(2),
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 110,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+
+  ia10Store.setInputSequence(ia10Key, 111);
+  const ia10AfterKeepBoth = await ia10Store.loadLatestState(ia10Key, ia10Now(2));
+  const ia10BookHistory = [
+    { role: 'assistant', content: ia10Prepared.payload! },
+    { role: 'user', content: 'Pode manter os dois' },
+    { role: 'assistant', content: ia10KeepBoth.payload! },
+    { role: 'user', content: 'pode' },
+  ];
+  const ia10Gate = bookingConfirmationGate({
+    currentUserMessage: 'pode',
+    history: ia10BookHistory,
+    confirmedDuplicate: false,
+    expectedBooking: {
+      date: '2026-08-16',
+      time: '10:00',
+      serviceName: 'Drenagem Linfática',
+      professionalName: 'Júlia',
+    },
+    v2ConfirmationContext: {
+      pending: ia10AfterKeepBoth.pending!.snapshot,
+      flowState: ia10AfterKeepBoth.pending!.flowState,
+      catalog: services,
+      lastAcceptedDelivery: ia10AfterKeepBoth.lastAcceptedDelivery,
+      now: ia10Now(3),
+    },
+  });
+  assert.equal(
+    ia10Gate.ok,
+    true,
+    ia10Gate.ok ? '' : ia10Gate.reason
+  );
+  let ia10Writes = 0;
+  const ia10Book = await getReceptionistReplyV2({
+    phone: ia10Phone,
+    userMessage: 'pode',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'pode', sequence: 111 }),
+    deps: {
+      ...baseDeps(ia10Store),
+      now: () => ia10Now(3),
+      executeProactiveDuplicateRead: async () => {
+        throw new Error('IA-10 book pós-keep-both não relê duplicidade');
+      },
+      loadHistory: async () => ia10BookHistory,
+      executeTool: async (name, args) => {
+        assert.equal(name, 'bookAppointment');
+        assert.deepEqual(args, {
+          serviceId: 'svc-drenagem',
+          date: '2026-08-16',
+          time: '10:00',
+          professionalId: 'prof-julia',
+        });
+        ia10Writes += 1;
+        return JSON.stringify({ success: true });
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-10 book pós-keep-both não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia10Writes, 1);
+  assert.equal(ia10Book.transition.kind, 'resolve');
+  const ia10BookDelivery = await deliverPreparedReceptionistTurnV2(ia10Book, {
+    store: ia10Store,
+    id: nextId,
+    now: () => ia10Now(3),
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 111,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  assert.equal(ia10BookDelivery.receipt.pendingCommitOutcome, 'resolved');
+  assert.equal((await ia10Store.loadLatestState(ia10Key, ia10Now(3))).pending, null);
 
   console.log('smoke ana conversational v2 route: OK');
 }

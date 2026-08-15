@@ -89,12 +89,30 @@ async function main() {
   // --- Caso 1: flush falha → buffer limpo + fallback enviado 1x --------------
   __resetFlushStateForTest();
   const key1 = __seedFlushBufferForTest(config, from, ['oi', 'quero marcar']);
-  await flushBuffer(key1, failingDeps);
+  const flushErrorLogs: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    flushErrorLogs.push(args.map((value) => String(value)).join(' '));
+  };
+  try {
+    await flushBuffer(key1, failingDeps);
+  } finally {
+    console.error = originalConsoleError;
+  }
 
   expect('1) buffer limpo após falha', !__hasBufferForTest(key1));
   expect('1) fallback enviado exatamente 1x', sent.length === 1);
   expect('1) fallback é a mensagem de recuperação', sent[0]?.text === FALLBACK);
   expect('1) fallback foi pro cliente certo', sent[0]?.from === from);
+  const flushErrorLog = flushErrorLogs.find((line) => line.includes('Erro no flush')) ?? '';
+  expect(
+    '1) log de flush inclui message',
+    flushErrorLog.includes('OpenAI 500 (simulado)')
+  );
+  expect(
+    '1) log de flush inclui stack',
+    flushErrorLog.includes('detail=') && flushErrorLog.includes('Error:')
+  );
 
   // --- Caso 2: re-flush imediato na MESMA conversa → fallback suprimido ------
   const key2 = __seedFlushBufferForTest(config, from, ['de novo']);

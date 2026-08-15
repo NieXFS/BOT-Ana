@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { isAmbiguousWhatsAppTransportError } from '../../whatsappCloudService';
+import { runtimeErrorDetail } from '../../observability/safeRuntime';
 import { containsUnlicensedHandoffPromise } from '../receptionistOutbound';
 import { historyContentForAcceptedAssistant } from '../humanConversationContext';
 import type {
@@ -121,17 +122,33 @@ async function persistSuccessor(
 }
 
 function emitPlan(prepared: PreparedReceptionistTurnV2): void {
-  console.info(
-    `[ana-conversational-v2-plan] ${serializeTurnPlanReceiptV2(
-      prepared.planReceipt
-    )}`
-  );
+  try {
+    console.info(
+      `[ana-conversational-v2-plan] ${serializeTurnPlanReceiptV2(
+        prepared.planReceipt
+      )}`
+    );
+  } catch (error) {
+    console.error(
+      `[ana-conversational-v2-plan] serialize_failed planReceiptIdHash=${opaqueReceiptHashV2(
+        prepared.planReceipt.planReceiptId
+      )} turnIdHash=${opaqueReceiptHashV2(prepared.planReceipt.turnId)} detail=${runtimeErrorDetail(error)}`
+    );
+  }
 }
 
 function emitDelivery(receipt: TurnDeliveryReceiptV2): void {
-  console.info(
-    `[ana-conversational-v2-delivery] ${serializeTurnDeliveryReceiptV2(receipt)}`
-  );
+  try {
+    console.info(
+      `[ana-conversational-v2-delivery] ${serializeTurnDeliveryReceiptV2(receipt)}`
+    );
+  } catch (error) {
+    console.error(
+      `[ana-conversational-v2-delivery] serialize_failed deliveryReceiptIdHash=${opaqueReceiptHashV2(
+        receipt.deliveryReceiptId
+      )} planReceiptIdHash=${opaqueReceiptHashV2(receipt.planReceiptId)} detail=${runtimeErrorDetail(error)}`
+    );
+  }
 }
 
 export async function deliverPreparedReceptionistTurnV2(

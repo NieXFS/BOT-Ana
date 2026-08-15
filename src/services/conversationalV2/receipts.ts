@@ -48,6 +48,14 @@ const FORBIDDEN_KEY_FRAGMENT_RE =
   /(?:text|content|message|reply|payload|phone|displayname|entityid|args|arguments|toolresult|wamid)/i;
 const PHONE_VALUE_RE = /(?:^|\D)\+?\d{10,15}(?:\D|$)/u;
 const WAMID_VALUE_RE = /\bwamid\b|wamid\./iu;
+/**
+ * `randomUUID()` cai no PHONE_VALUE_RE (~1,6%/id): o último grupo tem 12 hex.
+ * A isenção exige UUID v4 REAL (versão 4 + variante RFC) — o único formato que
+ * este runtime emite; um shape 8-4-4-4-12 forjado sem versão/variante continua
+ * sujeito ao scrub (conferência Sol, Exec IA-10).
+ */
+const RFC4122_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function assertRedactedValue(
   value: unknown,
@@ -62,7 +70,12 @@ function assertRedactedValue(
     if (hashField && !hashLike) {
       throw new Error(`Receipt v2 contém hash fora do formato SHA-256 em ${path}.`);
     }
-    if (!hashLike && (PHONE_VALUE_RE.test(value) || WAMID_VALUE_RE.test(value))) {
+    const uuidLike = RFC4122_UUID_RE.test(value);
+    if (
+      !hashLike &&
+      !uuidLike &&
+      (PHONE_VALUE_RE.test(value) || WAMID_VALUE_RE.test(value))
+    ) {
       throw new Error(`Receipt v2 contém identificador de mensagem/telefone em ${path}.`);
     }
     if (

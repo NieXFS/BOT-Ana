@@ -839,6 +839,28 @@ assert.throws(() =>
     ],
   })
 );
+const unluckyUuid = 'ea75666d-e51a-4408-8f41-041115543015';
+assert.doesNotThrow(
+  () =>
+    serializeTurnPlanReceiptV2({
+      ...planReceipt,
+      planReceiptId: unluckyUuid,
+      turnId: unluckyUuid,
+    }),
+  'UUID RFC-4122 com 10+ dígitos no último grupo não é telefone'
+);
+// Conferência Sol (IA-10): shape 8-4-4-4-12 SEM versão v4/variante RFC não ganha
+// a isenção — sufixo decimal cru continua tratado como possível telefone.
+const forgedUuidShape = 'ea75666d-e51a-1408-cf41-041115543015';
+assert.throws(
+  () =>
+    serializeTurnPlanReceiptV2({
+      ...planReceipt,
+      planReceiptId: forgedUuidShape,
+    }),
+  /identificador de mensagem\/telefone/,
+  'UUID-shaped forjado (sem versão/variante RFC) com sufixo decimal deve lançar'
+);
 for (const invalidPlan of [
   { ...planReceipt, frameHash: 'a'.repeat(63) },
   {

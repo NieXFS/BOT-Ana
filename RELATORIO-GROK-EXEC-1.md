@@ -1449,3 +1449,79 @@ HEAD permaneceu `2fcb88b` destacado. Sem commit.
 
 - Write ainda colapsa full único e descarta irmãos fuzzy. Só a leitura F1 absorve token de irmão por span (escopo vinculante do Sol).
 - `pode remarcar?` pode ainda acionar o read de `getUpcomingAppointments` (`remarcar` no matcher de upcoming). Isso não é seleção da opção pendente; o matcher de opção devolve null.
+
+## Exec IA-10 — crash no flush do turno de duplicidade após IA-7/8/9
+
+**Status:** hotfix local sobre `HEAD` destacado `a16cc80` (= produção). Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Prioridade: canário com clientes reais; o fluxo quebrado é responder horário com agendamento futuro do mesmo serviço (pergunta de duplicidade).
+
+### Evidência e reprodução
+
+Turno 108 OK (TIME aberto, 23 slots de 16/08). Turno 109 `"10h"`: PLAN aceito (`fast_path`, `getUpcomingAppointments` success, `pendingTransitionCandidate {kind:open, pendingKind:CONFIRMATION, optionCount:4}`, `planReceiptId 9568aa1b-…`). Depois disso: nenhuma linha nova em `ana_v2_outbound_outbox` e nenhum delivery receipt. Catch em `src/messageHandler.ts` logou `error=Error` e mandou o fallback legado.
+
+Fixture Memory-store do cenário exato (TIME aberto → `"10h"` → upcoming do mesmo serviço em **outro dia**) planejou a pergunta de duplicidade e só explodia no flush quando `planReceiptId`/`turnId` eram UUID azarado.
+
+### Causa raiz (stack, não chute)
+
+Não foi F4 reducer, F5 keep-both nem D9 de supersessão TIME→CONFIRMATION. O plano de duplicidade estava certo. A exceção é **depois** de `savePlanReceipt` e **antes** de `prepareOutbound`:
+
+```
+src/services/conversationalV2/delivery.ts
+  await store.savePlanReceipt(prepared.planReceipt);
+  emitPlan(prepared);  // serializeTurnPlanReceiptV2 → THROW
+```
+
+`serializeTurnPlanReceiptV2` → `assertReceiptRedactedV2` → `assertRedactedValue`:
+
+`PHONE_VALUE_RE = /(?:^|\D)\+?\d{10,15}(?:\D|$)/u` casa o último grupo de 12 hex de um `randomUUID()` ~1,6% das vezes. Dois campos UUID (`planReceiptId` + `turnId`) ⇒ ~3,3% dos turnos. O `planReceiptId` de produção `9568aa1b-…` era sortudo; o `turnId` irmão (também `randomUUID`) é o gatilho típico. Por isso o plano aparece em `ana_v2_turn_receipts` e o outbox não.
+
+UUID azarado reproduzido: `ea75666d-e51a-4408-8f41-041115543015`.
+
+```
+Error: Receipt v2 contém identificador de mensagem/telefone em $.planReceiptId.
+    at assertRedactedValue (src/services/conversationalV2/receipts.ts:66:13)
+    at assertReceiptRedactedV2 (receipts.ts:128:3)
+    at serializeTurnPlanReceiptV2 (receipts.ts:138:3)
+```
+
+`error.name === "Error"` explica `error=Error` seco. O regex existe desde o v2 (`6b77b1c`); o pacote IA-7/8/9 não tocou `delivery.ts`/`receipts.ts`/`messageHandler.ts`. O contraste 17:35 UTC (pré-IA-7, funcionou) vs 22:32 UTC é loteria de UUID, coincidente com o deploy.
+
+### Correção
+
+1. **`receipts.ts`:** isentar só valor RFC-4122 (`8-4-4-4-12` hex). Continua throw em `invocationId` com 10+ dígitos hex consecutivos, `deliveryAttemptId: 'attempt-5511999999999'` e `turnId: 'wamid.raw-sensitive-id'`.
+2. **`delivery.ts`:** `emitPlan`/`emitDelivery` em try/catch. Falha de serialize loga hashes + `runtimeErrorDetail` e **não** derruba o caminho do cliente (o plano já foi persistido).
+3. **Observabilidade:** `runtimeErrorKind` permanece o `error.name` curto para tags Sentry. Novo `runtimeErrorDetail` (name+message+stack numa linha, `scrubText`). Call site do flush interpola `detail=` na string; não passa o objeto `err` como 2º argumento de `console.error`.
+
+### Fixtures
+
+- contracts: UUID azarado serializa; throws de telefone/wamid/`invocationId` hex intactos.
+- route: TIME 23 slots 16/08 → `"10h"` → duplicidade 17/08 10h SP → serialize UUID azarado → outbox `accepted_by_provider` + 4 `duplicate-resolution:*` → `"Pode manter os dois"` → `"pode"` → `bookAppointment`.
+- persistence: TIME aberto + OPEN CONFIRMATION duplicidade + UUID azarado → outbox + 4 opções.
+- wave1: serialize do plano de duplicidade com UUID azarado.
+- fallback-intent: `"10h"` em TIME com opção `10:00` = `ANSWER_TO_PENDING`.
+- debounce-flush: log de `Erro no flush` contém message + stack.
+- pii-runtime: `runtimeErrorDetail` redige E.164.
+
+### Validações finais (exit real)
+
+| Comando | exit | resultado |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `./node_modules/.bin/tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-contracts` | 0 | UUID azarado serializa |
+| `npm run smoke:ana-conversational-v2-route` | 0 | TIME→10h→duplicidade→outbox→keep-both→book |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | serialize do plano de duplicidade |
+| `npm run smoke:ana-conversational-v2-persistence` | 0 | outbox prepared/accepted com UUID azarado |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | `10h` = `ANSWER_TO_PENDING` |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+| `npm run smoke:debounce-flush` | 0 | 56/56; log com message+stack |
+| `npm run smoke:ana-pii-runtime` | 0 | 7 checks; detail redige E.164 |
+
+HEAD permaneceu `a16cc80` destacado. Sem commit.
+
+### Riscos que permanecem
+
+- ~3,3% dos turnos **já** gravaram plano e cairam no fallback legado; o cliente viu a mensagem de erro, não a pergunta de duplicidade. Após o hotfix, UUID técnico deixa de abortar o outbox.
+- `emitPlan`/`emitDelivery` agora engolem falha de serialize: o cliente recebe, o log estruturado do plano pode faltar naquele turno (hashes + detail no `serialize_failed`).
+- A loteria continua em qualquer outro sítio que aplique `PHONE_VALUE_RE` a UUID sem a isenção RFC-4122.

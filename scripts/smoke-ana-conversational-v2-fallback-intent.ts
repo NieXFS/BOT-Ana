@@ -141,6 +141,15 @@ assert.equal(
   'ANSWER_TO_PENDING',
   'matcher temporal fechado da TIME vence a pontuação'
 );
+const tenHourPendingFrame = frameWithPending('TIME', [
+  { position: 1, entityId: '10:00', displayName: '10:00' },
+  { position: 2, entityId: '10:30', displayName: '10:30' },
+]);
+assert.equal(
+  classify('10h', tenHourPendingFrame),
+  'ANSWER_TO_PENDING',
+  '10h responde TIME aberto com opção 10:00'
+);
 assert.equal(
   classify('a segunda opção?', servicePendingFrame),
   'ANSWER_TO_PENDING',

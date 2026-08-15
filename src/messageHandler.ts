@@ -66,6 +66,7 @@ import {
 } from './services/inboundOutbox';
 import {
   conversationHash,
+  runtimeErrorDetail,
   runtimeErrorKind,
 } from './observability/safeRuntime';
 import { truncateForW1 } from './services/inboundContent';
@@ -915,7 +916,7 @@ export async function flushBuffer(
         },
       });
       console.error(
-        `❌ Erro no flush | ${safeSalesContext(config, from)} | error=${runtimeErrorKind(err)}`
+        `❌ Erro no flush | ${safeSalesContext(config, from)} | error=${runtimeErrorKind(err)} detail=${runtimeErrorDetail(err)}`
       );
 
       if (err instanceof ConversationPausedBeforeDispatch) {

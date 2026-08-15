@@ -9,6 +9,7 @@ import { deliverPreparedReceptionistTurnV2 } from '../src/services/conversationa
 import {
   assertReceiptRedactedV2,
   opaqueReceiptHashV2,
+  serializeTurnPlanReceiptV2,
 } from '../src/services/conversationalV2/receipts';
 import {
   ANA_CONVERSATIONAL_V2_PREPARED_KIND,
@@ -569,6 +570,141 @@ async function main(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
   stopConversationalV2SuccessorSweepForTest();
   assert.equal(successorSweepRuns, 1, 'sweeper sucessor faz run inicial sem espera');
+
+  const ia10UnluckyUuid = 'ea75666d-e51a-4408-8f41-041115543015';
+  const ia10Store = new MemoryConversationalV2StateStore();
+  const ia10Key = 'PN:ia10-duplicity';
+  const ia10Time: PendingFrameSnapshotV2 = {
+    questionId: 'ia10-time-q',
+    askedAt: now.toISOString(),
+    kind: 'TIME',
+    flowId: 'ia10-flow',
+    version: 2,
+    options: [
+      { position: 1, entityId: '10:00', displayName: '10:00' },
+      { position: 2, entityId: '11:00', displayName: '11:00' },
+    ],
+  };
+  ia10Store.pending.set(ia10Key, [
+    {
+      conversationKey: ia10Key,
+      state: 'OPEN',
+      snapshot: ia10Time,
+      flowState: {
+        flowId: ia10Time.flowId,
+        fixedServiceId: 'svc-drenagem',
+        fixedProfessionalId: 'prof-julia',
+        resolvedDate: '2026-08-16',
+        bookingDraft: {
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-16',
+          time: '10:00',
+          slotEvidenceTurnId: 'turn-ia10-slots',
+        },
+        slotEvidence: {
+          turnId: 'turn-ia10-slots',
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-16',
+          slots: ['10:00', '11:00'],
+        },
+        fixedByProofVersion: {
+          fixedServiceId: 1,
+          fixedProfessionalId: 1,
+          resolvedDate: 1,
+        },
+      },
+      updatedAt: ia10Time.askedAt,
+    },
+  ]);
+  const ia10DuplicateOptions = [
+    { position: 1, entityId: 'duplicate-resolution:keep-both', displayName: 'manter os dois' },
+    { position: 2, entityId: 'duplicate-resolution:reschedule', displayName: 'remarcar' },
+    { position: 3, entityId: 'duplicate-resolution:cancel-only', displayName: 'só cancelar o anterior' },
+    { position: 4, entityId: 'duplicate-resolution:decide-later', displayName: 'decidir depois' },
+  ] as const;
+  const ia10Prepared = prepared({
+    conversationKey: ia10Key,
+    pending: ia10Time,
+    payload:
+      'Vi que você já tem outro agendamento de Drenagem Linfática em 17/08/2026 às 10:00. Quer manter os dois, remarcar, só cancelar o anterior ou decidir depois?',
+    transition: {
+      kind: 'open',
+      frame: {
+        questionId: 'ia10-dup-q',
+        askedAt: now.toISOString(),
+        kind: 'CONFIRMATION',
+        flowId: ia10Time.flowId,
+        version: 3,
+        options: [...ia10DuplicateOptions],
+      },
+      expectedQuestionId: ia10Time.questionId,
+      expectedVersion: ia10Time.version,
+      nextFlowState: {
+        flowId: ia10Time.flowId,
+        fixedServiceId: 'svc-drenagem',
+        fixedProfessionalId: 'prof-julia',
+        resolvedDate: '2026-08-16',
+        bookingDraft: {
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-16',
+          time: '10:00',
+          slotEvidenceTurnId: 'turn-ia10-slots',
+        },
+        slotEvidence: {
+          turnId: 'turn-ia10-slots',
+          serviceId: 'svc-drenagem',
+          professionalId: 'prof-julia',
+          date: '2026-08-16',
+          slots: ['10:00', '11:00'],
+        },
+        fixedByProofVersion: {
+          fixedServiceId: 1,
+          fixedProfessionalId: 1,
+          resolvedDate: 1,
+        },
+      },
+    },
+  });
+  const ia10Unlucky = {
+    ...ia10Prepared,
+    frame: { ...ia10Prepared.frame, turnId: ia10UnluckyUuid },
+    planReceipt: {
+      ...ia10Prepared.planReceipt,
+      planReceiptId: ia10UnluckyUuid,
+      turnId: ia10UnluckyUuid,
+      route: 'fast_path' as const,
+      pendingTransitionCandidate: {
+        kind: 'open' as const,
+        pendingKind: 'CONFIRMATION' as const,
+        flowIdHash: opaqueReceiptHashV2(ia10Time.flowId),
+        optionCount: 4,
+      },
+      toolEffects: [
+        {
+          invocationId: 'invocation-upcoming',
+          tool: 'getUpcomingAppointments',
+          class: 'read' as const,
+          outcome: 'success' as const,
+          writeCommitted: false,
+        },
+      ],
+    },
+  };
+  assert.doesNotThrow(() => serializeTurnPlanReceiptV2(ia10Unlucky.planReceipt));
+  const ia10Result = await deliver({ store: ia10Store, prepared: ia10Unlucky });
+  assert.equal(ia10Result.delivery, 'sent');
+  assert.equal(ia10Result.receipt.outboxState, 'accepted_by_provider');
+  assert.equal(ia10Result.receipt.pendingCommitOutcome, 'opened');
+  assert.equal([...ia10Store.outbox.values()][0]?.state, 'accepted_by_provider');
+  const ia10State = await ia10Store.loadLatestState(ia10Key, now);
+  assert.equal(ia10State.pending?.snapshot.kind, 'CONFIRMATION');
+  assert.deepEqual(
+    ia10State.pending?.snapshot.options.map((option) => option.entityId),
+    ia10DuplicateOptions.map((option) => option.entityId)
+  );
 
   if (process.env.ANA_CONVERSATIONAL_V2_SMOKE_DB === '1') {
     const { ensureProcessedMessagesTable } = await import(

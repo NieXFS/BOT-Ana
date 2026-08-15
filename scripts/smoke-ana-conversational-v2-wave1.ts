@@ -1235,6 +1235,44 @@ async function main(): Promise<void> {
     'resolved',
     'mesmo serviço conflita mesmo em outra data, conforme filtro tipado'
   );
+  assert.doesNotThrow(
+    () =>
+      receiptModule.serializeTurnPlanReceiptV2({
+        schemaVersion: 2,
+        planReceiptId: 'ea75666d-e51a-4408-8f41-041115543015',
+        turnId: 'ea75666d-e51a-4408-8f41-041115543015',
+        frameHash: 'b'.repeat(64),
+        inputSequence: 109,
+        route: 'fast_path',
+        provider: 'openai',
+        requestedModel: 'gpt-4o-mini',
+        response: { model: null, systemFingerprint: null },
+        thinkingMode: 'disabled',
+        strictTools: false,
+        primaryModelRounds: 0,
+        primaryProviderCalls: 0,
+        regenProviderCalls: 0,
+        pendingTransitionCandidate: {
+          kind: 'open',
+          pendingKind: 'CONFIRMATION',
+          flowIdHash: 'c'.repeat(64),
+          optionCount: 4,
+        },
+        toolEffects: [
+          {
+            invocationId: 'invocation-upcoming',
+            tool: 'getUpcomingAppointments',
+            class: 'read',
+            outcome: 'success',
+            writeCommitted: false,
+          },
+        ],
+        boundaryAttempts: [{ index: 0, candidateHash: 'd'.repeat(64), reasonCodes: [] }],
+        recoveryKind: 'none',
+        result: 'accepted_for_delivery',
+      }),
+    'plano de duplicidade com UUID azarado serializa'
+  );
 
   const duplicatePending = pending({
     kind: 'CONFIRMATION',

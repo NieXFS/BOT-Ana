@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { scrubText } from './scrub';
 
 /** Hash técnico curto para ids isolados (provider, phone-number-id, message). */
 export function technicalHash(value: string): string {
@@ -26,6 +27,18 @@ export function conversationHash(
 export function runtimeErrorKind(error: unknown): string {
   if (error instanceof Error) return error.name || 'Error';
   return typeof error;
+}
+
+/**
+ * name+message+stack numa linha, com PII redigida. Para logs de catch em que
+ * `runtimeErrorKind` sozinho vira `error=Error` e impede o diagnóstico.
+ */
+export function runtimeErrorDetail(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return scrubText(String(error)).replace(/\s+/g, ' ');
+  }
+  const raw = error.stack?.trim() || `${error.name || 'Error'}: ${error.message}`;
+  return scrubText(raw).replace(/\s+/g, ' ');
 }
 
 export function safeHttpStatus(error: unknown): number | null {
