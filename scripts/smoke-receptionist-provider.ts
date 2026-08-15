@@ -156,10 +156,46 @@ const thinkingRequest = buildReceptionistCompletionRequest(deepseekRuntime, {
   thinkingMode: 'enabled',
 });
 assert.equal('temperature' in thinkingRequest, false);
+assert.equal('tool_choice' in thinkingRequest, false, 'thinking omite tool_choice mesmo com required');
 assert.equal(
   (thinkingRequest as unknown as { reasoning_effort: string }).reasoning_effort,
   'high'
 );
+
+const thinkingForced = buildReceptionistCompletionRequest(deepseekRuntime, {
+  messages,
+  tools,
+  temperature: 0.4,
+  maxTokens: 500,
+  thinkingMode: 'enabled',
+  toolChoice: 'required',
+});
+assert.equal('tool_choice' in thinkingForced, false);
+
+const deepseekRequired = buildReceptionistCompletionRequest(deepseekRuntime, {
+  messages,
+  tools,
+  temperature: 0.4,
+  maxTokens: 500,
+  toolChoice: 'required',
+});
+assert.equal(deepseekRequired.tool_choice, 'required');
+assert.deepEqual(
+  (deepseekRequired as unknown as { thinking: unknown }).thinking,
+  { type: 'disabled' }
+);
+
+const deepseekNamed = buildReceptionistCompletionRequest(deepseekRuntime, {
+  messages,
+  tools,
+  temperature: 0.4,
+  maxTokens: 500,
+  toolChoice: { type: 'function', name: 'noop' },
+});
+assert.deepEqual(deepseekNamed.tool_choice, {
+  type: 'function',
+  function: { name: 'noop' },
+});
 
 process.env.NODE_ENV = 'production';
 delete process.env.RECEPTIONIST_USER_ID_HMAC_SECRET;
@@ -204,6 +240,7 @@ const resumeRuntime = resolveAnaResumeClassifierRuntime();
 const resumeRequest = buildAnaResumeClassifierRequest(resumeRuntime, {
   messages,
 });
+assert.equal(resumeRuntime.supportsToolChoiceRequired, false);
 assert.equal('tools' in resumeRequest, false);
 assert.equal('tool_choice' in resumeRequest, false);
 assert.equal('temperature' in resumeRequest, false);

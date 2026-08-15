@@ -25,13 +25,24 @@ export { CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE } from './customerIdentitySafet
 export const RECEPTIONIST_SAFE_FALLBACK =
   'Desculpe, não consegui responder com segurança agora. A equipe do estabelecimento pode ajudar por aqui.';
 
-export type ReceptionistOutboundSource =
-  | 'GENERATED'
-  | 'GREETING'
-  | 'POST_BOOKING'
-  | 'APPROVED_RESPONSE'
-  | 'TEAM_REPLY'
-  | 'CANONICAL';
+export const RECEPTIONIST_OUTBOUND_SOURCES = [
+  'GENERATED',
+  'GREETING',
+  'POST_BOOKING',
+  'APPROVED_RESPONSE',
+  'TEAM_REPLY',
+  'CANONICAL',
+  'VOICE_REPHRASE',
+] as const;
+
+export type ReceptionistOutboundSource = (typeof RECEPTIONIST_OUTBOUND_SOURCES)[number];
+
+export const GENERATED_RECEPTIONIST_OUTBOUND_SOURCES: readonly ReceptionistOutboundSource[] = [
+  'GENERATED',
+  'GREETING',
+  'POST_BOOKING',
+  'VOICE_REPHRASE',
+];
 
 export type ReceptionistOutboundPurpose =
   | 'REACTIVE'
@@ -390,7 +401,7 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
       Boolean(
         block &&
         typeof block.text === 'string' &&
-        ['GENERATED', 'GREETING', 'POST_BOOKING', 'APPROVED_RESPONSE', 'TEAM_REPLY', 'CANONICAL'].includes(block.source)
+        (RECEPTIONIST_OUTBOUND_SOURCES as readonly string[]).includes(block.source)
       )
   );
   if (blocks.length !== rawBlocks.length || blocks.length === 0) {
@@ -442,7 +453,7 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
     reasons.add('INTERNAL_CONVERSATION_MARKER');
   }
   const generatedSources = blocks.some((block) =>
-    ['GENERATED', 'GREETING', 'POST_BOOKING'].includes(block.source)
+    GENERATED_RECEPTIONIST_OUTBOUND_SOURCES.includes(block.source)
   );
   const sourceInboundText = envelope.evidence?.sourceInboundText?.trim() ?? '';
   const turnPermission = sourceInboundText

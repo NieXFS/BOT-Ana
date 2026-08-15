@@ -5,8 +5,16 @@ import type {
   Response as OpenAIResponse,
   ResponseCreateParamsNonStreaming,
   ResponseInput,
+  ToolChoiceFunction as ResponsesToolChoiceFunction,
+  ToolChoiceOptions as ResponsesToolChoiceOptions,
 } from 'openai/resources/responses/responses';
 import type { TenantBotConfig } from '../configProvider';
+import {
+  isNamedToolChoice,
+  type ReceptionistToolChoice,
+} from './providerProtocol';
+
+export type { ReceptionistToolChoice } from './providerProtocol';
 
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 export const DEEPSEEK_BETA_BASE_URL = 'https://api.deepseek.com/beta';
@@ -33,6 +41,11 @@ export interface ReceptionistAiRuntime {
   /** Capability explícita; só o DeepSeek troca para /beta quando há tools strict. */
   supportsStrictTools: boolean;
   strictToolsUseBetaEndpoint: boolean;
+  /**
+   * required/named em non-thinking. A limitação "thinking rejeita tool_choice"
+   * é só do thinking; o emit omite nesse modo.
+   */
+  supportsToolChoiceRequired: boolean;
 }
 
 export interface ReceptionistCompletionInput {
@@ -54,6 +67,11 @@ export interface ReceptionistCompletionInput {
   responseFormat?: 'json_object';
   /** Override estreito por chamada; o intérprete poder-zero usa fail-fast. */
   timeoutMs?: number;
+  /**
+   * Default auto. required/named só saem em non-thinking e se o runtime
+   * anunciar a capability. Thinking omite tool_choice.
+   */
+  toolChoice?: ReceptionistToolChoice;
 }
 
 export interface AnaResumeClassifierCompletionInput {
@@ -130,6 +148,7 @@ export function resolveReceptionistAiRuntime(
       supportsJsonObjectResponseFormat: true,
       supportsStrictTools: true,
       strictToolsUseBetaEndpoint: false,
+      supportsToolChoiceRequired: true,
     };
   }
 
@@ -155,6 +174,7 @@ export function resolveReceptionistAiRuntime(
       supportsJsonObjectResponseFormat: true,
       supportsStrictTools: true,
       strictToolsUseBetaEndpoint: false,
+      supportsToolChoiceRequired: true,
     };
   }
 
@@ -181,6 +201,7 @@ export function resolveReceptionistAiRuntime(
       supportsJsonObjectResponseFormat: true,
       supportsStrictTools: true,
       strictToolsUseBetaEndpoint: true,
+      supportsToolChoiceRequired: true,
     };
   }
 
@@ -205,6 +226,7 @@ export function resolveAnaResumeClassifierRuntime(): ReceptionistAiRuntime {
     supportsJsonObjectResponseFormat: true,
     supportsStrictTools: false,
     strictToolsUseBetaEndpoint: false,
+    supportsToolChoiceRequired: false,
   };
 }
 
@@ -345,9 +367,65 @@ export function assertStrictToolSchemas(
 }
 
 /**
+ * Monta tool_choice do Chat Completions. Thinking NUNCA emite tool_choice
+ * (limitação só do thinking). DeepSeek non-thinking omite auto (default
+ * oficial) e emite required/named atrás da capability.
+ */
+export function emitChatToolChoice(input: {
+  runtime: ReceptionistAiRuntime;
+  toolsLength: number;
+  thinkingMode: DeepSeekThinkingMode;
+  requested?: ReceptionistToolChoice;
+}):
+  | OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming['tool_choice']
+  | undefined {
+  if (input.toolsLength === 0) {
+    if (input.runtime.provider === 'openai' && input.thinkingMode !== 'enabled') {
+      return 'auto';
+    }
+    return undefined;
+  }
+  if (input.thinkingMode === 'enabled') return undefined;
+  const requested = input.requested ?? 'auto';
+  const wantsForced =
+    requested === 'required' || isNamedToolChoice(requested);
+  if (wantsForced && !input.runtime.supportsToolChoiceRequired) {
+    return input.runtime.provider === 'openai' ? 'auto' : undefined;
+  }
+  if (requested === 'required') return 'required';
+  if (isNamedToolChoice(requested)) {
+    return {
+      type: 'function',
+      function: { name: requested.name },
+    };
+  }
+  if (input.runtime.provider === 'deepseek') return undefined;
+  return 'auto';
+}
+
+export function emitResponsesToolChoice(input: {
+  runtime: ReceptionistAiRuntime;
+  toolsLength: number;
+  requested?: ReceptionistToolChoice;
+}): ResponsesToolChoiceOptions | ResponsesToolChoiceFunction | undefined {
+  if (input.toolsLength === 0) return undefined;
+  const requested = input.requested ?? 'auto';
+  const wantsForced =
+    requested === 'required' || isNamedToolChoice(requested);
+  if (wantsForced && !input.runtime.supportsToolChoiceRequired) {
+    return 'auto';
+  }
+  if (requested === 'required') return 'required';
+  if (isNamedToolChoice(requested)) {
+    return { type: 'function', name: requested.name };
+  }
+  return 'auto';
+}
+
+/**
  * Monta o payload por provider. O DeepSeek V4 liga thinking por default, então
- * o braço principal sempre envia "disabled" explicitamente. tool_choice é
- * omitido no DeepSeek: com tools presentes, auto já é o default oficial.
+ * o braço principal sempre envia "disabled" explicitamente. tool_choice auto é
+ * omitido no DeepSeek (default oficial); required/named saem em non-thinking.
  */
 export function buildReceptionistCompletionRequest(
   runtime: ReceptionistAiRuntime,
@@ -359,22 +437,27 @@ export function buildReceptionistCompletionRequest(
   if (strictToolsEnabled(runtime, input.tools)) {
     assertStrictToolSchemas(input.tools);
   }
+  const thinkingMode = input.thinkingMode ?? 'disabled';
+  const toolChoice = emitChatToolChoice({
+    runtime,
+    toolsLength: input.tools.length,
+    thinkingMode,
+    requested: input.toolChoice,
+  });
   const base: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
     model: runtime.model,
     messages: input.messages,
     tools: input.tools,
     temperature: input.temperature,
     max_tokens: input.maxTokens,
+    ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
     ...(input.responseFormat === 'json_object'
       ? { response_format: { type: 'json_object' as const } }
       : {}),
   };
 
   if (runtime.provider === 'openai') {
-    return {
-      ...base,
-      tool_choice: 'auto',
-    };
+    return base;
   }
 
   // Defesa em profundidade: um runtime DeepSeek construído manualmente ou
@@ -382,7 +465,6 @@ export function buildReceptionistCompletionRequest(
   // montar uma chamada produtiva sem o gate de governança.
   assertDeepSeekProductionApproved();
 
-  const thinkingMode = input.thinkingMode ?? 'disabled';
   if (thinkingMode === 'enabled' && process.env.NODE_ENV === 'production') {
     throw new Error(
       'Thinking mode do DeepSeek está bloqueado em produção até o transcript completo de tool calls ser persistido.'
@@ -489,13 +571,18 @@ export function buildLunaResponsesRequest(
     assertStrictToolSchemas(input.tools);
   }
   const tools = convertChatToolsToResponsesTools(input.tools);
+  const toolChoice = emitResponsesToolChoice({
+    runtime,
+    toolsLength: tools.length,
+    requested: input.toolChoice,
+  });
   return {
     model: runtime.model,
     input: convertChatMessagesToResponsesInput(input.messages),
     ...(tools.length > 0
       ? {
           tools,
-          tool_choice: 'auto' as const,
+          tool_choice: toolChoice ?? 'auto',
           parallel_tool_calls: true,
         }
       : {}),

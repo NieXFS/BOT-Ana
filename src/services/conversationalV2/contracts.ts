@@ -1,5 +1,6 @@
 import type { HumanControlDisposition } from '../receptionistTurnDecision';
 import type { CopyVariantIdV2 } from './copyVariants';
+import type { VoiceReceiptV2 } from './voice/types';
 
 export const MODEL_REPLY_PURPOSES_V2 = [
   'SOCIAL',
@@ -391,6 +392,8 @@ export interface TurnPlanReceiptV2 {
     | 'direct_fallback';
   /** Proveniência técnica da copy; nunca contém texto da conversa. */
   copyVariant?: CopyVariantIdV2;
+  /** Subrecibo da camada de voz; hashes/enums apenas, sem copy. */
+  voice?: VoiceReceiptV2;
   result: 'accepted_for_delivery';
 }
 

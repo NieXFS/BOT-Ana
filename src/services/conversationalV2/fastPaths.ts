@@ -73,7 +73,7 @@ function pendingOrdinalPosition(
 }
 
 function compactAffirmative(value: string): boolean {
-  return /^(?:sim+|isso|ok+|certo|pode ser|fechado|combinado|confirmo|beleza|perfeito)(?: por favor)?$/.test(
+  return /^(?:sim+|isso|ok+|certo|pode ser|fechado|combinado|confirmo|beleza|perfeito|ta(?: bom)?)(?: por favor)?$/.test(
     normalize(value)
   );
 }
@@ -195,6 +195,93 @@ function temporalPendingPosition(
   return matches.length === 1 ? matches[0]!.position : null;
 }
 
+function afterTimePendingPosition(
+  inboundText: string,
+  frame: TurnFrameV2
+): number | null {
+  if (frame.pending?.kind !== 'TIME') return null;
+  const text = normalize(inboundText);
+  const match = /^(?:pode ser\s+)?depois\s+(?:das?|de)\s+(.+)$/u.exec(text);
+  if (!match?.[1]) return null;
+  const rest = match[1]!.replace(/^(?:as|das?)\s+/u, '');
+  const parsed = [
+    ...new Set(
+      normalizeTemporalAssertionsV2(rest)
+        .filter((assertion) => assertion.kind === 'time')
+        .map((assertion) => assertion.normalized)
+    ),
+  ];
+  const wordHours: Record<string, number> = {
+    uma: 1,
+    um: 1,
+    duas: 2,
+    dois: 2,
+    tres: 3,
+    quatro: 4,
+    cinco: 5,
+    seis: 6,
+    sete: 7,
+    oito: 8,
+    nove: 9,
+    dez: 10,
+    onze: 11,
+    doze: 12,
+  };
+  const wordHour = wordHours[rest];
+  if (wordHour !== undefined) {
+    parsed.push(`${String(wordHour).padStart(2, '0')}:00`);
+    if (wordHour >= 1 && wordHour <= 11) {
+      parsed.push(`${String(wordHour + 12).padStart(2, '0')}:00`);
+    }
+  }
+  const bare = /^(?:as\s+)?([01]?\d|2[0-3])(?:h(?:[0-5]\d)?)?$/.exec(rest);
+  if (bare?.[1]) {
+    const hour = Number(bare[1]);
+    parsed.push(
+      `${String(hour).padStart(2, '0')}:00`,
+      ...(hour >= 1 && hour <= 11
+        ? [`${String(hour + 12).padStart(2, '0')}:00`]
+        : [])
+    );
+  }
+  const unique = [...new Set(parsed)];
+  if (unique.length === 0) return null;
+  const candidates: number[] = [];
+  for (const threshold of unique) {
+    const later = frame.pending.options.filter(
+      (option) => option.entityId > threshold
+    );
+    if (later.length === 1) {
+      candidates.push(later[0]!.position);
+    }
+  }
+  const distinct = [...new Set(candidates)];
+  return distinct.length === 1 ? distinct[0]! : null;
+}
+
+function correctedTimePendingPosition(
+  inboundText: string,
+  frame: TurnFrameV2
+): number | null {
+  if (frame.pending?.kind !== 'TIME') return null;
+  if (
+    !/\b(?:nao|na verdade|melhor|quer dizer|corrigindo|pera(?:i)?|alias)\b/u.test(
+      normalize(inboundText)
+    )
+  ) {
+    return null;
+  }
+  const times = normalizeTemporalAssertionsV2(inboundText)
+    .filter((assertion) => assertion.kind === 'time')
+    .map((assertion) => assertion.normalized);
+  const last = times.at(-1);
+  if (!last) return null;
+  const matches = frame.pending.options.filter(
+    (option) => option.entityId === last
+  );
+  return matches.length === 1 ? matches[0]!.position : null;
+}
+
 type BarePendingHourResolution =
   | { kind: 'no_match' }
   | { kind: 'ambiguous'; options: readonly PendingOptionV2[] }
@@ -210,7 +297,7 @@ function barePendingHourPosition(
   frame: TurnFrameV2
 ): BarePendingHourResolution {
   if (frame.pending?.kind !== 'TIME') return { kind: 'no_match' };
-  const match = /^(?:(?:pode ser|prefiro|quero)\s+)?(?:as\s+)?([01]?\d|2[0-3])(?:\s+(?:por favor|mesmo))?$/u.exec(
+  const match = /^(?:(?:pode ser|prefiro|quero)\s+)?(?:o\s+)?(?:(?:as|das?)\s+)?([01]?\d|2[0-3])(?:\s+(?:por favor|mesmo))?$/u.exec(
     normalize(inboundText)
   );
   if (!match?.[1]) return { kind: 'no_match' };
@@ -302,19 +389,36 @@ export function resolvePendingOptionProofV2(input: {
   // Igualdade temporal normalizada é soberana: 17h = 17:00, portanto nunca
   // pode cair no comparador de "mesma hora" e casar também com 17:30.
   const exactTemporalPosition = temporalPendingPosition(inboundText, frame);
-  const clarificationPosition = exactTemporalPosition === null
-    ? activeHalfHourClarificationPositionV2({
-        inboundText,
-        frame,
-        lastAcceptedAssistantText: input.lastAcceptedAssistantText,
-      })
-    : null;
-  const bareHour = exactTemporalPosition === null && clarificationPosition === null
-    ? barePendingHourPosition(inboundText, frame)
-    : ({ kind: 'no_match' } as const);
+  const afterTimePosition =
+    exactTemporalPosition === null
+      ? afterTimePendingPosition(inboundText, frame)
+      : null;
+  const correctedTimePosition =
+    exactTemporalPosition === null && afterTimePosition === null
+      ? correctedTimePendingPosition(inboundText, frame)
+      : null;
+  const clarificationPosition =
+    exactTemporalPosition === null &&
+    afterTimePosition === null &&
+    correctedTimePosition === null
+      ? activeHalfHourClarificationPositionV2({
+          inboundText,
+          frame,
+          lastAcceptedAssistantText: input.lastAcceptedAssistantText,
+        })
+      : null;
+  const bareHour =
+    exactTemporalPosition === null &&
+    afterTimePosition === null &&
+    correctedTimePosition === null &&
+    clarificationPosition === null
+      ? barePendingHourPosition(inboundText, frame)
+      : ({ kind: 'no_match' } as const);
   if (bareHour.kind === 'ambiguous') return null;
   const position =
     exactTemporalPosition ??
+    afterTimePosition ??
+    correctedTimePosition ??
     clarificationPosition ??
     (bareHour.kind === 'resolved' ? bareHour.position : null) ??
     typedControlOptionPositionV2(inboundText, frame) ??

@@ -51,6 +51,13 @@ import {
   type ReceptionistAiRuntime,
 } from './receptionistLlmProvider';
 import {
+  detectPseudoToolCallsInText,
+  isForcedToolChoice,
+  isNamedToolChoice,
+  type ProviderProtocolEvent,
+  type ReceptionistToolChoice,
+} from './providerProtocol';
+import {
   bookingConfirmationGate,
   cancellationIntentGate,
   CONFIRMATION_HINT,
@@ -942,6 +949,7 @@ export interface ReceptionistModelLoopResult {
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
   toolTrace: ReceptionistToolTraceEntry[];
   usage: ReceptionistRequestUsage[];
+  protocolEvents?: ProviderProtocolEvent[];
   /** Terminal recuperável apenas quando explicitamente ativado pelo caller v2. */
   terminalFailure?: 'AI_RESPONSE_TRUNCATED';
 }
@@ -985,6 +993,8 @@ export interface RunReceptionistModelLoopInput {
     messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
     responseFormat?: 'json_object';
     tools: OpenAI.Chat.Completions.ChatCompletionTool[];
+    toolChoice?: ReceptionistToolChoice;
+    thinkingMode?: DeepSeekThinkingMode;
   }) => Promise<OpenAI.Chat.Completions.ChatCompletion>;
   /**
    * Ativa o terminal determinístico quando o gate de serviço bloquear. A chave
@@ -994,6 +1004,11 @@ export interface RunReceptionistModelLoopInput {
     services: ServiceLike[];
     intentionKey: string;
   };
+  /**
+   * Round 1 quando a máquina de estados já sabe que o ato é tool
+   * (forceUpcomingRead / named). Thinking omite no emit.
+   */
+  initialToolChoice?: ReceptionistToolChoice;
 }
 
 type ExtendedCompletionUsage = NonNullable<
@@ -1225,6 +1240,36 @@ function isServiceSelectionBlockedResult(result: string): boolean {
   }
 }
 
+function lastInvalidArgsHintedTool(
+  toolTrace: readonly ReceptionistToolTraceEntry[]
+): string | undefined {
+  const last = toolTrace.at(-1);
+  if (!last) return undefined;
+  try {
+    const parsed = JSON.parse(last.result) as { message?: unknown };
+    if (
+      typeof parsed.message === 'string' &&
+      parsed.message.startsWith('INTERNAL_HINT:') &&
+      /argumentos inválidos/u.test(parsed.message)
+    ) {
+      return last.name;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function toolChoiceForRoundV2(input: {
+  initial?: ReceptionistToolChoice;
+  toolTrace: readonly ReceptionistToolTraceEntry[];
+}): ReceptionistToolChoice | undefined {
+  if (input.toolTrace.length === 0) return input.initial;
+  const hinted = lastInvalidArgsHintedTool(input.toolTrace);
+  if (hinted) return { type: 'function', name: hinted };
+  return 'auto';
+}
+
 /**
  * Loop compartilhado pela produção e pelo benchmark. Não grava histórico, não
  * acessa o ERP e não envia WhatsApp por conta própria: todo efeito passa pelo
@@ -1242,6 +1287,7 @@ export async function runReceptionistModelLoop(
   const usage: ReceptionistRequestUsage[] = [];
   const providerReportedModels: string[] = [];
   const systemFingerprints: string[] = [];
+  const protocolEvents: ProviderProtocolEvent[] = [];
   const blockedServiceAttempts = new Set<string>();
   const blockedServiceTools = new Set<string>();
   const tools = input.tools ?? RECEPTIONIST_TOOLS;
@@ -1258,12 +1304,23 @@ export async function runReceptionistModelLoop(
     strictTools,
   } as const;
   let emptyCompletionRetryUsed = false;
+  let expectedToolRetryUsed = false;
   const canonicalServiceQuestion = input.serviceSelectionAntiLoop
     ? buildServiceQuestion(input.serviceSelectionAntiLoop.services)
     : null;
+  const finish = (
+    result: ReceptionistModelLoopResult
+  ): ReceptionistModelLoopResult =>
+    protocolEvents.length > 0
+      ? { ...result, protocolEvents: [...protocolEvents] }
+      : result;
 
   for (let index = 0; index < maxToolRounds; index += 1) {
     const round = index + 1;
+    const roundToolChoice = toolChoiceForRoundV2({
+      initial: input.initialToolChoice,
+      toolTrace,
+    });
     const requestCompletion = async () => {
       const completion = input.completionFactory
         ? await input.completionFactory({
@@ -1273,6 +1330,8 @@ export async function runReceptionistModelLoop(
               ? { responseFormat: input.responseFormat }
               : {}),
             tools,
+            ...(roundToolChoice ? { toolChoice: roundToolChoice } : {}),
+            thinkingMode,
           })
         : await createReceptionistChatCompletion(runtime, {
             messages,
@@ -1281,6 +1340,7 @@ export async function runReceptionistModelLoop(
             maxTokens: sanitizeMaxTokens(input.config.aiMaxTokens),
             userId: input.userId,
             thinkingMode,
+            ...(roundToolChoice ? { toolChoice: roundToolChoice } : {}),
             ...(input.responseFormat && runtime.supportsJsonObjectResponseFormat
               ? { responseFormat: input.responseFormat }
               : {}),
@@ -1332,6 +1392,9 @@ export async function runReceptionistModelLoop(
       (!choice.message.tool_calls || choice.message.tool_calls.length === 0) &&
       (typeof choice.message.content !== 'string' ||
         choice.message.content.trim() === '');
+    if (isEffectFreeEmptyCompletion) {
+      protocolEvents.push({ code: 'EMPTY_GENERATION', round });
+    }
     if (
       input.retryEmptyCompletionOnce === true &&
       !emptyCompletionRetryUsed &&
@@ -1342,11 +1405,42 @@ export async function runReceptionistModelLoop(
       choice = response.choices[0]!;
     }
 
+    const hasStructuredToolCalls = Boolean(choice.message.tool_calls?.length);
+    const assistantText =
+      typeof choice.message.content === 'string' ? choice.message.content : '';
+    const pseudo = detectPseudoToolCallsInText(assistantText);
+    if (!hasStructuredToolCalls && pseudo.names.length > 0) {
+      protocolEvents.push({
+        code: 'PSEUDO_TOOL_IN_CONTENT',
+        round,
+        pseudoToolNames: pseudo.names,
+      });
+    }
+    if (
+      isForcedToolChoice(roundToolChoice) &&
+      !hasStructuredToolCalls &&
+      choice.finish_reason !== 'length'
+    ) {
+      protocolEvents.push({
+        code: 'EXPECTED_TOOL_GOT_TEXT',
+        round,
+        expectedTool: isNamedToolChoice(roundToolChoice)
+          ? roundToolChoice.name
+          : undefined,
+        ...(pseudo.names.length > 0 ? { pseudoToolNames: pseudo.names } : {}),
+      });
+      if (!expectedToolRetryUsed) {
+        expectedToolRetryUsed = true;
+        response = await completeAndRecord();
+        choice = response.choices[0]!;
+      }
+    }
+
     if (
       input.captureTruncationAsResult === true &&
       choice.finish_reason === 'length'
     ) {
-      return {
+      return finish({
         rawReply:
           typeof choice.message.content === 'string'
             ? choice.message.content
@@ -1361,7 +1455,7 @@ export async function runReceptionistModelLoop(
         toolTrace,
         usage,
         terminalFailure: 'AI_RESPONSE_TRUNCATED',
-      };
+      });
     }
 
     const assistantMessage = choice.message;
@@ -1375,13 +1469,25 @@ export async function runReceptionistModelLoop(
     );
 
     if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+      const leftoverPseudo = detectPseudoToolCallsInText(
+        typeof assistantMessage.content === 'string'
+          ? assistantMessage.content
+          : ''
+      );
+      if (leftoverPseudo.names.length > 0) {
+        protocolEvents.push({
+          code: 'PSEUDO_TOOL_IN_CONTENT',
+          round,
+          pseudoToolNames: leftoverPseudo.names,
+        });
+      }
       const rawReply =
         canonicalServiceQuestion && blockedServiceAttempts.size > 0
           ? canonicalServiceQuestion
           : typeof assistantMessage.content === 'string'
           ? assistantMessage.content.trim()
           : '';
-      return {
+      return finish({
         rawReply,
         exhausted: false,
         provider: runtime.provider,
@@ -1392,7 +1498,7 @@ export async function runReceptionistModelLoop(
         messages,
         toolTrace,
         usage,
-      };
+      });
     }
 
     for (const toolCall of assistantMessage.tool_calls) {
@@ -1422,7 +1528,7 @@ export async function runReceptionistModelLoop(
         (blockedServiceAttempts.has(serviceAttemptKey) ||
           blockedServiceTools.has(functionName))
       ) {
-        return {
+        return finish({
           rawReply: canonicalServiceQuestion,
           exhausted: false,
           provider: runtime.provider,
@@ -1433,7 +1539,7 @@ export async function runReceptionistModelLoop(
           messages,
           toolTrace,
           usage,
-        };
+        });
       }
       const result = schemaIssue
         ? JSON.stringify({
@@ -1472,7 +1578,7 @@ export async function runReceptionistModelLoop(
     }
   }
 
-  return {
+  return finish({
     rawReply: null,
     exhausted: true,
     provider: runtime.provider,
@@ -1483,7 +1589,7 @@ export async function runReceptionistModelLoop(
     messages,
     toolTrace,
     usage,
-  };
+  });
 }
 
 /**

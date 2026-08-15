@@ -88,7 +88,7 @@ export function varyUnanchoredServerCopyV2(input: {
 
   if (
     input.result.replyPurpose === 'DATE_TIME_QUESTION' &&
-    /^(?:Perfeito|Ótimo|Combinado)\. Qual dia você prefere\?$/u.test(
+    /^(?:Perfeito|Ótimo|Combinado, então)\. Qual dia você prefere\?$/u.test(
       input.result.reply
     )
   ) {
@@ -101,7 +101,7 @@ export function varyUnanchoredServerCopyV2(input: {
       variant === 'date_question_2'
         ? 'Ótimo.'
         : variant === 'date_question_3'
-          ? 'Combinado.'
+          ? 'Combinado, então.'
           : 'Perfeito.';
     return {
       result: { ...input.result, reply: `${prefix} Qual dia você prefere?` },

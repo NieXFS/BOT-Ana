@@ -113,6 +113,9 @@ async function main(): Promise<void> {
     receiptModule,
     boundaryModule,
     reentryModule,
+    canaryModule,
+    workflowModule,
+    voiceModule,
   ] = await Promise.all([
     import('../src/services/conversationalV2/currentDateResolution'),
     import('../src/services/conversationalV2/flowSession'),
@@ -124,6 +127,9 @@ async function main(): Promise<void> {
     import('../src/services/conversationalV2/receipts'),
     import('../src/services/conversationalV2/boundary'),
     import('../src/services/conversationalV2/bookingReentryFastPath'),
+    import('../src/services/conversationalV2/linguisticCanary'),
+    import('../src/services/conversationalV2/workflowLanguage'),
+    import('../src/services/conversationalV2/voice'),
   ]);
 
   const corrected = dateModule.resolveCurrentInboundDateV2({
@@ -794,6 +800,167 @@ async function main(): Promise<void> {
   });
   assert.equal(frozen.variant, 'canonical');
   assert.equal(frozen.result.reply, confirmation.reply, 'âncora de confirmação é byte-idêntica');
+
+  const dateQuestion = {
+    ...serviceQuestion,
+    reply: 'Perfeito. Qual dia você prefere?',
+    replyPurpose: 'DATE_TIME_QUESTION' as const,
+    pendingTransitionCandidate: {
+      kind: 'open' as const,
+      pendingKind: 'DATE' as const,
+      flowId: 'flow-wave1',
+      optionEntityIds: ['date-freeform'],
+    },
+  };
+  const dateQuestion3 = copyModule.varyUnanchoredServerCopyV2({
+    result: dateQuestion,
+    seed: 2,
+  });
+  assert.equal(dateQuestion3.variant, 'date_question_3');
+  assert.equal(
+    dateQuestion3.result.reply,
+    'Combinado, então. Qual dia você prefere?'
+  );
+  assert.deepEqual(
+    workflowModule.findWorkflowLanguageV2(dateQuestion3.result.reply),
+    []
+  );
+  assert.deepEqual(workflowModule.findWorkflowLanguageV2('Combinado.'), [
+    'Combinado.',
+  ]);
+  assert.deepEqual(
+    workflowModule.findWorkflowLanguageV2('Combinado, então.'),
+    []
+  );
+
+  assert.equal(voiceModule.VOICE_TEMPLATE_VERSION_V2, 2);
+  assert.equal(
+    voiceModule.VOICE_CONNECTIVE_PHRASES_V2.combinado_dot,
+    'Combinado, então.'
+  );
+  const nonAnchorCopies = [
+    ...Object.values(voiceModule.VOICE_CONNECTIVE_PHRASES_V2),
+    ...voiceModule.COMPILED_VOICE_POOLS_V2.flatMap((pool) =>
+      pool.variants.map((variant) => variant.connective)
+    ),
+    'Pra 14/08/2026 eu tenho 15:00, 16:00. Qual fica melhor pra você?',
+    'A gente ia de Drenagem Linfática em 14/08/2026 — quer continuar esse agendamento ou marcar outro?',
+    'A gente ainda estava no Drenagem Linfática de 14/08/2026 — quer continuar esse agendamento ou marcar outro?',
+    dateQuestion3.result.reply,
+  ];
+  for (const copy of nonAnchorCopies) {
+    assert.deepEqual(
+      workflowModule.findWorkflowLanguageV2(copy),
+      [],
+      `copy de workflow: ${copy}`
+    );
+  }
+  const anchors = [
+    'Confirmando: Drenagem Linfática, em 14/08/2026, às 14h, com Carla Mendes. Posso marcar?',
+    'Tudo certo! Seu agendamento foi confirmado com sucesso.',
+    'Você confirma essa opção?',
+  ];
+  for (const copy of anchors) {
+    assert.deepEqual(
+      workflowModule.findWorkflowLanguageV2(copy),
+      [],
+      `âncora tocada: ${copy}`
+    );
+  }
+
+  assert.deepEqual(
+    canaryModule.LINGUISTIC_CANARY_FIXTURES_V2.map((entry) => entry.id),
+    [
+      'pra',
+      'ta',
+      'ellipsis',
+      'pode_ser_as_15_q',
+      'depois_das_tres',
+      'time_correction',
+    ]
+  );
+  const praDate = dateModule.resolveCurrentInboundDateV2({
+    currentInboundIds: ['in-1'],
+    inboundTextsById: {
+      'in-1': canaryModule.linguisticCanaryByIdV2('pra').inbound,
+    },
+    now,
+    timezone,
+  });
+  assert.equal(praDate.kind, 'resolved');
+  if (praDate.kind === 'resolved') {
+    assert.equal(praDate.date, '2026-08-13');
+  }
+
+  const canaryTimePending = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '14:00', displayName: '14h' },
+      { position: 2, entityId: '15:00', displayName: '15h' },
+      { position: 3, entityId: '16:00', displayName: '16h' },
+    ],
+  });
+  const canaryTimeFrame = frame({
+    pending: canaryTimePending,
+    flowState: {
+      flowId: canaryTimePending.flowId,
+      lastOperationalAt: now.toISOString(),
+      fixedServiceId: 'svc-drenagem',
+      resolvedDate: '2026-08-14',
+      slotEvidence: {
+        turnId: 'turn-canary',
+        serviceId: 'svc-drenagem',
+        date: '2026-08-14',
+        slots: ['14:00', '15:00', '16:00'],
+      },
+      fixedByProofVersion: { fixedServiceId: 1, resolvedDate: 1 },
+    },
+  });
+  const canaryEntity = (inbound: string) =>
+    fastPaths.resolvePendingOptionProofV2({
+      frame: canaryTimeFrame,
+      inboundId: 'in-1',
+      inboundText: inbound,
+      now,
+    })?.entityId ?? null;
+  assert.equal(
+    canaryEntity(canaryModule.linguisticCanaryByIdV2('ellipsis').inbound),
+    '15:00'
+  );
+  assert.equal(
+    canaryEntity(canaryModule.linguisticCanaryByIdV2('pode_ser_as_15_q').inbound),
+    '15:00'
+  );
+  assert.equal(
+    canaryEntity(canaryModule.linguisticCanaryByIdV2('depois_das_tres').inbound),
+    '16:00'
+  );
+  assert.equal(
+    canaryEntity(canaryModule.linguisticCanaryByIdV2('time_correction').inbound),
+    '16:00'
+  );
+  const singleTimePending = pending({
+    kind: 'TIME',
+    options: [{ position: 1, entityId: '15:00', displayName: '15h' }],
+  });
+  assert.equal(
+    fastPaths.resolvePendingOptionProofV2({
+      frame: frame({
+        pending: singleTimePending,
+        flowState: {
+          flowId: singleTimePending.flowId,
+          lastOperationalAt: now.toISOString(),
+          fixedServiceId: 'svc-drenagem',
+          resolvedDate: '2026-08-14',
+          fixedByProofVersion: { fixedServiceId: 1, resolvedDate: 1 },
+        },
+      }),
+      inboundId: 'in-1',
+      inboundText: canaryModule.linguisticCanaryByIdV2('ta').inbound,
+      now,
+    })?.entityId,
+    '15:00'
+  );
 
   const store = new stateModule.MemoryConversationalV2StateStore();
   store.pending.set('conversation-idle-not-expired', [

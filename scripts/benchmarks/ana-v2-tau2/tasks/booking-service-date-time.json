@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "booking-service-date-time",
+  "user_scenario": {
+    "persona": "cliente sintética da matriz mock",
+    "goal": "começar um agendamento escolhendo serviço",
+    "known_facts": ["quer agendar", "catálogo com Peeling facial e Drenagem Linfática"],
+    "unknown_facts": ["data", "horário"],
+    "constraints": ["não inventar preço", "não escrever no calendário neste task"],
+    "first_act": "quero agendar",
+    "stop_conditions": ["pergunta de serviço entregue", "write"]
+  },
+  "initial_state": {
+    "now": "2026-08-14T12:00:00-03:00",
+    "timezone": "America/Sao_Paulo",
+    "catalog": [],
+    "availability": [],
+    "appointments": [],
+    "conversation": {
+      "history": [],
+      "pending": null,
+      "flow": null,
+      "humanControl": {}
+    },
+    "pause": {},
+    "optOut": false
+  },
+  "evaluation_criteria": {
+    "target_state": {
+      "appointmentCount": 0,
+      "bookEffects": 0,
+      "cancelEffects": 0,
+      "pendingKind": "SERVICE",
+      "flowServiceId": null,
+      "optOut": false,
+      "paused": false,
+      "outboundCount": 1
+    },
+    "env_assertions": [
+      { "path": "writes.bookAppointment", "op": "eq", "expected": 0 },
+      { "path": "writes.cancelAppointment", "op": "eq", "expected": 0 },
+      { "path": "optOut", "op": "eq", "expected": false },
+      { "path": "pending.kind", "op": "eq", "expected": "SERVICE" }
+    ],
+    "communicate_info": [
+      { "kind": "service", "id": "svc-peeling", "label": "Peeling facial" },
+      { "kind": "service", "id": "svc-drenagem", "label": "Drenagem Linfática" }
+    ],
+    "reward_basis": ["STATE", "ENV_ASSERTION", "COMMUNICATE"]
+  },
+  "oracle_acts": ["quero agendar"]
+}

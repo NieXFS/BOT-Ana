@@ -62,11 +62,12 @@ interface CliOptions {
   elicitation: ElicitationVariantV2;
   provider: HarnessProvider;
   interpreter: boolean;
+  voice: boolean;
 }
 
 interface ProviderCallMetric {
   provider: HarnessProvider;
-  kind: 'brain' | 'social' | 'regen' | 'resume_thinking' | 'interpreter';
+  kind: 'brain' | 'social' | 'regen' | 'resume_thinking' | 'interpreter' | 'voice';
   scenarioId: string;
   stepId: string;
   repetition: number;
@@ -229,6 +230,7 @@ interface RunContext {
     buildConversationKey: typeof import('../src/services/contextManager').buildConversationKey;
     parseModelTurnResultV2: typeof import('../src/services/conversationalV2/modelResultParser').parseModelTurnResultV2;
     interpretPowerZeroV2: typeof import('../src/services/conversationalV2/powerZeroInterpreter').interpretPowerZeroV2;
+    assertLiveVoiceModelReceiptV2: typeof import('../src/services/conversationalV2/voice/liveReceipt').assertLiveVoiceModelReceiptV2;
   };
   calls: ProviderCallMetric[];
   mockUnwrapVariants: Set<MockUnwrapVariant>;
@@ -299,6 +301,7 @@ function parseArgs(argv: string[]): CliOptions {
   let thinking = false;
   let provider: HarnessProvider = 'deepseek';
   let interpreter = false;
+  let voice = false;
   let elicitation: ElicitationVariantV2 = 'v1';
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
@@ -356,9 +359,19 @@ function parseArgs(argv: string[]): CliOptions {
         throw new Error('--elicitation deve ser v1, v2, v3 ou v4.');
       }
       elicitation = value as ElicitationVariantV2;
+    } else if (arg === '--voice') {
+      const value = (argv[++index] ?? '').toLowerCase();
+      if (value === 'on') voice = true;
+      else if (value === 'off') voice = false;
+      else throw new Error('--voice deve ser on ou off.');
+    } else if (arg.startsWith('--voice=')) {
+      const value = arg.slice('--voice='.length).toLowerCase();
+      if (value === 'on') voice = true;
+      else if (value === 'off') voice = false;
+      else throw new Error('--voice deve ser on ou off.');
     } else if (arg === '--help' || arg === '-h') {
       console.log(
-        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--provider flash|deepseek|openai|gpt-4o-mini|luna] [--interpreter on|off] [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
+        'Uso: npm run behavioral:ana-v2-roteiros -- --mock-provider|--real [--provider flash|deepseek|openai|gpt-4o-mini|luna] [--interpreter on|off] [--voice on|off] [--thinking] [--elicitation v1|v2|v3|v4] [--repeats N] [--ids R1,R2] [--max-cost-usd N]'
       );
       process.exit(0);
     } else {
@@ -395,6 +408,7 @@ function parseArgs(argv: string[]): CliOptions {
     elicitation,
     provider,
     interpreter,
+    voice,
   };
 }
 
@@ -2439,6 +2453,7 @@ async function runCustomerTurn(
     elicitationVariant: ctx.options.elicitation,
     thinkingMode: ctx.options.thinking ? 'enabled' : 'disabled',
     interpreterEnabled: ctx.options.interpreter,
+    voiceEnabled: ctx.options.voice,
     turnControl: turnControl.control,
     turnRuntime: {
       turnId: nextId(session, 'turn'),
@@ -2462,7 +2477,64 @@ async function runCustomerTurn(
       isPaused: async () => false,
       runModelLoop,
       interpreterEnabled: ctx.options.interpreter,
+      voiceEnabled: ctx.options.voice,
       runInterpreter,
+      rephraseCompletion: async (input) => {
+        if (ctx.options.mode === 'real') {
+          const runtime = ctx.runtime.resolveReceptionistAiRuntime(config);
+          const completion = await trackedCompletion(ctx, session, 'voice', () =>
+            ctx.runtime.createReceptionistChatCompletion(runtime, {
+              messages: input.messages,
+              tools: [],
+              temperature: input.temperature,
+              maxTokens: input.maxTokens,
+              thinkingMode: 'disabled',
+              timeoutMs: input.timeoutMs,
+            })
+          );
+          ctx.runtime.assertLiveVoiceModelReceiptV2({
+            provider: runtime.provider,
+            requestedModel: runtime.model,
+            returnedModel: completion.model,
+          });
+          if (
+            ctx.options.provider === 'deepseek' &&
+            (runtime.model !== 'deepseek-v4-flash' ||
+              completion.model !== 'deepseek-v4-flash')
+          ) {
+            throw new Error(
+              `5º braço voz real exige deepseek-v4-flash; requested=${runtime.model} returned=${completion.model}`
+            );
+          }
+          return completion;
+        }
+        const started = Date.now();
+        const prompt = String(input.messages[0]?.content ?? '');
+        const connectiveId = prompt.includes('- perfeito →')
+          ? 'perfeito'
+          : 'combinado';
+        const completion = syntheticCompletion({
+          content: `{"connectiveId":"${connectiveId}"}`,
+        });
+        completion.model =
+          ctx.options.provider === 'luna'
+            ? 'gpt-5.6-luna-mock'
+            : ctx.options.provider === 'openai'
+              ? 'gpt-4o-mini-mock'
+              : 'deepseek-v4-flash-mock';
+        ctx.calls.push(
+          metricFromCompletion(
+            completion,
+            Date.now() - started,
+            'voice',
+            session.scenarioId,
+            step.id,
+            session.repetition,
+            ctx.options.provider
+          )
+        );
+        return completion;
+      },
       executeTool: session.executeTool,
       composeSocial,
       regenerate,
@@ -2475,6 +2547,21 @@ async function runCustomerTurn(
       },
     },
   });
+
+  if (ctx.options.mode === 'real' && ctx.options.voice && prepared.planReceipt.voice) {
+    const voice = prepared.planReceipt.voice;
+    if (voice.providerCallCount === 1) {
+      if (!voice.provider || !voice.requestedModel) {
+        throw new Error('recibo de voz real incompleto (provider/requestedModel).');
+      }
+      ctx.runtime.assertLiveVoiceModelReceiptV2({
+        provider: voice.provider,
+        requestedModel: voice.requestedModel,
+        returnedModel: voice.returnedModel,
+        decision: voice.decision,
+      });
+    }
+  }
 
   const deliveryResult = await ctx.runtime.deliverPreparedReceptionistTurnV2(
     prepared,
@@ -2873,6 +2960,7 @@ async function loadRuntime(): Promise<RunContext['runtime']> {
     flags,
     contextManager,
     interpreter,
+    voiceLive,
   ] = await Promise.all([
     import('../src/services/conversationalV2/stateStore'),
     import('../src/services/conversationalV2/runtime'),
@@ -2885,6 +2973,7 @@ async function loadRuntime(): Promise<RunContext['runtime']> {
     import('../src/services/conversationalV2/featureFlag'),
     import('../src/services/contextManager'),
     import('../src/services/conversationalV2/powerZeroInterpreter'),
+    import('../src/services/conversationalV2/voice/liveReceipt'),
   ]);
   return {
     MemoryConversationalV2StateStore: stateStore.MemoryConversationalV2StateStore,
@@ -2906,6 +2995,7 @@ async function loadRuntime(): Promise<RunContext['runtime']> {
       await import('../src/services/conversationalV2/modelResultParser')
     ).parseModelTurnResultV2,
     interpretPowerZeroV2: interpreter.interpretPowerZeroV2,
+    assertLiveVoiceModelReceiptV2: voiceLive.assertLiveVoiceModelReceiptV2,
   };
 }
 
@@ -3069,7 +3159,7 @@ async function main(): Promise<void> {
     throw new Error('Mock Thinking não comprovou reasoning tokens nas chamadas v2.');
   }
   const rawReport = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     harness: 'ana-v2-roteiros',
     startedAt,
     finishedAt,
@@ -3078,6 +3168,7 @@ async function main(): Promise<void> {
     arm,
     elicitationVariant: options.elicitation,
     interpreterEnabled: options.interpreter,
+    voiceEnabled: options.voice,
     thinkingMode: options.thinking ? 'enabled' : 'disabled',
     repeats: options.repeats,
     selectedScenarioIds: selected.map((scenario) => scenario.id),

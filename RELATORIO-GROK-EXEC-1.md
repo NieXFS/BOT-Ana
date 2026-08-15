@@ -392,3 +392,305 @@ Extras verdes: `smoke-echo-pause-race` (POST falho ⇒ latch ECHO + pause-ack). 
 - Recibo `suppressed_pause` para UNRECORDED_HANDOFF permanece o enum existente.
 - Rollout Ana nova + ERP antigo continua fail-closed no ack sem campos tipados; o latch ECHO é só local, independente do wire.
 
+## Exec 5 — voz e tau2
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada.
+
+Síntese (interseção ataque × estrutura): a voz não entra na `BoundaryEvaluation`. Rephrase em runtime só na Fase 1A (`initial_service_question`, `booking_reentry_service_question`, `service_selected_date_question`), com conferência completa (speech-act + conjunto/ordem + polaridade/modalidade + fatos duros). Qualquer falha, timeout ou segunda fronteira devolve o template **pós-P6** e o recibo `voice_rejected`. Oferta de slots e reabertura ficam em pools compilados `PENDENTE-PAINEL` (runtime não aplica até o painel aprovar). Denylist permanente byte-fixa: resumo canônico, write, duplicidade, clarificador de meia-hora, denial licenciada, cancel compliance, identidade, re-ask de `CONFIRMATION`. τ² evolui o harness: reward `STATE×ENV×COMMUNICATE`, `pass^1`/`pass^4`, simulador oracle, tom fora do reward, cinco braços mock.
+
+### Encaixe
+
+- Registry opt-in por proveniência `fast_path`; modelo/intérprete não escolhem `copyId`.
+- Dupla fronteira + `source: VOICE_REPHRASE` + checkpoint `during_voice`. Prompt sem inbound. T=0.3, `tools:[]`, thinking OFF, 4s, zero retry.
+- `copyVariant` intocado. Allowlist `ANA_CONVERSATIONAL_V2_VOICE_TENANT_SLUGS` vazia. Contrato: Revisão 3.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | voz default OFF |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-voice` | 0 | registry, fallback, recibo, `VOICE_REPHRASE` |
+| `smoke:ana-conversational-v2-voice-fidelity` | 0 | mutation tests da conferência (A1–A3 + conjunto/ordem) |
+| `smoke:ana-v2-tau2` | 0 | 5 braços, FAIL 0, pass^1=1, pass^4=1 |
+| `smoke:booking-confirmation-gate` | 0 | “pode” intacto |
+| `smoke:service-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:customer-reply-guard` | 0 | |
+| `smoke:receptionist-final-outbound` | 0 | `VOICE_REPHRASE` como fonte gerada |
+
+Sem deploy. Sem push. Sem escrita na VPS. Pools VOZ-2 nesta fase: fixtures mock `PENDENTE-PAINEL`; geração real gateada à parte.
+
+### Riscos que permanecem
+
+- Pools compilados não estão aprovados pelo painel; produção continua nas 3 variantes P6 de slots e na copy canônica de reabertura.
+- O quinto braço mock usa o mesmo Fast Path 1A; a matriz real (provider vivo) continua autorização própria.
+- Tom permanece juiz experimental, fora do reward; não calibra canário.
+
+## Exec 5b — retrabalho voz + τ² (três gates reprovados)
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada.
+
+A conferência da Exec 5 reprovou três gates obrigatórios. Este retrabalho fecha exatamente esses pontos.
+
+### 1. Conferência de voz — núcleo semântico inalcançável pelo modelo
+
+Na Fase 1A o LLM gera só um conectivo estilístico não factual (`{"connective":"..."}`, teto 48 tokens). O servidor compõe pergunta, lista e ordem canônicas. A conferência passou a checar `semanticAct` (`ask_service` ≠ `ask_date` ≠ handoff), gramática fechada (oração residual rejeita), negação pós-fixada, preço/duração por extenso e `hard_fact_uninterpretable`.
+
+As três sondas do conferente agora caem no template: `ask_date → “Você prefere falar com a equipe?”`; lista + `“Drenagem Linfática não é oferecida”`; `“O serviço custa cento e cinquenta reais”`. Pipeline: primeira boundary → rephrase de conectivo → composição → conferência → checkpoint → segunda boundary `VOICE_REPHRASE` → delivery ou fallback.
+
+### 2. Denylist permanente — inalcançável pelo registry
+
+`VoiceEligibleCopyIdV2` é disjunto de `PermanentVoiceAnchorIdV2`. `fastPathProvenanceV2` só aceita IDs elegíveis (`@ts-expect-error` em `canonical_booking_summary`). Produtores de âncora devolvem `null`. O resolver executa `if (isPermanentVoiceDenylistV2(copyId)) return null` **antes** de qualquer lookup. Registry congelado, não exportado mutável. Sonda forjada via cast → `resolve=null`; mutação do registry não reativa a âncora; `providerCallCount=0` nas oito âncoras.
+
+### 3. Harness τ² — executa tasks de verdade
+
+Runner valida/carrega o JSON, clona `initial_state` por `taskId×armId×trialId`, corre a sessão completa (`oracle_acts`, `deliverPrepared`), projeta o estado final fechado e agrega `pass^1`/`pass^4` só depois de agrupar por task. STATE usa hash da projeção completa (efeito extra ⇒ reward 0). Controlador de atos + amostragem real de transcripts; `inconclusive` se cobertura < `max(30, 20%)` ou 0/1 auditoria. Duas tasks (uma multi-step conta uma vez); macro entre tasks; juiz de tom fora do reward.
+
+Resultado mock: 2 tasks × 5 braços × 4 trials = 40 sessões; `pass^1=1`, `pass^4=1` por task e no macro; simulador 30/40 auditados, `inconclusive=false`; voz só no 5º braço (12 chamadas). Flash/Luna usam `requestedModel` distinto (`gpt-4o-mini` vs `gpt-5.6-luna`).
+
+### 4–5. Pools e proveniência
+
+`reviewOverride:"aprovado"` saiu da API de produção (`selectCompiledPoolVariantForTestV2` só no smoke). Proveniência registrada após a P6 e zerada se `recoveryKind !== "none"` ou `recovery.payload !== provenancedPayload`. Regen/fallback com candidato rejeitado: `rephraseCompletion` = 0.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npm run build` | 0 | inclui `@ts-expect-error` da denylist |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-voice` | 0 | denylist inalcançável, 8 âncoras call=0, 3 sondas → template, proveniência×recovery |
+| `smoke:ana-conversational-v2-voice-fidelity` | 0 | A1–A3 + sondas do conferente + pós-fixada/extenso/handoff/troca de pergunta |
+| `smoke:ana-v2-tau2` | 0 | 2 tasks, 5 braços, 40 sessões, FAIL 0, pass^1=1, pass^4=1, audit 30/40 |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:customer-reply-guard` | 0 | |
+| `smoke:receptionist-final-outbound` | 0 | |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **flash** × **voz** | 0 | Passos 30, FAIL 0, REVIEW 15; 94 chamadas (voz extra) |
+
+Sem deploy. Sem push. Sem escrita na VPS.
+
+### Riscos que permanecem
+
+- Pools compilados continuam `PENDENTE-PAINEL`; o runtime não os aplica.
+- Em 1A o fast-path ainda ganha do intérprete (ordem do runtime); os braços Flash/Luna distinguem-se por `requestedModel` e a voz por chamadas reais. A matriz viva continua autorização própria.
+- Tom permanece juiz experimental, fora do reward.
+
+## Exec 5c — retrabalho FINAL voz + τ² (enum, pass^k por braço, --real)
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada; matriz `--real` fica com o coordenador.
+
+A conferência da Exec 5b reprovou quatro gates. Este retrabalho fecha exatamente a instrução literal de aprovação.
+
+### 1. Voz por enum server-side
+
+O modelo devolve somente um `VoiceConnectiveId` de enum finito (`claro`, `combinado`, `vamos_la` para `ask_service`; `perfeito`, `otimo`, `combinado_dot` para `ask_date`). O servidor materializa a frase aprovada e cola o núcleo canônico. ID desconhecido, texto livre, campo `connective` ou ID incompatível com o ato ⇒ template cru. A gramática aberta (`isValidVoiceConnectiveV2` + denylist/regex de conectivo) saiu; as sondas que passavam — `Botox funciona!`, `Gestantes podem fazer!`, `Sem contraindicações!`, `É totalmente seguro!` — viraram fixtures de rejeição em compose, fidelidade e `applyConversationalVoiceV2`.
+
+### 2. `pass^k` por `taskId × armId`
+
+`aggregatePassKByTaskV2` agrupa por tarefa e braço. A sonda Flash `4/4` + Luna `0/4` produz duas linhas (`pass¹=1/pass⁴=1` e `pass¹=0/pass⁴=0`), nunca uma linha `trials=8`. O mock oficial agora emite 10 linhas (2 tasks × 5 braços), cada uma com `trials=4`.
+
+### 3. Auditoria do simulador com rótulos reais
+
+`labelSimulatorTranscriptV2` deriva rótulos dos transcripts (`ok`, `act_not_in_controller`, `oracle_sequence_mismatch`, `empty_agent_payload`, …). `auditSimulatorTranscriptsV2` amostra e conta a partir desses rótulos. O smoke não passa mais `failCount: 0` manual. Fixture de ato inventado falha; a amostra mock de 30/40 fica `ok` e `inconclusive=false`.
+
+### 4–5. τ² `--real` e Flash de verdade na voz
+
+O harness τ² aceita `--real` com preflight/recibo de provider+modelo por braço. Flash = `deepseek/deepseek-v4-flash` (não `gpt-4o-mini`). Sem `DEEPSEEK_API_KEY` o preflight falha fechado. Recibo `*-mock` ou `gpt-4o-mini` é rejeitado. No 5º braço, `--real` não injeta factory: chama `createReceptionistChatCompletion` no caminho default. O behavioral faz o mesmo na voz sob `--real --provider flash --voice on` e recusa o recibo mock.
+
+Schema do relatório τ²: 4. Política de voz: 3.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-voice` | 0 | enum, texto livre/ID incompatível ⇒ template |
+| `smoke:ana-conversational-v2-voice-fidelity` | 0 | sondas Botox/Gestantes/contraindicações/seguro + ID incompatível |
+| `smoke:ana-v2-tau2` | 0 | 10 linhas task×arm, FAIL 0, pass^1=1, pass^4=1, audit 30/40 rotulada, Flash=`deepseek-v4-flash` |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:customer-reply-guard` | 0 | |
+| `smoke:receptionist-final-outbound` | 0 | |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **flash** × **voz** | 0 | Passos 30, FAIL 0, REVIEW 15; 94 chamadas |
+
+Sem deploy. Sem push. Sem escrita na VPS. Sem matriz `--real` (coordenador).
+
+### Riscos que permanecem
+
+- Pools compilados continuam `PENDENTE-PAINEL`; o runtime não os aplica.
+- A matriz viva (`--real` τ² e 5º braço Flash+voz) continua autorização do coordenador; o mock prova o fecho, não o desempenho do Flash na rede.
+- Tom permanece juiz experimental, fora do reward.
+
+## Exec 6 — protocolo, workflow, canário pt-BR, juiz pairwise (última antes da matriz real)
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada; `--real` (protocolo e τ²) fica com o coordenador.
+
+Fonte: adendo §6 do dossiê (Deep Research GPT 5.6). Conclusão central respeitada: a evidência reforça a arquitetura já escolhida (plan-then-realize), não pede outra.
+
+### 1. `tool_choice` required/named (non-thinking, DOC OFICIAL)
+
+A limitação famosa é **só do thinking**. Non-thinking emite `required`/`named` atrás de `supportsToolChoiceRequired` (openai/luna/deepseek = true; classificador de retomada = false). Thinking omite `tool_choice` mesmo se o caller pedir `required`. DeepSeek non-thinking continua omitindo `auto`.
+
+Onde a máquina já sabe que o ato é tool (`forceUpcomingRead` no sucessor pós-write), `resolveForcedToolChoiceV2` manda named `getUpcomingAppointments` no `initialToolChoice` do loop. O fast-path de leitura ainda resolve o sucessor quando pode; o `tool_choice` cobre o continue_model. Retry de args inválidos também nomeia a tool.
+
+Políticas do adendo no loop: `EXPECTED_TOOL_GOT_TEXT` (forced + texto; 1 retry; content nunca executado); `EMPTY_GENERATION`; `PSEUDO_TOOL_IN_CONTENT` só telemetria — pseudo-tool no `content` jamais é desserializada.
+
+### 2. Suíte de protocolo (`smoke:provider-protocol`)
+
+Separada da suíte de negócio. Mock offline × 12: auto → `tool_calls` estruturado; required → zero execução de texto puro; named → nome exato (round 2 volta a `auto`); strict válido/inválido → aceito/400; pós-tool não-vazio; injection tool-like no texto da cliente → `executed=[]`. `--real` existe, barato, fail-closed sem chave real; esta exec não o corre.
+
+### 3. Purga da linguagem de workflow (não-âncora)
+
+Âncoras byte-fixas (resumo, write, duplicidade, clarificador, denial, cancel, identidade, re-ask de CONFIRMATION) **não** foram tocadas. `VOICE_TEMPLATE_VERSION_V2 = 2`. Varredura `findWorkflowLanguageV2` na wave1/voz.
+
+| Template | Antes | Depois |
+|---|---|---|
+| `VOICE_CONNECTIVE_PHRASES_V2.combinado_dot` | `Combinado.` | `Combinado, então.` |
+| P6 `date_question_3` | `Combinado.` | `Combinado, então.` |
+| Read fast-path de disponibilidade (sucesso) | `Tenho estes horários disponíveis para ${date}: ${slots}. Qual você prefere?` | `Pra ${date} eu tenho ${slots}. Qual fica melhor pra você?` |
+| Pool `booking_reentry` (variante 4) | `Seguimos com {service}…` | `A gente ia de {service} em {date}{timePart} — quer continuar esse agendamento ou marcar outro?` |
+| Pool `booking_reentry` (variante 8) | `Temos o {service} … em andamento` | `A gente ainda estava no {service} de {date}{timePart} — quer continuar esse agendamento ou marcar outro?` |
+
+Lifecycle `Encontrei horários para … Qual você prefere?` permanece (P6 `slots_offer_*` e conferência dos pools). Não era linguagem da denylist.
+
+### 4. Canário linguístico pt-BR
+
+Fixtures permanentes em `linguisticCanary.ts`, exercitados na wave1: `pra` (data), `tá` (afirmativa compacta com 1 TIME), elipse `pode ser o das 15...`, `pode ser às 15?`, `depois das três`, `não, peraí, às 16h`.
+
+### 5. Juiz de tom pairwise no τ²
+
+Schema do relatório: **5**. Mesmo payload ⇒ A=template, B=variante. Juiz cego devolve left/right; (A,B) e (B,A) independentes; só preferência consistente conta. Bandas de comprimento. Fidelidade é GATE (`evaluateVoiceFidelityV2` exclui antes do juiz) e **nunca** entra em `preferenceRate`. Juiz único não pode ser o gerador (Flash não julga Flash sozinho). Mock desta exec: `nComparisons=2`, `nExcludedFidelity=1`, `nExcludedLength=1`, `nConsistent=1`, `preferenceRate=1`, juiz=`luna`. Tom continua fora do reward.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | canário + denylist + P6 `Combinado, então.` |
+| `smoke:ana-conversational-v2-escalation` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-voice` | 0 | templateVersion=2; connectives/pools sem workflow |
+| `smoke:ana-conversational-v2-voice-fidelity` | 0 | mutations ok |
+| `smoke:ana-v2-tau2` | 0 | schema 5, FAIL 0, pass^1=1, pass^4=1, pairwise n=2 |
+| `smoke:provider-protocol` | 0 | mock × 12; injection nunca executa |
+| `smoke:receptionist-provider` | 0 | required/named DeepSeek; thinking omite |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:customer-reply-guard` | 0 | |
+| `smoke:receptionist-final-outbound` | 0 | |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15 |
+| mock × interpreter **on** × **flash** × **voz** | 0 | Passos 30, FAIL 0, REVIEW 15; 94 chamadas |
+
+Sem deploy. Sem push. Sem escrita na VPS. Sem `--real` (coordenador).
+
+### Riscos que permanecem
+
+- Pools compilados continuam `PENDENTE-PAINEL`; o runtime não os aplica.
+- A matriz viva (`--real` τ², protocolo `--real`, 5º braço Flash+voz na rede) continua autorização do coordenador.
+- Tom pairwise no `--real` deixa de publicar métrica sintética (Exec 6b); a escala ~85 comparações e o gold set humano brasileiro ficam para a matriz real.
+- Fast-path de `forceUpcomingRead` ainda resolve a leitura no servidor quando pode; `tool_choice` named é a rede de segurança do continue_model, não um substituto da leitura determinística.
+
+## Exec 6b — juiz pairwise real no `--real`
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada; `--real` τ² continua autorização do coordenador.
+
+Parecer do conferente: quatro gates da Exec 6 passaram, mas o `--real` ainda publicava o probe sintético (`askJudge: order === "ab" ? "right" : "left"`) como `judges:["luna"]`. O avaliador puro já estava correto; a cablagem não.
+
+### O que mudou
+
+O probe do avaliador permanece só como asserção interna. O JSON do harness passou a schema **6** e o campo `pairwiseTone` ganhou `status`.
+
+| Modo | `pairwiseTone.status` | Métrica |
+|---|---|---|
+| mock | `not_run` / `mock_harness` | `preferenceRate: null`, `nComparisons: 0`, `judges: []`. Pares dos braços são contados (`nPairedItems=12` nesta fixture) mas **não** julgados. |
+| `--real` com juiz válido | `judged` | Pares `taskId × trialId × copyId` dos outputs entregues por `flash_interpreter` (template) e `flash_interpreter_voice` (variante). Fidelidade e banda de comprimento **antes** do juiz. Duas chamadas por item elegível, ordem AB e BA. Recibo por chamada: provider, modelo pedido/devolvido, latência, tokens. `nComparisons` = número real de chamadas. |
+| `--real` sem credencial, autojuiz único, spec `*-mock` ou sem juiz fora do par | `not_run` | `inconclusive: true`, `preferenceRate: null`, `nComparisons: 0`. **Nunca** número sintético. Recibo `*-mock` no retorno do juiz **lança** (fail-closed). |
+
+Default do juiz: o provider que **não** está no par. O 5º braço é Flash+voz ⇒ Luna (`gpt-5.6-luna`). Override: `ANA_V2_TAU2_JUDGE_PROVIDER` / `ANA_V2_TAU2_JUDGE_MODEL`. Flash não julga Flash sozinho.
+
+Teste injetável no smoke: duas chamadas, esquerda/direita invertidas em BA, zero chamadas no item excluído por fidelidade, autojuiz único → `not_run` com zero chamadas, modelo `*-mock` rejeitado.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:provider-protocol` | 0 | |
+| `smoke:receptionist-provider` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-voice` | 0 | |
+| `smoke:ana-conversational-v2-voice-fidelity` | 0 | |
+| `smoke:ana-v2-tau2` | 0 | schema 6; mock `pairwiseTone.status=not_run`, `nPairedItems=12`, `preferenceRate=null`; probe interno n=2 |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:receptionist-final-outbound` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:customer-reply-guard` | 0 | |
+
+Sem deploy. Sem push. Sem escrita na VPS. Sem `--real` (coordenador). Roteiros comportamentais não reexecutados: o delta é só a cablagem do juiz no harness τ².
+
+### Riscos que permanecem
+
+- A matriz viva (`--real` τ²) continua autorização do coordenador. Com `OPENAI_API_KEY_LUNA` (já exigida pelos braços Luna) o juiz default **vai chamar a Luna de verdade** — 12 pares nesta fixture × 2 ordens = 24 completions de juiz, mais o 5º braço de voz.
+- Sem juiz não-gerador o relatório fica `not_run`/inconclusive; isso não autoriza publicar `preferenceRate` sintético.
+- Escala ~85 comparações e gold set humano brasileiro continuam fora desta exec.
+

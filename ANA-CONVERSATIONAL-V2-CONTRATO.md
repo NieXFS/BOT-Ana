@@ -155,6 +155,80 @@ Evidência: DeepSeek Flash real conversa corretamente mas não emite o envelope 
 - **Rotas tipadas:** `CONSULTAR_AGENDA` usa o read v2 identity-safe e só recorta por data civil unívoca do lote; disponibilidade não vira consulta de agenda. `CANCELAR|REMARCAR` fazem exclusivamente `getUpcomingAppointments` + copy segura existente, com zero `cancelAppointment`; seleção final continua nos gates legados sobre o inbound completo. `NOVO_AGENDAMENTO` apenas seleciona a pergunta server-owned já existente. `FALAR_HUMANO` exige testemunha humano/atendente/pessoa/equipe e chama a escalada autoritativa existente; nome de profissional de catálogo nunca escala.
 - **Observabilidade e medição:** recibo distingue `interpreter_hit|interpreter_nenhuma|interpreter_error`, sem PII. Harness aceita `--interpreter on|off`, ortogonal a `--provider flash|luna`; cobertura não é objetivo, precisão contra write e preempção modal é o gate.
 
+## REVISÃO 3 (2026-08-14) — Camada de voz (síntese) + harness τ²
+
+Consenso: interseção do ataque (kill list da voz) e do parecer de estrutura. A voz **não** é estágio da `BoundaryEvaluation`. Mora no runtime v2 depois da política/recovery e das coerções finais, **depois da P6**, antes de `PreparedReceptionistTurnV2` e fora de `withConversationLock`. Fail de qualquer camada devolve o template **pós-P6** já aprovado + recibo `voice.outcome = voice_rejected`. Sem regen, sem segunda chamada, sem silêncio. `copyVariant` permanece o ID da P6; voz é subrecibo ortogonal (`decision`, hashes, `providerCallCount`).
+
+### VOZ-1 — rephrase em runtime, só Fase 1A
+
+Opt-in por `ServerCopyProvenanceV2` (`producer:"fast_path"` + `copyId` server-owned). Ausência, producer que não seja fast-path, `copyId` desconhecido ou registry `off` ⇒ não chama o LLM. IDs da Fase 1A: `initial_service_question`, `booking_reentry_service_question`, `service_selected_date_question`. Allowlist `ANA_CONVERSATIONAL_V2_VOICE_TENANT_SLUGS` vazia por default, sem `*`. Matriz/testes injetam o booleano do braço.
+
+Ordem: (1) template final pós-P6/recovery atravessa `evaluateBoundaryV2` completa; (2) rephraser isolado devolve **somente** um `VoiceConnectiveId` de enum finito (`tools:[]`, thinking OFF, T=0.3, teto 48 tokens, timeout 4s, zero retry); o servidor materializa a frase aprovada e compõe pergunta, lista e ordem canônicas. ID desconhecido, texto livre, campo `connective` ou ID incompatível com o ato ⇒ template cru. Não há gramática aberta nem denylist/regex de conectivo; (3) conferência determinística (o prefixo tem de ser exatamente a frase materializada do enum daquele ato); (4) checkpoint `during_voice`; (5) segunda `evaluateBoundaryV2` completa com `source:"VOICE_REPHRASE"` (fonte gerada, nunca `CANONICAL`); (6) entrega ou fallback ao template aprovado. **Inbound da cliente fica fora do prompt**. Histórico 1A = 0 turnos. Dados sensíveis fora. Proveniência de voz é zerada se `recoveryKind !== "none"` ou o payload recuperado diverge do payload associado após a P6.
+
+Conferência (falhou QUALQUER camada ⇒ template cru + `voice_rejected`):
+- `semanticAct` específico (`ask_service` ≠ `ask_date` ≠ handoff); prefixo fora do enum do ato (inclui as sondas `Botox funciona!`, `Gestantes podem fazer!`, `Sem contraindicações!`, `É totalmente seguro!`) rejeita;
+- speech-act fechado `OFFER|DENY|ASK|CONFIRM_ACT|COMPLIANCE` classificado no template pelo `copyId` **antes** do LLM; o rewrite devolve a mesma classe;
+- igualdade de **conjunto** e de **ordem** de serviços/profissionais/slots (omitir, acrescentar ou reordenar falha; “existe no catálogo” não licencia);
+- polaridade/modalidade, inclusive negação pós-fixada (`X não é oferecida`);
+- fatos duros (data absoluta no fuso do tenant, hora `15h`≡`15:00`, centavos, duração por algarismo **ou** por extenso, write_state); fato novo, ausente, relativo (`amanhã`) ou não interpretável rejeita (`hard_fact_uninterpretable`);
+- denylist de modificadores (`só`, ranking, clínico, preço inventado) e CTA novo (CPF/link/handoff);
+- repetição exata da última entrega, se o template atual for outro, rejeita só a voz.
+
+### VOZ-2 — pools compilados (risco zero no runtime)
+
+Famílias densas/quase-âncoras **proibidas** de rephrase em runtime: `availability_slots_offer` (oferta de slots) e `booking_reentry_question` (reabertura). Pools de 8–15 variantes por template, gerados offline, validados em lote pela conferência completa. Nesta entrega os fixtures estão marcados `PENDENTE-PAINEL`; o runtime **só** escolhe variante se `reviewStatus==="aprovado"` (anti-repetição no mesmo espírito da P6, `copyVariant` intocado). A geração real dos pools é corrida **separada e gateada**. Denial licenciada **não** entra em pool.
+
+### VOZ-3 — denylist PERMANENTE (byte-fixos para sempre)
+
+Nunca rephrase, nunca pool, nunca “fase 2 com conferência estrita”. `VoiceEligibleCopyIdV2` é disjunto de `PermanentVoiceAnchorIdV2`; `fastPathProvenanceV2` só aceita IDs elegíveis; produtores de âncora devolvem `null`; o resolver veta a denylist **antes** de qualquer lookup, com registry congelado. Conferência estrita **não** restaura igualdade byte a byte do eco modal nem os matchers léxicos de gate.
+
+| copyId | Por que é âncora |
+|---|---|
+| `canonical_booking_summary` | `matchesScopedV2ModalEchoConfirmation` exige payload ≡ gerador canônico |
+| `write_success_confirmation` | predicado do ato; zero entidades; D4: write nunca regen |
+| `duplicate_choice_question` | `assistantPresentedDuplicateChoice` lê o texto (`manter`/`remarcar`/`cancelar`) |
+| `half_hour_clarifier` | `activeHalfHourClarificationPositionV2` exige igualdade com `lastAcceptedAssistantText` |
+| `licensed_service_denial` | denial só passa byte-idêntica a `UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2` |
+| `cancel_compliance` | copy de incapacidade; rephrase vira handoff/falsa write |
+| `identity_safe` | fail-closed de PII; zero entidades |
+| `confirmation_reask` | anti-repetição da boundary só libera a copy normativa de `CONFIRMATION` |
+
+O eco modal **não** é afrouxado. Gate de “pode” continua exigindo o resumo canônico exato.
+
+### τ² — harness evolutivo (não substitui o atual)
+
+Task JSON: o runner valida/carrega tasks, clona `initial_state` por `taskId×armId×trialId`, executa a sessão completa (atos do controlador, `oracle_acts`), projeta o estado final fechado e registra os três fatores. `env_assertions` (DSL fechada `path`+`op`+`expected`) / `communicate_info` tipado (`service`/`date`/`time`/`money_cents`, `15h`≡`15:00`). Reward binário `STATE × ENV_ASSERTION × COMMUNICATE`. STATE compara a projeção canônica completa (hash); efeito extra zera. `pass^1 = c/n`; `pass^4 = C(c,4)/C(n,4)` **por taskId × armId**, depois macro; **não** misturar braços na mesma linha e **não** usar `(pass^1)^4`. Simulador restrito: controlador escolhe o ato, LLM só verbaliza; auditoria amostra transcripts reais e deriva rótulos (`ok`, `act_not_in_controller`, `oracle_sequence_mismatch`, `empty_agent_payload`, …) — nunca `failCount` manual; cobertura < `max(30, 20%)` ou zero/uma auditoria torna a matriz inconclusiva. Erro crítico >5% também. Replay nomeado `fixed_user_replay`; incompatibilidade = `replay_incompatible`. Tom = juiz experimental **separado**, fora do reward. Execução `--real` faz preflight/recibo de provider+modelo por braço; o 5º braço chama `deepseek-v4-flash` na voz e rejeita recibo `*-mock` ou `gpt-4o-mini`. Schema do relatório do harness: 4.
+
+Braços: `flash`, `luna`, `flash+interpreter`, `luna+interpreter`, `flash+interpreter+voz`. Flash = `deepseek/deepseek-v4-flash`. O quinto só é válido pareado ao Flash idêntico em todas as outras dimensões (`voicePairingIsValidV2`). Schema do relatório do harness: 4 na R3; 5 na R4; **6 na Exec 6b**. `ProviderCallMetric.kind` inclui `voice`.
+
+## REVISÃO 4 (2026-08-14) — Protocolo do provider, purga de workflow, canário pt-BR, juiz pairwise
+
+Adendo §6 do dossiê (Deep Research GPT 5.6). Não muda a arquitetura; reforça o plan-then-realize já escolhido.
+
+### tool_choice required/named (non-thinking, DOC OFICIAL)
+
+A limitação "thinking rejeita tool_choice" é **só do thinking**. Non-thinking documenta `auto|none|required|named`. Onde a máquina de estados já sabe que o próximo ato só pode ser tool (`forceUpcomingRead` no sucessor pós-write; named `getUpcomingAppointments`), o loop envia `initialToolChoice` atrás de `supportsToolChoiceRequired`. Thinking **omite** `tool_choice`. Capability falsa degrada para `auto` (OpenAI) ou omissão (DeepSeek). DeepSeek non-thinking continua omitindo `auto` (default oficial).
+
+Pseudo-tool-call em `content` **nunca** é desserializada nem executada — só telemetria `PSEUDO_TOOL_IN_CONTENT`. Forced choice + texto puro ⇒ `EXPECTED_TOOL_GOT_TEXT` + uma regeneração na mesma rodada, sem executar o content. HTTP 200 + content vazio + sem `tool_calls` ⇒ `EMPTY_GENERATION`, nunca "mensagem vazia válida".
+
+### Suíte de protocolo (separada da de negócio)
+
+`scripts/smoke-provider-protocol.ts` / `npm run smoke:provider-protocol`. Fixtures mínimos × N=12: auto com tool necessária → `tool_calls` estruturado; required non-thinking → nunca texto puro executado; named → nome exato; strict válido/inválido → aceito/400; pós-tool → não-vazio; injection tool-like no texto da cliente → zero execução. Default mock offline. `--real` é barato e só para revisão de modelo (esta exec não o corre).
+
+### Purga da linguagem de workflow (não-âncora)
+
+Copies canônicas fora da denylist permanente de âncoras byte-fixas. Âncoras da VOZ-3 **não** são tocadas. `VOICE_TEMPLATE_VERSION_V2 = 2`. Varredura `findWorkflowLanguageV2` na suíte.
+
+### Canário linguístico pt-BR
+
+Fixtures permanentes: `pra`, `tá`, elipse, `pode ser às 15?`, `depois das três`, correção de horário. Vendor não cobre pt-BR falado.
+
+### Juiz de tom pairwise no τ²
+
+Mesmo payload ⇒ A=template, B=variante. Comparações (A,B) e (B,A) independentes; só preferência consistente (mapeada de left/right cegos) conta. Bandas de comprimento. **Fidelidade é GATE**: `evaluateVoiceFidelityV2` exclui inválidos **antes** do juiz e **nunca** entra na média (`preferenceRate = variantWins / nConsistent`). Juiz configurável; juiz único não pode ser o mesmo modelo gerador. Tom permanece fora do reward binário.
+
+**`--real` (Exec 6b):** o relatório **não** pode publicar o probe sintético do avaliador como se tivesse sido julgado. Pares = outputs efetivamente entregues pelo baseline e pelo braço com voz no mesmo `taskId × trialId × copyId`. O juiz é um provider REAL configurável (`ANA_V2_TAU2_JUDGE_PROVIDER` / `ANA_V2_TAU2_JUDGE_MODEL`); default = o provider que **não** está no par (Flash+voz ⇒ Luna). Sem credencial, sem juiz não-gerador ou modelo `*-mock` no spec ⇒ `pairwiseTone.status: "not_run"` com `preferenceRate: null`, `nComparisons: 0` e `inconclusive: true` — **nunca** um número sintético. Recibo por chamada: provider, modelo pedido/devolvido, latência e tokens (custo). `nComparisons` = número real de chamadas. Schema do relatório do harness: **6**.
+
 ## Riscos declarados
 
 R1: capacidade do DeepSeek Flash com frame tipado — NÃO VERIFICÁVEL até roteiros+matriz (gate do Victor). R2: pior caso de latência percebida ~20s — SLO+medição. R3: complexidade nova (outbox/PendingFrame) em caminho crítico — mitigada por fases aditivas, flag e sweeper fail-closed.

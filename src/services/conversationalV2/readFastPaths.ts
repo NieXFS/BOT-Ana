@@ -292,7 +292,7 @@ function availabilitySuccessResult(
   }
   return {
     schemaVersion: 2,
-    reply: `Tenho estes horários disponíveis para ${displayDateV2(date)}: ${slots.join(', ')}. Qual você prefere?`,
+    reply: `Pra ${displayDateV2(date)} eu tenho ${slots.join(', ')}. Qual fica melhor pra você?`,
     replyPurpose: 'DATE_TIME_QUESTION',
     pendingTransitionCandidate: {
       kind: 'open',

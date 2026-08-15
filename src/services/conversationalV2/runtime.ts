@@ -97,6 +97,7 @@ import {
   resolveElicitationVariantV2,
   type ElicitationVariantV2,
 } from './elicitation';
+import { resolveForcedToolChoiceV2 } from './forcedToolChoice';
 import {
   opaqueReceiptHashV2,
   redactPendingTransitionCandidateV2,
@@ -139,6 +140,13 @@ import {
   isPowerZeroInterpreterEnabledV2,
   type PowerZeroInterpreterResultV2,
 } from './powerZeroInterpreter';
+import {
+  applyConversationalVoiceV2,
+  provenanceFromProducerPathV2,
+  shouldKeepVoiceProvenanceV2,
+  type ServerCopyProvenanceV2,
+  type VoiceRephraseCompletionFactoryV2,
+} from './voice';
 
 /** Arsenal fechado da rota v2: o catálogo já está congelado no TurnFrame. */
 export const RECEPTIONIST_V2_TOOLS = RECEPTIONIST_TOOLS.filter(
@@ -177,6 +185,9 @@ export interface ReceptionistV2RuntimeDeps {
   escalate?: typeof maybeEscalateReceptionistQuestionV2;
   interpreterEnabled?: boolean;
   runInterpreter?: typeof interpretPowerZeroV2;
+  /** Opt-in do braço de voz; produção omite e permanece OFF. */
+  voiceEnabled?: boolean;
+  rephraseCompletion?: VoiceRephraseCompletionFactoryV2;
   /** Somente observabilidade injetada; não é recibo nem log de produção. */
   onRejectedBoundaryCandidate?: (input: {
     stage: 'primary' | 'regen';
@@ -608,6 +619,7 @@ function mergeFastPathLoopsV2(
     messages: present.flatMap((entry) => entry.messages),
     toolTrace: present.flatMap((entry) => entry.toolTrace),
     usage: present.flatMap((entry) => entry.usage),
+    protocolEvents: present.flatMap((entry) => entry.protocolEvents ?? []),
   };
 }
 
@@ -640,6 +652,10 @@ function mergeEffectFreeLoopRetryV2(
         ...entry,
         round: entry.round + offset,
       })),
+    ],
+    protocolEvents: [
+      ...(first.protocolEvents ?? []),
+      ...(retried.protocolEvents ?? []),
     ],
   };
 }
@@ -714,6 +730,8 @@ export async function getReceptionistReplyV2(input: {
   thinkingMode?: DeepSeekThinkingMode;
   /** Braço ortogonal do intérprete poder-zero; default vem da env e é OFF. */
   interpreterEnabled?: boolean;
+  /** Braço ortogonal da camada de voz; default OFF, injetado na matriz. */
+  voiceEnabled?: boolean;
   deps?: ReceptionistV2RuntimeDeps;
 }): Promise<PreparedReceptionistTurnV2> {
   const deps = input.deps ?? {};
@@ -728,6 +746,7 @@ export async function getReceptionistReplyV2(input: {
   const interpreterEnabled = isPowerZeroInterpreterEnabledV2(
     input.interpreterEnabled ?? deps.interpreterEnabled
   );
+  const voiceEnabled = input.voiceEnabled ?? deps.voiceEnabled;
   const elicitationVariant = resolveElicitationVariantV2(
     input.elicitationVariant
   );
@@ -852,6 +871,9 @@ export async function getReceptionistReplyV2(input: {
   let copyVariant: CopyVariantIdV2 = 'canonical';
   let variedPrimaryReply: string | null = null;
   let selectedGateDecline: GateDeclineV2 | undefined;
+  let serverCopyProvenance: ServerCopyProvenanceV2 | null = null;
+  let provenancedPayload: string | null = null;
+  let voiceReceipt: TurnPlanReceiptV2['voice'];
 
   const makePlan = (args: {
     route: TurnPlanReceiptV2['route'];
@@ -862,6 +884,7 @@ export async function getReceptionistReplyV2(input: {
     primaryModelRounds?: number;
     primaryProviderCalls?: number;
     boundaryAttempts?: TurnPlanReceiptV2['boundaryAttempts'];
+    voice?: TurnPlanReceiptV2['voice'];
   }): TurnPlanReceiptV2 => {
     const aiRuntime = resolveReceptionistAiRuntime(input.config);
     return ({
@@ -892,6 +915,7 @@ export async function getReceptionistReplyV2(input: {
     recoveryKind: args.recoveryKind,
     copyVariant,
     ...(selectedGateDecline ? { gateDecline: selectedGateDecline } : {}),
+    ...(args.voice ? { voice: args.voice } : {}),
     result: 'accepted_for_delivery',
   });
   };
@@ -1520,6 +1544,10 @@ export async function getReceptionistReplyV2(input: {
             proof: null,
             nextFlowState: resolved.nextFlowState,
           };
+          serverCopyProvenance = provenanceFromProducerPathV2({
+            producer: 'interpreter_novo',
+            result: resolved.result,
+          });
         }
       } else {
         const witnessedEscalation = await escalate({
@@ -1725,6 +1753,10 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: bookingReentryFastPath.proof,
       resolutionProofRejections: [],
     };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'booking_reentry',
+      result: bookingReentryFastPath.result,
+    });
   } else if (dateSlotsFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = dateSlotsFastPath.loop;
@@ -1736,6 +1768,10 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: dateSlotsFastPath.proof,
       resolutionProofRejections: [],
     };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'date_slots',
+      result: dateSlotsFastPath.result,
+    });
   } else if (duplicateResolutionFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = duplicateResolutionFastPath.loop;
@@ -1747,6 +1783,10 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: duplicateResolutionFastPath.proof,
       resolutionProofRejections: [],
     };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'duplicate',
+      result: duplicateResolutionFastPath.result,
+    });
   } else if (confirmationDuplicatePreflight.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = confirmationDuplicatePreflight.loop;
@@ -1773,6 +1813,10 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: bookingConfirmationFastPath.proof,
       resolutionProofRejections: [],
     };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'booking_confirmation',
+      result: bookingConfirmationFastPath.result,
+    });
   } else if (readFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = readFastPath.loop;
@@ -1804,6 +1848,10 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: null,
       resolutionProofRejections: [],
     };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'initial_service',
+      result: initialServiceQuestionFastPath.result,
+    });
   } else if (selectionFastPath?.kind === 'resolved') {
     nominalRoute = 'fast_path';
     if (duplicatePreflight.loop) loop = duplicatePreflight.loop;
@@ -1816,6 +1864,10 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: selectionFastPath.proof,
       resolutionProofRejections: [],
     };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'selection',
+      result: selectionFastPath.result,
+    });
   } else if (interpreterResolved) {
     nominalRoute = 'interpreter_hit';
     loop = interpreterResolved.loop;
@@ -1828,6 +1880,9 @@ export async function getReceptionistReplyV2(input: {
       resolutionProofRejections: [],
     };
   } else {
+    const forcedToolChoice = resolveForcedToolChoiceV2({
+      forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
+    });
     const runPrimaryLoop = () => runLoop({
       config: input.config,
       messages,
@@ -1843,6 +1898,7 @@ export async function getReceptionistReplyV2(input: {
       retryEmptyCompletionOnce:
         elicitation.retryEmptyCompletionInsideLoop,
       thinkingMode,
+      ...(forcedToolChoice ? { initialToolChoice: forcedToolChoice } : {}),
     });
     let modelLoop = await runPrimaryLoop();
     if (isEmptyFinalModelOutputV2(modelLoop) && modelLoop.toolTrace.length === 0) {
@@ -1896,6 +1952,13 @@ export async function getReceptionistReplyV2(input: {
     };
     proof = null;
     selectionNextFlowState = lifecycleOverride.nextFlowState;
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer:
+        lifecycleOverride.kind === 'canonical_write'
+          ? 'lifecycle_write'
+          : 'lifecycle_slots',
+      result: lifecycleOverride.result,
+    });
   }
 
   if (primary.ok && nominalRoute === 'fast_path') {
@@ -1907,6 +1970,10 @@ export async function getReceptionistReplyV2(input: {
     primary = { ...primary, value: varied.result };
     copyVariant = varied.variant;
     variedPrimaryReply = varied.result.reply;
+  }
+
+  if (serverCopyProvenance && primary.ok) {
+    provenancedPayload = primary.value.reply;
   }
 
   const primaryRace = await checkRace('during_primary');
@@ -2023,6 +2090,15 @@ export async function getReceptionistReplyV2(input: {
   if (copyVariant !== 'canonical' && recovery.payload !== variedPrimaryReply) {
     copyVariant = 'canonical';
   }
+  if (
+    !shouldKeepVoiceProvenanceV2({
+      recoveryKind: recovery.recoveryKind,
+      recoveryPayload: recovery.payload,
+      provenancedPayload,
+    })
+  ) {
+    serverCopyProvenance = null;
+  }
 
   const recoveredFlowState = recovery.resolutionProof
     ? flowStateWithProof(
@@ -2052,6 +2128,51 @@ export async function getReceptionistReplyV2(input: {
     recoveredFlowState,
     startedAt
   );
+  const voiceLayer = recovery.payload
+    ? await applyConversationalVoiceV2({
+        config: input.config,
+        enabled: voiceEnabled,
+        templatePayload: recovery.payload,
+        provenance: serverCopyProvenance,
+        lastAcceptedPayload: stored.lastAcceptedDelivery?.payload ?? null,
+        frame: { ...frame, flowState: committedFlowState },
+        candidate,
+        replyPurpose: primary.ok
+          ? primary.value.replyPurpose
+          : 'OPERATIONAL_ANSWER',
+        services,
+        unknownServiceEvidence: primary.ok
+          ? primary.value.unknownServiceEvidence
+          : null,
+        toolTrace: loop.toolTrace as ToolTraceLike[],
+        boundaryContext: {
+          servicesResult: services,
+          sourceInboundText: input.userMessage,
+          currentInboundIds,
+          inboundTextsById,
+          route: interpreterResolved ? 'interpreter' : 'model',
+          pendingAnaOpen:
+            frame.pending !== null &&
+            frame.pending.flowId === frame.flowState.flowId,
+          pendingSnapshot: frame.pending,
+          recentAssistantReplies: stored.lastAcceptedDelivery?.payload
+            ? [stored.lastAcceptedDelivery.payload]
+            : [],
+        },
+        checkpoint: () => checkRace('during_voice'),
+        completionFactory: deps.rephraseCompletion,
+      })
+    : { kind: 'payload' as const, payload: recovery.payload, receipt: null };
+  if (voiceLayer.kind === 'preempted') {
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'preempted',
+    });
+    return preparedPreemption(voiceLayer.preemption, successorTurnId, loop);
+  }
+  voiceReceipt = voiceLayer.receipt ?? undefined;
+  const deliveredPayload = voiceLayer.payload;
+
   const transition = materializeTransition(
     candidate,
     frame,
@@ -2084,7 +2205,7 @@ export async function getReceptionistReplyV2(input: {
     phoneNumberId: input.config.phoneNumberId,
     customerPhone: input.phone,
     config: input.config,
-    payload: recovery.payload,
+    payload: deliveredPayload,
     transition,
     planReceipt: makePlan({
       route,
@@ -2093,6 +2214,7 @@ export async function getReceptionistReplyV2(input: {
       recoveryKind: recovery.recoveryKind,
       regenCalls: recovery.regenCount,
       boundaryAttempts,
+      voice: voiceReceipt,
     }),
     preemption: null,
     successorTurnId,
