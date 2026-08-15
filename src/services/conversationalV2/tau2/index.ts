@@ -20,12 +20,15 @@ export {
   defaultPairwiseJudgeSpecV2,
   generatorModelsForVoicePairV2,
   isBlockedTau2JudgeModelV2,
+  isFixtureLlmCredentialV2,
+  liveLlmCredentialV2,
   notRunPairwiseToneReportV2,
   pairVoiceArmTurnsForToneV2,
   parsePairwiseJudgeSideV2,
   pairwiseJudgeCredentialPresentV2,
   resolvePairwiseJudgeSpecV2,
   runPairwiseToneHarnessV2,
+  scrubFixtureLlmCredentialsFromEnvV2,
 } from './pairwiseJudge';
 export {
   auditSimulatorTranscriptsV2,

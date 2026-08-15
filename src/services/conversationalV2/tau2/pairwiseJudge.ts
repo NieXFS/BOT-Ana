@@ -199,14 +199,55 @@ export function pairVoiceArmTurnsForToneV2(input: {
   return items;
 }
 
+const FIXTURE_LLM_CREDENTIAL_RE =
+  /(?:smoke|fixture|no-network|mock-provider|mock-luna)/i;
+
+export function isFixtureLlmCredentialV2(
+  value: string | null | undefined
+): boolean {
+  const key = value?.trim() ?? '';
+  return key.length > 0 && FIXTURE_LLM_CREDENTIAL_RE.test(key);
+}
+
+export function liveLlmCredentialV2(
+  ...candidates: Array<string | null | undefined>
+): string | null {
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim() ?? '';
+    if (trimmed && !isFixtureLlmCredentialV2(trimmed)) return trimmed;
+  }
+  return null;
+}
+
+export function scrubFixtureLlmCredentialsFromEnvV2(
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  for (const key of [
+    'OPENAI_API_KEY',
+    'OPENAI_API_KEY_LUNA',
+    'DEEPSEEK_API_KEY',
+  ] as const) {
+    if (isFixtureLlmCredentialV2(env[key])) delete env[key];
+  }
+}
+
+/** Mesma resolução do adapter Luna: OPENAI_API_KEY_LUNA com fallback OPENAI_API_KEY. */
 export function pairwiseJudgeCredentialPresentV2(
   provider: string,
   env: NodeJS.Dict<string> = process.env
 ): boolean {
   const normalized = provider.trim().toLowerCase();
-  if (normalized === 'luna') return Boolean(env.OPENAI_API_KEY_LUNA?.trim());
-  if (normalized === 'deepseek') return Boolean(env.DEEPSEEK_API_KEY?.trim());
-  if (normalized === 'openai') return Boolean(env.OPENAI_API_KEY?.trim());
+  if (normalized === 'luna') {
+    return Boolean(
+      liveLlmCredentialV2(env.OPENAI_API_KEY_LUNA, env.OPENAI_API_KEY)
+    );
+  }
+  if (normalized === 'deepseek') {
+    return Boolean(liveLlmCredentialV2(env.DEEPSEEK_API_KEY));
+  }
+  if (normalized === 'openai') {
+    return Boolean(liveLlmCredentialV2(env.OPENAI_API_KEY));
+  }
   return false;
 }
 

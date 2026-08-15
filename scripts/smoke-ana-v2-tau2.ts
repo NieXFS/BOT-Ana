@@ -43,6 +43,7 @@ import {
   passAt1,
   passAt4,
   passAtK,
+  pairwiseJudgeCredentialPresentV2,
   preflightTau2ArmV2,
   preflightTau2RealRunV2,
   projectSessionStateV2,
@@ -52,9 +53,12 @@ import {
   resolvePairwiseJudgeSpecV2,
   runPairwiseToneHarnessV2,
   runTau2TrialV2,
+  scrubFixtureLlmCredentialsFromEnvV2,
   summarizeSimulatorAuditV2,
   tau2ArmProviderSpecV2,
   voicePairingIsValidV2,
+  isFixtureLlmCredentialV2,
+  liveLlmCredentialV2,
   type Tau2ArmId,
   type Tau2CanonicalState,
   type Tau2PairwiseArmTurnV2,
@@ -70,6 +74,8 @@ process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = 'postgresql://smoke:smoke@127.0.0.1:1/tau2';
 process.env.OPENAI_API_KEY ||= 'sk-smoke-invalid';
 process.env.ERP_API_TOKEN = 'smoke-invalid';
+
+const SMOKE_LUNA_FIXTURE_KEY = 'sk-smoke-luna-invalid';
 
 const TASKS_DIR = path.join(
   __dirname,
@@ -134,7 +140,7 @@ function armConfig(arm: Tau2ArmId, mode: 'mock' | 'real'): TenantBotConfig {
       mode === 'real'
         ? null
         : spec.provider === 'luna'
-          ? 'sk-smoke-luna-invalid'
+          ? SMOKE_LUNA_FIXTURE_KEY
           : null,
     botIsAlwaysActive: true,
     botActiveStart: '00:00',
@@ -356,7 +362,9 @@ async function executeSessionTurn(input: {
 
 async function main(): Promise<void> {
   const mode = parseMode(process.argv.slice(2));
-  if (mode === 'mock') {
+  if (mode === 'real') {
+    scrubFixtureLlmCredentialsFromEnvV2();
+  } else {
     process.env.DEEPSEEK_API_KEY ||= 'sk-smoke-invalid';
   }
   assert.equal(passAt4(3, 8), 0);
@@ -627,6 +635,55 @@ async function main(): Promise<void> {
   assert.equal(missingJudge.status, 'not_run');
   assert.equal(missingJudge.reason, 'missing_credential');
   assert.equal(missingJudge.preferenceRate, null);
+
+  assert.equal(isFixtureLlmCredentialV2(SMOKE_LUNA_FIXTURE_KEY), true);
+  assert.equal(isFixtureLlmCredentialV2('sk-smoke-invalid'), true);
+  assert.equal(isFixtureLlmCredentialV2('sk-proj-live-credential-test'), false);
+  assert.equal(
+    liveLlmCredentialV2(SMOKE_LUNA_FIXTURE_KEY, 'sk-smoke-invalid'),
+    null
+  );
+  assert.equal(
+    liveLlmCredentialV2(SMOKE_LUNA_FIXTURE_KEY, 'sk-proj-live-credential-test'),
+    'sk-proj-live-credential-test'
+  );
+  assert.equal(
+    pairwiseJudgeCredentialPresentV2('luna', {
+      OPENAI_API_KEY: 'sk-smoke-invalid',
+    }),
+    false
+  );
+  assert.equal(
+    pairwiseJudgeCredentialPresentV2('luna', {
+      OPENAI_API_KEY_LUNA: SMOKE_LUNA_FIXTURE_KEY,
+      OPENAI_API_KEY: 'sk-smoke-invalid',
+    }),
+    false
+  );
+  assert.equal(
+    pairwiseJudgeCredentialPresentV2('luna', {
+      OPENAI_API_KEY: 'sk-proj-live-credential-test',
+    }),
+    true
+  );
+  const fixtureJudge = await runPairwiseToneHarnessV2({
+    items: [pairwiseItems[0]!],
+    generatorModels: [DEEPSEEK_V4_FLASH_MODEL],
+    env: {
+      OPENAI_API_KEY: 'sk-smoke-invalid',
+      OPENAI_API_KEY_LUNA: SMOKE_LUNA_FIXTURE_KEY,
+    },
+  });
+  assert.equal(fixtureJudge.status, 'not_run');
+  assert.equal(fixtureJudge.reason, 'missing_credential');
+  assert.equal(fixtureJudge.inconclusive, true);
+  assert.equal(fixtureJudge.nComparisons, 0);
+  assert.equal(armConfig('luna', 'real').openaiApiKey, null);
+  assert.equal(armConfig('luna', 'mock').openaiApiKey, SMOKE_LUNA_FIXTURE_KEY);
+  assert.equal(
+    JSON.stringify(armConfig('luna', 'real')).includes(SMOKE_LUNA_FIXTURE_KEY),
+    false
+  );
 
   await assert.rejects(
     () =>

@@ -66,8 +66,32 @@ async function main(): Promise<void> {
   );
   assert.equal(text.choices[0]?.message.content, 'Olá!');
   assert.equal(text.choices[0]?.finish_reason, 'stop');
+  assert.equal(text.model, 'gpt-5.6-luna');
+  assert.equal(text.system_fingerprint, undefined);
   assert.equal(text.usage?.prompt_tokens_details?.cached_tokens, 8);
   assert.equal(text.usage?.completion_tokens_details?.reasoning_tokens, 3);
+
+  const withFingerprint = provider.normalizeLunaResponseToChatCompletion(
+    {
+      ...response({ outputText: 'Olá!' }),
+      system_fingerprint: 'fp_luna_protocol',
+    } as Response & { system_fingerprint: string }
+  );
+  assert.equal(withFingerprint.system_fingerprint, 'fp_luna_protocol');
+
+  const fromMetadata = provider.normalizeLunaResponseToChatCompletion(
+    {
+      ...response({ outputText: 'Olá!' }),
+      metadata: { system_fingerprint: 'fp_luna_meta' },
+    } as Response
+  );
+  assert.equal(fromMetadata.system_fingerprint, 'fp_luna_meta');
+  const echoAbsent = provider.providerResponseEchoV2(
+    response({ outputText: 'Olá!' })
+  );
+  assert.equal(echoAbsent.responseModel, 'gpt-5.6-luna');
+  assert.equal(echoAbsent.systemFingerprint, null);
+  assert.equal(echoAbsent.fingerprintStatus, 'absent');
 
   const oneTool = provider.normalizeLunaResponseToChatCompletion(
     response({ output: [toolCall('call_slots', 'getAvailableSlots')] })

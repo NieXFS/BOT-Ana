@@ -694,3 +694,157 @@ Sem deploy. Sem push. Sem escrita na VPS. Sem `--real` (coordenador). Roteiros c
 - Sem juiz não-gerador o relatório fica `not_run`/inconclusive; isso não autoriza publicar `preferenceRate` sintético.
 - Escala ~85 comparações e gold set humano brasileiro continuam fora desta exec.
 
+## Exec 7 — auditabilidade do harness behavioral (recibo + anti-mock + preços Luna)
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada; `--real` continua autorização do coordenador. Esta exec **não** fez chamadas reais.
+
+O relatório de decisão estava bloqueado: no braço Luna `--real`, os `providerCalls` do behavioral saíram com `requestedModel`/`fingerprint` ausentes (63× `?`) e custo implausível (US$0,0012 / 63 chamadas — ~20× mais barato que Flash/chamada).
+
+### 1. Recibo plumado em cada `providerCall`
+
+O runtime já gravava `requestedModel`, `response.model` e `response.systemFingerprint` no recibo de turno (Exec 6). O log do harness **não** copiava esses campos para `ProviderCallMetric`, então a auditoria do JSON só via `?`.
+
+Cada chamada agora leva o mesmo shape do recibo de turno. Schema do relatório behavioral: **4**. O adapter Luna (`normalizeLunaResponseToChatCompletion`) copia `system_fingerprint` quando a Responses API envia o campo. No log do harness o campo `response.systemFingerprint` existe sempre (`null` se a API omitir).
+
+### 2. Preflight anti-mock no `--real` (igual ao τ²)
+
+Antes de correr o braço: provider/modelo resolvidos têm de casar com o spec (`luna/gpt-5.6-luna`, `deepseek/deepseek-v4-flash`, `openai/gpt-4o-mini`). R10 continua exigindo o chefe Thinking em Flash.
+
+Em **cada** `providerCall` e de novo **antes de escrever** `raw.json`: recibo `*-mock` ou modelo divergente do braço ⇒ lança e **nunca publica**. `requestedModel` ou `response.model` ausentes também abortam. Fingerprint nulo é lícito (Responses da Luna pode não mandar). O 5º braço de voz mantém `assertLiveVoiceModelReceiptV2`.
+
+Não havia mock vazando no caminho Luna brain sob `--real`: o `completionFactory` só usa `syntheticCompletion` / `*-mock` quando `mode === 'mock'`; o `--real` já chamava `createReceptionistChatCompletion`. A lacuna era a **ausência de gate** — um recibo mock poderia ser publicado. O gate fecha isso.
+
+### 3. Auditoria da tabela de preços Luna — veredito: pricing, não chamada fake
+
+Evidência no código, sem rede:
+
+| Peça | O que mostra |
+|---|---|
+| `PRICE_PER_MILLION.luna` (antes) | `Number(process.env.OPENAI_LUNA_* ?? 0)` — default **0** |
+| `.env.example` | documentava deixar 0 “até o contrato comercial” |
+| Custo US$0,0012 / 63 | 62 chamadas Luna a US$0 + ~1 chamada `resume_thinking` Flash (`4_000` completion × US$0,28/1M ≈ US$0,00112) |
+| `kind === 'resume_thinking' ? 'deepseek'` | o chefe do R10 entra no total do braço Luna com preço Flash |
+| `mode === 'mock'` no brain | **não** entra no `--real`; tokens do mock são 0, o que daria US$0,00, não 0,0012 |
+
+Conclusão: o número barato **não** prova Luna 20× mais barata nem prova mock no brain. Prova tabela Luna zerada + custo residual do classificador DeepSeek misturado no total. Com a tabela 0 o harness **publicava US$0 como se fosse preço**.
+
+Correção: `--real --provider luna` com `OPENAI_LUNA_INPUT/OUTPUT_USD_PER_MILLION=0` aborta (`recusando publicar custo US$0`). Não inventa preço comercial. O relatório passa a ter `pricingStatus` e `estimatedCostUsdByProvider`. Mock continua podendo logar custo 0.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 4; mock aborta; Luna unpriced aborta; 62×US$0+Flash thinking ≈ US$0,0012 |
+| `smoke:ana-luna-responses-protocol` | 0 | fingerprint copiado quando presente; omitido quando a Responses não manda |
+| `smoke:provider-protocol` | 0 | |
+| `smoke:receptionist-provider` | 0 | |
+| `smoke:ana-v2-tau2` | 0 | schema 6 intacto |
+| `smoke:ana-conversational-v2-voice` | 0 | |
+| `smoke:ana-conversational-v2-voice-fidelity` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:customer-reply-guard` | 0 | |
+| `smoke:receptionist-final-outbound` | 0 | |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15; 73 chamadas |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15; 64 chamadas |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15; 73 chamadas; `requestedModel=gpt-5.6-luna`, `response.model=gpt-5.6-luna-mock`, fingerprint 73/73; `pricingStatus=unpriced`; `estimatedCostUsdByProvider={luna:0, deepseek:0.000012}` |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15; 64 chamadas |
+| mock × interpreter **on** × **flash** × **voz** | 0 | Passos 30, FAIL 0, REVIEW 15; 94 chamadas |
+
+Sem deploy. Sem push. Sem escrita na VPS. Sem `--real` (coordenador). Próxima matriz Luna `--real` exige `OPENAI_LUNA_INPUT_USD_PER_MILLION` e `OPENAI_LUNA_OUTPUT_USD_PER_MILLION` > 0; senão o braço aborta antes de publicar.
+
+### Riscos que permanecem
+
+- O contrato comercial da Luna continua de fora: esta exec não inventa USD/1M. Sem env preenchido o `--real` luna não corre — proposital.
+- Responses API da Luna pode devolver `system_fingerprint: null`; o campo existe no log, o valor nulo não aborta.
+- R10 no braço Luna ainda chama Flash no chefe Thinking; o custo dessa fatia aparece em `estimatedCostUsdByProvider.deepseek`, não deve ser lido como preço Luna.
+- A matriz viva continua autorização do coordenador.
+
+## Exec 7b — fail-closed do anti-mock, echo de fingerprint, juiz τ² sem fixture
+
+**Status:** implementado na Ana; sem deploy; sem push; VPS intocada; `--real` continua autorização do coordenador. Esta exec **não** fez chamadas reais.
+
+O conferente reprovou a Exec 7: o helper anti-mock rejeitava mocks no assert, mas `recordProviderCall` lançava **antes** do `push`. Voz/intérprete/social/regen/R10 engolem a exceção como `provider_error`/`PROVIDER_FAILURE`. A sonda integrada de voz comprovou o furo: `gateExceptionEscaped:false`, resultado `{ok:false, reason:"provider_error", returnedModel:null}` — a chamada inválida não entrava em `ctx.calls` e o sweep final não tinha o que reprovar.
+
+Na matriz real o coordenador viu `systemFingerprint` 0/N em todos os braços (requestedModel ok) e o juiz τ² `--real` caiu em 401 com `sk-smoke-luna-invalid`.
+
+### 1. Latch anti-mock fail-closed
+
+Cada `providerCall` em `--real` agora: avalia o recibo → se inválido, **dispara o latch no `RunContext`**, **empurra a métrica com `poisoned:true`**, e só então lança. Camadas resilientes podem continuar engolindo a exceção; a detecção não desaparece.
+
+`assertBehavioralPublishAllowedV2` roda **antes** de `mkdir` e de qualquer `writeFile`. Latch ou log poisoned ⇒ aborta sem `raw.json`, `summary.md` ou `comparison.md`.
+
+A sonda integrada do conferente virou fixture em `smoke:ana-v2-behavioral-receipt`: mock atravessa as camadas reais que capturam exceção (brain, intérprete, social, regen, voz, chefe R10, juiz τ²). Em todas o latch dispara, o recibo poisoned entra no log, e o publisher espião não cria artefato.
+
+Schema do relatório behavioral: **5**.
+
+### 2. Echo de fingerprint (nunca silencioso)
+
+`providerResponseEchoV2` lê o eco real:
+
+| Transporte | Campos |
+|---|---|
+| chat/completions | `response.model` + `response.system_fingerprint` (também camelCase) |
+| Responses API | `response.model` + `system_fingerprint` no topo **ou** em `metadata.system_fingerprint` / `metadata.fingerprint` |
+
+Se o provider não devolver fingerprint: `response.model` continua no log e `fingerprintStatus: "absent"`. O summary deixa de ser um 0/N mudo: `Fingerprints: present X / absent Y / N`. Ausência **não** aborta (Responses da Luna pode omitir). Mock desta exec: 73/73 present (`fp_ana_v2_mock`).
+
+### 3. Juiz τ² `--real` sem chave fixture
+
+O ternário em `armConfig` injeta `sk-smoke-luna-invalid` **só no mock**. Em `--real`: `openaiApiKey=null` e o smoke **remove** chaves fixture do env (`sk-smoke-*`, `fixture`, `no-network`). Credencial do juiz = mesma resolução do adapter Luna (`OPENAI_API_KEY_LUNA` com fallback `OPENAI_API_KEY`); fixture conta como ausente ⇒ `pairwiseTone.status: "not_run"`, `inconclusive: true`, `nComparisons: 0`. Nunca 401 com chave de smoke.
+
+### Validação Ana (exit real)
+
+| Comando | exit | nota |
+|---|---|---|
+| `git diff --check` | 0 | |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5; latch+poisoned; mutações 7 camadas sem artefato |
+| `smoke:ana-luna-responses-protocol` | 0 | fingerprint do topo e de `metadata`; `absent` quando a Responses omite |
+| `smoke:ana-v2-tau2` | 0 | schema 6; mock `not_run`; fixture key ⇒ `missing_credential` |
+| `smoke:provider-protocol` | 0 | |
+| `smoke:receptionist-provider` | 0 | |
+| `smoke:ana-conversational-v2-wave1` | 0 | |
+| `smoke:ana-conversational-v2-voice` | 0 | |
+| `smoke:ana-conversational-v2-voice-fidelity` | 0 | |
+| `smoke:ana-conversational-v2-contracts` | 0 | |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-recovery` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-social-reads` | 0 | |
+| `smoke:ana-conversational-v2-escalation` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:booking-confirmation-gate` | 0 | |
+| `smoke:service-gate` | 0 | |
+| `smoke:professional-selection-gate` | 0 | |
+| `smoke:customer-reply-guard` | 0 | |
+| `smoke:receptionist-final-outbound` | 0 | |
+| mock × interpreter **on** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15; 73 chamadas; fingerprint present 73/73 |
+| mock × interpreter **off** × **flash** | 0 | Passos 30, FAIL 0, REVIEW 15; 64 chamadas |
+| mock × interpreter **on** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15; 73 chamadas; schema 5 |
+| mock × interpreter **off** × **luna** | 0 | Passos 30, FAIL 0, REVIEW 15; 64 chamadas |
+| mock × interpreter **on** × **flash** × **voz** | 0 | Passos 30, FAIL 0, REVIEW 15; 94 chamadas |
+
+Sem deploy. Sem push. Sem escrita na VPS. Sem `--real` (coordenador).
+
+### Riscos que permanecem
+
+- Fingerprint `absent` na matriz viva é agora um fato auditável, não um furo de cablagem. Se Flash/Luna realmente não ecoarem `system_fingerprint`, o relatório dirá `absent` — não inventamos fingerprint.
+- O juiz `--real` com `OPENAI_API_KEY_LUNA` viva **vai chamar** a Luna; sem ela (ou só com fixture) fica `not_run`/inconclusive.
+- Split de custo Luna vs `resume_thinking` DeepSeek da Exec 7 permanece correto; esta exec não mexeu em preços.
+- A matriz viva continua autorização do coordenador.
+

@@ -610,6 +610,64 @@ function responseOutputText(response: OpenAIResponse): string {
     .join('');
 }
 
+export type ProviderFingerprintStatusV2 = 'present' | 'absent';
+
+export interface ProviderResponseEchoV2 {
+  readonly responseModel: string | null;
+  readonly systemFingerprint: string | null;
+  readonly fingerprintStatus: ProviderFingerprintStatusV2;
+}
+
+function asEchoRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readEchoString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function fingerprintFromEchoSource(
+  source: Record<string, unknown> | null
+): string | null {
+  if (!source) return null;
+  const direct =
+    readEchoString(source.system_fingerprint) ??
+    readEchoString(source.systemFingerprint);
+  if (direct) return direct;
+  const metadata = asEchoRecord(source.metadata);
+  if (!metadata) return null;
+  return (
+    readEchoString(metadata.system_fingerprint) ??
+    readEchoString(metadata.systemFingerprint) ??
+    readEchoString(metadata.fingerprint)
+  );
+}
+
+/**
+ * Echo auditável do provider: chat/completions lê `model` + `system_fingerprint`;
+ * Responses API lê `model` e metadados equivalentes. Ausência vira
+ * `fingerprintStatus: "absent"` — nunca silêncio.
+ */
+export function providerResponseEchoV2(response: unknown): ProviderResponseEchoV2 {
+  const root = asEchoRecord(response);
+  const nested = asEchoRecord(root?.response);
+  const source =
+    readEchoString(root?.model) || fingerprintFromEchoSource(root)
+      ? root
+      : nested ?? root;
+  const responseModel =
+    readEchoString(source?.model) ?? readEchoString(root?.model);
+  const systemFingerprint =
+    fingerprintFromEchoSource(source) ?? fingerprintFromEchoSource(root);
+  return {
+    responseModel,
+    systemFingerprint,
+    fingerprintStatus: systemFingerprint ? 'present' : 'absent',
+  };
+}
+
 /** Normalização semântica Responses -> contrato único consumido pelo loop v1/v2. */
 export function normalizeLunaResponseToChatCompletion(
   response: OpenAIResponse
@@ -628,11 +686,15 @@ export function normalizeLunaResponseToChatCompletion(
         ? 'tool_calls'
         : 'stop';
   const usage = response.usage;
+  const echo = providerResponseEchoV2(response);
   return {
     id: response.id,
     object: 'chat.completion',
     created: response.created_at,
-    model: String(response.model),
+    model: echo.responseModel ?? String(response.model),
+    ...(echo.systemFingerprint
+      ? { system_fingerprint: echo.systemFingerprint }
+      : {}),
     choices: [
       {
         index: 0,

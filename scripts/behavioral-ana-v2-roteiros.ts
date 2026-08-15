@@ -48,9 +48,27 @@ import {
   type RoteiroScenario,
   type RoteiroStep,
 } from './benchmarks/ana-v2-roteiros/scenarios';
+import {
+  BEHAVIORAL_ROTEIROS_REPORT_SCHEMA_VERSION,
+  assertBehavioralPublishAllowedV2,
+  createBehavioralAntiMockLatchV2,
+  estimatedBehavioralCostUsdV2,
+  evaluateBehavioralAntiMockCallV2,
+  expectedModelForBehavioralCallV2,
+  fingerprintStatusFromCompletionV2,
+  preflightBehavioralRealRunV2,
+  resolveBehavioralHarnessPricingV2,
+  responseModelFromCompletionV2,
+  systemFingerprintFromCompletionV2,
+  tripBehavioralAntiMockLatchV2,
+  type BehavioralAntiMockLatchV2,
+  type BehavioralFingerprintStatusV2,
+  type BehavioralHarnessProvider,
+  type BehavioralHarnessPricingV2,
+} from '../src/services/conversationalV2/behavioralReal';
 
 type ProviderMode = 'mock' | 'real';
-type HarnessProvider = 'deepseek' | 'openai' | 'luna';
+type HarnessProvider = BehavioralHarnessProvider;
 type CheckStatus = 'PASS' | 'FAIL' | 'REVIEW';
 
 interface CliOptions {
@@ -80,6 +98,14 @@ interface ProviderCallMetric {
   reasoningTokens: number | null;
   finishReason: string | null;
   estimatedCostUsd: number;
+  requestedModel: string;
+  poisoned: boolean;
+  antiMockReason: string | null;
+  response: {
+    model: string | null;
+    systemFingerprint: string | null;
+    fingerprintStatus: BehavioralFingerprintStatusV2;
+  };
 }
 
 interface ParseFailureArtifact {
@@ -231,28 +257,17 @@ interface RunContext {
     parseModelTurnResultV2: typeof import('../src/services/conversationalV2/modelResultParser').parseModelTurnResultV2;
     interpretPowerZeroV2: typeof import('../src/services/conversationalV2/powerZeroInterpreter').interpretPowerZeroV2;
     assertLiveVoiceModelReceiptV2: typeof import('../src/services/conversationalV2/voice/liveReceipt').assertLiveVoiceModelReceiptV2;
+    DEEPSEEK_V4_FLASH_MODEL: typeof import('../src/services/receptionistLlmProvider').DEEPSEEK_V4_FLASH_MODEL;
+    OPENAI_LUNA_MODEL: typeof import('../src/services/receptionistLlmProvider').OPENAI_LUNA_MODEL;
   };
   calls: ProviderCallMetric[];
+  antiMockLatch: BehavioralAntiMockLatchV2;
   mockUnwrapVariants: Set<MockUnwrapVariant>;
 }
 
-const PRICE_PER_MILLION = {
-  deepseek: {
-    promptCacheHit: 0.0028,
-    promptCacheMiss: 0.14,
-    completion: 0.28,
-  },
-  openai: {
-    promptCacheHit: 0.075,
-    promptCacheMiss: 0.15,
-    completion: 0.6,
-  },
-  luna: {
-    promptCacheHit: Number(process.env.OPENAI_LUNA_CACHED_INPUT_USD_PER_MILLION ?? 0),
-    promptCacheMiss: Number(process.env.OPENAI_LUNA_INPUT_USD_PER_MILLION ?? 0),
-    completion: Number(process.env.OPENAI_LUNA_OUTPUT_USD_PER_MILLION ?? 0),
-  },
-} as const;
+function pricingForProvider(provider: HarnessProvider): BehavioralHarnessPricingV2 {
+  return resolveBehavioralHarnessPricingV2(provider);
+}
 
 const OLD_DRY_DENIAL =
   'Esse tipo de atendimento não está disponível neste estabelecimento.';
@@ -505,27 +520,6 @@ function percentile(values: readonly number[], ratio: number): number {
   return Number((sorted[index] ?? 0).toFixed(2));
 }
 
-function estimatedCost(input: {
-  promptTokens: number;
-  completionTokens: number;
-  cachedPromptTokens: number | null;
-  cacheMissPromptTokens: number | null;
-  provider: HarnessProvider;
-}): number {
-  const cached = Math.max(0, input.cachedPromptTokens ?? 0);
-  const miss = Math.max(
-    0,
-    input.cacheMissPromptTokens ?? input.promptTokens - cached
-  );
-  const pricing = PRICE_PER_MILLION[input.provider];
-  return (
-    (cached * pricing.promptCacheHit +
-      miss * pricing.promptCacheMiss +
-      Math.max(0, input.completionTokens) * pricing.completion) /
-    1_000_000
-  );
-}
-
 function metricFromCompletion(
   completion: OpenAI.Chat.Completions.ChatCompletion,
   durationMs: number,
@@ -533,7 +527,8 @@ function metricFromCompletion(
   scenarioId: string,
   stepId: string,
   repetition: number,
-  provider: HarnessProvider = 'deepseek'
+  provider: HarnessProvider,
+  requestedModel: string
 ): ProviderCallMetric {
   const usage = completion.usage as
     | (NonNullable<OpenAI.Chat.Completions.ChatCompletion['usage']> & {
@@ -547,6 +542,11 @@ function metricFromCompletion(
     usage?.prompt_cache_hit_tokens ??
     usage?.prompt_tokens_details?.cached_tokens ??
     null;
+  const echo = {
+    model: responseModelFromCompletionV2(completion),
+    systemFingerprint: systemFingerprintFromCompletionV2(completion),
+    fingerprintStatus: fingerprintStatusFromCompletionV2(completion),
+  };
   const metric: ProviderCallMetric = {
     provider,
     kind,
@@ -563,9 +563,76 @@ function metricFromCompletion(
       usage?.completion_tokens_details?.reasoning_tokens ?? null,
     finishReason: completion.choices[0]?.finish_reason ?? null,
     estimatedCostUsd: 0,
+    requestedModel,
+    poisoned: false,
+    antiMockReason: null,
+    response: echo,
   };
-  metric.estimatedCostUsd = estimatedCost(metric);
+  metric.estimatedCostUsd = estimatedBehavioralCostUsdV2({
+    ...metric,
+    rates: pricingForProvider(provider).rates,
+  });
   return metric;
+}
+
+function recordProviderCall(
+  ctx: RunContext,
+  session: ScenarioSession,
+  kind: ProviderCallMetric['kind'],
+  completion: OpenAI.Chat.Completions.ChatCompletion,
+  durationMs: number,
+  requestedModel: string
+): ProviderCallMetric {
+  const spec = expectedModelForBehavioralCallV2(ctx.options.provider, kind);
+  const metric = metricFromCompletion(
+    completion,
+    durationMs,
+    kind,
+    session.scenarioId,
+    session.activeStep!.id,
+    session.repetition,
+    spec.provider,
+    requestedModel
+  );
+  if (ctx.options.mode === 'real') {
+    const verdict = evaluateBehavioralAntiMockCallV2({
+      callProvider: spec.provider,
+      kind,
+      requestedModel: metric.requestedModel,
+      returnedModel: metric.response.model,
+      systemFingerprint: metric.response.systemFingerprint,
+      fingerprintStatus: metric.response.fingerprintStatus,
+    });
+    if (!verdict.ok) {
+      tripBehavioralAntiMockLatchV2(ctx.antiMockLatch, verdict.reason);
+      metric.poisoned = true;
+      metric.antiMockReason = verdict.reason;
+      ctx.calls.push(metric);
+      throw new Error(verdict.reason);
+    }
+  }
+  ctx.calls.push(metric);
+  return metric;
+}
+
+function armRequestedModel(
+  ctx: RunContext,
+  kind: ProviderCallMetric['kind']
+): string {
+  return expectedModelForBehavioralCallV2(ctx.options.provider, kind)
+    .requestedModel;
+}
+
+function stampMockReturnedModel(
+  completion: OpenAI.Chat.Completions.ChatCompletion,
+  provider: HarnessProvider
+): void {
+  completion.model =
+    provider === 'luna'
+      ? 'gpt-5.6-luna-mock'
+      : provider === 'openai'
+        ? 'gpt-4o-mini-mock'
+        : 'deepseek-v4-flash-mock';
 }
 
 function syntheticCompletion(input: {
@@ -1453,21 +1520,19 @@ async function trackedCompletion(
   ctx: RunContext,
   session: ScenarioSession,
   kind: ProviderCallMetric['kind'],
-  complete: () => Promise<OpenAI.Chat.Completions.ChatCompletion>
+  complete: () => Promise<OpenAI.Chat.Completions.ChatCompletion>,
+  requestedModel: string
 ): Promise<OpenAI.Chat.Completions.ChatCompletion> {
-  const step = session.activeStep!;
   const startedAt = Date.now();
   const response = await complete();
-  const metric = metricFromCompletion(
+  recordProviderCall(
+    ctx,
+    session,
+    kind,
     response,
     Date.now() - startedAt,
-    kind,
-    session.scenarioId,
-    step.id,
-    session.repetition,
-    kind === 'resume_thinking' ? 'deepseek' : ctx.options.provider
+    requestedModel
   );
-  ctx.calls.push(metric);
   return response;
 }
 
@@ -1511,27 +1576,26 @@ async function resolveTurnControlForStep(
             content: raw,
             reasoningContent: MOCK_REASONING_SENTINEL,
           });
-          const metric = metricFromCompletion(
+          recordProviderCall(
+            ctx,
+            session,
+            'resume_thinking',
             completion,
             Date.now() - startedAt,
-            'resume_thinking',
-            session.scenarioId,
-            step.id,
-            session.repetition,
-            'deepseek'
+            ctx.runtime.DEEPSEEK_V4_FLASH_MODEL
           );
-          ctx.calls.push(metric);
           return raw;
         }
+        const classifierRuntime = ctx.runtime.resolveAnaResumeClassifierRuntime();
         const completion = await trackedCompletion(
           ctx,
           session,
           'resume_thinking',
           () =>
-            ctx.runtime.createAnaResumeClassifierCompletion(
-              ctx.runtime.resolveAnaResumeClassifierRuntime(),
-              { messages }
-            )
+            ctx.runtime.createAnaResumeClassifierCompletion(classifierRuntime, {
+              messages,
+            }),
+          classifierRuntime.model
         );
         return completion.choices[0]?.message?.content ?? '';
       },
@@ -2112,22 +2176,14 @@ async function runCustomerTurn(
             ctx.options.elicitation,
             ctx.mockUnwrapVariants
           );
-          completion.model =
-            ctx.options.provider === 'luna'
-              ? 'gpt-5.6-luna-mock'
-              : ctx.options.provider === 'openai'
-                ? 'gpt-4o-mini-mock'
-                : 'deepseek-v4-flash-mock';
-          ctx.calls.push(
-            metricFromCompletion(
-              completion,
-              Date.now() - started,
-              'brain',
-              session.scenarioId,
-              step.id,
-              session.repetition,
-              ctx.options.provider
-            )
+          stampMockReturnedModel(completion, ctx.options.provider);
+          recordProviderCall(
+            ctx,
+            session,
+            'brain',
+            completion,
+            Date.now() - started,
+            armRequestedModel(ctx, 'brain')
           );
           recordModelOutput(session, {
             stage: 'primary',
@@ -2139,10 +2195,13 @@ async function runCustomerTurn(
           });
           return completion;
         }
-        const completion = await trackedCompletion(ctx, session, 'brain', () =>
-          ctx.runtime.createReceptionistChatCompletion(
-            ctx.runtime.resolveReceptionistAiRuntime(config),
-            {
+        const brainRuntime = ctx.runtime.resolveReceptionistAiRuntime(config);
+        const completion = await trackedCompletion(
+          ctx,
+          session,
+          'brain',
+          () =>
+            ctx.runtime.createReceptionistChatCompletion(brainRuntime, {
               messages,
               tools,
               temperature: config.aiTemperature,
@@ -2150,8 +2209,8 @@ async function runCustomerTurn(
               userId: input.userId,
               thinkingMode: ctx.options.thinking ? 'enabled' : 'disabled',
               ...(responseFormat ? { responseFormat } : {}),
-            }
-          )
+            }),
+          brainRuntime.model
         );
         recordModelOutput(session, {
           stage: 'primary',
@@ -2199,28 +2258,24 @@ async function runCustomerTurn(
           completion = syntheticCompletion({
             content: JSON.stringify({ choice: 'NENHUMA' }),
           });
-          completion.model =
-            ctx.options.provider === 'luna'
-              ? 'gpt-5.6-luna-mock'
-              : ctx.options.provider === 'openai'
-                ? 'gpt-4o-mini-mock'
-                : 'deepseek-v4-flash-mock';
-          ctx.calls.push(
-            metricFromCompletion(
-              completion,
-              Date.now() - started,
-              'interpreter',
-              session.scenarioId,
-              step.id,
-              session.repetition,
-              ctx.options.provider
-            )
+          stampMockReturnedModel(completion, ctx.options.provider);
+          recordProviderCall(
+            ctx,
+            session,
+            'interpreter',
+            completion,
+            Date.now() - started,
+            armRequestedModel(ctx, 'interpreter')
           );
         } else {
-          completion = await trackedCompletion(ctx, session, 'interpreter', () =>
-            ctx.runtime.createReceptionistChatCompletion(
-              ctx.runtime.resolveReceptionistAiRuntime(config),
-              {
+          const interpreterRuntime =
+            ctx.runtime.resolveReceptionistAiRuntime(config);
+          completion = await trackedCompletion(
+            ctx,
+            session,
+            'interpreter',
+            () =>
+              ctx.runtime.createReceptionistChatCompletion(interpreterRuntime, {
                 messages: completionInput.messages,
                 tools: [],
                 temperature: 0,
@@ -2228,8 +2283,8 @@ async function runCustomerTurn(
                 thinkingMode: 'disabled',
                 responseFormat: 'json_object',
                 timeoutMs: completionInput.timeoutMs,
-              }
-            )
+              }),
+            interpreterRuntime.model
           );
         }
         recordModelOutput(session, {
@@ -2256,22 +2311,14 @@ async function runCustomerTurn(
               ? { reasoningContent: MOCK_REASONING_SENTINEL }
               : {}),
           });
-          completion.model =
-            ctx.options.provider === 'luna'
-              ? 'gpt-5.6-luna-mock'
-              : ctx.options.provider === 'openai'
-                ? 'gpt-4o-mini-mock'
-                : 'deepseek-v4-flash-mock';
-          ctx.calls.push(
-            metricFromCompletion(
-              completion,
-              Date.now() - started,
-              'social',
-              session.scenarioId,
-              step.id,
-              session.repetition,
-              ctx.options.provider
-            )
+          stampMockReturnedModel(completion, ctx.options.provider);
+          recordProviderCall(
+            ctx,
+            session,
+            'social',
+            completion,
+            Date.now() - started,
+            armRequestedModel(ctx, 'social')
           );
           recordModelOutput(session, {
             stage: 'social',
@@ -2283,11 +2330,17 @@ async function runCustomerTurn(
           });
           return completion;
         }
-        const completion = await trackedCompletion(ctx, session, 'social', () =>
-          ctx.runtime.createReceptionistChatCompletion(
-            ctx.runtime.resolveReceptionistAiRuntime(config),
-            completionInput
-          )
+        const socialRuntime = ctx.runtime.resolveReceptionistAiRuntime(config);
+        const completion = await trackedCompletion(
+          ctx,
+          session,
+          'social',
+          () =>
+            ctx.runtime.createReceptionistChatCompletion(
+              socialRuntime,
+              completionInput
+            ),
+          socialRuntime.model
         );
         recordModelOutput(session, {
           stage: 'social',
@@ -2387,29 +2440,27 @@ async function runCustomerTurn(
               ? { reasoningContent: MOCK_REASONING_SENTINEL }
               : {}),
           });
-          completion.model =
-            ctx.options.provider === 'luna'
-              ? 'gpt-5.6-luna-mock'
-              : ctx.options.provider === 'openai'
-                ? 'gpt-4o-mini-mock'
-                : 'deepseek-v4-flash-mock';
-          ctx.calls.push(
-            metricFromCompletion(
-              completion,
-              0,
-              'regen',
-              session.scenarioId,
-              step.id,
-              session.repetition,
-              ctx.options.provider
-            )
+          stampMockReturnedModel(completion, ctx.options.provider);
+          recordProviderCall(
+            ctx,
+            session,
+            'regen',
+            completion,
+            0,
+            armRequestedModel(ctx, 'regen')
           );
         } else {
-          completion = await trackedCompletion(ctx, session, 'regen', () =>
-            ctx.runtime.createReceptionistChatCompletion(
-              ctx.runtime.resolveReceptionistAiRuntime(config),
-              completionInput
-            )
+          const regenRuntime = ctx.runtime.resolveReceptionistAiRuntime(config);
+          completion = await trackedCompletion(
+            ctx,
+            session,
+            'regen',
+            () =>
+              ctx.runtime.createReceptionistChatCompletion(
+                regenRuntime,
+                completionInput
+              ),
+            regenRuntime.model
           );
         }
         rawFinal =
@@ -2482,15 +2533,20 @@ async function runCustomerTurn(
       rephraseCompletion: async (input) => {
         if (ctx.options.mode === 'real') {
           const runtime = ctx.runtime.resolveReceptionistAiRuntime(config);
-          const completion = await trackedCompletion(ctx, session, 'voice', () =>
-            ctx.runtime.createReceptionistChatCompletion(runtime, {
-              messages: input.messages,
-              tools: [],
-              temperature: input.temperature,
-              maxTokens: input.maxTokens,
-              thinkingMode: 'disabled',
-              timeoutMs: input.timeoutMs,
-            })
+          const completion = await trackedCompletion(
+            ctx,
+            session,
+            'voice',
+            () =>
+              ctx.runtime.createReceptionistChatCompletion(runtime, {
+                messages: input.messages,
+                tools: [],
+                temperature: input.temperature,
+                maxTokens: input.maxTokens,
+                thinkingMode: 'disabled',
+                timeoutMs: input.timeoutMs,
+              }),
+            runtime.model
           );
           ctx.runtime.assertLiveVoiceModelReceiptV2({
             provider: runtime.provider,
@@ -2516,22 +2572,14 @@ async function runCustomerTurn(
         const completion = syntheticCompletion({
           content: `{"connectiveId":"${connectiveId}"}`,
         });
-        completion.model =
-          ctx.options.provider === 'luna'
-            ? 'gpt-5.6-luna-mock'
-            : ctx.options.provider === 'openai'
-              ? 'gpt-4o-mini-mock'
-              : 'deepseek-v4-flash-mock';
-        ctx.calls.push(
-          metricFromCompletion(
-            completion,
-            Date.now() - started,
-            'voice',
-            session.scenarioId,
-            step.id,
-            session.repetition,
-            ctx.options.provider
-          )
+        stampMockReturnedModel(completion, ctx.options.provider);
+        recordProviderCall(
+          ctx,
+          session,
+          'voice',
+          completion,
+          Date.now() - started,
+          armRequestedModel(ctx, 'voice')
         );
         return completion;
       },
@@ -2820,6 +2868,23 @@ function markdownReport(input: {
 - Intérprete poder-zero: ${input.options.interpreter ? 'on' : 'off'}
 - Repetições: ${input.options.repeats}
 - Chamadas: ${input.calls.length}
+- Recibos requestedModel: ${
+    input.calls.length
+      ? [...new Set(input.calls.map((call) => call.requestedModel))].join(', ')
+      : 'nenhuma'
+  }
+- Recibos response.model: ${
+    input.calls.length
+      ? [...new Set(input.calls.map((call) => call.response.model ?? 'null'))].join(', ')
+      : 'nenhuma'
+  }
+- Fingerprints: present ${
+    input.calls.filter((call) => call.response.fingerprintStatus === 'present')
+      .length
+  } / absent ${
+    input.calls.filter((call) => call.response.fingerprintStatus === 'absent')
+      .length
+  } / ${input.calls.length}
 - Tokens: prompt ${tokens.prompt} · completion ${tokens.completion} · reasoning ${tokens.reasoning} · total ${tokens.total}
 - Custo estimado: US$ ${cost.toFixed(6)}
 - Latência por chamada: p50 ${percentile(callLatencies, 0.5)} ms · p95 ${percentile(callLatencies, 0.95)} ms
@@ -2996,6 +3061,8 @@ async function loadRuntime(): Promise<RunContext['runtime']> {
     ).parseModelTurnResultV2,
     interpretPowerZeroV2: interpreter.interpretPowerZeroV2,
     assertLiveVoiceModelReceiptV2: voiceLive.assertLiveVoiceModelReceiptV2,
+    DEEPSEEK_V4_FLASH_MODEL: provider.DEEPSEEK_V4_FLASH_MODEL,
+    OPENAI_LUNA_MODEL: provider.OPENAI_LUNA_MODEL,
   };
 }
 
@@ -3011,16 +3078,18 @@ async function main(): Promise<void> {
     (scenario) => !options.scenarioIds || options.scenarioIds.has(scenario.id)
   );
   if (options.mode === 'real') {
-    runtime.resolveReceptionistAiRuntime(buildArmConfig(options));
-    if (selected.some((scenario) => scenario.id === 'R10')) {
-      runtime.resolveAnaResumeClassifierRuntime();
-    }
+    preflightBehavioralRealRunV2({
+      provider: options.provider,
+      config: buildArmConfig(options),
+      includesResumeClassifier: selected.some((scenario) => scenario.id === 'R10'),
+    });
   }
   const startedAt = new Date().toISOString();
   const ctx: RunContext = {
     options,
     runtime,
     calls: [],
+    antiMockLatch: createBehavioralAntiMockLatchV2(),
     mockUnwrapVariants: new Set(),
   };
   const runs: StepRun[] = [];
@@ -3135,6 +3204,21 @@ async function main(): Promise<void> {
     outputParent,
     `${timestamp}-${options.elicitation}-${arm}-interpreter-${options.interpreter ? 'on' : 'off'}`
   );
+  assertBehavioralPublishAllowedV2({
+    mode: options.mode,
+    armProvider: options.provider,
+    latch: ctx.antiMockLatch,
+    calls: ctx.calls.map((call) => ({
+      callProvider: call.provider,
+      kind: call.kind,
+      requestedModel: call.requestedModel,
+      returnedModel: call.response.model,
+      systemFingerprint: call.response.systemFingerprint,
+      fingerprintStatus: call.response.fingerprintStatus,
+      poisoned: call.poisoned,
+      antiMockReason: call.antiMockReason,
+    })),
+  });
   await mkdir(outputDir, { recursive: true });
   const callLatencies = ctx.calls.map((call) => call.durationMs);
   const turnLatencies = runs.map((run) => run.turnLatencyMs);
@@ -3158,8 +3242,16 @@ async function main(): Promise<void> {
   ) {
     throw new Error('Mock Thinking não comprovou reasoning tokens nas chamadas v2.');
   }
+  const costByProvider = ctx.calls.reduce(
+    (totals, call) => {
+      totals[call.provider] = (totals[call.provider] ?? 0) + call.estimatedCostUsd;
+      return totals;
+    },
+    {} as Record<string, number>
+  );
+  const pricing = pricingForProvider(options.provider);
   const rawReport = {
-    schemaVersion: 3,
+    schemaVersion: BEHAVIORAL_ROTEIROS_REPORT_SCHEMA_VERSION,
     harness: 'ana-v2-roteiros',
     startedAt,
     finishedAt,
@@ -3173,7 +3265,8 @@ async function main(): Promise<void> {
     repeats: options.repeats,
     selectedScenarioIds: selected.map((scenario) => scenario.id),
     syntheticFixture: true,
-    pricingUsdPerMillionTokens: PRICE_PER_MILLION[options.provider],
+    pricingUsdPerMillionTokens: pricing.rates,
+    pricingStatus: pricing.status,
     ...(options.mode === 'mock'
       ? { mockUnwrapVariants: [...ctx.mockUnwrapVariants].sort() }
       : {}),
@@ -3181,6 +3274,16 @@ async function main(): Promise<void> {
       calls: ctx.calls.length,
       turns: runs.length,
       estimatedCostUsd: cost,
+      estimatedCostUsdByProvider: costByProvider,
+      fingerprintEcho: {
+        present: ctx.calls.filter(
+          (call) => call.response.fingerprintStatus === 'present'
+        ).length,
+        absent: ctx.calls.filter(
+          (call) => call.response.fingerprintStatus === 'absent'
+        ).length,
+        total: ctx.calls.length,
+      },
       tokens,
       callLatencyMs: {
         p50: percentile(callLatencies, 0.5),
