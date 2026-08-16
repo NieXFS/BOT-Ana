@@ -247,7 +247,7 @@ Permanecem proteções técnicas, não editoriais: PII bloqueia; tamanho é limi
 
 ### D-DESC-2 — informação procedural ausente
 
-Mantém-se `reasonCode: "UNCADASTRED_INFO"`; `topicCode: "PROCEDURE_INFO"` é ortogonal. `ProcedureInfoDecisionV2` roda server-side depois do catálogo e decide `none | answer_from_license | escalate`, sempre carregando `serviceId`, facetas pedidas e cobertura. O match é cumulativo: interrogativa procedural **e** serviço resolvido no inbound atual ou anafórico fixado no fluxo ativo **e** domínio procedural. A exclusão operacional é feita pelo objeto da pergunta; “como funciona o agendamento/pagamento/cancelamento?” nunca é escalada procedural. Facetas clínicas continuam em `CLINICAL_DOUBT`. No v1, pergunta que ultrapassa `WHAT_IT_IS|HOW_PERFORMED` cobertas escala integralmente.
+Mantém-se `reasonCode: "UNCADASTRED_INFO"`; `topicCode: "PROCEDURE_INFO"` é ortogonal. `ProcedureInfoDecisionV2` roda server-side depois do catálogo e decide `none | answer_from_license | escalate`, sempre carregando `serviceId`, facetas pedidas e cobertura. O match é cumulativo: interrogativa procedural **e** serviço resolvido no inbound atual ou anafórico fixado no fluxo ativo **e** domínio procedural. A exclusão operacional é feita pelo objeto da pergunta; “como funciona o agendamento/pagamento/cancelamento?” nunca é escalada procedural. Facetas clínicas continuam em `CLINICAL_DOUBT`. Pergunta específica sobre faceta descoberta (`o que é` → `WHAT_IT_IS`; `como é feita a sessão/o procedimento` e `como funciona` seguido de objeto procedural `a aplicação`/`as aplicações`/`a sessão`/`as sessões`/`o procedimento`, inclusive com `de`/`do`/`da` antes do serviço → `HOW_PERFORMED`; esta forma de `como funciona` tem precedência sobre a classe genérica) escala integralmente quando a faceta não está coberta. Pergunta procedural genérica (`como funciona` sem esses objetos procedurais, `me fala/conta sobre`, `como é`) responde **todas** as facetas cobertas pela licença, na ordem original das cláusulas (`WHAT_IT_IS` antes de `HOW_PERFORMED`), sem escalar enquanto houver ao menos uma cláusula entregável; o teto de 700 corta em fronteira de cláusula e, se estourar, prioriza `WHAT_IT_IS` + a primeira `HOW_PERFORMED`.
 
 Mensagem mista torna a decisão procedural um componente do plano, nunca um short-circuit: (1) decompor conteúdo coberto, parte operacional e faceta não coberta; (2) executar no máximo leituras operacionais autorizadas; (3) criar Pergunta+pausa como efeito autoritativo final; (4) compor uma única resposta boundary-checked que entregue o testemunhado e confirme a escalada; (5) não executar write de agenda no mesmo turno em que uma escalada nova pausa a conversa. Precedência de conteúdo no runtime: `AnaApprovedResponse` da faceta exata → cláusula licenciada da mesma faceta → escalada. O decisor só entra após o contrato de payload do ERP.
 
@@ -260,6 +260,20 @@ Precedência do coordinator: identidade → confirmação canônica de write com
 ### D-DESC-4 — promoção explícita de resposta humana
 
 Conhecimento reutilizável nasce em `AnaApprovedResponse`, nunca em `AnaQuestion`, com `knowledgeKind: PROCEDURE_INFO`, faceta tipada e unicidade fail-closed por tenant+serviço+kind+faceta. A promoção exige ação explícita, preview editável e scan de PII; revisão/hash servem para integridade e alerta de duplicidade, nunca para reuso automático por similaridade. Conteúdo clínico segue o contrato de responsabilidade aplicável à revisão exata. Conflito ou múltiplos ativos falham fechado. Implementação fica para fase posterior.
+
+### D-ADDR — endereço operacional (`businessAddress` + `directionsMode`)
+
+O runtime consome o payload aditivo do ERP: `businessAddress { full, city, state, zipCode }` (cada campo `string | null`) e `structuredConfig.directionsMode` (`ENDERECO_COMPLETO | SO_CIDADE | APOS_CONFIRMACAO`). Campo ausente no payload = runtime velho: a pergunta cai no modelo como hoje, sem negação nova. Modo ausente/desconhecido trata-se como `SO_CIDADE`.
+
+Matcher determinístico (classe read fast-path), com polaridade local e exclusão de objeto alheio (`endereço do site/instagram/email`): `endereço`, `onde fica(m)` / `onde vocês ficam`, `como chego` / `como chegar`, `localização`, `qual o local`. Copies canônicas são materializadas server-side com os campos exatos; campo ausente é omitido, nunca inventado.
+
+- `ENDERECO_COMPLETO` exige `full`: `Estamos em <full>, <city> - <state>.` (+ `, CEP <zip>` se houver).
+- `SO_CIDADE` exige `city`: `Estamos em <city> - <state>. O endereço completo a equipe confirma com você no contato.`
+- `APOS_CONFIRMACAO` lê `getCustomerUpcomingAppointmentsV2` com a mesma âncora fail-closed de identidade do cancelamento. Sem upcoming futuro não-cancelado: copy de cidade/estado + ` assim que seu agendamento estiver confirmado te passo o endereço completinho.` Com upcoming: copy FULL. Identidade ambígua/mismatch ou leitura falha não vazam FULL.
+
+Pergunta pura e respondível short-circuita em `fast_path`. Mensagem mista (R8) torna o endereço um **componente**, nunca short-circuit: o servidor anexa a copy canônica depois da leitura operacional (ex.: `"qual o endereço? e tem vaga amanhã?"` → slots + endereço). Sem `full`/`city` para o modo pedido, preserva-se a rota do modelo.
+
+Os campos testemunhados entram na família de soft-facts: `UNKNOWN_ADDRESS` bloqueia rua/CEP/`estamos em` que não sejam os do payload. Payload ausente não arma esse bloqueio. O CEP da copy canônica server-owned não dispara `EXPLICIT_PII` (8 dígitos casam o detector de telefone); o mesmo número em segmento de origem modelo é reinspecionado com `PHONE_RE` cru e bloqueia.
 
 ## Riscos declarados
 

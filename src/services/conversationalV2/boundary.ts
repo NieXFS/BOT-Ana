@@ -1,4 +1,5 @@
 import type { ServicesResult } from '../calendarService';
+import type { TenantBusinessAddress } from '../../configProvider';
 import {
   inspectCustomerReply,
   normalizeCustomerReplyStyle,
@@ -50,6 +51,10 @@ import {
   normalizeTemporalAssertionsV2,
 } from './temporalNormalizer';
 import { buildPendingQuestionV2 } from './pendingQuestion';
+import {
+  hasUnlicensedBusinessAddressClaimV2,
+  stripCanonicalBusinessAddressCopyV2,
+} from './businessAddress';
 
 export const UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2 =
   'Esse procedimento não está disponível no momento. Posso te ajudar com outro serviço?';
@@ -76,6 +81,8 @@ export interface BoundaryEvaluationInputV2 {
     ReceptionistOutboundEvidence,
     'toolTrace' | 'sourceInboundText' | 'actionRecorded' | 'temporalContext'
   >;
+  /** Endereço testemunhado do payload `businessAddress`; ausente = ERP velho. */
+  businessAddress?: TenantBusinessAddress;
   serviceRelistExempt?: boolean;
   /** Rota que invocou a boundary; social estrita usa sua blocklist própria. */
   route?: 'model' | 'social' | 'interpreter';
@@ -1460,6 +1467,16 @@ function v2FactReasons(
   ) {
     reasons.add('UNVERIFIED_IMPLICIT_COMMITMENT');
   }
+  const witnessedAddress =
+    input.businessAddress ?? input.outboundEvidence?.businessAddress;
+  if (
+    hasUnlicensedBusinessAddressClaimV2(
+      normalizedCandidate,
+      witnessedAddress
+    )
+  ) {
+    reasons.add('UNKNOWN_ADDRESS');
+  }
   if (hasIneligibleProfessionalForFlow(normalizedCandidate, input.flowState, catalog)) {
     reasons.add('INELIGIBLE_PROFESSIONAL');
   }
@@ -1559,6 +1576,27 @@ function outboundReason(
   return mapping[reason];
 }
 
+function licensedAddressDiscardsUnverifiedAppointmentContextV2(
+  candidate: string,
+  input: BoundaryEvaluationInputV2,
+  toolTrace: readonly ToolTraceLike[]
+): boolean {
+  const address =
+    input.businessAddress ?? input.outboundEvidence?.businessAddress;
+  const remainder = stripCanonicalBusinessAddressCopyV2(candidate, address);
+  if (!address || remainder === candidate.trim()) return false;
+  if (!remainder) return true;
+  return !inspectCustomerReply(
+    remainder,
+    input.servicesResult,
+    input.forbiddenAppointmentIds ?? [],
+    [...toolTrace],
+    input.sourceInboundText,
+    input.temporalContext,
+    pendingTimeSlotEvidenceV2(input)?.slots ?? []
+  ).reasons.includes('unverified_appointment_context');
+}
+
 function stage(
   stageName: BoundaryStageEvaluationV2['stage'],
   reasons: BoundaryReasonCodeV2[]
@@ -1600,7 +1638,12 @@ export function evaluateBoundaryV2(
   const discardedPreBookingAppointmentContext =
     inspection.reasons.includes('unverified_appointment_context') &&
     (isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog) ||
-      isLicensedCancelCopyV2(normalizedCandidate, input));
+      isLicensedCancelCopyV2(normalizedCandidate, input) ||
+      licensedAddressDiscardsUnverifiedAppointmentContextV2(
+        factCheckedCandidate,
+        input,
+        toolTrace
+      ));
   const effectiveInspectionReasons = discardedPreBookingAppointmentContext
     ? inspection.reasons.filter(
         (reason) => reason !== 'unverified_appointment_context'
@@ -1628,6 +1671,9 @@ export function evaluateBoundaryV2(
       authoritativeCatalog: catalog,
       evidence: {
         ...input.outboundEvidence,
+        ...(input.businessAddress
+          ? { businessAddress: input.businessAddress }
+          : {}),
         toolTrace,
         sourceInboundText: input.sourceInboundText,
         actionRecorded: input.actionRecorded,
@@ -1686,7 +1732,12 @@ export function evaluateBoundaryV2(
   const discardedOutboundPreBookingContext =
     temporalFilteredReasons.includes('UNVERIFIED_APPOINTMENT_CONTEXT') &&
     (isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog) ||
-      isLicensedCancelCopyV2(normalizedCandidate, input));
+      isLicensedCancelCopyV2(normalizedCandidate, input) ||
+      licensedAddressDiscardsUnverifiedAppointmentContextV2(
+        factCheckedCandidate,
+        input,
+        toolTrace
+      ));
   const appointmentFilteredReasons = discardedOutboundPreBookingContext
     ? temporalFilteredReasons.filter(
         (reason) => reason !== 'UNVERIFIED_APPOINTMENT_CONTEXT'

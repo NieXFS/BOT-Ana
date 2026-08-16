@@ -13,6 +13,7 @@ import {
 import type {
   BookingMenuItem,
   PostBookingInstruction,
+  StructuredLocationPolicy,
   StructuredPreferencesConfig,
 } from './services/structuredPreferences';
 import type { AuthoritativeOutboundCatalog } from './services/receptionistOutbound';
@@ -25,8 +26,56 @@ import {
 export type {
   BookingMenuItem,
   PostBookingInstruction,
+  StructuredLocationPolicy,
   StructuredPreferencesConfig,
 } from './services/structuredPreferences';
+
+export type TenantDirectionsMode = StructuredLocationPolicy;
+
+export interface TenantBusinessAddress {
+  full: string | null;
+  city: string | null;
+  state: string | null;
+  zipCode: string | null;
+}
+
+const DIRECTIONS_MODES = new Set<TenantDirectionsMode>([
+  'ENDERECO_COMPLETO',
+  'SO_CIDADE',
+  'APOS_CONFIRMACAO',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function nullableAddressField(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+/** Espelha o shape aditivo do ERP: ausente = runtime velho; presente pode ter nulls. */
+export function normalizeBusinessAddressPayload(
+  value: unknown
+): TenantBusinessAddress | undefined {
+  if (!isRecord(value)) return undefined;
+  return {
+    full: nullableAddressField(value.full),
+    city: nullableAddressField(value.city),
+    state: nullableAddressField(value.state),
+    zipCode: nullableAddressField(value.zipCode),
+  };
+}
+
+export function parseDirectionsModePayload(
+  value: unknown
+): TenantDirectionsMode | undefined {
+  return typeof value === 'string' &&
+    DIRECTIONS_MODES.has(value as TenantDirectionsMode)
+    ? (value as TenantDirectionsMode)
+    : undefined;
+}
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -124,6 +173,14 @@ export interface TenantBotConfig {
   authoritativeCatalog?: AuthoritativeOutboundCatalog;
   descriptionTermAcceptance?: DescriptionTermAcceptanceV2 | null;
   escalationResponsibleName?: string | null;
+  /**
+   * Modo do card "Como chegar". Só preenchido quando o payload traz um enum
+   * válido (`structuredConfig.directionsMode` ou `directionsMode` no topo).
+   * Ausente/desconhecido é conservador no runtime de endereço (cidade/estado).
+   */
+  directionsMode?: TenantDirectionsMode;
+  /** Contrato aditivo ERP-1. Ausente = runtime velho do ERP. */
+  businessAddress?: TenantBusinessAddress;
   technicalMaintenance?: {
     enabled: boolean;
     paused: boolean;
@@ -213,6 +270,7 @@ export async function getTenantConfig(
     if (response.ok) {
       const raw = (await response.json()) as Partial<TenantBotConfig> & {
         directionsMode?: unknown;
+        businessAddress?: unknown;
       };
       // Fallbacks p/ tenants antigos cujo payload não traz os campos novos —
       // receptionist/openai = comportamento atual, 100% intocado.
@@ -244,6 +302,13 @@ export async function getTenantConfig(
         postBookingInstructions: normalizePostBookingInstructionsPayload(
           raw.postBookingInstructions
         ),
+        directionsMode: parseDirectionsModePayload(
+          (raw.structuredConfig && typeof raw.structuredConfig === 'object'
+            ? (raw.structuredConfig as unknown as Record<string, unknown>)
+                .directionsMode
+            : undefined) ?? raw.directionsMode
+        ),
+        businessAddress: normalizeBusinessAddressPayload(raw.businessAddress),
         authoritativeCatalog:
           raw.authoritativeCatalog && typeof raw.authoritativeCatalog === 'object'
             ? raw.authoritativeCatalog

@@ -7,6 +7,7 @@ import {
   RECEPTIONIST_TOOLS,
   runReceptionistModelLoop,
   type ReceptionistModelLoopResult,
+  type ReceptionistToolTraceEntry,
 } from '../brainService';
 import {
   resolveReceptionistAiRuntime,
@@ -138,6 +139,11 @@ import {
   procedureInfoModelInstructionV2,
   type ProcedureInfoDecisionV2,
 } from './procedureInfo';
+import {
+  businessAddressModelInstructionV2,
+  composeBusinessAddressComponentV2,
+  resolveBusinessAddressPlanV2,
+} from './businessAddress';
 import {
   regenerateReceptionistCopyV2,
   type RegenerationResultV2,
@@ -326,6 +332,9 @@ function v2RulesPrompt(
       address: config.authoritativeCatalog?.tenant?.address ?? null,
       city: config.authoritativeCatalog?.tenant?.city ?? null,
       state: config.authoritativeCatalog?.tenant?.state ?? null,
+      ...(config.businessAddress
+        ? { businessAddress: config.businessAddress }
+        : {}),
       businessHours: {
         alwaysActive: config.botIsAlwaysActive,
         start: config.botActiveStart,
@@ -1188,6 +1197,14 @@ export async function getReceptionistReplyV2(input: {
   // Mesmo executor server-owned, mas só alcançado depois que o read fast-path
   // v2 provou classifyExistingAppointmentIntent != none. Não amplia o gate v1.
   const executeEntitledUpcomingRead = executeDuplicatePreflightRead;
+  const addressPlan = await resolveBusinessAddressPlanV2({
+    inboundText: currentInboundBatchText,
+    config: input.config,
+    now: startedAt,
+    executeUpcomingRead: () =>
+      executeEntitledUpcomingRead('getUpcomingAppointments', {}),
+  });
+  const witnessedBusinessAddress = input.config.businessAddress;
 
   let primary: ModelTurnResultV2ParseResult;
   let loop = emptyLoopResult();
@@ -1248,9 +1265,15 @@ export async function getReceptionistReplyV2(input: {
       replyPurpose: 'OPERATIONAL_ANSWER',
       source: 'CANONICAL',
       actionRecorded: escalation.actionRecorded,
-      outboundEvidence: escalation.questionId
-        ? { authoritativeEscalationQuestionId: escalation.questionId }
-        : undefined,
+      businessAddress: witnessedBusinessAddress,
+      outboundEvidence: {
+        ...(escalation.questionId
+          ? { authoritativeEscalationQuestionId: escalation.questionId }
+          : {}),
+        ...(witnessedBusinessAddress
+          ? { businessAddress: witnessedBusinessAddress }
+          : {}),
+      },
       route: 'model',
       pendingAnaOpen:
         frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
@@ -1457,12 +1480,16 @@ export async function getReceptionistReplyV2(input: {
       replyPurpose: 'OPERATIONAL_ANSWER',
       source: 'CANONICAL',
       actionRecorded,
+      businessAddress: witnessedBusinessAddress,
       outboundEvidence: {
         ...(questionId
           ? { authoritativeEscalationQuestionId: questionId }
           : {}),
         ...(procedureInfoAnswer
           ? { licensedServiceDescription: procedureInfoAnswer.evidence }
+          : {}),
+        ...(witnessedBusinessAddress
+          ? { businessAddress: witnessedBusinessAddress }
           : {}),
       },
       route: 'model',
@@ -1528,6 +1555,92 @@ export async function getReceptionistReplyV2(input: {
     };
   }
 
+  if (
+    addressPlan.decision.kind === 'answer' &&
+    !addressPlan.requiresOperationalContinuation
+  ) {
+    const race = await checkRace('before_transport');
+    if (race) return preparedPreemption(race, successorTurnId);
+    const payload = composeBusinessAddressComponentV2({
+      componentText: addressPlan.decision.text,
+      courtesyAcknowledgement: addressPlan.hasCourtesyAcknowledgement,
+      ...(socialGreeting ? { socialGreeting } : {}),
+    });
+    const candidate = { kind: 'preserve' } as const;
+    const evaluation = evaluateBoundaryV2({
+      rawCandidate: payload,
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: frame.flowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER',
+      source: 'CANONICAL',
+      businessAddress: witnessedBusinessAddress,
+      outboundEvidence: witnessedBusinessAddress
+        ? { businessAddress: witnessedBusinessAddress }
+        : undefined,
+      route: 'model',
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    });
+    if (
+      !evaluation.safe ||
+      !evaluation.originalAccepted ||
+      !evaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Componente de endereço canônico rejeitado pela boundary.');
+    }
+    const addressLoop = emptyLoopResult();
+    addressLoop.thinkingMode = thinkingMode;
+    if (addressPlan.upcomingReadRaw) {
+      const upcomingTrace: ReceptionistToolTraceEntry = {
+        round: 0,
+        name: 'getUpcomingAppointments',
+        args: {},
+        argumentsValidJson: true,
+        result: addressPlan.upcomingReadRaw,
+      };
+      addressLoop.toolTrace = [upcomingTrace];
+    }
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'fast_path_business_address',
+    });
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame,
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: evaluation.acceptedPayload,
+      transition: { kind: 'preserve' },
+      planReceipt: makePlan({
+        route: 'fast_path',
+        loop: addressLoop,
+        candidate,
+        recoveryKind: 'none',
+        regenCalls: 0,
+        boundaryAttempts: [
+          {
+            index: 0,
+            candidateHash: opaqueReceiptHashV2(payload),
+            reasonCodes: evaluation.reasonCodes,
+          },
+        ],
+      }),
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: false,
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
+      elicitationVariant,
+      copyVariant,
+    };
+  }
+
   const validationContext: ModelResultValidationContextV2 = {
     frame,
     inboundTextsById,
@@ -1566,6 +1679,14 @@ export async function getReceptionistReplyV2(input: {
             content: procedureInfoModelInstructionV2(
               procedureInfoPlan.decision
             ),
+          },
+        ]
+      : []),
+    ...(addressPlan.decision.kind === 'answer'
+      ? [
+          {
+            role: 'system' as const,
+            content: businessAddressModelInstructionV2(),
           },
         ]
       : []),
@@ -2095,9 +2216,15 @@ export async function getReceptionistReplyV2(input: {
       replyPurpose: 'OPERATIONAL_ANSWER',
       source: 'CANONICAL',
       actionRecorded: interpreterActionRecorded,
-      outboundEvidence: interpreterEscalationQuestionId
-        ? { authoritativeEscalationQuestionId: interpreterEscalationQuestionId }
-        : undefined,
+      businessAddress: witnessedBusinessAddress,
+      outboundEvidence: {
+        ...(interpreterEscalationQuestionId
+          ? { authoritativeEscalationQuestionId: interpreterEscalationQuestionId }
+          : {}),
+        ...(witnessedBusinessAddress
+          ? { businessAddress: witnessedBusinessAddress }
+          : {}),
+      },
       route: 'interpreter',
       pendingAnaOpen:
         frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
@@ -2517,9 +2644,15 @@ export async function getReceptionistReplyV2(input: {
         nextFlowState
       ),
       actionRecorded: cancellationActionRecorded,
-      outboundEvidence: cancellationEscalationQuestionId
-        ? { authoritativeEscalationQuestionId: cancellationEscalationQuestionId }
-        : undefined,
+      businessAddress: witnessedBusinessAddress,
+      outboundEvidence: {
+        ...(cancellationEscalationQuestionId
+          ? { authoritativeEscalationQuestionId: cancellationEscalationQuestionId }
+          : {}),
+        ...(witnessedBusinessAddress
+          ? { businessAddress: witnessedBusinessAddress }
+          : {}),
+      },
       route: interpreterResolved ? 'interpreter' : 'model',
       pendingAnaOpen:
         frame.pending !== null &&
@@ -2631,12 +2764,18 @@ export async function getReceptionistReplyV2(input: {
             committedFlowState
           ),
           actionRecorded: cancellationActionRecorded,
-          outboundEvidence: cancellationEscalationQuestionId
-            ? {
-                authoritativeEscalationQuestionId:
-                  cancellationEscalationQuestionId,
-              }
-            : undefined,
+          businessAddress: witnessedBusinessAddress,
+          outboundEvidence: {
+            ...(cancellationEscalationQuestionId
+              ? {
+                  authoritativeEscalationQuestionId:
+                    cancellationEscalationQuestionId,
+                }
+              : {}),
+            ...(witnessedBusinessAddress
+              ? { businessAddress: witnessedBusinessAddress }
+              : {}),
+          },
           route: interpreterResolved ? 'interpreter' : 'model',
           pendingAnaOpen:
             frame.pending !== null &&
@@ -2714,6 +2853,7 @@ export async function getReceptionistReplyV2(input: {
           ? ('GENERATED' as const)
           : ('CANONICAL' as const),
       actionRecorded,
+      businessAddress: witnessedBusinessAddress,
       outboundEvidence: {
         ...(procedureEscalationQuestionId
           ? {
@@ -2723,6 +2863,9 @@ export async function getReceptionistReplyV2(input: {
           : {}),
         ...(procedureInfoAnswer
           ? { licensedServiceDescription: procedureInfoAnswer.evidence }
+          : {}),
+        ...(witnessedBusinessAddress
+          ? { businessAddress: witnessedBusinessAddress }
           : {}),
       },
       toolTrace: loop.toolTrace as ToolTraceLike[],
@@ -2777,6 +2920,96 @@ export async function getReceptionistReplyV2(input: {
     deliveredPayload = finalEvaluation.acceptedPayload;
   }
 
+  const addressBoundaryAttempts: Array<{
+    candidateHash: string;
+    reasonCodes: BoundaryReasonCodeV2[];
+  }> = [];
+  if (addressPlan.decision.kind === 'answer') {
+    const componentText = addressPlan.decision.text;
+    const composed = composeBusinessAddressComponentV2({
+      baseText: deliveredPayload,
+      componentText,
+      courtesyAcknowledgement: addressPlan.hasCourtesyAcknowledgement,
+    });
+    const addressBoundaryInput = {
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: committedFlowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER' as const,
+      source:
+        nominalRoute === 'model' || recovery.recoveryKind === 'regen'
+          ? ('GENERATED' as const)
+          : ('CANONICAL' as const),
+      businessAddress: witnessedBusinessAddress,
+      outboundEvidence: witnessedBusinessAddress
+        ? { businessAddress: witnessedBusinessAddress }
+        : undefined,
+      toolTrace: loop.toolTrace as ToolTraceLike[],
+      route: interpreterResolved ? ('interpreter' as const) : ('model' as const),
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    };
+    let addressEvaluation = evaluateBoundaryV2({
+      ...addressBoundaryInput,
+      rawCandidate: composed,
+    });
+    addressBoundaryAttempts.push({
+      candidateHash: opaqueReceiptHashV2(composed),
+      reasonCodes: addressEvaluation.reasonCodes,
+    });
+    if (
+      !addressEvaluation.safe ||
+      !addressEvaluation.originalAccepted ||
+      !addressEvaluation.acceptedPayload.trim()
+    ) {
+      candidate = { kind: 'preserve' };
+      const fallbackPayload = composeBusinessAddressComponentV2({
+        ...(addressPlan.requiresOperationalContinuation
+          ? { baseText: deliveredPayload }
+          : {}),
+        componentText,
+        courtesyAcknowledgement: addressPlan.hasCourtesyAcknowledgement,
+      });
+      addressEvaluation = evaluateBoundaryV2({
+        ...addressBoundaryInput,
+        rawCandidate: fallbackPayload,
+        pendingTransitionCandidate: candidate,
+        source: 'CANONICAL',
+      });
+      addressBoundaryAttempts.push({
+        candidateHash: opaqueReceiptHashV2(fallbackPayload),
+        reasonCodes: addressEvaluation.reasonCodes,
+      });
+    }
+    if (
+      !addressEvaluation.safe ||
+      !addressEvaluation.originalAccepted ||
+      !addressEvaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Fallback de endereço canônico rejeitado pela boundary.');
+    }
+    deliveredPayload = addressEvaluation.acceptedPayload;
+    if (
+      addressPlan.upcomingReadRaw &&
+      !loop.toolTrace.some((entry) => entry.name === 'getUpcomingAppointments')
+    ) {
+      loop.toolTrace = [
+        {
+          round: 0,
+          name: 'getUpcomingAppointments',
+          args: {},
+          argumentsValidJson: true,
+          result: addressPlan.upcomingReadRaw,
+        },
+        ...loop.toolTrace,
+      ];
+    }
+  }
+
   const transition = materializeTransition(
     candidate,
     frame,
@@ -2801,6 +3034,13 @@ export async function getReceptionistReplyV2(input: {
     reasonCodes: entry.evaluation.reasonCodes,
   }));
   for (const attempt of procedureBoundaryAttempts) {
+    boundaryAttempts.push({
+      index: boundaryAttempts.length,
+      candidateHash: attempt.candidateHash,
+      reasonCodes: attempt.reasonCodes,
+    });
+  }
+  for (const attempt of addressBoundaryAttempts) {
     boundaryAttempts.push({
       index: boundaryAttempts.length,
       candidateHash: attempt.candidateHash,

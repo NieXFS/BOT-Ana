@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
-import type { TenantBotConfig } from '../configProvider';
+import type { TenantBotConfig, TenantBusinessAddress } from '../configProvider';
 import type { ServicesResult } from './calendarService';
+import { canonicalBusinessAddressCopiesV2 } from './conversationalV2/businessAddress';
 import { sendFreeformMessage } from '../whatsappCloudService';
 import {
   HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE,
@@ -142,6 +143,8 @@ export interface ReceptionistOutboundEvidence {
   verifiedAvailabilitySlots?: readonly string[];
   /** Bloco exato materializado de cláusulas licenciadas do catálogo. */
   licensedServiceDescription?: LicensedServiceDescriptionEvidenceV2;
+  /** Endereço operacional testemunhado do payload `businessAddress`. */
+  businessAddress?: TenantBusinessAddress;
 }
 
 export interface ReceptionistOutboundEnvelope {
@@ -199,6 +202,95 @@ const AVISAR_NOMINAL_HANDOFF_RE = new RegExp(
   'iu'
 );
 const CLINICAL_RE = /\b(?:diagn[oó]stic[oa]|diagnosticamos|cura|curamos|elimina|resolve|garante|garantimos|n[aã]o\s+d[oó]i|sem\s+dor|resultado\s+garantido|adequad[oa]\s+para|indicad[oa]\s+para|seguro\s+para|eficaz)\b/iu;
+
+function zipDigits(value: string): string {
+  return value.replace(/\D/gu, '');
+}
+
+interface LicensedZipForms {
+  raw: string;
+  digits: string;
+  hyphenated: string;
+}
+
+function licensedZipForms(
+  address: TenantBusinessAddress | null | undefined
+): LicensedZipForms | null {
+  const raw = typeof address?.zipCode === 'string' ? address.zipCode.trim() : '';
+  const digits = zipDigits(raw);
+  if (digits.length < 8) return null;
+  return {
+    raw,
+    digits,
+    hyphenated: `${digits.slice(0, 5)}-${digits.slice(5)}`,
+  };
+}
+
+function stripLicensedZipForms(text: string, forms: LicensedZipForms): string {
+  return text
+    .split(forms.raw)
+    .join(' ')
+    .split(forms.digits)
+    .join(' ')
+    .split(forms.hyphenated)
+    .join(' ');
+}
+
+function hasRawExplicitPii(text: string): boolean {
+  return CPF_RE.test(text) || PHONE_RE.test(text) || RECORD_RE.test(text);
+}
+
+function remainderHasLicensedZip(text: string, forms: LicensedZipForms): boolean {
+  const pattern = new RegExp(
+    `\\b(?:${escapeRegExp(forms.digits)}|${escapeRegExp(forms.hyphenated)})\\b`,
+    'u'
+  );
+  return pattern.test(text);
+}
+
+/**
+ * CEP brasileiro tem 8 dígitos e casa o PHONE_RE (4+4). A isenção não é
+ * lexical/global: só o trecho da copy canônica de endereço materializada pelo
+ * servidor ignora o CEP testemunhado. Todo o restante — inclusive bloco de
+ * origem modelo — é reinspecionado com PHONE_RE cru. O formato 5-3
+ * (`01310-930`) não casa o detector 4-4; leftover do zip no restante também
+ * conta como PII explícita.
+ */
+function segmentHasUnlicensedPii(
+  text: string,
+  address: TenantBusinessAddress | null | undefined
+): boolean {
+  const forms = licensedZipForms(address);
+  const copies = canonicalBusinessAddressCopiesV2(address);
+  let remaining = text;
+  for (const copy of copies) {
+    let index = remaining.indexOf(copy);
+    while (index >= 0) {
+      const licensedSpan = forms ? stripLicensedZipForms(copy, forms) : copy;
+      if (hasRawExplicitPii(licensedSpan)) return true;
+      remaining = `${remaining.slice(0, index)}${remaining.slice(index + copy.length)}`;
+      index = remaining.indexOf(copy);
+    }
+  }
+  remaining = remaining.replace(/\n{3,}/gu, '\n\n').trim();
+  if (hasRawExplicitPii(remaining)) return true;
+  return forms ? remainderHasLicensedZip(remaining, forms) : false;
+}
+
+function hasExplicitPii(
+  text: string,
+  address: TenantBusinessAddress | null | undefined,
+  blocks: readonly ReceptionistOutboundBlock[]
+): boolean {
+  if (segmentHasUnlicensedPii(text, address)) return true;
+  for (const block of blocks) {
+    if (!GENERATED_RECEPTIONIST_OUTBOUND_SOURCES.includes(block.source)) {
+      continue;
+    }
+    if (segmentHasUnlicensedPii(block.text, address)) return true;
+  }
+  return false;
+}
 
 export function hasAuthoritativeHandoffLicense(
   evidence?: ReceptionistOutboundEvidence
@@ -628,7 +720,9 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   }
 
   if (HUMAN_DEADLINE_RE.test(text)) reasons.add('HUMAN_RESPONSE_DEADLINE');
-  if (CPF_RE.test(text) || PHONE_RE.test(text) || RECORD_RE.test(text)) reasons.add('EXPLICIT_PII');
+  if (hasExplicitPii(text, envelope.evidence?.businessAddress, blocks)) {
+    reasons.add('EXPLICIT_PII');
+  }
   if (emojiCount(text) > 1) reasons.add('TOO_MANY_EMOJIS');
   if (containsUnlicensedHandoffPromise(text, envelope.evidence)) {
     reasons.add('UNRECORDED_HANDOFF');

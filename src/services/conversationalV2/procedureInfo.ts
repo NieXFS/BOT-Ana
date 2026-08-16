@@ -5,6 +5,7 @@ import {
   type LicensedCatalogSegmentV2,
 } from '../humanConversationContext';
 import {
+  LICENSED_SERVICE_DESCRIPTION_FACETS_V1,
   LICENSED_SERVICE_DESCRIPTION_POLICY_V1,
   normalizeLicensedServiceDescriptionV2,
   validDescriptionTermAcceptanceV2,
@@ -56,30 +57,75 @@ function normalize(value: string): string {
     .trim();
 }
 
-const WHAT_IT_IS_RE = /\bo\s+que\s+(?:e|eh)\b/u;
-const HOW_PERFORMED_RE =
-  /\b(?:como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\b/u;
-const PROCEDURAL_INTERROGATIVE_RE = new RegExp(
-  `${WHAT_IT_IS_RE.source}|${HOW_PERFORMED_RE.source}`,
+const WHAT_IT_IS_SRC = String.raw`o\s+que\s+(?:e|eh)`;
+const SPECIFIC_HOW_DONE_SRC = String.raw`como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])`;
+const PROCEDURAL_OBJECT_SRC = String.raw`(?:(?:a|as)\s+aplicac(?:ao|oes)|(?:a|as)\s+sess(?:ao|oes)|(?:o|os)\s+procedimentos?)`;
+const COMO_FUNCIONA_SRC = String.raw`como\s+funciona(?:m)?`;
+const SPECIFIC_HOW_FUNCIONA_SRC = `${COMO_FUNCIONA_SRC}\\s+${PROCEDURAL_OBJECT_SRC}`;
+const SPECIFIC_HOW_SRC = `(?:${SPECIFIC_HOW_DONE_SRC}|${SPECIFIC_HOW_FUNCIONA_SRC})`;
+const GENERIC_BARE_SRC = String.raw`em\s+que\s+consiste|me\s+(?:fala|fale|conta|conte)(?:\s+um\s+pouco)?\s+sobre|como\s+(?:e|eh)(?!\s+(?:feit[oa]|aplicad[oa]|realizad[oa]))`;
+const GENERIC_PROCEDURE_SRC = `(?:${COMO_FUNCIONA_SRC}(?!\\s+${PROCEDURAL_OBJECT_SRC})|${GENERIC_BARE_SRC})`;
+const PROCEDURAL_CUE_SRC = `(?:${WHAT_IT_IS_SRC}|${SPECIFIC_HOW_DONE_SRC}|${COMO_FUNCIONA_SRC}|${GENERIC_BARE_SRC})`;
+const WHAT_IT_IS_RE = new RegExp(`\\b${WHAT_IT_IS_SRC}\\b`, 'u');
+const SPECIFIC_HOW_RE = new RegExp(`\\b${SPECIFIC_HOW_SRC}\\b`, 'u');
+const GENERIC_PROCEDURE_RE = new RegExp(`\\b(?:${GENERIC_PROCEDURE_SRC})\\b`, 'u');
+const PROCEDURAL_INTERROGATIVE_RE = new RegExp(`\\b${PROCEDURAL_CUE_SRC}\\b`, 'u');
+const NEGATED_PROCEDURAL_RE = new RegExp(
+  `\\bnao\\b(?:\\s+\\w+){0,4}\\s+${PROCEDURAL_CUE_SRC}\\b`,
   'u'
 );
-const NEGATED_PROCEDURAL_RE =
-  /\bnao\b(?:\s+\w+){0,4}\s+(?:o\s+que\s+(?:e|eh)|como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\b/u;
-const OPERATIONAL_OBJECT_RE =
-  /\b(?:o\s+que\s+(?:e|eh)|como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\s+(?:(?:o|a|os|as|um|uma|de|dos|das)\s+)?(?:agendamentos?|pagamentos?|pacotes?|cancelamentos?|remarcac(?:ao|oes)|horarios?|agendas?)\b/u;
-const TEMPORAL_SESSION_OBJECT_RE =
-  /\b(?:o\s+que\s+(?:e|eh)|como\s+funciona|como\s+(?:e|eh)\s+(?:feit[oa]|aplicad[oa]|realizad[oa])|em\s+que\s+consiste)\s+(?:(?:o|a)\s+)?sessao\s+(?:de\s+)?(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}[/-]\d{1,2})\b/u;
+const OPERATIONAL_OBJECT_RE = new RegExp(
+  `\\b${PROCEDURAL_CUE_SRC}\\s+(?:(?:o|a|os|as|um|uma|de|dos|das)\\s+)?(?:agendamentos?|pagamentos?|pacotes?|cancelamentos?|remarcac(?:ao|oes)|horarios?|agendas?)\\b`,
+  'u'
+);
+const TEMPORAL_SESSION_OBJECT_RE = new RegExp(
+  `\\b${PROCEDURAL_CUE_SRC}\\s+(?:(?:o|a)\\s+)?sessao\\s+(?:de\\s+)?(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\\d{1,2}[/-]\\d{1,2})\\b`,
+  'u'
+);
 const ANAPHORIC_PROCEDURE_RE =
   /\b(?:esse|essa|este|esta|o|a)\s+(?:tratamento|procedimento|servico|sessao)\b/u;
 const COURTESY_ACK_RE =
   /\b(?:muito\s+)?(?:obrigad[oa]|agradeco|valeu|vlw)\b/u;
 const ADDITIONAL_OPERATIONAL_RE =
-  /\b(?:tem\s+vaga|tem\s+horario|disponibilidade|agenda(?:r|mento)?|marcar|remarcar|cancelar|desmarcar|pagamento|pagar|pix|cartao|preco|valor|quanto\s+custa|profissional|amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}(?::\d{2}|h\d{0,2})?)\b/u;
+  /\b(?:tem\s+vaga|tem\s+horario|disponibilidade|agenda(?:r|mento)?|marcar|remarcar|cancelar|desmarcar|pagamento|pagar|pix|cartao|preco|valor|quanto\s+custa|profissional|amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}(?::\d{2}|h\d{0,2})?|endereco|localizacao|onde\s+ficam?|como\s+cheg(?:o|ar)|qual\s+(?:o\s+)?local)\b/u;
 
-function requestedFacets(text: string): LicensedServiceDescriptionFacetV2[] {
+function coveredFacetsFromLicense(
+  service: NonNullable<ServicesResult['services']>[number]
+): LicensedServiceDescriptionFacetV2[] {
+  const present = new Set(
+    (service.licensedDescription?.clauses ?? []).map((clause) => clause.facet)
+  );
+  return LICENSED_SERVICE_DESCRIPTION_FACETS_V1.filter((facet) =>
+    present.has(facet)
+  );
+}
+
+function isGenericProceduralQuestion(text: string): boolean {
+  return GENERIC_PROCEDURE_RE.test(text);
+}
+
+function isSpecificHowQuestion(text: string): boolean {
+  return SPECIFIC_HOW_RE.test(text);
+}
+
+function requestedFacetsForDecision(
+  text: string,
+  service: NonNullable<ServicesResult['services']>[number]
+): LicensedServiceDescriptionFacetV2[] {
+  if (isSpecificHowQuestion(text)) {
+    const facets: LicensedServiceDescriptionFacetV2[] = [];
+    if (WHAT_IT_IS_RE.test(text)) facets.push('WHAT_IT_IS');
+    facets.push('HOW_PERFORMED');
+    return facets;
+  }
+  if (isGenericProceduralQuestion(text)) {
+    const covered = coveredFacetsFromLicense(service);
+    return covered.length > 0
+      ? covered
+      : [...LICENSED_SERVICE_DESCRIPTION_FACETS_V1];
+  }
   const facets: LicensedServiceDescriptionFacetV2[] = [];
   if (WHAT_IT_IS_RE.test(text)) facets.push('WHAT_IT_IS');
-  if (HOW_PERFORMED_RE.test(text)) facets.push('HOW_PERFORMED');
   return facets;
 }
 
@@ -195,26 +241,32 @@ export function decideProcedureInfoV2(input: {
   const service = services.find((entry) => entry.id === serviceId);
   if (!service) return none;
 
-  const facets = requestedFacets(text);
+  const generic =
+    isGenericProceduralQuestion(text) && !isSpecificHowQuestion(text);
+  const facets = requestedFacetsForDecision(text, service);
   if (facets.length === 0) return none;
   const selection = selectedClauseIdsWithinBudget(service, facets);
   const uncovered = facets.filter((facet) => !selection.covered.has(facet));
-  const decision: ProcedureInfoDecisionV2 =
-    !service.licensedDescription || uncovered.length > 0
-      ? {
-          kind: 'escalate',
-          reasonCode: PROCEDURE_INFO_REASON_CODE_V2,
-          topicCode: PROCEDURE_INFO_TOPIC_CODE_V2,
-          serviceId,
-          requestedFacets: facets,
-          uncoveredFacets: service.licensedDescription ? uncovered : [...facets],
-        }
-      : {
-          kind: 'answer_from_license',
-          serviceId,
-          requestedFacets: facets,
-          clauseIds: selection.clauseIds,
-        };
+  const hasDeliverableLicense =
+    Boolean(service.licensedDescription) && selection.clauseIds.length > 0;
+  const shouldEscalate = generic
+    ? !hasDeliverableLicense
+    : !service.licensedDescription || uncovered.length > 0;
+  const decision: ProcedureInfoDecisionV2 = shouldEscalate
+    ? {
+        kind: 'escalate',
+        reasonCode: PROCEDURE_INFO_REASON_CODE_V2,
+        topicCode: PROCEDURE_INFO_TOPIC_CODE_V2,
+        serviceId,
+        requestedFacets: facets,
+        uncoveredFacets: service.licensedDescription ? uncovered : [...facets],
+      }
+    : {
+        kind: 'answer_from_license',
+        serviceId,
+        requestedFacets: facets,
+        clauseIds: selection.clauseIds,
+      };
 
   return {
     decision,

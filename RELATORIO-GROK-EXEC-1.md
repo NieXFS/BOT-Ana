@@ -1699,3 +1699,162 @@ Removida a linha em branco extra no EOF de `RELATORIO-GROK-EXEC-1.md` (`git diff
 | `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
 
 HEAD permaneceu `81025c2` destacado. Sem commit.
+
+## Exec IA-13 — Generosidade de facetas na descrição licenciada
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `a8241cb` (= produção). Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Feedback vinculante do Victor: `"Como funciona a drenagem?"` entregava só `HOW_PERFORMED`; a expectativa de produto é a descrição completa (`WHAT_IT_IS` + `HOW_PERFORMED`) quando cabe no teto de 700. **Emenda IA-13b:** `como funciona` + objeto procedural (`a aplicação`/`a sessão`/`o procedimento`) deixa de ser genérica; ver seção seguinte.
+
+### Entrega
+
+Allow-only no decisor `ProcedureInfoDecisionV2`. Fronteira, envelope de segmentos, placeholder na projeção e materialização de cláusulas exatas permaneceram intactos.
+
+1. **Pergunta genérica** (`como funciona X`, `me fala/conta sobre X`, `como é X`, e o já existente `em que consiste`) pede **todas** as facetas cobertas pela licença. O servidor materializa na ordem original das cláusulas (`WHAT_IT_IS` antes de `HOW_PERFORMED`).
+2. **Pergunta específica continua estreita.** `o que é X` → só `WHAT_IT_IS`. `como é feita a sessão / o procedimento / feito|aplicado|realizado` → só `HOW_PERFORMED`.
+3. **Escalada por faceta descoberta inalterada para o caso específico.** `"Como é feito o peeling?"` com licença só `WHAT_IT_IS` continua `escalate`. Genérica com licença cobrindo ao menos 1 faceta **responde o que tem** e não escala (peeling + `"Como funciona o peeling?"` entrega `WHAT_IT_IS`; HOW-only injetado entrega `HOW_PERFORMED`).
+4. **Orçamento 700 em fronteira de cláusula.** Se estoura, a seleção pára na cláusula que não cabe e prioriza `WHAT_IT_IS` + a primeira `HOW` (Massagem Longa: `budget-what` + `budget-how-1`; a segunda HOW cai). Genérica não escala só porque uma faceta licenciada não coube.
+5. **Transcript do Victor.** `"como funciona a drenagem?"` com as 2 cláusulas reais do studio-viti (massagem manual + sessão na maca, 273 chars) entrega as duas, WHAT primeiro, abaixo de 700.
+
+### Arquivos
+
+- `src/services/conversationalV2/procedureInfo.ts`
+- `scripts/smoke-ana-conversational-v2-procedure-info.ts`
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md` (D-DESC-2: genérica vs específica)
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | genérica 2 facetas, HOW-only, `o que é`, orçamento, transcript Victor, específica estreita, envelope/placeholder intactos |
+| `npm run smoke:ana-conversational-v2-route` | 0 | |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | IA-11/IA-12 intactos |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `a8241cb` destacado. Sem commit.
+
+## Exec IA-13b — matcher de HOW específica em "como funciona <objeto procedural>"
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `a8241cb` (= produção) + working tree IA-13. Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Instrução mínima do Sol: `"como funciona"` seguido de objeto procedural (`a aplicação`, `a sessão`, `o procedimento`) era classificado como genérico e entregava facetas cobertas; deve ser HOW específica, com precedência maior que a classe genérica, igual a `"como é feita a aplicação..."`.
+
+### Entrega
+
+Allow-only no decisor `ProcedureInfoDecisionV2`. Cue interrogativa, exclusão operacional e exclusão temporal (`sessão de amanhã`) permanecem no `como funciona` curto, para não quebrar o objeto temporal.
+
+1. **HOW específica nova.** `como funciona(m)` + `a/as aplicação(ões)` / `a/as sessão(ões)` / `o/os procedimento(s)` pede só `HOW_PERFORMED`. Variantes `de`/`do`/`da` antes do serviço entram pelo objeto, não pela genérica.
+2. **Precedência.** O matcher específico roda antes da genérica; essas formas são excluídas da classe `como funciona` genérica (lookahead negativo no objeto procedural).
+3. **Comportamento idêntico a `como é feita a aplicação`.** Licença só `WHAT_IT_IS` → `escalate` com `requestedFacets`/`uncoveredFacets` = `HOW_PERFORMED`. Licença WHAT+HOW → `answer_from_license` somente com a cláusula HOW.
+4. **Regressão IA-13 intacta.** `"Como funciona o peeling?"` continua genérica e entrega as facetas cobertas (WHAT-only → `peeling-what`, sem escalar). `"Como funciona a Drenagem?"` e o transcript Victor seguem entregando as duas cláusulas.
+5. **Contrato D-DESC-2.** A linha de pergunta específica passa a citar expressamente os objetos procedurais como HOW específica, com precedência sobre a genérica.
+
+### Arquivos
+
+- `src/services/conversationalV2/procedureInfo.ts`
+- `scripts/smoke-ana-conversational-v2-procedure-info.ts`
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md` (D-DESC-2: objetos procedurais como HOW específica)
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | aplicação/sessão × WHAT-only escala HOW; × WHAT+HOW só HOW; peeling genérico intacto; flexões/de-da/procedimento |
+| `npm run smoke:ana-conversational-v2-route` | 0 | |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | IA-11/IA-12 intactos |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `a8241cb` destacado. Sem commit.
+
+## Exec IA-14 — "Como chegar": consumo de businessAddress + directionsMode
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `a8241cb` (= produção) + working tree IA-13/13b. Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. O ERP já expõe (Exec ERP-1, deployado) `businessAddress { full, city, state, zipCode }` aditivo no payload de config e `structuredConfig.directionsMode` (`ENDERECO_COMPLETO | SO_CIDADE | APOS_CONFIRMACAO`). O runtime ignorava os campos; "Qual o endereço de vocês?" caía no modelo ("não tenho essa informação").
+
+### Entrega
+
+1. **Matcher determinístico** (classe read fast-path): `endereço`, `onde fica(m)` / `onde vocês ficam`, `como chego` / `como chegar`, `localização`, `qual o local`. Polaridade local (negativa não dispara) e exclusão de objeto alheio (`site` / `instagram` / `email` / `facebook` / `whatsapp` / `link` / `perfil` / `página`).
+2. **Copies canônicas server-side**, campos exatos do payload, nunca texto do modelo; campo ausente omitido:
+   - FULL: `Estamos em <full>, <city> - <state>.` (+ `, CEP <zip>` se houver).
+   - Cidade/estado: `Estamos em <city> - <state>. O endereço completo a equipe confirma com você no contato.`
+   - APOS sem upcoming futuro não-cancelado: copy de cidade + ` assim que seu agendamento estiver confirmado te passo o endereço completinho.`
+   - APOS com upcoming (leitura `getUpcomingAppointments`, mesma âncora fail-closed de identidade do cancelamento) → copy FULL. Identidade ambígua/mismatch, cancelado, passado ou leitura falha não vazam FULL.
+3. **Dados ausentes.** Sem `businessAddress` (ERP velho) ou sem `full`/`city` para o modo pedido → rota do modelo, nenhuma negação nova. Modo ausente/desconhecido → `SO_CIDADE`.
+4. **Fronteira.** `UNKNOWN_ADDRESS` bloqueia rua / `estamos em` / CEP que não sejam os do payload. Payload ausente não arma o bloqueio. CEP testemunhado de 8 dígitos é removido da varredura `EXPLICIT_PII` (casava o detector de telefone). A copy APOS contém `seu agendamento`; o guard de contexto de agenda descarta esse motivo quando o restante, sem a copy canônica, está limpo.
+5. **R8.** Endereço é componente, nunca short-circuit em mensagem mista. `"qual o endereço? e tem vaga amanhã?"` lê slots e anexa a copy FULL. Leftover operacional recíproco no decisor procedural impede que "como funciona X? qual o endereço?" short-circuite só a descrição.
+
+### Arquivos
+
+- `src/configProvider.ts` (`businessAddress`, `directionsMode`; parse só com enum válido)
+- `src/services/conversationalV2/businessAddress.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `src/services/conversationalV2/boundary.ts` (`UNKNOWN_ADDRESS` + descarte do contexto de agenda da copy canônica)
+- `src/services/conversationalV2/contracts.ts`
+- `src/services/conversationalV2/procedureInfo.ts` (leftover de endereço)
+- `src/services/receptionistOutbound.ts` (CEP testemunhado ≠ telefone)
+- `scripts/smoke-ana-conversational-v2-business-address.ts`
+- `scripts/smoke-receptionist-config-wire.ts`
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md` (D-ADDR)
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-business-address` | 0 | 3 modos; APOS × com/sem upcoming; dados ausentes; onde fica / como chegar; mista endereço+slots; negativa e endereço de site/instagram; invenção → `UNKNOWN_ADDRESS`; ERP velho → modelo |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | leftover de endereço não engole a composição mista; IA-13/13b intactos |
+| `npm run smoke:ana-conversational-v2-route` | 0 | `tenantFacts` sem `businessAddress` no payload velho |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | IA-11/IA-12 intactos |
+| `npm run smoke:ana-conversational-v2-social-reads` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+| `npm run smoke:receptionist-config-wire` | 0 | `businessAddress.full/city/state/zipCode` + `directionsMode` |
+
+HEAD permaneceu `a8241cb` destacado. Sem commit.
+
+## Exec IA-14b — CEP isento por proveniência, não por strip lexical global
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `a8241cb` (= produção) + working tree IA-13/13b/14. Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. IA-13b e IA-14.1/2/4/5 aceitos. Bloqueio único do Sol: `textWithoutLicensedZip` removia globalmente o CEP do tenant (com/sem hífen) antes do `PHONE_RE`; sonda `"Ligue para 01310930."` com `zipCode 01310930` retornou `safe:true` — telefone real de 8 dígitos coincidente com o CEP atravessava a fronteira PII.
+
+### Entrega
+
+1. **Removida a exceção global** `split(zip)` / `split(digits)` / `split(hyphenated)` sobre o payload inteiro. O CEP testemunhado não é mais apagado da varredura antes do detector.
+2. **Isenção por proveniência/segmento server-owned.** Só o trecho da copy canônica de endereço materializada pelo servidor (`canonicalBusinessAddressCopiesV2`) ignora o CEP; o span copiado é varrido depois de remover o zip *localmente*. Todo o restante do payload — e cada bloco de origem modelo (`GENERATED` / `GREETING` / `POST_BOOKING` / `VOICE_REPHRASE`) — é reinspecionado com `PHONE_RE` cru.
+3. **Formato 5-3.** `01310-930` não casa o `PHONE_RE` (4+4). Leftover do zip testemunhado no restante (dígitos ou hifenizado) também conta como `EXPLICIT_PII`.
+4. **Fixtures no smoke de endereço:** copy FULL canônica com CEP passa; `"Telefone: 01310930"` e `"Telefone: 01310-930"` com o mesmo `businessAddress` → `EXPLICIT_PII`; composto misto (copy canônica + trecho de modelo contendo o número) bloqueia pelo trecho de modelo.
+5. **Contrato D-ADDR.** A isenção de `EXPLICIT_PII` fica restrita à copy canônica server-owned; o mesmo número em segmento de modelo bloqueia.
+
+### Arquivos
+
+- `src/services/receptionistOutbound.ts` (PII por segmento; sem strip lexical global)
+- `scripts/smoke-ana-conversational-v2-business-address.ts` (fixtures IA-14b)
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md` (D-ADDR)
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-business-address` | 0 | FULL com CEP passa; telefone 8 dígitos / 5-3 → `EXPLICIT_PII`; misto copy+modelo bloqueia |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | IA-13/13b intactos |
+| `npm run smoke:ana-conversational-v2-route` | 0 | |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | IA-11/IA-12 intactos |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `a8241cb` destacado. Sem commit.

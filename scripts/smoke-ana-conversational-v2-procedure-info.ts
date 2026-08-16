@@ -53,6 +53,43 @@ const drenagemLicense = {
   ],
 };
 
+const studioVitiDrenagemLicense = {
+  sourceHash: '7'.repeat(64),
+  policyVersion: 'licensed-service-description-v1' as const,
+  clauses: [
+    {
+      clauseId: 'viti-drenagem-what',
+      facet: 'WHAT_IT_IS' as const,
+      exactText:
+        'A drenagem linfática é uma massagem manual com toques suaves que estimula a circulação da linfa e ajuda a reduzir o inchaço e a sensação de pernas pesadas.',
+    },
+    {
+      clauseId: 'viti-drenagem-how',
+      facet: 'HOW_PERFORMED' as const,
+      exactText:
+        'A sessão é feita na maca, com movimentos leves e ritmados nas pernas, abdômen e braços, sempre no ritmo do seu corpo.',
+    },
+  ],
+};
+
+function licensedExactText(
+  license: { clauses: readonly { clauseId: string; exactText: string }[] },
+  clauseIds?: readonly string[]
+): string {
+  const selected = clauseIds
+    ? clauseIds.map(
+        (clauseId) =>
+          license.clauses.find((clause) => clause.clauseId === clauseId)!
+      )
+    : [...license.clauses];
+  return selected.map((clause) => clause.exactText).join(' ');
+}
+
+const drenagemExactBoth = licensedExactText(drenagemLicense);
+const studioVitiDrenagemExact = licensedExactText(studioVitiDrenagemLicense);
+assert.ok(studioVitiDrenagemExact.length < 700);
+assert.ok(studioVitiDrenagemExact.length > 250);
+
 const peelingLicense = {
   sourceHash: 'b'.repeat(64),
   policyVersion: 'licensed-service-description-v1' as const,
@@ -63,6 +100,12 @@ const peelingLicense = {
       exactText: 'O peeling é uma renovação controlada da superfície da pele.',
     },
   ],
+};
+
+const peelingHowClause = {
+  clauseId: 'peeling-how',
+  facet: 'HOW_PERFORMED' as const,
+  exactText: 'A aplicação é feita em camadas finas sobre a pele limpa.',
 };
 
 const clinicalLicense = {
@@ -377,8 +420,8 @@ async function main(): Promise<void> {
   assert.deepEqual(how.decision, {
     kind: 'answer_from_license',
     serviceId: 'svc-drenagem',
-    requestedFacets: ['HOW_PERFORMED'],
-    clauseIds: ['drenagem-how'],
+    requestedFacets: ['WHAT_IT_IS', 'HOW_PERFORMED'],
+    clauseIds: ['drenagem-what', 'drenagem-how'],
   });
   assert.equal(how.requiresOperationalContinuation, false);
   assert.equal(
@@ -401,8 +444,8 @@ async function main(): Promise<void> {
     reasonCode: 'UNCADASTRED_INFO',
     topicCode: 'PROCEDURE_INFO',
     serviceId: 'svc-drenagem',
-    requestedFacets: ['HOW_PERFORMED'],
-    uncoveredFacets: ['HOW_PERFORMED'],
+    requestedFacets: ['WHAT_IT_IS', 'HOW_PERFORMED'],
+    uncoveredFacets: ['WHAT_IT_IS', 'HOW_PERFORMED'],
   });
 
   const anaphoric = procedure.decideProcedureInfoV2({
@@ -416,6 +459,13 @@ async function main(): Promise<void> {
       ? anaphoric.decision.serviceId
       : null,
     'svc-drenagem'
+  );
+  assert.deepEqual(
+    anaphoric.decision.kind === 'answer_from_license'
+      ? anaphoric.decision.requestedFacets
+      : [],
+    ['HOW_PERFORMED'],
+    'como funciona o procedimento é HOW específica, não genérica'
   );
   assert.equal(
     procedure.decideProcedureInfoV2({
@@ -452,6 +502,9 @@ async function main(): Promise<void> {
     'Como funciona a agenda da Drenagem?',
     'Como funciona as agendas da Drenagem?',
     'Como funciona a sessão de amanhã da Drenagem?',
+    'Me fala sobre o agendamento da Drenagem?',
+    'Me conta sobre o pagamento da Drenagem?',
+    'Como é o horário da Drenagem?',
   ]) {
     assert.equal(
       procedure.decideProcedureInfoV2({
@@ -476,6 +529,34 @@ async function main(): Promise<void> {
       : [],
     ['peeling-what']
   );
+  assert.deepEqual(
+    peelingWhat.decision.kind === 'answer_from_license'
+      ? peelingWhat.decision.requestedFacets
+      : [],
+    ['WHAT_IT_IS']
+  );
+  const drenagemWhatOnly = procedure.decideProcedureInfoV2({
+    inboundText: 'O que é drenagem?',
+    frame: frame(),
+    servicesResult: licensedServices,
+  });
+  assert.deepEqual(drenagemWhatOnly.decision, {
+    kind: 'answer_from_license',
+    serviceId: 'svc-drenagem',
+    requestedFacets: ['WHAT_IT_IS'],
+    clauseIds: ['drenagem-what'],
+  });
+  const drenagemSpecificHow = procedure.decideProcedureInfoV2({
+    inboundText: 'Como é feita a sessão da Drenagem?',
+    frame: frame(),
+    servicesResult: licensedServices,
+  });
+  assert.deepEqual(drenagemSpecificHow.decision, {
+    kind: 'answer_from_license',
+    serviceId: 'svc-drenagem',
+    requestedFacets: ['HOW_PERFORMED'],
+    clauseIds: ['drenagem-how'],
+  });
   const peelingHow = procedure.decideProcedureInfoV2({
     inboundText: 'Como é feito o peeling?',
     frame: frame(),
@@ -489,6 +570,181 @@ async function main(): Promise<void> {
     requestedFacets: ['HOW_PERFORMED'],
     uncoveredFacets: ['HOW_PERFORMED'],
   });
+  assert.deepEqual(
+    procedure.decideProcedureInfoV2({
+      inboundText: 'Como é feita a sessão de peeling?',
+      frame: frame(),
+      servicesResult: licensedServices,
+    }).decision,
+    peelingHow.decision
+  );
+  assert.deepEqual(
+    procedure.decideProcedureInfoV2({
+      inboundText: 'Como é feito o procedimento de peeling?',
+      frame: frame(),
+      servicesResult: licensedServices,
+    }).decision,
+    peelingHow.decision
+  );
+
+  const specificComoFuncionaPeeling = [
+    'Como funciona a aplicação do peeling?',
+    'Como funciona a sessão do peeling?',
+  ] as const;
+  const specificComoFuncionaPeelingEscalate = {
+    kind: 'escalate' as const,
+    reasonCode: 'UNCADASTRED_INFO' as const,
+    topicCode: 'PROCEDURE_INFO' as const,
+    serviceId: 'svc-peeling',
+    requestedFacets: ['HOW_PERFORMED'] as const,
+    uncoveredFacets: ['HOW_PERFORMED'] as const,
+  };
+  for (const inboundText of specificComoFuncionaPeeling) {
+    assert.deepEqual(
+      procedure.decideProcedureInfoV2({
+        inboundText,
+        frame: frame(),
+        servicesResult: licensedServices,
+      }).decision,
+      specificComoFuncionaPeelingEscalate,
+      `${inboundText} × WHAT-only escala HOW_PERFORMED`
+    );
+  }
+  for (const inboundText of [
+    'Como funciona as aplicações do peeling?',
+    'Como funcionam as sessões do peeling?',
+    'Como funciona a sessão de peeling?',
+    'Como funciona a aplicação de peeling?',
+    'Como funciona o procedimento do peeling?',
+    'Como funciona o procedimento de peeling?',
+  ]) {
+    assert.deepEqual(
+      procedure.decideProcedureInfoV2({
+        inboundText,
+        frame: frame(),
+        servicesResult: licensedServices,
+      }).decision,
+      specificComoFuncionaPeelingEscalate,
+      inboundText
+    );
+  }
+
+  for (const genericPhrase of [
+    'Me fala sobre a Drenagem?',
+    'Me conta sobre a Drenagem?',
+    'Me fala um pouco sobre a Drenagem?',
+    'Como é a Drenagem?',
+  ]) {
+    const genericDecision = procedure.decideProcedureInfoV2({
+      inboundText: genericPhrase,
+      frame: frame(),
+      servicesResult: licensedServices,
+    });
+    assert.deepEqual(
+      genericDecision.decision,
+      {
+        kind: 'answer_from_license',
+        serviceId: 'svc-drenagem',
+        requestedFacets: ['WHAT_IT_IS', 'HOW_PERFORMED'],
+        clauseIds: ['drenagem-what', 'drenagem-how'],
+      },
+      genericPhrase
+    );
+  }
+
+  const peelingGeneric = procedure.decideProcedureInfoV2({
+    inboundText: 'Como funciona o peeling?',
+    frame: frame(),
+    servicesResult: licensedServices,
+  });
+  assert.deepEqual(
+    peelingGeneric.decision,
+    {
+      kind: 'answer_from_license',
+      serviceId: 'svc-peeling',
+      requestedFacets: ['WHAT_IT_IS'],
+      clauseIds: ['peeling-what'],
+    },
+    'genérica com licença só WHAT entrega o que há e não escala'
+  );
+
+  const peelingBothServices: ServicesResult = {
+    ...licensedServices,
+    services: licensedServices.services?.map((service) =>
+      service.id === 'svc-peeling'
+        ? {
+            ...service,
+            licensedDescription: {
+              sourceHash: '9'.repeat(64),
+              policyVersion: 'licensed-service-description-v1' as const,
+              clauses: [...peelingLicense.clauses, peelingHowClause],
+            },
+          }
+        : service
+    ),
+  };
+  const specificComoFuncionaPeelingAnswer = {
+    kind: 'answer_from_license' as const,
+    serviceId: 'svc-peeling',
+    requestedFacets: ['HOW_PERFORMED'] as const,
+    clauseIds: ['peeling-how'],
+  };
+  for (const inboundText of specificComoFuncionaPeeling) {
+    assert.deepEqual(
+      procedure.decideProcedureInfoV2({
+        inboundText,
+        frame: frame(),
+        servicesResult: peelingBothServices,
+      }).decision,
+      specificComoFuncionaPeelingAnswer,
+      `${inboundText} × WHAT+HOW entrega somente HOW_PERFORMED`
+    );
+  }
+  assert.deepEqual(
+    procedure.decideProcedureInfoV2({
+      inboundText: 'Como funciona a sessão da Drenagem?',
+      frame: frame(),
+      servicesResult: licensedServices,
+    }).decision,
+    {
+      kind: 'answer_from_license',
+      serviceId: 'svc-drenagem',
+      requestedFacets: ['HOW_PERFORMED'],
+      clauseIds: ['drenagem-how'],
+    },
+    'da + serviço: HOW específica, não genérica'
+  );
+
+  const howOnlyServices: ServicesResult = {
+    ...licensedServices,
+    services: licensedServices.services?.map((service) =>
+      service.id === 'svc-drenagem'
+        ? {
+            ...service,
+            licensedDescription: {
+              sourceHash: '8'.repeat(64),
+              policyVersion: 'licensed-service-description-v1' as const,
+              clauses: [drenagemLicense.clauses[1]!],
+            },
+          }
+        : service
+    ),
+  };
+  const genericHowOnly = procedure.decideProcedureInfoV2({
+    inboundText: 'Como funciona a Drenagem?',
+    frame: frame(),
+    servicesResult: howOnlyServices,
+  });
+  assert.deepEqual(
+    genericHowOnly.decision,
+    {
+      kind: 'answer_from_license',
+      serviceId: 'svc-drenagem',
+      requestedFacets: ['HOW_PERFORMED'],
+      clauseIds: ['drenagem-how'],
+    },
+    'genérica com licença só HOW entrega HOW e não escala'
+  );
 
   const budgetDecision = procedure.decideProcedureInfoV2({
     inboundText: 'Como funciona a Massagem Longa?',
@@ -500,7 +756,8 @@ async function main(): Promise<void> {
     budgetDecision.decision.kind === 'answer_from_license'
       ? budgetDecision.decision.clauseIds
       : [],
-    ['budget-how-1']
+    ['budget-what', 'budget-how-1'],
+    'orçamento estourado corta na fronteira de cláusula e prioriza WHAT_IT_IS + primeira HOW'
   );
   const budgetMaterialized =
     budgetDecision.decision.kind === 'answer_from_license'
@@ -510,9 +767,59 @@ async function main(): Promise<void> {
           termAcceptance: acceptance,
         })
       : null;
-  assert.equal(budgetMaterialized?.text, longSentenceOne);
+  assert.equal(
+    budgetMaterialized?.text,
+    licensedExactText(budgetLicense, ['budget-what', 'budget-how-1'])
+  );
   assert.ok((budgetMaterialized?.text.length ?? Infinity) <= 700);
+  assert.match(budgetMaterialized?.text ?? '', /A massagem longa usa/u);
   assert.doesNotMatch(budgetMaterialized?.text ?? '', /Pressão suave/u);
+
+  const vitiServices = procedure.hydrateLicensedServiceDescriptionsV2({
+    servicesResult: rawServices,
+    authoritativeCatalog: {
+      ...config(true).authoritativeCatalog!,
+      services: authoritativeServices(true).map((service) =>
+        service.id === 'svc-drenagem'
+          ? { ...service, licensedDescription: studioVitiDrenagemLicense }
+          : service
+      ),
+    },
+    termAcceptance: acceptance,
+    contractVersion: 2,
+  });
+  const victorTranscript = procedure.decideProcedureInfoV2({
+    inboundText: 'como funciona a drenagem?',
+    frame: frame(),
+    servicesResult: vitiServices,
+  });
+  assert.deepEqual(victorTranscript.decision, {
+    kind: 'answer_from_license',
+    serviceId: 'svc-drenagem',
+    requestedFacets: ['WHAT_IT_IS', 'HOW_PERFORMED'],
+    clauseIds: ['viti-drenagem-what', 'viti-drenagem-how'],
+  });
+  assert.equal(victorTranscript.decision.kind, 'answer_from_license');
+  if (victorTranscript.decision.kind !== 'answer_from_license') {
+    throw new Error('unreachable');
+  }
+  const victorMaterialized = procedure.materializeProcedureInfoAnswerV2({
+    decision: victorTranscript.decision,
+    servicesResult: vitiServices,
+    termAcceptance: acceptance,
+  });
+  assert.equal(victorMaterialized?.text, studioVitiDrenagemExact);
+  assert.ok((victorMaterialized?.text.length ?? Infinity) <= 700);
+  assert.equal(
+    victorMaterialized?.text.startsWith(
+      studioVitiDrenagemLicense.clauses[0]!.exactText
+    ),
+    true
+  );
+  assert.match(
+    victorMaterialized?.text ?? '',
+    /movimentos leves e ritmados/u
+  );
 
   assert.equal(how.decision.kind, 'answer_from_license');
   if (how.decision.kind !== 'answer_from_license') throw new Error('unreachable');
@@ -522,6 +829,7 @@ async function main(): Promise<void> {
     termAcceptance: acceptance,
   });
   assert.ok(materialized);
+  assert.equal(materialized!.text, drenagemExactBoth);
   const exactBoundary = boundary.evaluateBoundaryV2({
     rawCandidate: materialized!.text,
     servicesResult: licensedServices,
@@ -751,6 +1059,7 @@ async function main(): Promise<void> {
       },
     ],
   };
+  const poisonExact = licensedExactText(poisonLicense);
   const appointmentContextLicense = {
     sourceHash: '2'.repeat(64),
     policyVersion: 'licensed-service-description-v1' as const,
@@ -970,8 +1279,18 @@ async function main(): Promise<void> {
     activeConfig: config(true),
   });
   assert.equal(pureLicensed.reads, 0);
-  assert.equal(pureLicensed.prepared.payload, drenagemLicense.clauses[1]!.exactText);
+  assert.equal(pureLicensed.prepared.payload, drenagemExactBoth);
   assert.equal(pureLicensed.prepared.planReceipt.route, 'fast_path');
+
+  const victorRuntime = await runRuntime({
+    text: 'como funciona a drenagem?',
+    activeConfig: configWithDrenagemLicense(studioVitiDrenagemLicense, 'VITI'),
+  });
+  assert.equal(victorRuntime.reads, 0);
+  assert.equal(victorRuntime.escalations, 0);
+  assert.equal(victorRuntime.prepared.payload, studioVitiDrenagemExact);
+  assert.ok((victorRuntime.prepared.payload?.length ?? Infinity) <= 700);
+  assert.equal(victorRuntime.prepared.planReceipt.route, 'fast_path');
 
   const pureEscalated = await runRuntime({
     text: 'Como funciona a Drenagem?',
@@ -997,7 +1316,7 @@ async function main(): Promise<void> {
   assert.match(mixedLicensed.prepared.payload ?? '', /10h e 11h/u);
   assert.match(
     mixedLicensed.prepared.payload ?? '',
-    new RegExp(drenagemLicense.clauses[1]!.exactText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u')
+    new RegExp(drenagemExactBoth.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u')
   );
   const mixedLicensedStored = historyContentForAcceptedAssistant(
     mixedLicensed.prepared.payload ?? '',
@@ -1012,9 +1331,7 @@ async function main(): Promise<void> {
     'projeção LLM do turno misto preserva o segmento operacional'
   );
   assert.equal(
-    (mixedLicensedProjected[0]?.content ?? '').includes(
-      drenagemLicense.clauses[1]!.exactText
-    ),
+    (mixedLicensedProjected[0]?.content ?? '').includes(drenagemExactBoth),
     false,
     'projeção LLM do turno misto não reapresenta exactText'
   );
@@ -1051,7 +1368,7 @@ async function main(): Promise<void> {
   );
   assert.match(
     greetedLicensed.prepared.payload ?? '',
-    new RegExp(drenagemLicense.clauses[1]!.exactText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u')
+    new RegExp(drenagemExactBoth.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u')
   );
   assert.ok(
     (greetedLicensed.prepared.licensedCatalogSegments?.length ?? 0) > 0
@@ -1095,7 +1412,7 @@ async function main(): Promise<void> {
     text: 'Como funciona a Drenagem?',
     activeConfig: poisonConfig,
   });
-  assert.equal(poisonTurn.prepared.payload, poisonHowText);
+  assert.equal(poisonTurn.prepared.payload, poisonExact);
   assert.ok((poisonTurn.prepared.licensedCatalogSegments?.length ?? 0) > 0);
   const storedHistory = [
     { role: 'user' as const, content: 'Como funciona a Drenagem?' },
@@ -1109,10 +1426,10 @@ async function main(): Promise<void> {
   ];
   const storedAssistant = storedHistory[1]!.content;
   assert.match(storedAssistant, new RegExp(LICENSED_CATALOG_HISTORY_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u'));
-  assert.equal(customerVisibleAssistantContent(storedAssistant), poisonHowText);
+  assert.equal(customerVisibleAssistantContent(storedAssistant), poisonExact);
   assert.equal(
     panelVisibleConversationContent('assistant', storedAssistant),
-    poisonHowText,
+    poisonExact,
     'cláusula continua visível no histórico do painel/cliente'
   );
   const llmProjected = projectAssistantContentForLlm(storedAssistant);
@@ -1121,7 +1438,7 @@ async function main(): Promise<void> {
   assert.equal(llmProjected.includes('Drenagem Linfática'), false);
   assert.equal(llmProjected.includes('drenagem-poison-how'), false);
   assert.match(llmProjected, new RegExp(LICENSED_CATALOG_LLM_PLACEHOLDER_HEAD.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u'));
-  assert.match(llmProjected, /FACETAS: HOW_PERFORMED/u);
+  assert.match(llmProjected, /FACETAS: WHAT_IT_IS,HOW_PERFORMED/u);
   assert.equal(llmProjected.includes(LICENSED_CATALOG_MODEL_CONTEXT_PREFIX), false);
 
   const rePresented = toReceptionistModelHistory(storedHistory);
@@ -1463,7 +1780,7 @@ async function main(): Promise<void> {
   );
 
   console.log(
-    '✅ Ana conversational v2 procedure info: decisão, licença exata, boundary, retry, composição mista e regressões IA-5/IA-6 verificados.'
+    '✅ Ana conversational v2 procedure info: decisão, licença exata, boundary, retry, composição mista, generosidade IA-13, HOW específica IA-13b e regressões IA-5/IA-6 verificados.'
   );
 }
 
