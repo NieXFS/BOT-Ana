@@ -14,7 +14,8 @@ export const MODEL_REPLY_PURPOSES_V2 = [
 
 export type ModelReplyPurposeV2 = (typeof MODEL_REPLY_PURPOSES_V2)[number];
 
-export const PENDING_KINDS_V2 = [
+/** Pendências que o envelope plano do modelo pode declarar. */
+export const MODEL_PENDING_KINDS_V2 = [
   'SERVICE',
   'PROFESSIONAL',
   'DATE',
@@ -22,10 +23,18 @@ export const PENDING_KINDS_V2 = [
   'CONFIRMATION',
 ] as const;
 
+export type ModelPendingKindV2 = (typeof MODEL_PENDING_KINDS_V2)[number];
+
+export const PENDING_KINDS_V2 = [
+  ...MODEL_PENDING_KINDS_V2,
+  'CANCEL_TARGET',
+  'CANCEL_CONFIRMATION',
+] as const;
+
 export type PendingKindV2 = (typeof PENDING_KINDS_V2)[number];
 
 export const FLAT_NEXT_PENDING_V2 = [
-  ...PENDING_KINDS_V2,
+  ...MODEL_PENDING_KINDS_V2,
   'PRESERVE',
   'RESOLVED',
 ] as const;
@@ -126,6 +135,34 @@ export interface DuplicatePreflightClearanceV2 {
   readonly time: string;
 }
 
+export const CANCELLATION_DISPOSITIONS_V2 = [
+  'AUTO_CANCEL_ALLOWED',
+  'HUMAN_REVIEW_REQUIRED',
+  'NOT_CANCELABLE',
+] as const;
+
+export type CancellationDispositionV2 =
+  (typeof CANCELLATION_DISPOSITIONS_V2)[number];
+
+export type CancellationTargetTokenV2 = `cancel-target:${string}`;
+
+export interface CancellationCandidateV2 {
+  readonly token: CancellationTargetTokenV2;
+  /** Server-owned. Nunca entra em projeção de modelo, payload ou recibo. */
+  readonly appointmentId: string;
+  readonly startTime: string;
+  readonly fingerprint: string;
+  readonly disposition: CancellationDispositionV2;
+  readonly displayName: string;
+}
+
+export interface CancellationFlowV2 {
+  readonly flowId: string;
+  readonly candidates: readonly CancellationCandidateV2[];
+  readonly selectedToken?: CancellationTargetTokenV2;
+  readonly sourceReadTurnId: string;
+}
+
 export interface FlowStateV2 {
   readonly flowId: string;
   /** Relógio server-owned do último avanço operacional commitado. */
@@ -143,6 +180,8 @@ export interface FlowStateV2 {
   readonly duplicateResolution?: DuplicateResolutionEvidenceV2;
   /** Read v2 já executado para este draft e sem conflito computável. */
   readonly duplicatePreflightClearance?: DuplicatePreflightClearanceV2;
+  /** Fluxo de cancelamento conversacional; appointmentId nunca é projetado. */
+  readonly cancellation?: CancellationFlowV2;
   readonly fixedByProofVersion: FixedByProofVersionV2;
 }
 

@@ -16,7 +16,8 @@ export type VoiceCopyProducerPathV2 =
   | 'lifecycle_write'
   | 'lifecycle_slots'
   | 'interpreter_novo'
-  | 'read';
+  | 'read'
+  | 'cancellation';
 
 export function fastPathProvenanceV2(
   copyId: VoiceEligibleCopyIdV2
@@ -88,6 +89,7 @@ function copyIdFromProducerPathV2(
     case 'booking_confirmation':
     case 'lifecycle_write':
     case 'read':
+    case 'cancellation':
       return null;
     case 'lifecycle_slots':
       return 'availability_slots_offer';

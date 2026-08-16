@@ -56,6 +56,7 @@
     "smoke:ana-conversational-v2-wave1": "ts-node -T scripts/smoke-ana-conversational-v2-wave1.ts",
     "smoke:ana-conversational-v2-voice": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-voice.ts",
     "smoke:ana-conversational-v2-voice-fidelity": "ts-node -T scripts/smoke-ana-conversational-v2-voice-fidelity.ts",
+    "smoke:ana-conversational-v2-cancellation": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ANA_ESCALATION_ENABLED=true ts-node -T scripts/smoke-ana-conversational-v2-cancellation.ts",
     "smoke:ana-v2-tau2": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=${OPENAI_API_KEY:-sk-smoke-invalid} ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-v2-tau2.ts",
     "smoke:ana-v2-behavioral-receipt": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid OPENAI_API_KEY_LUNA=sk-luna-smoke-invalid DEEPSEEK_API_KEY=sk-deepseek-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-v2-behavioral-receipt.ts",
     "smoke:provider-protocol": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/protocol OPENAI_API_KEY=sk-smoke-invalid OPENAI_API_KEY_LUNA=sk-luna-smoke-invalid DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-deepseek-smoke-invalid} ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-provider-protocol.ts",

@@ -17,6 +17,7 @@ export type V2CheckpointStage =
   | 'before_regen'
   | 'during_regen'
   | 'during_voice'
+  | 'before_cancel_post'
   | 'before_transport';
 
 export interface ConversationalV2Checkpoint {

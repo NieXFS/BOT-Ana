@@ -114,6 +114,11 @@ interface AvailabilityResponse {
   professionalId?: string | number | null;
 }
 
+export type CancellationDisposition =
+  | 'AUTO_CANCEL_ALLOWED'
+  | 'HUMAN_REVIEW_REQUIRED'
+  | 'NOT_CANCELABLE';
+
 export type UpcomingAppointment = {
   id: string;
   startTime: string;
@@ -121,6 +126,8 @@ export type UpcomingAppointment = {
   serviceName: string;
   professionalName: string;
   status: string;
+  /** Aditivo ERP-6. Ausente = runtime velho; o fluxo v2 falha fechado. */
+  cancellationDisposition?: CancellationDisposition;
 };
 
 interface UpcomingAppointmentsResponse {
@@ -903,7 +910,19 @@ async function getCustomerUpcomingAppointmentsWithPolicy(
             typeof appointment?.id === 'string' &&
             typeof appointment.startTime === 'string' &&
             typeof appointment.endTime === 'string'
-        )
+        ).map((appointment) => {
+          const disposition = appointment.cancellationDisposition;
+          if (
+            disposition === 'AUTO_CANCEL_ALLOWED' ||
+            disposition === 'HUMAN_REVIEW_REQUIRED' ||
+            disposition === 'NOT_CANCELABLE'
+          ) {
+            return { ...appointment, cancellationDisposition: disposition };
+          }
+          const { cancellationDisposition: _ignored, ...rest } = appointment;
+          void _ignored;
+          return rest;
+        })
       : [];
 
     return { success: true, appointments };

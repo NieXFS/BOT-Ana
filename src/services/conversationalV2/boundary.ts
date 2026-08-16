@@ -1017,6 +1017,51 @@ export function isLicensedPreBookingSummaryV2(
   );
 }
 
+function isLicensedCancelCopyV2(
+  candidate: string,
+  input: BoundaryEvaluationInputV2
+): boolean {
+  const flow = input.flowState?.cancellation;
+  const normalized = normalize(candidate);
+  if (flow) {
+    for (const entry of flow.candidates) {
+      if (
+        normalized ===
+        normalize(`Confirma o cancelamento de ${entry.displayName}?`)
+      ) {
+        return true;
+      }
+    }
+    const names = flow.candidates
+      .map((entry) => entry.displayName.trim())
+      .filter(Boolean);
+    if (
+      names.length >= 1 &&
+      names.length <= 5 &&
+      (normalized ===
+        normalize(`Qual você quer cancelar: ${names.join('; ')}?`) ||
+        (names.length === 1 &&
+          normalized ===
+            normalize(
+              `Encontrei este agendamento: ${names[0]}. Qual você quer cancelar?`
+            )))
+    ) {
+      return true;
+    }
+  }
+  return [
+    'nao encontrei um agendamento futuro neste cadastro.',
+    'esse agendamento nao pode ser cancelado por aqui.',
+    'voce tem varios agendamentos. me diga a data e o horario do que quer cancelar.',
+    'nao identifiquei qual agendamento cancelar. pode me dizer a data e o horario?',
+    'nao localizei esse agendamento para cancelar. pode me dizer de novo a data e o horario?',
+    'tudo certo! o agendamento foi cancelado.',
+    'nao consegui cancelar esse agendamento agora. pode tentar novamente em instantes?',
+    'esse cancelamento precisa da equipe do estabelecimento. eu nao consegue conclui-lo por aqui.',
+    'esse cancelamento precisa da equipe do estabelecimento. eu nao consigo conclui-lo por aqui.',
+  ].includes(normalized);
+}
+
 function zonedCivilDate(now: Date, timezone: string): string | null {
   try {
     const values = Object.fromEntries(
@@ -1452,11 +1497,12 @@ function repeatedClarificationReasonsV2(
         catalog: input.servicesResult,
       })
     : null;
-  // Somente a copy normativa de CONFIRMATION (booking ou duplicidade) é
-  // repetível: ela reancora gates de escrita. Outra clarificação repetida no
-  // mesmo estado, inclusive sem PendingFrame, continua bloqueada.
+  // Somente a copy normativa de CONFIRMATION (booking, duplicidade ou
+  // cancelamento conversacional) é repetível: ela reancora gates de escrita.
   if (
-    pending?.kind === 'CONFIRMATION' &&
+    (pending?.kind === 'CONFIRMATION' ||
+      pending?.kind === 'CANCEL_CONFIRMATION' ||
+      pending?.kind === 'CANCEL_TARGET') &&
     canonicalPending !== null &&
     normalize(canonicalPending) === normalize(normalizedCandidate)
   ) {
@@ -1553,7 +1599,8 @@ export function evaluateBoundaryV2(
   );
   const discardedPreBookingAppointmentContext =
     inspection.reasons.includes('unverified_appointment_context') &&
-    isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog);
+    (isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog) ||
+      isLicensedCancelCopyV2(normalizedCandidate, input));
   const effectiveInspectionReasons = discardedPreBookingAppointmentContext
     ? inspection.reasons.filter(
         (reason) => reason !== 'unverified_appointment_context'
@@ -1638,7 +1685,8 @@ export function evaluateBoundaryV2(
     : mappedOutboundReasons;
   const discardedOutboundPreBookingContext =
     temporalFilteredReasons.includes('UNVERIFIED_APPOINTMENT_CONTEXT') &&
-    isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog);
+    (isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog) ||
+      isLicensedCancelCopyV2(normalizedCandidate, input));
   const appointmentFilteredReasons = discardedOutboundPreBookingContext
     ? temporalFilteredReasons.filter(
         (reason) => reason !== 'UNVERIFIED_APPOINTMENT_CONTEXT'

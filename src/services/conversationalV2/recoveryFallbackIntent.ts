@@ -44,6 +44,17 @@ function legacyPendingSnapshotV2(
 ): PendingOperationalQuestion | null {
   const pending = frame.pending;
   if (!pending) return null;
+  if (
+    pending.kind === 'CANCEL_TARGET' ||
+    pending.kind === 'CANCEL_CONFIRMATION'
+  ) {
+    return {
+      source: 'ANA',
+      listedServiceNames: [],
+      listedProfessionalNames: [],
+      alreadyAskedConfirmation: pending.kind === 'CANCEL_CONFIRMATION',
+    };
+  }
   const displayed = pending.options
     .map((option) => option.displayName.trim())
     .filter(Boolean);

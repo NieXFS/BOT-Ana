@@ -357,7 +357,8 @@ async function main(): Promise<void> {
     'getUpcomingAppointments'
   );
 
-  // Caso mínimo 4/K6: “cancela amanhã” só lê e mostra a rota segura; zero write.
+  // Caso mínimo 4/K6: “cancela amanhã” é do planner conversacional (antes do
+  // Power Zero). Com 2 alvos no dia, abre CANCEL_TARGET e zero write.
   const cancel = await runPrepared({
     phone: '+5511999000202',
     text: 'cancela amanhã',
@@ -372,6 +373,7 @@ async function main(): Promise<void> {
           serviceName: 'Drenagem Linfática',
           professionalName: 'Carla Mendes',
           status: 'CONFIRMED',
+          cancellationDisposition: 'AUTO_CANCEL_ALLOWED',
         },
         {
           id: 'appointment-b-secret',
@@ -380,11 +382,12 @@ async function main(): Promise<void> {
           serviceName: 'Peeling Facial',
           professionalName: 'Marina Costa',
           status: 'CONFIRMED',
+          cancellationDisposition: 'AUTO_CANCEL_ALLOWED',
         },
       ],
     },
   });
-  assert.equal(cancel.prepared.planReceipt.route, 'interpreter_hit');
+  assert.equal(cancel.prepared.planReceipt.route, 'fast_path');
   assert.equal(cancel.readCalls, 1);
   assert.equal(cancel.modelCalls, 0);
   assert.deepEqual(
@@ -395,7 +398,21 @@ async function main(): Promise<void> {
     JSON.stringify(cancel.prepared.planReceipt.toolEffects),
     /cancelAppointment/u
   );
-  assert.match(cancel.prepared.payload ?? '', /equipe/iu);
+  assert.match(
+    cancel.prepared.payload ?? '',
+    /^Qual você quer cancelar: Drenagem Linfática em 15\/08\/2026 às 10:00 com Carla Mendes; Peeling Facial em 15\/08\/2026 às 15:00 com Marina Costa\?$/u
+  );
+  assert.doesNotMatch(cancel.prepared.payload ?? '', /equipe/iu);
+  assert.doesNotMatch(
+    cancel.prepared.payload ?? '',
+    /appointment-a-secret|appointment-b-secret/u
+  );
+  if (cancel.prepared.transition.kind === 'open') {
+    assert.equal(cancel.prepared.transition.frame.kind, 'CANCEL_TARGET');
+    assert.equal(cancel.prepared.transition.frame.options.length, 2);
+  } else {
+    assert.fail('cancela amanhã com 2 alvos deve abrir CANCEL_TARGET');
+  }
 
   // Caso mínimo 2: CONFIRMATION + ack não chama intérprete, read nem write.
   const confirmationStore = new state.MemoryConversationalV2StateStore();

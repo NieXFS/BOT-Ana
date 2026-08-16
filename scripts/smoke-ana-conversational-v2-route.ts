@@ -2588,6 +2588,7 @@ async function main(): Promise<void> {
               serviceName: 'Drenagem Linfática',
               professionalName: 'Júlia',
               status: 'CONFIRMED',
+              cancellationDisposition: 'AUTO_CANCEL_ALLOWED',
             },
           ],
         });
@@ -2599,8 +2600,16 @@ async function main(): Promise<void> {
   });
   assert.equal(cancelReadCalls, 1);
   assert.equal(entitledCancelRead.planReceipt.route, 'fast_path');
-  assert.match(entitledCancelRead.payload ?? '', /Encontrei este agendamento/u);
+  assert.equal(
+    entitledCancelRead.payload,
+    'Confirma o cancelamento de Drenagem Linfática em 15/08/2026 às 14:00 com Júlia?'
+  );
+  assert.doesNotMatch(entitledCancelRead.payload ?? '', /appointment-not-exposed/u);
   assert.equal(entitledCancelRead.planReceipt.gateDecline, undefined);
+  assert.doesNotMatch(
+    JSON.stringify(entitledCancelRead.planReceipt.toolEffects),
+    /cancelAppointment/u
+  );
 
   // Replay canário T1/T2: pedido genérico supersede pendência velha sem modelo,
   // entrega SERVICE OPEN e ancora a resposta ordinal seguinte.

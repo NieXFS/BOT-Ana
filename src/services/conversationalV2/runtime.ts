@@ -24,10 +24,16 @@ import {
 } from '../contextManager';
 import { toReceptionistModelHistory, isHumanEchoContent, customerVisibleAssistantContent } from '../humanConversationContext';
 import { isConversationPaused } from '../pauseService';
+import type { EscalationDeps } from '../questionEscalation';
 import {
+  escalateCancelHumanReviewV2,
   escalateProcedureInfoQuestionV2,
   maybeEscalateReceptionistQuestionV2,
 } from '../questionEscalation';
+import {
+  cancelAppointmentV2Authorized,
+  type CancelAppointmentV2AuthorizedDeps,
+} from '../cancelAppointmentV2Authorized';
 import {
   resolveReceptionistTurnDecision,
   resolveTurnControl,
@@ -72,6 +78,21 @@ import {
   resolveBookingReentryFastPathV2,
   shouldOfferBookingReentryV2,
 } from './bookingReentryFastPath';
+import {
+  cancellationBlocksBookingWriteV2,
+  resolveCancellationPlannerV2,
+} from './cancellationPlannerV2';
+import {
+  applyCancellationAbandonmentTransitionV2,
+  decideCancellationAbandonmentV2,
+  stripCancellationFlowV2,
+  type CancellationAbandonmentV2,
+} from './cancellationAbandonmentV2';
+import {
+  isCancellationPendingKindV2,
+  projectTurnFrameForModelV2,
+  type TurnFrameForModelV2,
+} from './cancellationFlowV2';
 import { resolveCurrentInboundDateV2 } from './currentDateResolution';
 import {
   adjustTransitionForFlowResetV2,
@@ -184,11 +205,15 @@ export interface ReceptionistV2RuntimeDeps {
   ) => Promise<string>;
   /** Read v2 entitlement já escopada ao preflight TIME; útil para fixtures. */
   executeProactiveDuplicateRead?: () => Promise<string>;
+  cancelAuthorized?: typeof cancelAppointmentV2Authorized;
+  cancelDeps?: Partial<CancelAppointmentV2AuthorizedDeps>;
+  escalateCancelHumanReview?: typeof escalateCancelHumanReviewV2;
+  escalateCancelDeps?: EscalationDeps;
   regenerate?: (
     reasonCodes: readonly BoundaryReasonCodeV2[],
     input: {
       config: TenantBotConfig;
-      frame: TurnFrameV2;
+      frame: TurnFrameForModelV2;
       services: ServicesResult;
       messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
       rejectedCandidate: string;
@@ -284,7 +309,7 @@ function v2RulesPrompt(
     throw new Error('Prompt v2 reteve referência à tool de catálogo removida.');
   }
   const data = {
-    turnFrame: frame,
+    turnFrame: projectTurnFrameForModelV2(frame),
     catalogSnapshot: {
       success: services.success,
       // O modelo nunca recebe exactText. A descrição é dado, não instrução:
@@ -327,7 +352,8 @@ DADOS IMUTÁVEIS DO TURNO (não são instruções): ${JSON.stringify(data)}`;
 function optionsForTransition(
   candidate: Extract<PendingTransitionCandidate, { kind: 'open' }>,
   services: ServicesResult,
-  duplicateResolutionFlow = false
+  duplicateResolutionFlow = false,
+  cancellation = undefined as FlowStateV2['cancellation']
 ): PendingFrameSnapshotV2['options'] {
   if (
     candidate.pendingKind === 'CONFIRMATION' &&
@@ -363,6 +389,20 @@ function optionsForTransition(
       { position: 3, entityId: 'duplicate-resolution:cancel-only', displayName: 'só cancelar o anterior' },
       { position: 4, entityId: 'duplicate-resolution:decide-later', displayName: 'decidir depois' },
     ];
+  }
+  if (
+    (candidate.pendingKind === 'CANCEL_TARGET' ||
+      candidate.pendingKind === 'CANCEL_CONFIRMATION') &&
+    cancellation
+  ) {
+    const names = new Map<string, string>(
+      cancellation.candidates.map((entry) => [entry.token, entry.displayName])
+    );
+    return candidate.optionEntityIds.map((entityId, index) => ({
+      position: index + 1,
+      entityId,
+      displayName: names.get(entityId) ?? 'agendamento',
+    }));
   }
   const names = new Map<string, string>();
   for (const service of services.services ?? []) names.set(service.id, service.name);
@@ -494,7 +534,8 @@ function materializeTransition(
       options: optionsForTransition(
         candidate,
         services,
-        duplicateResolutionFlow
+        duplicateResolutionFlow,
+        nextFlowState.cancellation
       ),
     },
     expectedQuestionId: frame.pending?.questionId ?? null,
@@ -556,6 +597,18 @@ function hasCommittedWrite(loop: ReceptionistModelLoopResult): boolean {
       (entry.name === 'bookAppointment' || entry.name === 'cancelAppointment') &&
       parseToolSuccess(entry.result)
   );
+}
+
+function forbiddenAppointmentIdsV2(
+  ...flowStates: Array<FlowStateV2 | null | undefined>
+): string[] {
+  const ids = new Set<string>();
+  for (const flowState of flowStates) {
+    for (const candidate of flowState?.cancellation?.candidates ?? []) {
+      if (candidate.appointmentId.trim()) ids.add(candidate.appointmentId);
+    }
+  }
+  return [...ids];
 }
 
 function hasDuplicateResolutionReadEvidence(
@@ -1097,10 +1150,21 @@ export async function getReceptionistReplyV2(input: {
             'INTERNAL_HINT: escrita bloqueada porque uma escalada procedural será registrada neste turno.',
         });
       }
+      if (
+        cancellationBlocksBookingWriteV2(groundingFrame.flowState) &&
+        (functionName === 'bookAppointment' || functionName === 'cancelAppointment')
+      ) {
+        return JSON.stringify({
+          success: false,
+          reason: 'blocked',
+          message:
+            'INTERNAL_HINT: escrita bloqueada porque há um fluxo de cancelamento conversacional ativo.',
+        });
+      }
       return baseExecute(functionName, args);
     };
   };
-  const executeTool = executeToolForFrame(frame);
+  let executeTool = executeToolForFrame(frame);
   // Entitlement v2 deliberadamente separado do executor compartilhado: ele
   // só é usado depois que o fast-path provou uma opção TIME autoritativa. O
   // modelo continua sujeito ao upcomingAppointmentReadGate da rota legada.
@@ -1607,12 +1671,63 @@ export async function getReceptionistReplyV2(input: {
           },
         })
       : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
+  const cancellationAbandonment: CancellationAbandonmentV2 =
+    decideCancellationAbandonmentV2({
+      inboundText: currentInboundBatchText,
+      pending: frame.pending,
+      flowState: frame.flowState,
+      now: startedAt,
+    });
+  if (cancellationAbandonment.kind === 'abandon') {
+    executeTool = executeToolForFrame({
+      ...frame,
+      flowState: cancellationAbandonment.nextFlowState,
+    });
+  }
+  const cancellationPlannerInput = {
+    frame,
+    inboundText: currentInboundBatchText,
+    dateResolution,
+    config: input.config,
+    now: startedAt,
+    lastAcceptedDelivery: stored.lastAcceptedDelivery,
+    phone: input.phone,
+    inboundId,
+    executeUpcomingRead: () =>
+      executeEntitledUpcomingRead('getUpcomingAppointments', {}),
+    beforeCancelPost: () => checkRace('before_cancel_post'),
+    ...(deps.cancelAuthorized
+      ? { cancelAuthorized: deps.cancelAuthorized }
+      : {}),
+    ...(deps.cancelDeps ? { cancelDeps: deps.cancelDeps } : {}),
+    ...(deps.escalateCancelHumanReview
+      ? { escalateHumanReview: deps.escalateCancelHumanReview }
+      : {}),
+    ...(deps.escalateCancelDeps
+      ? { escalateDeps: deps.escalateCancelDeps }
+      : {}),
+    onGateDecline: (decline: GateDeclineV2) => {
+      selectedGateDecline = decline;
+    },
+  };
+  const cancellationFastPath =
+    cancellationAbandonment.kind === 'abandon'
+      ? { kind: 'continue_model' as const, reason: 'cancellation_abandoned' }
+      : !procedureEscalationPlanned &&
+          bookingReentryFastPath.kind === 'continue_model' &&
+          dateSlotsFastPath.kind === 'continue_model' &&
+          duplicateResolutionFastPath.kind === 'continue_model' &&
+          confirmationDuplicatePreflight.kind === 'continue_model' &&
+          bookingConfirmationFastPath.kind === 'continue_model'
+        ? await resolveCancellationPlannerV2(cancellationPlannerInput)
+        : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
   const readFastPath =
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
     confirmationDuplicatePreflight.kind === 'continue_model' &&
-    bookingConfirmationFastPath.kind === 'continue_model'
+    bookingConfirmationFastPath.kind === 'continue_model' &&
+    cancellationFastPath.kind === 'continue_model'
       ? await resolveReadFastPathV2({
         frame,
         inboundText: currentInboundText,
@@ -1634,6 +1749,7 @@ export async function getReceptionistReplyV2(input: {
     duplicateResolutionFastPath.kind === 'continue_model' &&
     confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
+    cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model'
       ? await resolveTimeDuplicatePreflightV2({
           frame,
@@ -1653,6 +1769,7 @@ export async function getReceptionistReplyV2(input: {
     duplicateResolutionFastPath.kind === 'continue_model' &&
     confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
+    cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model'
       ? resolveInitialServiceQuestionFastPathV2({
@@ -1668,6 +1785,7 @@ export async function getReceptionistReplyV2(input: {
     duplicateResolutionFastPath.kind === 'continue_model' &&
     confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
+    cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved'
@@ -1688,10 +1806,23 @@ export async function getReceptionistReplyV2(input: {
     duplicateResolutionFastPath.kind === 'continue_model' &&
     confirmationDuplicatePreflight.kind === 'continue_model' &&
     bookingConfirmationFastPath.kind === 'continue_model' &&
+    cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved' &&
     selectionFastPath?.kind !== 'resolved';
+
+  if (cancellationFastPath.kind === 'preempted') {
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'preempted',
+    });
+    return preparedPreemption(
+      cancellationFastPath.preemption,
+      successorTurnId,
+      cancellationFastPath.loop
+    );
+  }
 
   let interpreterResult: PowerZeroInterpreterResultV2 | null = null;
   let interpreterReceiptRoute:
@@ -1704,6 +1835,9 @@ export async function getReceptionistReplyV2(input: {
     loop: ReceptionistModelLoopResult;
     proof: ResolutionProof | null;
     nextFlowState?: FlowStateV2;
+    authoritativeEscalationQuestionId?: string;
+    actionRecorded?: boolean;
+    cancellationOwned?: boolean;
   } | null = null;
   let interpreterActionRecorded = false;
   let interpreterEscalationQuestionId: string | null = null;
@@ -1737,16 +1871,54 @@ export async function getReceptionistReplyV2(input: {
             nextFlowState: resolved.nextFlowState,
           };
         }
+      } else if (interpreted.route === 'CANCELAR') {
+        const resolved = await resolveCancellationPlannerV2({
+          ...cancellationPlannerInput,
+          forcePlan: true,
+        });
+        if (resolved.kind === 'preempted') {
+          emitRouteComparisonShadow({
+            legacyRoute: legacyShadowRoute,
+            v2Route: 'preempted',
+          });
+          return preparedPreemption(
+            resolved.preemption,
+            successorTurnId,
+            mergeFastPathLoopsV2(interpreterResult.loop, resolved.loop)
+          );
+        }
+        if (resolved.kind === 'resolved') {
+          interpreterResolved = {
+            result: resolved.result,
+            loop: mergeFastPathLoopsV2(interpreterResult.loop, resolved.loop),
+            proof: null,
+            nextFlowState: resolved.nextFlowState,
+            ...(resolved.authoritativeEscalationQuestionId
+              ? {
+                  authoritativeEscalationQuestionId:
+                    resolved.authoritativeEscalationQuestionId,
+                }
+              : {}),
+            ...(resolved.actionRecorded ? { actionRecorded: true } : {}),
+            cancellationOwned: true,
+          };
+          if (resolved.actionRecorded && resolved.authoritativeEscalationQuestionId) {
+            interpreterActionRecorded = true;
+            interpreterEscalationQuestionId =
+              resolved.authoritativeEscalationQuestionId;
+          }
+          serverCopyProvenance = provenanceFromProducerPathV2({
+            producer: 'cancellation',
+            result: resolved.result,
+          });
+        }
       } else if (
         interpreted.route === 'CONSULTAR_AGENDA' ||
-        interpreted.route === 'CANCELAR' ||
         interpreted.route === 'REMARCAR'
       ) {
-        const forcedExistingIntent = interpreted.route === 'CANCELAR'
-          ? 'cancel'
-          : interpreted.route === 'REMARCAR'
-            ? 'reschedule'
-            : 'inspect';
+        const forcedExistingIntent = interpreted.route === 'REMARCAR'
+          ? 'reschedule'
+          : 'inspect';
         const resolved = await resolveReadFastPathV2({
           frame,
           inboundText: currentInboundBatchText,
@@ -1867,6 +2039,14 @@ export async function getReceptionistReplyV2(input: {
       selectedGateDecline = {
         gate: 'duplicate_resolution',
         reason: duplicateResolutionFastPath.reason,
+      };
+    } else if (
+      isCancellationPendingKindV2(frame.pending?.kind) &&
+      cancellationAbandonment.kind !== 'abandon'
+    ) {
+      selectedGateDecline = {
+        gate: 'cancellation',
+        reason: cancellationFastPath.reason,
       };
     } else if (
       hasExplicitUpcomingReadRequestV2(currentInboundText) ||
@@ -2054,6 +2234,21 @@ export async function getReceptionistReplyV2(input: {
       producer: 'booking_confirmation',
       result: bookingConfirmationFastPath.result,
     });
+  } else if (cancellationFastPath.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    loop = cancellationFastPath.loop;
+    proof = null;
+    selectionNextFlowState = cancellationFastPath.nextFlowState;
+    primary = {
+      ok: true,
+      value: cancellationFastPath.result,
+      resolutionProof: null,
+      resolutionProofRejections: [],
+    };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'cancellation',
+      result: cancellationFastPath.result,
+    });
   } else if (readFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = readFastPath.loop;
@@ -2174,12 +2369,26 @@ export async function getReceptionistReplyV2(input: {
 
   writeCommitted = hasCommittedWrite(loop);
 
-  const lifecycleOverride = reduceToolLifecycleV2({
-    frame,
-    toolTrace: loop.toolTrace,
-    services,
-    sourceInboundText: input.userMessage,
-  });
+  const cancellationOwnedTurn =
+    cancellationFastPath.kind === 'resolved' ||
+    interpreterResolved?.cancellationOwned === true;
+  const cancellationEscalationQuestionId =
+    cancellationFastPath.kind === 'resolved'
+      ? cancellationFastPath.authoritativeEscalationQuestionId ?? null
+      : interpreterResolved?.authoritativeEscalationQuestionId ?? null;
+  const cancellationActionRecorded =
+    cancellationFastPath.kind === 'resolved'
+      ? cancellationFastPath.actionRecorded === true
+      : interpreterResolved?.actionRecorded === true;
+
+  const lifecycleOverride = cancellationOwnedTurn
+    ? null
+    : reduceToolLifecycleV2({
+        frame,
+        toolTrace: loop.toolTrace,
+        services,
+        sourceInboundText: input.userMessage,
+      });
   if (lifecycleOverride) {
     primary = {
       ok: true,
@@ -2222,10 +2431,14 @@ export async function getReceptionistReplyV2(input: {
     return preparedPreemption(primaryRace, successorTurnId, loop);
   }
 
-  const nextFlowState =
+  const nextFlowStateRaw =
     selectionNextFlowState
       ? selectionNextFlowState
       : flowStateWithProof(frame, proof, services);
+  const nextFlowState =
+    cancellationAbandonment.kind === 'abandon'
+      ? stripCancellationFlowV2(nextFlowStateRaw)
+      : nextFlowStateRaw;
   const primaryCandidate: ModelTurnResultV2 | null = primary.ok
     ? primary.value
     : null;
@@ -2237,10 +2450,12 @@ export async function getReceptionistReplyV2(input: {
   const runRegeneration = async (
     reasonCodes: readonly BoundaryReasonCodeV2[]
   ): Promise<RegenerationResultV2> => {
+    const completeRegenFrame = { ...frame, flowState: nextFlowState };
+    const projectedRegenFrame = projectTurnFrameForModelV2(completeRegenFrame);
     const regenerated = deps.regenerate
       ? await deps.regenerate(reasonCodes, {
           config: input.config,
-          frame: { ...frame, flowState: nextFlowState },
+          frame: projectedRegenFrame,
           services,
           messages,
           rejectedCandidate: rejectedPrimaryRaw,
@@ -2249,14 +2464,14 @@ export async function getReceptionistReplyV2(input: {
             !primaryFailedWithEmptyOutput,
           validationContext: {
             ...validationContext,
-            frame: { ...frame, flowState: nextFlowState },
+            frame: completeRegenFrame,
             toolTrace: loop.toolTrace,
           },
         })
       : await regenerateReceptionistCopyV2({
           config: input.config,
           snapshot: {
-            frame: { ...frame, flowState: nextFlowState },
+            frame: projectedRegenFrame,
             catalogSnapshot: {
               services: modelVisibleServicesV2(services).services ?? [],
               professionals: services.professionals ?? [],
@@ -2271,7 +2486,7 @@ export async function getReceptionistReplyV2(input: {
             !primaryFailedWithEmptyOutput,
           validationContext: {
             ...validationContext,
-            frame: { ...frame, flowState: nextFlowState },
+            frame: completeRegenFrame,
             toolTrace: loop.toolTrace,
           },
         });
@@ -2297,6 +2512,14 @@ export async function getReceptionistReplyV2(input: {
       sourceInboundText: input.userMessage,
       currentInboundIds,
       inboundTextsById,
+      forbiddenAppointmentIds: forbiddenAppointmentIdsV2(
+        frame.flowState,
+        nextFlowState
+      ),
+      actionRecorded: cancellationActionRecorded,
+      outboundEvidence: cancellationEscalationQuestionId
+        ? { authoritativeEscalationQuestionId: cancellationEscalationQuestionId }
+        : undefined,
       route: interpreterResolved ? 'interpreter' : 'model',
       pendingAnaOpen:
         frame.pending !== null &&
@@ -2371,10 +2594,16 @@ export async function getReceptionistReplyV2(input: {
     frame.pending,
     flowResetReason
   );
-  const committedFlowState = stampFlowOperationalActivityV2(
-    recoveredFlowState,
-    startedAt
+  candidate = applyCancellationAbandonmentTransitionV2(
+    candidate,
+    cancellationAbandonment
   );
+  const skipOperationalStamp =
+    cancellationFastPath.kind === 'resolved' &&
+    cancellationFastPath.refreshOperationalAt === false;
+  const committedFlowState = skipOperationalStamp
+    ? recoveredFlowState
+    : stampFlowOperationalActivityV2(recoveredFlowState, startedAt);
   const voiceLayer = recovery.payload
     ? await applyConversationalVoiceV2({
         config: input.config,
@@ -2397,6 +2626,17 @@ export async function getReceptionistReplyV2(input: {
           sourceInboundText: input.userMessage,
           currentInboundIds,
           inboundTextsById,
+          forbiddenAppointmentIds: forbiddenAppointmentIdsV2(
+            frame.flowState,
+            committedFlowState
+          ),
+          actionRecorded: cancellationActionRecorded,
+          outboundEvidence: cancellationEscalationQuestionId
+            ? {
+                authoritativeEscalationQuestionId:
+                  cancellationEscalationQuestionId,
+              }
+            : undefined,
           route: interpreterResolved ? 'interpreter' : 'model',
           pendingAnaOpen:
             frame.pending !== null &&
@@ -2553,6 +2793,8 @@ export async function getReceptionistReplyV2(input: {
       : recovery.recoveryKind === 'direct_fallback'
         ? 'fallback'
         : nominalRoute);
+  const handoffQuestionId =
+    procedureEscalationQuestionId ?? cancellationEscalationQuestionId;
   const boundaryAttempts = recovery.boundaryAttempts.map((entry) => ({
     index: entry.index,
     candidateHash: entry.candidateHash,
@@ -2597,11 +2839,8 @@ export async function getReceptionistReplyV2(input: {
     ),
     elicitationVariant,
     copyVariant,
-    ...(procedureEscalationQuestionId
-      ? {
-          authoritativeEscalationQuestionId:
-            procedureEscalationQuestionId,
-        }
+    ...(handoffQuestionId
+      ? { authoritativeEscalationQuestionId: handoffQuestionId }
       : {}),
     ...(procedureInfoAnswer
       ? licensedCatalogProvenanceForPayloadV2(

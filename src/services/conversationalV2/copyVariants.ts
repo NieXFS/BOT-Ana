@@ -57,7 +57,10 @@ export function varyUnanchoredServerCopyV2(input: {
   const transition = input.result.pendingTransitionCandidate;
   if (
     input.result.replyPurpose === 'WRITE_CONFIRMATION' ||
-    (transition.kind === 'open' && transition.pendingKind === 'CONFIRMATION')
+    (transition.kind === 'open' &&
+      (transition.pendingKind === 'CONFIRMATION' ||
+        transition.pendingKind === 'CANCEL_CONFIRMATION' ||
+        transition.pendingKind === 'CANCEL_TARGET'))
   ) {
     return { result: input.result, variant: 'canonical' };
   }

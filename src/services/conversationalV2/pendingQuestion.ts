@@ -215,5 +215,28 @@ export function buildPendingQuestionV2(input: {
           })
         : 'Você confirma essa opção?';
     }
+    case 'CANCEL_TARGET': {
+      if (names.length > 5) {
+        return 'Você tem vários agendamentos. Me diga a data e o horário do que quer cancelar.';
+      }
+      return names.length > 0
+        ? `Qual você quer cancelar: ${names.join('; ')}?`
+        : 'Qual agendamento você quer cancelar?';
+    }
+    case 'CANCEL_CONFIRMATION': {
+      const selected =
+        input.flowState.cancellation?.candidates.find(
+          (candidate) =>
+            candidate.token === input.flowState.cancellation?.selectedToken
+        ) ??
+        input.flowState.cancellation?.candidates.find(
+          (candidate) => candidate.token === pending.options[0]?.entityId
+        );
+      return selected
+        ? `Confirma o cancelamento de ${selected.displayName}?`
+        : names[0]
+          ? `Confirma o cancelamento de ${names[0]}?`
+          : 'Confirma o cancelamento?';
+    }
   }
 }

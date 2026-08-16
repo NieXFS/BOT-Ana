@@ -5,6 +5,7 @@ import {
   updateEscalationCache,
 } from './escalationCache';
 import { customerPhoneAsE164 } from './conversationOrder';
+import { buildHumanReviewCancelFallbackCopyV2 } from './conversationalV2/cancellationFlowV2';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -252,6 +253,53 @@ export async function escalateProcedureInfoQuestionV2(
   return {
     matched: true,
     reply: buildEscalationReplyV2(outcome, input.responsibleName),
+    actionRecorded: outcome.kind === 'created',
+    questionId: outcome.kind === 'created' ? outcome.questionId : null,
+    outcome: outcome.kind,
+  };
+}
+
+/**
+ * Pedido operacional de cancelamento que a Ana não pode escrever sozinha
+ * (PAID, fiscal, comissão, pacote consumido, contrato ausente). OUT_OF_SCOPE
+ * — não é UNCADASTRED_INFO nem HUMAN_REQUEST: a cliente pediu cancelar, não
+ * falar com alguém, e a Ana não tem a informação em falta; o ato automático
+ * está fora do alcance dela.
+ */
+export async function escalateCancelHumanReviewV2(
+  input: {
+    phoneNumberId: string;
+    customerPhone: string;
+    messageId: string | null;
+    responsibleName?: string;
+  },
+  deps: EscalationDeps = defaultDeps
+): Promise<ReceptionistEscalationV2Decision> {
+  if (!isAnaEscalationEnabled() || !input.messageId) {
+    const outcome = { kind: 'failed' } as const;
+    return {
+      matched: true,
+      reply: buildHumanReviewCancelFallbackCopyV2(),
+      actionRecorded: false,
+      questionId: null,
+      outcome: outcome.kind,
+    };
+  }
+  const outcome = await escalateQuestion(
+    {
+      phoneNumberId: input.phoneNumberId,
+      customerPhone: input.customerPhone,
+      messageId: input.messageId,
+      reasonCode: 'OUT_OF_SCOPE',
+    },
+    deps
+  );
+  return {
+    matched: true,
+    reply:
+      outcome.kind === 'created'
+        ? buildEscalationReplyV2(outcome, input.responsibleName)
+        : buildHumanReviewCancelFallbackCopyV2(),
     actionRecorded: outcome.kind === 'created',
     questionId: outcome.kind === 'created' ? outcome.questionId : null,
     outcome: outcome.kind,

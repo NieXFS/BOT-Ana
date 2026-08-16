@@ -11,8 +11,11 @@ import type {
   BoundaryReasonCodeV2,
   ModelTurnResultV2,
   ResolutionProof,
-  TurnFrameV2,
 } from './contracts';
+import {
+  projectTurnFrameForModelV2,
+  type TurnFrameForModelV2,
+} from './cancellationFlowV2';
 import {
   parseModelTurnResultV2,
   type ModelResultValidationContextV2,
@@ -21,7 +24,7 @@ import {
 import { MODEL_TURN_RESULT_V2_CONTRACT_BLOCK } from './modelResultContract';
 
 export interface FrozenRegenerationSnapshotV2 {
-  frame: TurnFrameV2;
+  frame: TurnFrameForModelV2;
   catalogSnapshot: AuthoritativeOutboundCatalog;
   messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
   rejectedCandidate: string;
@@ -104,7 +107,7 @@ export function buildRegenerationMessagesV2(
 ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
   const frozen = deepFreeze(cloneJson(snapshot));
   const correctionData = {
-    turnFrame: frozen.frame,
+    turnFrame: projectTurnFrameForModelV2(frozen.frame),
     catalogSnapshot: frozen.catalogSnapshot,
     rejectedCandidate: frozen.rejectedCandidate,
     boundaryReasonCodes: [...reasonCodes],

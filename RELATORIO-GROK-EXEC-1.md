@@ -1525,3 +1525,177 @@ HEAD permaneceu `a16cc80` destacado. Sem commit.
 - ~3,3% dos turnos **já** gravaram plano e cairam no fallback legado; o cliente viu a mensagem de erro, não a pergunta de duplicidade. Após o hotfix, UUID técnico deixa de abortar o outbox.
 - `emitPlan`/`emitDelivery` agora engolem falha de serialize: o cliente recebe, o log estruturado do plano pode faltar naquele turno (hashes + detail no `serialize_failed`).
 - A loteria continua em qualquer outro sítio que aplique `PHONE_VALUE_RE` a UUID sem a isenção RFC-4122.
+
+## Exec IA-11 — Fluxo de cancelamento conversacional v2
+
+**Status:** implementado na worktree, sem commit. HEAD destacado `81025c29a06a73a19d2a808a01aaf66343e7abf0` (= produção; IA-10 + isenção UUID v4-estrita). Sem troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Instrução executável do Sol seguida na íntegra.
+
+### Evidência (F6, E2E real)
+
+Três turnos reais não roteavam até a âncora de compliance e a lista não abria pendência:
+
+1. `"Na verdade preciso cancelar esse de domingo às 10h"` → listou e parou.
+2. `"O de domingo as 10h"` → fallback OTHER.
+3. `"Quero cancelar a drenagem de 16/08 as 10h"` → listou de novo.
+
+A âncora existia; o Power Zero `CANCELAR` só lia + copy `STANDALONE_CANCEL` (“equipe”) e o intérprete não aceita pendings `CANCEL_*` (só SERVICE/PROFESSIONAL/TIME). Extensão do intérprete ficou **fora** deste exec, como pedido.
+
+### Contrato ERP (Exec ERP-6, `43f2bd4`, ainda não deployado)
+
+Fixtures espelham o contrato aditivo:
+
+- `GET /api/v1/agenda/customer-upcoming`: `cancellationDisposition: "AUTO_CANCEL_ALLOWED" | "HUMAN_REVIEW_REQUIRED" | "NOT_CANCELABLE"`. Upcoming inclui PAID futuro (HUMAN_REVIEW). COMPLETED/CANCELLED/NO_SHOW fora.
+- `POST /api/v1/agenda/cancel` com disposition ≠ AUTO → HTTP 422 `{ error, code: "CANCEL_DISPOSITION_DENIED", disposition }`.
+- Item **sem** disposition (runtime velho) → fail-closed = HUMAN_REVIEW.
+
+`cancelAppointment` legado e `cancellationIntentGate` **não** foram alterados nem chamados pelo write v2.
+
+### O que entrou
+
+**Puro** — `src/services/conversationalV2/cancellationFlowV2.ts`:
+
+- `detectPositiveCancellationIntentV2`, `resolveCancellationCandidateV2`, `planCancellationIntentV2`, `resolveCancellationPendingSelectionV2`, `cancelConfirmationGateV2`.
+- Entrada: `currentInboundBatchText`, `CurrentDateResolutionV2`, timezone, pendência fresca, candidatos server-owned, `lastAcceptedDelivery`. Sem ID técnico na projeção de modelo.
+- Token `cancel-target:<20 hex SHA-256 de ana-v2-cancel-target:${id}>`. Fingerprint e `appointmentId` ficam no estado persistido; `projectTurnFrameForModelV2` os omite.
+- Copies canônicas byte-fixas. Confirmação: `Confirma o cancelamento de <resumo canônico>?` — sem voz, sem regeneração semântica, sem modelo. **Não** reutiliza `CANCELLATION_HINT`.
+- Resolução: data+hora civil **ou** weekday+hora no TZ do tenant. Data explícita em conflito com weekday = ambiguous. “O de domingo às 10h” contra pendência aberta só casa se for **exatamente um** candidato. Ordinal e strip de cortesia só ancorados na pendência. 0 ou 2+ matches preservam a pendência.
+
+**Contratos / persistência**
+
+- `PendingKindV2 += CANCEL_TARGET | CANCEL_CONFIRMATION`. Envelope do modelo **intacto**: `MODEL_PENDING_KINDS_V2` / contrato flat continuam sem CANCEL_*.
+- `FlowStateV2.cancellation?: CancellationFlowV2` (flowId, candidates com token opaco + appointmentId server-owned, selectedToken?, sourceReadTurnId).
+- `pendingQuestion.ts`, boundary, provenance (`producer: 'cancellation'` → denylist de voz), copyVariants, recoveryFallbackIntent.
+
+**Write separado** — `src/services/cancelAppointmentV2Authorized.ts`:
+
+- Relê via `getCustomerUpcomingAppointmentsV2`.
+- Valida identidade (telefone **só** do inbound autenticado), `cancellationDisposition === AUTO`, `appointmentId`, `startTime`, fingerprint e token da pendência.
+- Um POST tenant+customer-scoped. Cliente só vê “cancelado” após `success:true`.
+
+**Planner no runtime** — `cancellationPlannerV2.ts`, inserido **depois** do booking-confirmation fast-path e **antes** de `readFastPath`. Rota Power Zero `CANCELAR` chama o mesmo planner com `forcePlan: true` (rede de segurança; o verbo já é interceptado antes do intérprete).
+
+- Consulta pura permanece terminal, sem pendência de cancel.
+- 1 alvo AUTO → abre `CANCEL_CONFIRMATION` (zero write nesse turno).
+- 2–5 → abre `CANCEL_TARGET`.
+- 6+ → pede data/hora (abre `CANCEL_TARGET` com os tokens para o resolvedor; copy é datetime, não lista).
+- Nunca cancela no turno de seleção.
+- `bookAppointment` e `cancelAppointment` do modelo bloqueados enquanto `CancellationFlowV2` ativo.
+- Turno owned pelo planner **não** passa por `reduceToolLifecycleV2` (evita “agendamento **anterior** foi cancelado”).
+
+### Disposições e escalada — `OUT_OF_SCOPE`
+
+| Disposition | Efeito |
+|---|---|
+| `AUTO_CANCEL_ALLOWED` | fluxo completo (lista/confirmação/write) |
+| `HUMAN_REVIEW_REQUIRED` | zero POST; cria Pergunta pela máquina de escalada existente |
+| `NOT_CANCELABLE` | copy canônica, zero write |
+| ausente / inválida | fail-closed = HUMAN_REVIEW |
+
+**Por que `OUT_OF_SCOPE` e não `UNCADASTRED_INFO` / `HUMAN_REQUEST`:** a cliente pediu um ato operacional (cancelar), não “falar com alguém”. Não falta um fato de cadastro para a Ana responder — o write automático está fora do alcance dela (PAID, fiscal, comissão, pacote, contrato ausente). `HUMAN_REQUEST` é pedido explícito de humano; `UNCADASTRED_INFO` é dúvida de catálogo. `OUT_OF_SCOPE` é o reason code existente cuja semântica casa: o ato não cabe na Ana. Helper: `escalateCancelHumanReviewV2`.
+
+### Invariantes de segurança (cobertas no smoke)
+
+- Confirmação só vale com delivery **ACEITO** da pergunta canônica (mesma âncora delivery-aware do booking; pausa/supersedida/vencida/não entregue → zero write).
+- Opt-out, HUMAN_ACTIVE, escalada e pausa vencem entrada e write pelo `messageHandler` / preemption do runtime — sem atalho paralelo.
+- 1 write por turno. Telefone sempre do inbound autenticado.
+- Alvo de outro cliente, removido, fingerprint alterado → zero POST.
+- Nenhum `appointmentId` em prompt, payload de cliente, histórico de modelo ou recibo de cliente.
+
+### Smokes tocados fora do novo
+
+- `smoke-ana-conversational-v2-interpreter.ts` caso 4/K6 (`cancela amanhã`): agora espera `fast_path` + lista `CANCEL_TARGET` + zero write. **Não** revertemos o planner para fingir `interpreter_hit` + copy “equipe”.
+- `smoke-ana-conversational-v2-route.ts` entitlement `quero cancelar` com 1 alvo AUTO: confirmação canônica, zero `cancelAppointment`.
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | 11 cenários do Sol; HUMAN_REVIEW=`OUT_OF_SCOPE`; zero appointmentId projetado |
+| `npm run smoke:ana-conversational-v2-contracts` | 0 | |
+| `npm run smoke:ana-conversational-v2-boundary` | 0 | |
+| `npm run smoke:ana-conversational-v2-recovery` | 0 | |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `npm run smoke:ana-conversational-v2-persistence` | 0 | |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | |
+| `npm run smoke:ana-conversational-v2-social-reads` | 0 | |
+| `npm run smoke:ana-conversational-v2-escalation` | 0 | |
+| `npm run smoke:ana-conversational-v2-voice` | 0 | |
+| `npm run smoke:ana-conversational-v2-voice-fidelity` | 0 | |
+| `npm run smoke:ana-conversational-v2-interpreter` | 0 | K6 agora `fast_path` + lista |
+| `npm run smoke:ana-conversational-v2-route` | 0 | entitlement de cancel = confirmação v2 |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `81025c2` destacado. Sem commit. Conferência do Sol na sequência; deploy só depois.
+
+### Riscos / fora de escopo
+
+- ERP-6 ainda não está em produção: em runtime velho, upcoming **sem** `cancellationDisposition` cai em HUMAN_REVIEW (fail-closed). O canário de cancelamento conversacional com write AUTO depende do deploy do ERP.
+- Intérprete Power Zero **não** passou a aceitar `CANCEL_TARGET` / `CANCEL_CONFIRMATION`; o resolvedor determinístico cobre a seleção. Frases sem verbo de cancelar e sem pendência aberta continuam fora (ex.: o 2º turno F6 só resolve **depois** da lista entregue).
+- 6+ candidatos abrem `CANCEL_TARGET` interno para o resolvedor de datetime, mas a copy pedida ao cliente é só data/hora — não listamos os 6.
+- Confirmação de cancelamento é denylist de voz (`producer: 'cancellation'`).
+
+## Exec IA-12 — 3 bloqueios do Sol sobre o IA-11 (+ whitespace)
+
+**Status:** corrigido na worktree, sem commit. HEAD destacado `81025c2` (= produção; working tree IA-11 + IA-12). Sem troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Instruções vinculantes do Sol seguidas na íntegra. Q1 (write path), âncora de delivery, Q5 (OUT_OF_SCOPE), Q6 (K6) e Q7 (fail-closed) permaneceram.
+
+### 1 (CRÍTICO) — Regeneração não vaza appointmentId/fingerprint
+
+Provado pelo Sol: `runtime.ts` passava o TurnFrameV2 completo ao regenerador; `buildRegenerationMessagesV2` serializava o frame integral.
+
+Correção:
+
+- `projectTurnFrameForModelV2` roda **dentro** de `buildRegenerationMessagesV2` (defesa em profundidade).
+- Contrato de `deps.regenerate` recebe `TurnFrameForModelV2` (projeção). O frame completo fica só no `validationContext` local, não serializado ao provider.
+- Snapshot de produção também leva a projeção.
+
+Regressões no smoke de cancelamento:
+
+- Sonda direta de `buildRegenerationMessagesV2` com frame completo contendo `appointmentId` + fingerprint → mensagens sem as duas chaves e sem os valores.
+- Runtime boundary→regen com `CancellationFlowV2` no estado: `regenInput.frame` e mensagens capturadas sem `appointmentId`/`fingerprint`; `validationContext.frame` local ainda tem o frame completo.
+
+### 2 — Abandono e expiração do CancellationFlowV2
+
+`CancellationAbandonmentV2` corre **antes** do planner. Reconhece:
+
+- pedido explícito de agendamento/remarcação (`agendar`/`marcar`/`remarcar`/`reagendar`);
+- retirada explícita (`não quero cancelar`, `deixa pra lá`);
+- pendência `CANCEL_*` vencida (>4h), mesmo com `lastOperationalAt` recente.
+
+Efeito: invalida a pendência `CANCEL_*`, remove `flowState.cancellation`, o pipeline normal trata o pedido. `bookAppointment` deixa de receber o INTERNAL_HINT artificial.
+
+`ambiguous_reference` **não** renova `lastOperationalAt` (planner `stampActivity: false` + runtime `refreshOperationalAt: false`).
+
+Fixtures: `CANCEL_TARGET` → `"quero agendar Drenagem"`; `CANCEL_CONFIRMATION` → `"não quero cancelar; quero agendar"`; pendência vencida com atividade recente — todas com zero POST de cancel e zero bloqueio artificial de booking.
+
+### 3 — Checkpoint imediatamente antes do POST
+
+`beforeCancelPost(): Promise<DeliveryPreemptionV2 | null>` vai do runtime ao executor. Chamado após releitura/fingerprint/disposition e **imediatamente** antes de `postCancel`. Estágio `before_cancel_post`.
+
+Em `PAUSE_RECHECK` ou `SUPERSEDED_BY_NEW_INBOUND`: zero POST, pendência preservada, sucessor enfileirado. Fixture que vira o checkpoint exatamente entre releitura e POST → `posts=0`, `preemption=SUPERSEDED_BY_NEW_INBOUND`.
+
+### 4 — whitespace EOF
+
+Removida a linha em branco extra no EOF de `RELATORIO-GROK-EXEC-1.md` (`git diff --check` em `:1641`).
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | IA-11 intacto + regen sem vazamento + abandono/TTL + checkpoint pré-POST |
+| `npm run smoke:ana-conversational-v2-recovery` | 0 | |
+| `npm run smoke:ana-conversational-v2-route` | 0 | |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-conversational-v2-interpreter` | 0 | K6 permanece `fast_path` + lista |
+| `npm run smoke:ana-conversational-v2-persistence` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `81025c2` destacado. Sem commit.

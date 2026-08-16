@@ -491,6 +491,12 @@ export function resolvePendingOptionProofV2(input: {
 }): ResolutionProof | null {
   const { frame, inboundId, inboundText, now } = input;
   if (!frame.pending || !pendingFresh(frame, now)) return null;
+  if (
+    frame.pending.kind === 'CANCEL_TARGET' ||
+    frame.pending.kind === 'CANCEL_CONFIRMATION'
+  ) {
+    return null;
+  }
   // Igualdade temporal normalizada é soberana: 17h = 17:00, portanto nunca
   // pode cair no comparador de "mesma hora" e casar também com 17:30.
   const exactTemporalPosition = temporalPendingPosition(inboundText, frame);
