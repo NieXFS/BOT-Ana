@@ -37,7 +37,7 @@ import {
 } from './salesOpeners';
 import {
   getConversationPartnerSlug,
-  rememberConversationPartnerSlug,
+  observePartnerAttributionInbound,
 } from './salesPartnerState';
 import { resolveDemoServiceId } from './demoScheduling';
 import { sendDemoVideo } from '../media/demoVideo';
@@ -889,20 +889,19 @@ export async function getSalesReply(
   const isFirstResponse = !history.some((message) => message.role === 'assistant');
   const isFirstInboundWindow = userMessages.length === 1 && isFirstResponse;
 
-  // Mesma janela determinística do matchAdOpening: só a primeira mensagem
-  // consolidada da conversa pode criar a atribuição. O carimbo inicial não leva
-  // `status` nem evento; falha de rede jamais interrompe a resposta.
-  if (isFirstInboundWindow) {
-    const detectedPartnerSlug = matchPartnerMention(userMessage);
-    if (detectedPartnerSlug) {
-      rememberConversationPartnerSlug(conversationKey, detectedPartnerSlug);
-      void capturePartnerAttribution(
-        config.phoneNumberId,
-        phone,
-        detectedPartnerSlug
-      ).catch(() => undefined);
-    }
-  }
+  // A atribuição financeira observa até 10 inbounds e para após o POST
+  // confirmado. A saudação, gerida separadamente pelo estado, continua restrita
+  // à primeira janela. Tudo é determinístico e fire-and-forget.
+  observePartnerAttributionInbound(
+    {
+      conversationKey,
+      phoneNumberId: config.phoneNumberId,
+      customerPhone: phone,
+      userMessage,
+      isFirstInboundWindow,
+    },
+    { matchPartnerMention, capturePartnerAttribution }
+  );
 
   // Régua de follow-up ZERA a cada inbound (best-effort, não bloqueia a resposta).
   await deps

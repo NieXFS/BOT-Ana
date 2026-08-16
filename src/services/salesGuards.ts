@@ -1,5 +1,3 @@
-import { isExplicitBookingConfirmation } from './bookingConfirmationGate';
-
 type ConversationMessage = {
   role: string;
   content?: unknown;
@@ -90,37 +88,135 @@ function emailsIn(text: string): string[] {
   return (text.match(EMAIL_RE) ?? []).map((email) => email.toLowerCase());
 }
 
-function asksToConfirmEmail(text: string, email: string): boolean {
+function withoutEdgePunctuation(text: string): string {
+  return text
+    .replace(/^[.!?,;:\s]+|[.!?,;:\s]+$/g, '')
+    .replace(/\s*,\s*/g, ', ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const POSITIVE_CONFIRMATION_EMOJI_RE =
+  /^(?:👍[\u{1F3FB}-\u{1F3FF}]?|🆗|👌[\u{1F3FB}-\u{1F3FF}]?)$/u;
+
+const EMAIL_PROPOSAL_CUE_RE =
+  /\b(?:confirma(?:r|ndo)?|certo|certinh[oa]|corret[oa]|(?:esta|ta)\s+(?:certo|certinh[oa]|corret[oa]))\b/;
+
+const EMAIL_WITH_ADDRESS_CONFIRMATION_RE =
+  /\b(?:sim|certo|certinh[oa]|correto|confirmo|confirmado|isso mesmo|esta certo|ta certo)\b/;
+
+const EMAIL_REPLY_AFFIRMATION_RE =
+  /\b(?:sim|certo|certinh[oa]|corret[oa]|(?:esta|ta)\s+(?:certo|certinh[oa]|corret[oa])|tudo\s+cert(?:o|inh[oa])|(?:esta|ta)\s+tudo\s+cert(?:o|inh[oa])|confirmo|confirmado|isso(?:\s+mesmo)?|perfeito|exato|aham|uhum|pode\s+mandar|sim\s+pode|pode\s+sim|ja\s+confirmei|beleza|blz|show|fechado|combinado|ta\s+bom)\b/;
+
+const EMAIL_SHORT_CONFIRMATION_RE =
+  /^(?:(?:sim|ok|okay|certo(?:\s+mesmo)?|certinh[oa]|(?:ta|esta)\s+cert(?:o|inh[oa])|corret[oa]|confirmo|confirmado|perfeito|exato|aham|uhum|isso(?:\s+mesmo)?|e\s+isso|tudo\s+cert(?:o|inh[oa])|(?:esta|ta)\s+tudo\s+cert(?:o|inh[oa])|beleza|blz|show|fechado|combinado|ta\s+(?:bom|otimo))(?:\s*,?\s*(?:sim|pode|mandar|por favor|isso(?:\s+mesmo)?|tudo\s+cert(?:o|inh[oa])))*|pode\s+sim|sim\s+pode|pode\s+mandar|ja\s+confirmei|nao\s*,\s*ta\s+certo)$/u;
+
+const EMAIL_CLOSED_CONFIRMATION_RE =
+  /(?:^|[.!?,;]\s*)(?:pode mandar(?:\s+(?:o\s+)?link)?|ja confirmei|(?:ta|esta)\s+certinh[oa]|nao precisa (?:perguntar|confirmar) de (?:novo|novamente))(?:$|[.!?,;])/;
+
+function hasLeadingAdversativeEmailConfirmation(text: string): boolean {
+  const match = text.match(
+    /^(.+?)(?:\s*[,;:—-]\s*|\s+)(?:mas|porem|so que)\s+\S/u
+  );
+  return (
+    match !== null &&
+    EMAIL_SHORT_CONFIRMATION_RE.test(withoutEdgePunctuation(match[1]))
+  );
+}
+
+function hasEmailCorrectionSignal(text: string): boolean {
   const normalized = normalize(text);
   return (
-    normalized.includes(email) &&
-    /\b(?:confirma|confirmar|confirmando|certo|certinh[oa]|correto|esta certo|ta certo)\b/.test(
+    /\bnao\b.{0,45}\b(?:errado|esse|email|e-mail)\b/.test(normalized) ||
+    /\bnao\s+(?:(?:esta|ta)\s+)?(?:tudo\s+)?(?:cert(?:o|inh[oa])|corret[oa])\b/.test(
+      normalized
+    ) ||
+    /\b(?:corrig\w*|troq\w*|mud\w*|confere\w*|na verdade|errado|incorret\w*)\b/.test(
       normalized
     )
   );
 }
 
-function explicitlyConfirmsEmail(text: string, email: string): boolean {
+function isExplicitEmailCorrection(text: string): boolean {
   const normalized = normalize(text);
-  if (
-    /\b(?:nao|corrig|troca|muda|na verdade|mas|outro email|e-mail errado)\b/.test(
-      normalized
-    )
-  ) {
-    return false;
+  if (!hasEmailCorrectionSignal(text)) return false;
+  return (
+    /\b(?:e-?mail|endereco)\b/.test(normalized) ||
+    emailsIn(text).length > 0 ||
+    /\b(?:esse|ele)\b/.test(normalized)
+  );
+}
+
+function emailConfirmationWindow(text: string, email: string): string | null {
+  const normalized = normalize(text);
+  const emailIndex = normalized.indexOf(email);
+  if (emailIndex < 0) return null;
+
+  // Mascara os pontos internos do e-mail para que só pontuação de frase/cláusula
+  // determine a janela final da proposta.
+  const masked = `${normalized.slice(0, emailIndex)}${' '.repeat(
+    email.length
+  )}${normalized.slice(emailIndex + email.length)}`;
+  let start = 0;
+  let end = normalized.length;
+  for (const match of masked.matchAll(/[.!?;\n]/g)) {
+    const boundary = match.index ?? 0;
+    if (boundary < emailIndex) {
+      start = boundary + 1;
+    } else {
+      end = boundary;
+      break;
+    }
   }
+  return normalized.slice(start, end);
+}
+
+/**
+ * Reconhece somente uma proposta dedicada de confirmação do e-mail. Uma
+ * pergunta sobre outra coisa na mesma mensagem, ou uma confirmação distante
+ * do endereço, não licencia respostas curtas no turno seguinte.
+ */
+export function isDedicatedEmailConfirmationProposal(
+  text: string,
+  emailValue: string
+): boolean {
+  const email = normalizeEmail(emailValue);
+  if (!email) return false;
+  const emails = emailsIn(text);
+  if (emails.length !== 1 || emails[0] !== email) return false;
+  if (countActionableSalesQuestions(text) > 1) return false;
+  const window = emailConfirmationWindow(text, email);
+  return window !== null && EMAIL_PROPOSAL_CUE_RE.test(window);
+}
+
+/**
+ * Classificador único da confirmação de e-mail da lead. Ele é deliberadamente
+ * independente do gate de confirmação de agendamento da Ana.
+ */
+export function classifyEmailConfirmationReply(
+  text: string,
+  emailValue: string
+): boolean {
+  const email = normalizeEmail(emailValue);
+  if (!email) return false;
+
+  const normalized = normalize(text);
+  if (!normalized) return false;
 
   const emails = emailsIn(text);
   if (emails.some((candidate) => candidate !== email)) return false;
-  if (
-    emails.includes(email) &&
-    /\b(?:sim|certo|correto|confirmo|confirmado|isso mesmo|pode mandar|manda ver)\b/.test(
-      normalized
-    )
-  ) {
-    return true;
-  }
-  return isExplicitBookingConfirmation(text);
+  if (hasEmailCorrectionSignal(text)) return false;
+
+  const compact = withoutEdgePunctuation(normalized);
+  if (POSITIVE_CONFIRMATION_EMOJI_RE.test(compact)) return true;
+  if (EMAIL_SHORT_CONFIRMATION_RE.test(compact)) return true;
+  if (hasLeadingAdversativeEmailConfirmation(normalized)) return true;
+
+  const hasOwnEmail = emails.includes(email);
+  return (
+    (hasOwnEmail && EMAIL_REPLY_AFFIRMATION_RE.test(normalized)) ||
+    EMAIL_CLOSED_CONFIRMATION_RE.test(normalized)
+  );
 }
 
 /**
@@ -142,13 +238,13 @@ export function hasConfirmedSalesEmail(
   // aceitar o primeiro envio do e-mail como confirmação implícita.
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
+    const messageEmails = emailsIn(message.text);
     if (
       message.role !== 'user' ||
-      !emailsIn(message.text).includes(email) ||
-      !/\b(?:sim|certo|correto|confirmo|confirmado|isso mesmo|esta certo|ta certo)\b/.test(
-        normalize(message.text)
-      ) ||
-      !explicitlyConfirmsEmail(message.text, email)
+      !messageEmails.includes(email) ||
+      messageEmails.some((candidate) => candidate !== email) ||
+      !EMAIL_WITH_ADDRESS_CONFIRMATION_RE.test(normalize(message.text)) ||
+      hasEmailCorrectionSignal(message.text)
     ) {
       continue;
     }
@@ -157,24 +253,34 @@ export function hasConfirmedSalesEmail(
       .filter((candidate) => candidate.role === 'user')
       .some((candidate) => {
         const laterEmails = emailsIn(candidate.text);
-        return laterEmails.some((laterEmail) => laterEmail !== email);
+        return (
+          laterEmails.some((laterEmail) => laterEmail !== email) ||
+          isExplicitEmailCorrection(candidate.text)
+        );
       });
     if (!invalidated) return true;
   }
 
   for (let index = 0; index < messages.length - 1; index += 1) {
     const proposal = messages[index];
-    if (
-      proposal.role !== 'assistant' ||
-      !asksToConfirmEmail(proposal.text, email)
-    ) {
+    if (proposal.role !== 'assistant') continue;
+    const dedicatedProposal = isDedicatedEmailConfirmationProposal(
+      proposal.text,
+      email
+    );
+    const hasAnyProposalEmail = emailsIn(proposal.text).length > 0;
+    if (!dedicatedProposal && !hasAnyProposalEmail) {
+      continue;
+    }
+    if (!dedicatedProposal && !emailsIn(proposal.text).includes(email)) {
       continue;
     }
 
     const confirmation = messages[index + 1];
     if (
       confirmation.role !== 'user' ||
-      !explicitlyConfirmsEmail(confirmation.text, email)
+      !classifyEmailConfirmationReply(confirmation.text, email) ||
+      (!dedicatedProposal && !emailsIn(confirmation.text).includes(email))
     ) {
       continue;
     }
@@ -184,13 +290,10 @@ export function hasConfirmedSalesEmail(
       .filter((message) => message.role === 'user')
       .map((message) => message.text);
     const invalidated = laterUserTexts.some((text) => {
-      const normalized = normalize(text);
       const laterEmails = emailsIn(text);
       return (
         laterEmails.some((candidate) => candidate !== email) ||
-        (/\b(?:corrig|troca|muda|na verdade|email errado|e-mail errado)\b/.test(
-          normalized
-        ) && laterEmails.length > 0)
+        isExplicitEmailCorrection(text)
       );
     });
     if (!invalidated) return true;
@@ -211,7 +314,7 @@ export function authorizeSalesToolCall(input: {
     ok: false,
     reason: 'email_confirmation_required',
     hintMessage:
-      'INTERNAL_HINT: o link pré-preenchido NÃO foi gerado porque o e-mail ainda não tem confirmação inequívoca em um turno posterior. Repita o e-mail exato para a lead, pergunte se está correto e aguarde a resposta. Correção de e-mail exige uma nova confirmação; não prometa que enviou link.',
+      'INTERNAL_HINT: o link pré-preenchido NÃO foi gerado porque o e-mail ainda não tem confirmação inequívoca em um turno posterior. Faça uma única proposta dedicada com o e-mail exato e aguarde uma resposta afirmativa da lead (por exemplo: "Certo", "Tá certinho", "Sim pode", "Pode mandar" ou "Já confirmei"); não exija que ela repita o e-mail. Correção de e-mail exige uma nova confirmação; não prometa que enviou link.',
   };
 }
 

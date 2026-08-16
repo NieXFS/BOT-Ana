@@ -6,11 +6,13 @@ import {
   authorizeSalesToolCall,
   buildDeterministicSalesGuardReply,
   buildSafeSalesRecoveryReply,
+  classifyEmailConfirmationReply,
   countActionableSalesQuestions,
   ensureSalesSignupUrlInReply,
   hasConfirmedSalesEmail,
   hasSalesSignupUrl,
   inspectSalesReplyActionClaims,
+  isDedicatedEmailConfirmationProposal,
   isThinkingOnlyResponse,
   normalizeSalesReplyStyle,
   resolveRequiredCommonSignup,
@@ -74,6 +76,234 @@ assert.equal(
   true
 );
 console.log('  ✓ linguagem natural "certinho" também libera');
+
+const incidentEmail = 'joana@lecs.example.com';
+const dedicatedEmailProposal = [
+  {
+    role: 'assistant',
+    content: `Só confirma pra mim: ${incidentEmail}, certo?`,
+  },
+];
+for (const response of [
+  'Certo',
+  'Certo',
+  'Ta certinho',
+  'Uai De novo? Já confirmei',
+  'Sim pode.',
+]) {
+  assert.equal(classifyEmailConfirmationReply(response, incidentEmail), true);
+  assert.equal(
+    hasConfirmedSalesEmail(incidentEmail, [
+      ...dedicatedEmailProposal,
+      { role: 'user', content: response },
+    ]),
+    true
+  );
+}
+console.log('  ✓ transcrito de 16/08 libera as cinco confirmações naturais');
+
+const confirmationWithAdjacentFact =
+  'certo, mas o nome da clínica é Studio Lia';
+assert.equal(
+  classifyEmailConfirmationReply(confirmationWithAdjacentFact, incidentEmail),
+  true
+);
+assert.equal(
+  hasConfirmedSalesEmail(incidentEmail, [
+    ...dedicatedEmailProposal,
+    { role: 'user', content: confirmationWithAdjacentFact },
+  ]),
+  true
+);
+for (const correction of [
+  'certo, mas esse e-mail está errado',
+  'certo, mas o e-mail certo é outro@lecs.example.com',
+]) {
+  assert.equal(classifyEmailConfirmationReply(correction, incidentEmail), false);
+  assert.equal(
+    hasConfirmedSalesEmail(incidentEmail, [
+      ...dedicatedEmailProposal,
+      { role: 'user', content: correction },
+    ]),
+    false
+  );
+}
+console.log(
+  '  ✓ confirmação antes de fato adjacente libera sem mascarar correção de e-mail'
+);
+
+for (const response of [
+  'Sim',
+  'sim',
+  'isso',
+  'ok',
+  'confirmo',
+  'isso mesmo',
+  'perfeito',
+  'aham',
+  '👍',
+  '👌🏽',
+  '🆗',
+  'tudo certo',
+  'correto',
+  'beleza',
+  'blz',
+  'show',
+  'fechado',
+  'combinado',
+  'tá bom',
+  'pode sim',
+  'não, tá certo',
+]) {
+  assert.equal(
+    hasConfirmedSalesEmail(incidentEmail, [
+      ...dedicatedEmailProposal,
+      { role: 'user', content: response },
+    ]),
+    true
+  );
+}
+for (const response of [
+  'incerto',
+  'showroom',
+  'pode',
+  '👍🏽 pode me ligar?',
+  'não tá certo',
+  'não está tudo certo',
+  `${incidentEmail} não está correto`,
+]) {
+  assert.equal(classifyEmailConfirmationReply(response, incidentEmail), false);
+}
+assert.equal(
+  hasConfirmedSalesEmail(incidentEmail, [
+    { role: 'user', content: `${incidentEmail} não está correto` },
+  ]),
+  false
+);
+assert.equal(
+  hasConfirmedSalesEmail(incidentEmail, [
+    { role: 'user', content: `Meu e-mail é ${incidentEmail}, tá certinho.` },
+  ]),
+  true
+);
+console.log('  ✓ vocabulário de confirmação anterior permanece liberado');
+
+assert.equal(
+  isDedicatedEmailConfirmationProposal(
+    `Anotei ${incidentEmail}. Você atende sozinha, certo?`,
+    incidentEmail
+  ),
+  false
+);
+assert.equal(
+  isDedicatedEmailConfirmationProposal(
+    `Confirma ${incidentEmail}? Qual é o nome da clínica?`,
+    incidentEmail
+  ),
+  false
+);
+assert.equal(
+  hasConfirmedSalesEmail(incidentEmail, [
+    {
+      role: 'assistant',
+      content: `Anotei ${incidentEmail}. Você atende sozinha, certo?`,
+    },
+    { role: 'user', content: 'Certo' },
+  ]),
+  false
+);
+console.log('  ✓ pergunta frouxa sobre outro assunto não licencia "Certo"');
+
+assert.equal(
+  isDedicatedEmailConfirmationProposal(
+    'Não é a@x.com, é b@y.com, certo?',
+    'b@y.com'
+  ),
+  false
+);
+assert.equal(
+  hasConfirmedSalesEmail('b@y.com', [
+    { role: 'assistant', content: 'Não é a@x.com, é b@y.com, certo?' },
+    { role: 'user', content: 'Certo' },
+  ]),
+  false
+);
+assert.equal(
+  hasConfirmedSalesEmail('a@x.com', [
+    { role: 'assistant', content: 'Não é a@x.com, é b@y.com, certo?' },
+    { role: 'user', content: 'Certo' },
+  ]),
+  false
+);
+console.log('  ✓ proposta com dois endereços não é dedicada');
+
+const ambiguousOneTurnEmails = [
+  {
+    role: 'user',
+    content:
+      'Sim, primeiro@lecs.example.com está certo; segundo@lecs.example.com também.',
+  },
+];
+assert.equal(
+  hasConfirmedSalesEmail(
+    'primeiro@lecs.example.com',
+    ambiguousOneTurnEmails
+  ),
+  false
+);
+assert.equal(
+  hasConfirmedSalesEmail(
+    'segundo@lecs.example.com',
+    ambiguousOneTurnEmails
+  ),
+  false
+);
+console.log('  ✓ fallback de um turno não autoriza mensagem com dois endereços');
+
+const correctionAfterConfirmation = [
+  ...dedicatedEmailProposal,
+  { role: 'user', content: 'Certo' },
+  { role: 'user', content: 'Espera, o e-mail tá errado.' },
+];
+assert.equal(
+  classifyEmailConfirmationReply(
+    'Espera, o e-mail tá errado.',
+    incidentEmail
+  ),
+  false
+);
+assert.equal(
+  hasConfirmedSalesEmail(incidentEmail, correctionAfterConfirmation),
+  false
+);
+for (const correction of [
+  'O e-mail não confere.',
+  'Troquei o e-mail.',
+  'Mudou o e-mail.',
+]) {
+  assert.equal(classifyEmailConfirmationReply(correction, incidentEmail), false);
+  assert.equal(
+    hasConfirmedSalesEmail(incidentEmail, [
+      ...dedicatedEmailProposal,
+      { role: 'user', content: 'Certo' },
+      { role: 'user', content: correction },
+    ]),
+    false
+  );
+}
+console.log('  ✓ correção posterior sem novo endereço invalida a confirmação');
+
+for (const response of ['pode deixar pra depois', 'pode me ligar?']) {
+  assert.equal(classifyEmailConfirmationReply(response, incidentEmail), false);
+  assert.equal(
+    hasConfirmedSalesEmail(incidentEmail, [
+      ...dedicatedEmailProposal,
+      { role: 'user', content: response },
+    ]),
+    false
+  );
+}
+console.log('  ✓ "pode" não libera pedidos de prazo ou ligação');
 
 const firstTurnOnly = [
   {

@@ -94,9 +94,9 @@ export async function capturePartnerAttribution(
   phoneNumberId: string,
   customerPhone: string,
   partnerSlug: string
-): Promise<void> {
+): Promise<'attributed' | 'not-attributed' | 'failed'> {
   try {
-    await axios.post(
+    const response = await axios.post<{ partnerSlug?: unknown }>(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
       { customerPhone, partnerSlug },
       {
@@ -107,8 +107,13 @@ export async function capturePartnerAttribution(
         timeout: REQUEST_TIMEOUT_MS,
       }
     );
+    return typeof response.data.partnerSlug === 'string' &&
+      response.data.partnerSlug.trim().length > 0
+      ? 'attributed'
+      : 'not-attributed';
   } catch (error) {
     capture(error, 'capture-partner-attribution', phoneNumberId);
+    return 'failed';
   }
 }
 
