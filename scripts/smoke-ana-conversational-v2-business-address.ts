@@ -8,6 +8,7 @@ import type { ServicesResult } from '../src/services/calendarService';
 import { evaluateBoundaryV2 } from '../src/services/conversationalV2/boundary';
 import {
   composeBusinessAddressComponentV2,
+  isUsableBusinessAddressV2,
   matchBusinessAddressQuestionV2,
   materializeAfterConfirmationBusinessAddressCopyV2,
   materializeCityBusinessAddressCopyV2,
@@ -42,6 +43,26 @@ const CITY_ONLY: TenantBusinessAddress = {
   state: 'PE',
   zipCode: null,
 };
+/** Shape EXATO do ERP sem cadastro (Exec ERP-1): objeto presente, campos null. */
+const ERP_UNREGISTERED_ADDRESS: TenantBusinessAddress = {
+  full: null,
+  city: null,
+  state: null,
+  zipCode: null,
+};
+const ZIP_ONLY: TenantBusinessAddress = {
+  full: null,
+  city: null,
+  state: null,
+  zipCode: '01310930',
+};
+const CITY_WITHOUT_REST: TenantBusinessAddress = {
+  full: null,
+  city: 'Recife',
+  state: null,
+  zipCode: null,
+};
+const GRACEFUL_TEAM_REPLY = 'O endereço é com a equipe da clínica.';
 const expectedFull =
   'Estamos em Avenida Paulista, 1000, São Paulo - SP, CEP 01310930.';
 const expectedCity =
@@ -50,6 +71,8 @@ const expectedApos =
   `${expectedCity} assim que seu agendamento estiver confirmado te passo o endereço completinho.`;
 const expectedCityRecife =
   'Estamos em Recife - PE. O endereço completo a equipe confirma com você no contato.';
+const expectedCityWithoutState =
+  'Estamos em Recife. O endereço completo a equipe confirma com você no contato.';
 
 const services: ServicesResult = {
   success: true,
@@ -143,6 +166,25 @@ async function main(): Promise<void> {
     FULL_ADDRESS
   );
   assert.equal(normalizeBusinessAddressPayload(undefined), undefined);
+  assert.deepEqual(
+    normalizeBusinessAddressPayload(ERP_UNREGISTERED_ADDRESS),
+    ERP_UNREGISTERED_ADDRESS
+  );
+  assert.equal(isUsableBusinessAddressV2(undefined), false);
+  assert.equal(isUsableBusinessAddressV2(ERP_UNREGISTERED_ADDRESS), false);
+  assert.equal(isUsableBusinessAddressV2(ZIP_ONLY), false);
+  assert.equal(
+    isUsableBusinessAddressV2({
+      full: '  ',
+      city: '',
+      state: null,
+      zipCode: '01310930',
+    }),
+    false
+  );
+  assert.equal(isUsableBusinessAddressV2(CITY_ONLY), true);
+  assert.equal(isUsableBusinessAddressV2(CITY_WITHOUT_REST), true);
+  assert.equal(isUsableBusinessAddressV2(FULL_ADDRESS), true);
   assert.equal(parseDirectionsModePayload(undefined), undefined);
   assert.equal(parseDirectionsModePayload('MODO_NOVO'), undefined);
   assert.equal(resolveDirectionsModeV2({}), 'SO_CIDADE');
@@ -159,6 +201,14 @@ async function main(): Promise<void> {
   );
   assert.equal(materializeFullBusinessAddressCopyV2(CITY_ONLY), null);
   assert.equal(materializeCityBusinessAddressCopyV2(CITY_ONLY), expectedCityRecife);
+  assert.equal(
+    materializeCityBusinessAddressCopyV2(CITY_WITHOUT_REST),
+    expectedCityWithoutState
+  );
+  assert.equal(materializeFullBusinessAddressCopyV2(ERP_UNREGISTERED_ADDRESS), null);
+  assert.equal(materializeCityBusinessAddressCopyV2(ERP_UNREGISTERED_ADDRESS), null);
+  assert.equal(materializeFullBusinessAddressCopyV2(ZIP_ONLY), null);
+  assert.equal(materializeCityBusinessAddressCopyV2(ZIP_ONLY), null);
   assert.equal(
     materializeFullBusinessAddressCopyV2({
       full: 'Rua das Flores, 10',
@@ -360,6 +410,57 @@ async function main(): Promise<void> {
     'business_address_absent'
   );
 
+  const erpUnregisteredPlan = await resolveBusinessAddressPlanV2({
+    inboundText: 'Qual o endereço de vocês?',
+    config: baseConfig({
+      directionsMode: 'ENDERECO_COMPLETO',
+      businessAddress: ERP_UNREGISTERED_ADDRESS,
+    }),
+    now,
+    executeUpcomingRead: async () => {
+      throw new Error('endereço todo-null não lê upcoming');
+    },
+  });
+  assert.equal(erpUnregisteredPlan.decision.kind, 'none');
+  assert.equal(
+    erpUnregisteredPlan.decision.kind === 'none' &&
+      erpUnregisteredPlan.decision.reason,
+    'business_address_absent'
+  );
+
+  const zipOnlyPlan = await resolveBusinessAddressPlanV2({
+    inboundText: 'Qual o endereço de vocês?',
+    config: baseConfig({
+      directionsMode: 'SO_CIDADE',
+      businessAddress: ZIP_ONLY,
+    }),
+    now,
+    executeUpcomingRead: async () => {
+      throw new Error('só zipCode não lê upcoming');
+    },
+  });
+  assert.equal(zipOnlyPlan.decision.kind, 'none');
+  assert.equal(
+    zipOnlyPlan.decision.kind === 'none' && zipOnlyPlan.decision.reason,
+    'business_address_absent'
+  );
+
+  const cityUsablePlan = await resolveBusinessAddressPlanV2({
+    inboundText: 'Qual o endereço de vocês?',
+    config: baseConfig({
+      directionsMode: 'SO_CIDADE',
+      businessAddress: CITY_WITHOUT_REST,
+    }),
+    now,
+    executeUpcomingRead: async () => {
+      throw new Error('city utilizável não lê upcoming em SO_CIDADE');
+    },
+  });
+  assert.equal(
+    cityUsablePlan.decision.kind === 'answer' && cityUsablePlan.decision.text,
+    expectedCityWithoutState
+  );
+
   const unknownMode = await resolveBusinessAddressPlanV2({
     inboundText: 'onde fica?',
     config: baseConfig({ businessAddress: FULL_ADDRESS }),
@@ -516,6 +617,69 @@ async function main(): Promise<void> {
     oldErpInvented.reasonCodes.includes('UNKNOWN_ADDRESS'),
     false,
     'sem businessAddress o bloqueio novo não entra'
+  );
+
+  const unregisteredGraceful = evaluateBoundaryV2({
+    rawCandidate: GRACEFUL_TEAM_REPLY,
+    servicesResult: services,
+    sourceInboundText: 'Qual o endereço de vocês?',
+    currentInboundIds: ['in-1'],
+    inboundTextsById: { 'in-1': 'Qual o endereço de vocês?' },
+    flowState: { flowId: 'flow-v2', fixedByProofVersion: {} },
+    pendingTransitionCandidate: { kind: 'preserve' },
+    replyPurpose: 'OPERATIONAL_ANSWER',
+    source: 'GENERATED',
+    businessAddress: ERP_UNREGISTERED_ADDRESS,
+    route: 'model',
+  });
+  assert.equal(
+    unregisteredGraceful.safe,
+    true,
+    String(unregisteredGraceful.reasonCodes)
+  );
+  assert.equal(
+    unregisteredGraceful.reasonCodes.includes('UNKNOWN_ADDRESS'),
+    false,
+    'objeto todo-null do ERP não arma UNKNOWN_ADDRESS'
+  );
+
+  const unregisteredInvented = evaluateBoundaryV2({
+    rawCandidate: 'Estamos na Rua da Outra Unidade, 999.',
+    servicesResult: services,
+    sourceInboundText: 'Qual o endereço de vocês?',
+    currentInboundIds: ['in-1'],
+    inboundTextsById: { 'in-1': 'Qual o endereço de vocês?' },
+    flowState: { flowId: 'flow-v2', fixedByProofVersion: {} },
+    pendingTransitionCandidate: { kind: 'preserve' },
+    replyPurpose: 'OPERATIONAL_ANSWER',
+    source: 'GENERATED',
+    businessAddress: ERP_UNREGISTERED_ADDRESS,
+    route: 'model',
+  });
+  assert.equal(
+    unregisteredInvented.reasonCodes.includes('UNKNOWN_ADDRESS'),
+    false,
+    'todo-null não veta invenção — legado do modelo'
+  );
+
+  const zipOnlyGraceful = evaluateBoundaryV2({
+    rawCandidate: GRACEFUL_TEAM_REPLY,
+    servicesResult: services,
+    sourceInboundText: 'Qual o endereço de vocês?',
+    currentInboundIds: ['in-1'],
+    inboundTextsById: { 'in-1': 'Qual o endereço de vocês?' },
+    flowState: { flowId: 'flow-v2', fixedByProofVersion: {} },
+    pendingTransitionCandidate: { kind: 'preserve' },
+    replyPurpose: 'OPERATIONAL_ANSWER',
+    source: 'GENERATED',
+    businessAddress: ZIP_ONLY,
+    route: 'model',
+  });
+  assert.equal(zipOnlyGraceful.safe, true, String(zipOnlyGraceful.reasonCodes));
+  assert.equal(
+    zipOnlyGraceful.reasonCodes.includes('UNKNOWN_ADDRESS'),
+    false,
+    'só zipCode não arma UNKNOWN_ADDRESS'
   );
 
   const mixedComposed = composeBusinessAddressComponentV2({
@@ -743,6 +907,42 @@ async function main(): Promise<void> {
   assert.equal(runtimeOldErp.modelLoopCalls, 1);
   assert.equal(runtimeOldErp.upcomingReads, 0);
   assert.doesNotMatch(runtimeOldErp.prepared.payload ?? '', /Estamos em/u);
+
+  const runtimeErpUnregistered = await runRuntime({
+    text: 'Qual o endereço de vocês?',
+    config: baseConfig({
+      directionsMode: 'ENDERECO_COMPLETO',
+      businessAddress: ERP_UNREGISTERED_ADDRESS,
+    }),
+    modelReply: GRACEFUL_TEAM_REPLY,
+  });
+  assert.equal(runtimeErpUnregistered.modelLoopCalls, 1);
+  assert.equal(runtimeErpUnregistered.upcomingReads, 0);
+  assert.notEqual(runtimeErpUnregistered.prepared.planReceipt.route, 'fast_path');
+  assert.equal(runtimeErpUnregistered.prepared.payload, GRACEFUL_TEAM_REPLY);
+
+  const runtimeZipOnly = await runRuntime({
+    text: 'Qual o endereço de vocês?',
+    config: baseConfig({
+      directionsMode: 'SO_CIDADE',
+      businessAddress: ZIP_ONLY,
+    }),
+    modelReply: GRACEFUL_TEAM_REPLY,
+  });
+  assert.equal(runtimeZipOnly.modelLoopCalls, 1);
+  assert.notEqual(runtimeZipOnly.prepared.planReceipt.route, 'fast_path');
+  assert.equal(runtimeZipOnly.prepared.payload, GRACEFUL_TEAM_REPLY);
+
+  const runtimeCityUsable = await runRuntime({
+    text: 'Qual o endereço de vocês?',
+    config: baseConfig({
+      directionsMode: 'SO_CIDADE',
+      businessAddress: CITY_WITHOUT_REST,
+    }),
+  });
+  assert.equal(runtimeCityUsable.modelLoopCalls, 0);
+  assert.equal(runtimeCityUsable.prepared.planReceipt.route, 'fast_path');
+  assert.equal(runtimeCityUsable.prepared.payload, expectedCityWithoutState);
 
   const runtimeNegative = await runRuntime({
     text: 'não quero o endereço',

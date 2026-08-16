@@ -179,7 +179,7 @@ export interface TenantBotConfig {
    * Ausente/desconhecido é conservador no runtime de endereço (cidade/estado).
    */
   directionsMode?: TenantDirectionsMode;
-  /** Contrato aditivo ERP-1. Ausente = runtime velho do ERP. */
+  /** Contrato aditivo ERP-1. Parse preserva objeto todo-null; o runtime só arma com full/city. */
   businessAddress?: TenantBusinessAddress;
   technicalMaintenance?: {
     enabled: boolean;

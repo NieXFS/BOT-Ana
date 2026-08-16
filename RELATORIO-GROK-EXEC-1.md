@@ -1858,3 +1858,40 @@ HEAD permaneceu `a8241cb` destacado. Sem commit.
 | `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
 
 HEAD permaneceu `a8241cb` destacado. Sem commit.
+
+## Exec IA-14c — UNKNOWN_ADDRESS não arma com businessAddress todo-null
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `3cbcf4f` (= produção). Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Bug real em produção: "Qual o endereço de vocês?" no studio-viti (endereço não cadastrado) caiu em `direct_fallback` com boundary `[["UNKNOWN_ADDRESS"],["UNKNOWN_ADDRESS"],[]]`. A fixture de IA-14 ("payload ausente não arma") testou `businessAddress` **ausente**; o ERP (Exec ERP-1) **sempre** inclui o objeto com campos null. Objeto presente todo-null armou o gate e vetou a resposta graciosa do modelo ("esse detalhe é com a equipe..." / "o endereço é com a equipe...").
+
+### Entrega
+
+1. **Utilizável = `full` ou `city` não-vazios após trim.** `isUsableBusinessAddressV2` é a condição única para armar o fast-path de endereço e o `UNKNOWN_ADDRESS`. `state`/`zipCode` sozinhos não bastam.
+2. **Legado integral** quando o objeto está ausente, é null, tem todos os campos null/vazios, ou só `zipCode` preenchido: rota do modelo, gate desarmado, zero negação nova. O parse **preserva** o shape do ERP (`{full:null, city:null, state:null, zipCode:null}`); não colapsa no `normalizeBusinessAddressPayload`.
+3. **Runtime.** `witnessedBusinessAddress` só propaga endereço utilizável para a boundary/evidence; objeto todo-null não testemunha CEP nem rua.
+4. **Regressão dos modos.** Objeto com `city` preenchida (mesmo sem `full`/`state`/`zip`) continua armando o fast-path `SO_CIDADE`. `ENDERECO_COMPLETO` + `full` intacto. `CITY_ONLY` + modo FULL continua indo ao modelo **com** gate armado (invenção de rua ainda bloqueia).
+5. **Contrato D-ADDR.** Payload inutilizável = runtime velho; `UNKNOWN_ADDRESS` só com `{full, city}` testemunháveis.
+
+### Arquivos
+
+- `src/services/conversationalV2/businessAddress.ts` (`isUsableBusinessAddressV2`; fast-path + gate)
+- `src/services/conversationalV2/runtime.ts` (testemunha só utilizável)
+- `src/services/conversationalV2/boundary.ts` (comentário)
+- `src/configProvider.ts` (comentário; parse intacto)
+- `scripts/smoke-ana-conversational-v2-business-address.ts` (shape ERP todo-null; só zip; city utilizável)
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md` (D-ADDR)
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-business-address` | 0 | ERP `{full:null,city:null,state:null,zipCode:null}` → modelo; reply graciosa não leva `UNKNOWN_ADDRESS`; só zip = legado; `city` preenchida → `fast_path`; modos IA-14/14b intactos |
+| `npm run smoke:ana-conversational-v2-route` | 0 | |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `3cbcf4f` destacado. Sem commit.

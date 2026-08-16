@@ -142,6 +142,7 @@ import {
 import {
   businessAddressModelInstructionV2,
   composeBusinessAddressComponentV2,
+  isUsableBusinessAddressV2,
   resolveBusinessAddressPlanV2,
 } from './businessAddress';
 import {
@@ -1204,7 +1205,11 @@ export async function getReceptionistReplyV2(input: {
     executeUpcomingRead: () =>
       executeEntitledUpcomingRead('getUpcomingAppointments', {}),
   });
-  const witnessedBusinessAddress = input.config.businessAddress;
+  const witnessedBusinessAddress = isUsableBusinessAddressV2(
+    input.config.businessAddress
+  )
+    ? input.config.businessAddress
+    : undefined;
 
   let primary: ModelTurnResultV2ParseResult;
   let loop = emptyLoopResult();

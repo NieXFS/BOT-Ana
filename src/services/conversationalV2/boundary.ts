@@ -81,7 +81,7 @@ export interface BoundaryEvaluationInputV2 {
     ReceptionistOutboundEvidence,
     'toolTrace' | 'sourceInboundText' | 'actionRecorded' | 'temporalContext'
   >;
-  /** Endereço testemunhado do payload `businessAddress`; ausente = ERP velho. */
+  /** Endereço testemunhado utilizável (`full`/`city`); ausente ou todo-null = ERP velho. */
   businessAddress?: TenantBusinessAddress;
   serviceRelistExempt?: boolean;
   /** Rota que invocou a boundary; social estrita usa sua blocklist própria. */

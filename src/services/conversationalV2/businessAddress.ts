@@ -78,6 +78,18 @@ function presentField(value: string | null | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
+/**
+ * O ERP sempre envia o objeto `businessAddress` (campos null quando não há
+ * cadastro). Só `full` ou `city` não-vazios após trim tornam o payload
+ * utilizável: sem isso o fast-path e o UNKNOWN_ADDRESS ficam desarmados.
+ */
+export function isUsableBusinessAddressV2(
+  address: TenantBusinessAddress | null | undefined
+): address is TenantBusinessAddress {
+  if (!address) return false;
+  return presentField(address.full) !== null || presentField(address.city) !== null;
+}
+
 export function resolveDirectionsModeV2(
   config: Pick<TenantBotConfig, 'directionsMode'>
 ): TenantDirectionsMode {
@@ -197,7 +209,7 @@ export async function resolveBusinessAddressPlanV2(input: {
   if (!match.matched) return empty;
 
   const address = input.config.businessAddress;
-  if (!address) {
+  if (!isUsableBusinessAddressV2(address)) {
     return {
       ...empty,
       decision: { kind: 'none', reason: 'business_address_absent' },
@@ -374,7 +386,7 @@ export function hasUnlicensedBusinessAddressClaimV2(
   text: string,
   address: TenantBusinessAddress | null | undefined
 ): boolean {
-  if (!address) return false;
+  if (!isUsableBusinessAddressV2(address)) return false;
   const licensedZip = presentField(address.zipCode)
     ? zipDigits(address.zipCode as string)
     : '';

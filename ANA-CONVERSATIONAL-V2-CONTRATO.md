@@ -263,7 +263,7 @@ Conhecimento reutilizável nasce em `AnaApprovedResponse`, nunca em `AnaQuestion
 
 ### D-ADDR — endereço operacional (`businessAddress` + `directionsMode`)
 
-O runtime consome o payload aditivo do ERP: `businessAddress { full, city, state, zipCode }` (cada campo `string | null`) e `structuredConfig.directionsMode` (`ENDERECO_COMPLETO | SO_CIDADE | APOS_CONFIRMACAO`). Campo ausente no payload = runtime velho: a pergunta cai no modelo como hoje, sem negação nova. Modo ausente/desconhecido trata-se como `SO_CIDADE`.
+O runtime consome o payload aditivo do ERP: `businessAddress { full, city, state, zipCode }` (cada campo `string | null`) e `structuredConfig.directionsMode` (`ENDERECO_COMPLETO | SO_CIDADE | APOS_CONFIRMACAO`). O ERP sempre inclui o objeto, com campos null quando não há cadastro. Fast-path e `UNKNOWN_ADDRESS` só armam com endereço **utilizável**: ao menos um de `{full, city}` não-null e não-vazio após trim. Objeto ausente, null, todos os campos null/vazios, ou só `zipCode` preenchido = runtime velho (rota do modelo, gate desarmado, zero negação nova). Modo ausente/desconhecido trata-se como `SO_CIDADE`.
 
 Matcher determinístico (classe read fast-path), com polaridade local e exclusão de objeto alheio (`endereço do site/instagram/email`): `endereço`, `onde fica(m)` / `onde vocês ficam`, `como chego` / `como chegar`, `localização`, `qual o local`. Copies canônicas são materializadas server-side com os campos exatos; campo ausente é omitido, nunca inventado.
 
@@ -273,7 +273,7 @@ Matcher determinístico (classe read fast-path), com polaridade local e exclusã
 
 Pergunta pura e respondível short-circuita em `fast_path`. Mensagem mista (R8) torna o endereço um **componente**, nunca short-circuit: o servidor anexa a copy canônica depois da leitura operacional (ex.: `"qual o endereço? e tem vaga amanhã?"` → slots + endereço). Sem `full`/`city` para o modo pedido, preserva-se a rota do modelo.
 
-Os campos testemunhados entram na família de soft-facts: `UNKNOWN_ADDRESS` bloqueia rua/CEP/`estamos em` que não sejam os do payload. Payload ausente não arma esse bloqueio. O CEP da copy canônica server-owned não dispara `EXPLICIT_PII` (8 dígitos casam o detector de telefone); o mesmo número em segmento de origem modelo é reinspecionado com `PHONE_RE` cru e bloqueia.
+Os campos testemunhados entram na família de soft-facts: `UNKNOWN_ADDRESS` bloqueia rua/CEP/`estamos em` que não sejam os do payload. Payload ausente ou inutilizável (todo-null / só CEP) não arma esse bloqueio. O CEP da copy canônica server-owned não dispara `EXPLICIT_PII` (8 dígitos casam o detector de telefone); o mesmo número em segmento de origem modelo é reinspecionado com `PHONE_RE` cru e bloqueia.
 
 ## Riscos declarados
 
