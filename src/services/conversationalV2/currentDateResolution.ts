@@ -20,12 +20,19 @@ interface DateMentionV2 {
 
 const CORRECTION_RE =
   /\b(?:nao|na\s+verdade|melhor|quer\s+dizer|corrigindo|pera(?:i)?|alias)\b/gu;
+const ORDINAL_OPTION_SPAN_RE =
+  /\b(?:(?:a\s+)?(?:primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa])\s+opcao|opcao\s+(?:numero\s+)?(?:[1-9]\d*|primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa]))\b/gu;
 
 function normalize(value: string): string {
   return value
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
+}
+
+/** Mascara só o span ordinal ("segunda opção"), sem vetar o inbound inteiro. */
+export function maskOrdinalOptionSpansV2(text: string): string {
+  return text.replace(ORDINAL_OPTION_SPAN_RE, (match) => ' '.repeat(match.length));
 }
 
 function correctionBefore(text: string, start: number): boolean {
@@ -39,11 +46,7 @@ function mentionsForInbound(input: {
   now: Date;
   timezone: string;
 }): DateMentionV2[] {
-  const normalized = normalize(input.text);
-  // "segunda opção" pertence ao domínio ordinal. O token explícito opção veta
-  // TODA leitura civil deste inbound para impedir que weekday ganhe precedência
-  // sobre a escolha ancorada no PendingFrame.
-  if (/\bopcao\b/u.test(normalized)) return [];
+  const normalized = maskOrdinalOptionSpansV2(normalize(input.text));
   const mentions: DateMentionV2[] = [];
   for (const match of matchCivilDateTokensV2(normalized)) {
     const token = match[0];
@@ -59,6 +62,15 @@ function mentionsForInbound(input: {
     });
   }
   return mentions;
+}
+
+/**
+ * Token civil no inbound atual (weekday/relativo/absoluto), com/sem acento.
+ * Span ordinal ("segunda opção") é mascarado; o restante continua legível.
+ */
+export function inboundHasCivilDateTokenV2(text: string): boolean {
+  const normalized = maskOrdinalOptionSpansV2(normalize(text));
+  return matchCivilDateTokensV2(normalized).length > 0;
 }
 
 /**

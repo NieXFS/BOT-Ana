@@ -55,6 +55,10 @@ import {
   hasUnlicensedBusinessAddressClaimV2,
   stripCanonicalBusinessAddressCopyV2,
 } from './businessAddress';
+import {
+  SERVICE_LIST_TRANSPORT_CEILING_V2,
+  stripExactCanonicalServiceListSegmentV2,
+} from './serviceList';
 
 export const UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2 =
   'Esse procedimento não está disponível no momento. Posso te ajudar com outro serviço?';
@@ -83,7 +87,11 @@ export interface BoundaryEvaluationInputV2 {
   >;
   /** Endereço testemunhado utilizável (`full`/`city`); ausente ou todo-null = ERP velho. */
   businessAddress?: TenantBusinessAddress;
-  serviceRelistExempt?: boolean;
+  /**
+   * Testemunho tipado da copy canônica de lista. A boundary só isenta o
+   * segmento server-owned que casa UMA vez com este texto exato.
+   */
+  exactCanonicalServiceListText?: string;
   /** Rota que invocou a boundary; social estrita usa sua blocklist própria. */
   route?: 'model' | 'social' | 'interpreter';
   /** Snapshot tipado: existe PendingFrame.OPEN originado pela Ana. */
@@ -247,6 +255,9 @@ function rawLeakReasons(input: BoundaryEvaluationInputV2): BoundaryReasonCodeV2[
   const reasons = new Set<BoundaryReasonCodeV2>();
   const raw = input.rawCandidate;
   if (!raw.trim()) reasons.add('EMPTY_PAYLOAD');
+  if (raw.length > SERVICE_LIST_TRANSPORT_CEILING_V2) {
+    reasons.add('PAYLOAD_EXCEEDS_TRANSPORT');
+  }
   if (/INTERNAL_HINT/iu.test(raw)) reasons.add('INTERNAL_HINT');
   if (
     containsUnlicensedHandoffPromise(raw, {
@@ -1353,6 +1364,20 @@ function looksLikeServiceRelist(
   );
 }
 
+const GENERATED_SERVICE_ENUMERATION_ACT_RE =
+  /\b(?:as\s+opcoes\s+sao|os\s+(?:servicos|procedimentos)(?:\s+disponiveis)?\s+sao)\b/u;
+
+function hasGeneratedServiceEnumerationActV2(
+  candidate: string,
+  catalog: AuthoritativeOutboundCatalog
+): boolean {
+  if (!candidate.trim()) return false;
+  return (
+    looksLikeServiceRelist(candidate, catalog) ||
+    GENERATED_SERVICE_ENUMERATION_ACT_RE.test(normalize(candidate))
+  );
+}
+
 function socialTemporalEchoLicensed(
   candidate: string,
   input: BoundaryEvaluationInputV2
@@ -1480,12 +1505,29 @@ function v2FactReasons(
   if (hasIneligibleProfessionalForFlow(normalizedCandidate, input.flowState, catalog)) {
     reasons.add('INELIGIBLE_PROFESSIONAL');
   }
+  const listStrip = stripExactCanonicalServiceListSegmentV2(
+    normalizedCandidate,
+    input.exactCanonicalServiceListText
+      ? normalizeCustomerReplyStyle(input.exactCanonicalServiceListText)
+      : undefined
+  );
+  const relistSubject = listStrip.stripped
+    ? listStrip.remainder
+    : normalizedCandidate;
   if (
-    !input.serviceRelistExempt &&
     shouldProhibitServiceRelistV2(input.flowState, input.pendingTransitionCandidate) &&
-    looksLikeServiceRelist(normalizedCandidate, catalog)
+    looksLikeServiceRelist(relistSubject, catalog)
   ) {
     reasons.add('SERVICE_RELIST_AFTER_FIXED');
+  }
+  // Só o segmento autorado pelo modelo. Lista canônica já foi retirada;
+  // remainder CANONICAL (leitura/fast-path) não herda este reason.
+  if (
+    input.exactCanonicalServiceListText?.trim() &&
+    (input.source ?? 'GENERATED') === 'GENERATED' &&
+    hasGeneratedServiceEnumerationActV2(relistSubject, catalog)
+  ) {
+    reasons.add('UNLICENSED_SERVICE_LIST');
   }
   for (const reason of socialRouteReasons(input.rawCandidate, input, catalog)) {
     reasons.add(reason);

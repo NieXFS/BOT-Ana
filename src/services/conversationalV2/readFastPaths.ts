@@ -24,10 +24,19 @@ import type {
   ResolutionProof,
   TurnFrameV2,
 } from './contracts';
-import type { CurrentDateResolutionV2 } from './currentDateResolution';
+import {
+  inboundHasCivilDateTokenV2,
+  type CurrentDateResolutionV2,
+} from './currentDateResolution';
 import { hasPositiveClauseMatchV2 } from './polarity';
 import { displayDateV2 } from './lifecycleReducer';
+import {
+  emptyAvailabilityDayCopyV2,
+  EXPLICIT_DAY_QUESTION_V2,
+  isRepeatedEmptyAvailabilityDayV2,
+} from './pendingQuestion';
 import { stripPowerZeroMetalinguisticAssignmentsV2 } from './powerZeroWitness';
+import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 
 const UPCOMING_READ_REQUEST_RE =
   /\b(?:(?:ver|consultar|conferir|mostrar|mostra|lembrar|lembra)\b(?:\s+\w+){0,7}\b(?:agendamentos?|horarios?|marcacoes?)|(?:meus?|minhas?)\s+(?:agendamentos?|horarios?|marcacoes?)|(?:quando|qual\s+dia|que\s+dia|que\s+horario)\b(?:\s+\w+){0,6}\b(?:agendamento|horario|marcado)|(?:tenho|tem)\b(?:\s+\w+){0,5}\b(?:agendamento|horario)\b|(?:remarcar|reagendar|cancelar|desmarcar)\b)/gu;
@@ -296,7 +305,7 @@ function availabilitySuccessResult(
   if (slots.length === 0) {
     return {
       schemaVersion: 2,
-      reply: 'Não encontrei horários disponíveis nessa data. Quer tentar outro dia?',
+      reply: emptyAvailabilityDayCopyV2(date),
       replyPurpose: 'DATE_TIME_QUESTION',
       pendingTransitionCandidate: {
         kind: 'open',
@@ -364,6 +373,7 @@ export async function resolveReadFastPathV2(input: {
   upcomingDateFilter?: string;
   dateResolution?: CurrentDateResolutionV2;
   now?: Date;
+  lastAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<ReadFastPathResultV2> {
   const explicitUpcoming = hasExplicitUpcomingReadRequestV2(input.inboundText);
@@ -436,10 +446,13 @@ export async function resolveReadFastPathV2(input: {
     inboundResolution.kind === 'resolved' ? inboundResolution.entity : undefined;
   const serviceId =
     input.frame.flowState.fixedServiceId ?? inboundService?.id;
+  const inboundHasCivilToken = inboundHasCivilDateTokenV2(input.inboundText);
   const date =
     input.dateResolution?.kind === 'resolved'
       ? input.dateResolution.date
-      : input.frame.flowState.resolvedDate;
+      : inboundHasCivilToken
+        ? undefined
+        : input.frame.flowState.resolvedDate;
   if (!serviceId) {
     return { kind: 'continue_model', reason: 'service_not_resolved' };
   }
@@ -487,6 +500,42 @@ export async function resolveReadFastPathV2(input: {
   });
   if (!professionalGate.ok) {
     return { kind: 'continue_model', reason: professionalGate.reason };
+  }
+  if (
+    input.now &&
+    isRepeatedEmptyAvailabilityDayV2(input.lastAcceptedDelivery, date, input.now)
+  ) {
+    const alreadyAskingDate = input.frame.pending?.kind === 'DATE';
+    return {
+      kind: 'resolved',
+      proof: null,
+      loop: {
+        rawReply: null,
+        exhausted: false,
+        provider: 'openai',
+        model: 'read-fast-path-v2',
+        providerReportedModels: [],
+        rounds: 0,
+        messages: [],
+        toolTrace: [],
+        usage: [],
+      },
+      result: {
+        schemaVersion: 2,
+        reply: EXPLICIT_DAY_QUESTION_V2,
+        replyPurpose: 'DATE_TIME_QUESTION',
+        pendingTransitionCandidate: alreadyAskingDate
+          ? { kind: 'preserve' }
+          : {
+              kind: 'open',
+              pendingKind: 'DATE',
+              flowId: input.frame.flowState.flowId,
+              optionEntityIds: ['date-freeform'],
+            },
+        resolutionCandidate: null,
+        unknownServiceEvidence: null,
+      },
+    };
   }
   const args: Record<string, unknown> = { date, serviceId };
   if (professionalGate.effectiveProfessionalId) {

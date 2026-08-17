@@ -426,6 +426,32 @@ async function main(): Promise<void> {
   assert.equal(how.requiresOperationalContinuation, false);
   assert.equal(
     procedure.decideProcedureInfoV2({
+      inboundText: 'o que é a drenagem e quais serviços vocês fazem?',
+      frame: frame(),
+      servicesResult: licensedServices,
+    }).requiresOperationalContinuation,
+    true,
+    'IA-16d: pergunta de lista é continuação operacional da descrição licenciada'
+  );
+  assert.equal(
+    procedure.decideProcedureInfoV2({
+      inboundText: 'como funciona a drenagem e quais serviços vocês fazem?',
+      frame: frame(),
+      servicesResult: unlicensedServices,
+    }).decision.kind,
+    'escalate'
+  );
+  assert.equal(
+    procedure.decideProcedureInfoV2({
+      inboundText: 'como funciona a drenagem e quais serviços vocês fazem?',
+      frame: frame(),
+      servicesResult: unlicensedServices,
+    }).requiresOperationalContinuation,
+    true,
+    'IA-16d: pergunta de lista é continuação operacional da escalada procedural'
+  );
+  assert.equal(
+    procedure.decideProcedureInfoV2({
       inboundText: 'Como funciona a Drenagem(',
       frame: frame(),
       servicesResult: licensedServices,

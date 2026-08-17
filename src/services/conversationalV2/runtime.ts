@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'crypto';
 import type OpenAI from 'openai';
-import type { TenantBotConfig } from '../../configProvider';
+import type {
+  TenantBotConfig,
+  TenantBusinessAddress,
+} from '../../configProvider';
 import {
   buildSystemPromptFromServices,
   executeReceptionistFunction,
@@ -56,6 +59,7 @@ import {
 } from './contracts';
 import {
   evaluateBoundaryV2,
+  type BoundaryEvaluationInputV2,
 } from './boundary';
 import {
   resolveInitialServiceQuestionFastPathV2,
@@ -145,6 +149,12 @@ import {
   isUsableBusinessAddressV2,
   resolveBusinessAddressPlanV2,
 } from './businessAddress';
+import {
+  composeServiceListComponentV2,
+  decideServiceListV2,
+  materializeServiceListCopyWithinBudgetV2,
+  serviceListModelInstructionV2,
+} from './serviceList';
 import {
   regenerateReceptionistCopyV2,
   type RegenerationResultV2,
@@ -256,6 +266,56 @@ function modelVisibleServicesV2(services: ServicesResult): ServicesResult {
       ({ licensedDescription: _licensedDescription, ...service }) => service
     ),
   };
+}
+
+/**
+ * Segmento server-owned já autorizado pela boundary do próprio componente.
+ * A composição da lista precisa do texto E da evidência: senão o fallback
+ * recompõe descrição clínica / handoff como prosa nua e a fronteira lança.
+ */
+type AuthorizedServerOwnedNonListSegmentV2 = {
+  text: string;
+  source: 'CANONICAL';
+  actionRecorded?: boolean;
+  outboundEvidence?: Pick<
+    NonNullable<BoundaryEvaluationInputV2['outboundEvidence']>,
+    | 'licensedServiceDescription'
+    | 'authoritativeEscalationQuestionId'
+    | 'businessAddress'
+  >;
+};
+
+function mergeAuthorizedServerOwnedListEvidenceV2(
+  segments: readonly AuthorizedServerOwnedNonListSegmentV2[],
+  witnessedBusinessAddress?: TenantBusinessAddress | null
+): {
+  actionRecorded: boolean;
+  outboundEvidence: NonNullable<BoundaryEvaluationInputV2['outboundEvidence']>;
+} {
+  let actionRecorded = false;
+  const outboundEvidence: NonNullable<
+    BoundaryEvaluationInputV2['outboundEvidence']
+  > = {
+    ...(witnessedBusinessAddress
+      ? { businessAddress: witnessedBusinessAddress }
+      : {}),
+  };
+  for (const segment of segments) {
+    if (segment.actionRecorded) actionRecorded = true;
+    const evidence = segment.outboundEvidence;
+    if (evidence?.licensedServiceDescription) {
+      outboundEvidence.licensedServiceDescription =
+        evidence.licensedServiceDescription;
+    }
+    if (evidence?.authoritativeEscalationQuestionId) {
+      outboundEvidence.authoritativeEscalationQuestionId =
+        evidence.authoritativeEscalationQuestionId;
+    }
+    if (evidence?.businessAddress) {
+      outboundEvidence.businessAddress = evidence.businessAddress;
+    }
+  }
+  return { actionRecorded, outboundEvidence };
 }
 
 function licensedCatalogProvenanceForPayloadV2(
@@ -1206,6 +1266,10 @@ export async function getReceptionistReplyV2(input: {
     executeUpcomingRead: () =>
       executeEntitledUpcomingRead('getUpcomingAppointments', {}),
   });
+  const serviceListPlan = decideServiceListV2({
+    inboundText: currentInboundBatchText,
+    servicesResult: services,
+  });
   const witnessedBusinessAddress = isUsableBusinessAddressV2(
     input.config.businessAddress
   )
@@ -1647,6 +1711,91 @@ export async function getReceptionistReplyV2(input: {
     };
   }
 
+  if (
+    serviceListPlan.decision.kind === 'answer' &&
+    !serviceListPlan.requiresOperationalContinuation
+  ) {
+    const race = await checkRace('before_transport');
+    if (race) return preparedPreemption(race, successorTurnId);
+    const componentText = materializeServiceListCopyWithinBudgetV2({
+      servicesResult: services,
+      courtesyAcknowledgement: serviceListPlan.hasCourtesyAcknowledgement,
+      ...(socialGreeting ? { socialGreeting } : {}),
+    });
+    if (!componentText) {
+      throw new Error('Lista canônica de serviços sem orçamento de transporte.');
+    }
+    const payload = composeServiceListComponentV2({
+      componentText,
+      courtesyAcknowledgement: serviceListPlan.hasCourtesyAcknowledgement,
+      ...(socialGreeting ? { socialGreeting } : {}),
+    });
+    const candidate = { kind: 'preserve' } as const;
+    const evaluation = evaluateBoundaryV2({
+      rawCandidate: payload,
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: frame.flowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER',
+      source: 'CANONICAL',
+      exactCanonicalServiceListText: componentText,
+      businessAddress: witnessedBusinessAddress,
+      outboundEvidence: witnessedBusinessAddress
+        ? { businessAddress: witnessedBusinessAddress }
+        : undefined,
+      route: 'model',
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    });
+    if (
+      !evaluation.safe ||
+      !evaluation.originalAccepted ||
+      !evaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Lista canônica de serviços rejeitada pela boundary.');
+    }
+    const serviceListLoop = emptyLoopResult();
+    serviceListLoop.thinkingMode = thinkingMode;
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'fast_path_service_list',
+    });
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame,
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: evaluation.acceptedPayload,
+      transition: { kind: 'preserve' },
+      planReceipt: makePlan({
+        route: 'fast_path',
+        loop: serviceListLoop,
+        candidate,
+        recoveryKind: 'none',
+        regenCalls: 0,
+        boundaryAttempts: [
+          {
+            index: 0,
+            candidateHash: opaqueReceiptHashV2(payload),
+            reasonCodes: evaluation.reasonCodes,
+          },
+        ],
+      }),
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: false,
+      canonicalPendingQuestion: canonicalPendingQuestion(frame, services),
+      elicitationVariant,
+      copyVariant,
+    };
+  }
+
   const validationContext: ModelResultValidationContextV2 = {
     frame,
     inboundTextsById,
@@ -1696,6 +1845,14 @@ export async function getReceptionistReplyV2(input: {
           },
         ]
       : []),
+    ...(serviceListPlan.decision.kind === 'answer'
+      ? [
+          {
+            role: 'system' as const,
+            content: serviceListModelInstructionV2(),
+          },
+        ]
+      : []),
   ];
 
   const bookingReentryFastPath = resolveBookingReentryFastPathV2({
@@ -1716,6 +1873,7 @@ export async function getReceptionistReplyV2(input: {
         servicesResult: services,
         config: input.config,
         now: startedAt,
+        lastAcceptedDelivery: stored.lastAcceptedDelivery,
         executeTool,
       })
     : { kind: 'continue_model' as const, reason: 'booking_reentry_resolved' };
@@ -1867,6 +2025,7 @@ export async function getReceptionistReplyV2(input: {
         forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
         dateResolution,
         now: startedAt,
+        lastAcceptedDelivery: stored.lastAcceptedDelivery,
         executeTool: async (name, args) =>
           name === 'getUpcomingAppointments'
             ? executeEntitledUpcomingRead(name, args)
@@ -2807,6 +2966,8 @@ export async function getReceptionistReplyV2(input: {
   }
   voiceReceipt = voiceLayer.receipt ?? undefined;
   let deliveredPayload = voiceLayer.payload;
+  const authorizedServerOwnedNonListSegments: AuthorizedServerOwnedNonListSegmentV2[] =
+    [];
   let procedureEscalationQuestionId: string | null = null;
   const procedureBoundaryAttempts: Array<{
     candidateHash: string;
@@ -2927,6 +3088,22 @@ export async function getReceptionistReplyV2(input: {
       throw new Error('Fallback procedural canônico rejeitado pela boundary.');
     }
     deliveredPayload = finalEvaluation.acceptedPayload;
+    authorizedServerOwnedNonListSegments.push({
+      text: componentText,
+      source: 'CANONICAL',
+      ...(actionRecorded ? { actionRecorded: true } : {}),
+      outboundEvidence: {
+        ...(procedureEscalationQuestionId
+          ? {
+              authoritativeEscalationQuestionId:
+                procedureEscalationQuestionId,
+            }
+          : {}),
+        ...(procedureInfoAnswer
+          ? { licensedServiceDescription: procedureInfoAnswer.evidence }
+          : {}),
+      },
+    });
   }
 
   const addressBoundaryAttempts: Array<{
@@ -3002,6 +3179,13 @@ export async function getReceptionistReplyV2(input: {
       throw new Error('Fallback de endereço canônico rejeitado pela boundary.');
     }
     deliveredPayload = addressEvaluation.acceptedPayload;
+    authorizedServerOwnedNonListSegments.push({
+      text: componentText,
+      source: 'CANONICAL',
+      outboundEvidence: witnessedBusinessAddress
+        ? { businessAddress: witnessedBusinessAddress }
+        : undefined,
+    });
     if (
       addressPlan.upcomingReadRaw &&
       !loop.toolTrace.some((entry) => entry.name === 'getUpcomingAppointments')
@@ -3017,6 +3201,108 @@ export async function getReceptionistReplyV2(input: {
         ...loop.toolTrace,
       ];
     }
+  }
+
+  const serviceListBoundaryAttempts: Array<{
+    candidateHash: string;
+    reasonCodes: BoundaryReasonCodeV2[];
+  }> = [];
+  if (serviceListPlan.decision.kind === 'answer') {
+    const componentText = materializeServiceListCopyWithinBudgetV2({
+      servicesResult: services,
+      baseText: deliveredPayload,
+      courtesyAcknowledgement: serviceListPlan.hasCourtesyAcknowledgement,
+    });
+    if (!componentText) {
+      throw new Error('Lista canônica de serviços sem orçamento de transporte.');
+    }
+    const composed = composeServiceListComponentV2({
+      baseText: deliveredPayload,
+      componentText,
+      courtesyAcknowledgement: serviceListPlan.hasCourtesyAcknowledgement,
+    });
+    const authorizedListEvidence = mergeAuthorizedServerOwnedListEvidenceV2(
+      authorizedServerOwnedNonListSegments,
+      witnessedBusinessAddress
+    );
+    const serviceListBoundaryInput = {
+      servicesResult: services,
+      sourceInboundText: currentInboundBatchText,
+      currentInboundIds,
+      inboundTextsById,
+      flowState: committedFlowState,
+      pendingTransitionCandidate: candidate,
+      replyPurpose: 'OPERATIONAL_ANSWER' as const,
+      source:
+        nominalRoute === 'model' || recovery.recoveryKind === 'regen'
+          ? ('GENERATED' as const)
+          : ('CANONICAL' as const),
+      exactCanonicalServiceListText: componentText,
+      actionRecorded: authorizedListEvidence.actionRecorded,
+      businessAddress: witnessedBusinessAddress,
+      outboundEvidence: authorizedListEvidence.outboundEvidence,
+      toolTrace: loop.toolTrace as ToolTraceLike[],
+      route: interpreterResolved ? ('interpreter' as const) : ('model' as const),
+      pendingAnaOpen:
+        frame.pending !== null && frame.pending.flowId === frame.flowState.flowId,
+      pendingSnapshot: frame.pending,
+    };
+    let listEvaluation = evaluateBoundaryV2({
+      ...serviceListBoundaryInput,
+      rawCandidate: composed,
+    });
+    serviceListBoundaryAttempts.push({
+      candidateHash: opaqueReceiptHashV2(composed),
+      reasonCodes: listEvaluation.reasonCodes,
+    });
+    if (
+      !listEvaluation.safe ||
+      !listEvaluation.originalAccepted ||
+      !listEvaluation.acceptedPayload.trim()
+    ) {
+      // Composição gerada rejeitada: nunca reclassificar o baseText
+      // gerado como CANONICAL. Entrega só a lista + segmentos
+      // server-owned já autorizados; estado permanece preserve.
+      candidate = { kind: 'preserve' };
+      const fallbackBaseText = authorizedServerOwnedNonListSegments
+        .map((part) => part.text.trim())
+        .filter(Boolean)
+        .join('\n\n');
+      const fallbackComponentText = materializeServiceListCopyWithinBudgetV2({
+        servicesResult: services,
+        ...(fallbackBaseText ? { baseText: fallbackBaseText } : {}),
+        courtesyAcknowledgement: serviceListPlan.hasCourtesyAcknowledgement,
+        ...(socialGreeting ? { socialGreeting } : {}),
+      });
+      if (!fallbackComponentText) {
+        throw new Error('Lista canônica de serviços sem orçamento de transporte.');
+      }
+      const fallbackPayload = composeServiceListComponentV2({
+        ...(fallbackBaseText ? { baseText: fallbackBaseText } : {}),
+        componentText: fallbackComponentText,
+        courtesyAcknowledgement: serviceListPlan.hasCourtesyAcknowledgement,
+        ...(socialGreeting ? { socialGreeting } : {}),
+      });
+      listEvaluation = evaluateBoundaryV2({
+        ...serviceListBoundaryInput,
+        rawCandidate: fallbackPayload,
+        pendingTransitionCandidate: candidate,
+        exactCanonicalServiceListText: fallbackComponentText,
+        source: 'CANONICAL',
+      });
+      serviceListBoundaryAttempts.push({
+        candidateHash: opaqueReceiptHashV2(fallbackPayload),
+        reasonCodes: listEvaluation.reasonCodes,
+      });
+    }
+    if (
+      !listEvaluation.safe ||
+      !listEvaluation.originalAccepted ||
+      !listEvaluation.acceptedPayload.trim()
+    ) {
+      throw new Error('Fallback da lista canônica de serviços rejeitado pela boundary.');
+    }
+    deliveredPayload = listEvaluation.acceptedPayload;
   }
 
   const transition = materializeTransition(
@@ -3050,6 +3336,13 @@ export async function getReceptionistReplyV2(input: {
     });
   }
   for (const attempt of addressBoundaryAttempts) {
+    boundaryAttempts.push({
+      index: boundaryAttempts.length,
+      candidateHash: attempt.candidateHash,
+      reasonCodes: attempt.reasonCodes,
+    });
+  }
+  for (const attempt of serviceListBoundaryAttempts) {
     boundaryAttempts.push({
       index: boundaryAttempts.length,
       candidateHash: attempt.candidateHash,

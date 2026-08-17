@@ -68,11 +68,13 @@ const expectedFull =
 const expectedCity =
   'Estamos em São Paulo - SP. O endereço completo a equipe confirma com você no contato.';
 const expectedApos =
-  `${expectedCity} assim que seu agendamento estiver confirmado te passo o endereço completinho.`;
+  'Estamos em São Paulo - SP. Assim que seu agendamento estiver confirmado te passo o endereço completinho.';
 const expectedCityRecife =
   'Estamos em Recife - PE. O endereço completo a equipe confirma com você no contato.';
 const expectedCityWithoutState =
   'Estamos em Recife. O endereço completo a equipe confirma com você no contato.';
+const expectedAposTiete =
+  'Estamos em Tietê - SP. Assim que seu agendamento estiver confirmado te passo o endereço completinho.';
 
 const services: ServicesResult = {
   success: true,
@@ -198,6 +200,20 @@ async function main(): Promise<void> {
   assert.equal(
     materializeAfterConfirmationBusinessAddressCopyV2(FULL_ADDRESS),
     expectedApos
+  );
+  assert.equal(
+    materializeAfterConfirmationBusinessAddressCopyV2({
+      full: null,
+      city: 'Tietê',
+      state: 'SP',
+      zipCode: null,
+    }),
+    expectedAposTiete
+  );
+  assert.doesNotMatch(
+    expectedApos,
+    /equipe confirma/u,
+    'APOS_CONFIRMACAO sem upcoming não emenda a frase da equipe'
   );
   assert.equal(materializeFullBusinessAddressCopyV2(CITY_ONLY), null);
   assert.equal(materializeCityBusinessAddressCopyV2(CITY_ONLY), expectedCityRecife);

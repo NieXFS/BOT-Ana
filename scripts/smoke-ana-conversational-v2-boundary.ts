@@ -10,6 +10,10 @@ import {
   isTemporalOnlyServiceOfferSpanV2,
   shouldProhibitServiceRelistV2,
 } from '../src/services/conversationalV2/boundary';
+import {
+  materializeServiceListCopyV2,
+  SERVICE_LIST_TRANSPORT_CEILING_V2,
+} from '../src/services/conversationalV2/serviceList';
 import { hasPositiveClauseMatchV2 } from '../src/services/conversationalV2/polarity';
 import { normalizeTemporalAssertionsV2 } from '../src/services/conversationalV2/temporalNormalizer';
 import { classifyReceptionistTurnPermission } from '../src/services/receptionistSocialSafety';
@@ -1067,6 +1071,81 @@ assert.equal(
     optionEntityIds: ['svc-peeling', 'svc-drenagem'],
   }),
   false
+);
+
+const canonicalServiceList = materializeServiceListCopyV2(servicesResult);
+assert.ok(canonicalServiceList);
+const licensedCanonicalList = boundary(canonicalServiceList!, {
+  source: 'CANONICAL',
+  exactCanonicalServiceListText: canonicalServiceList,
+});
+assert.equal(
+  licensedCanonicalList.safe,
+  true,
+  `lista canônica testemunhada deve passar: ${licensedCanonicalList.reasonCodes.join(',')}`
+);
+const solProbe = boundary(
+  `As opções são Botox e Drenagem Linfática\n\n${canonicalServiceList}`,
+  {
+    source: 'GENERATED',
+    exactCanonicalServiceListText: canonicalServiceList,
+  }
+);
+assert.equal(
+  solProbe.reasonCodes.includes('UNLICENSED_SERVICE_LIST'),
+  true,
+  'sonda Sol: base gerada que enumera + lista canônica bloqueia'
+);
+assert.equal(solProbe.safe, false);
+const licensedCanonicalReading = boundary(
+  `Encontrei estes agendamentos: Drenagem e Peeling Facial em 20/08/2026.\n\n${canonicalServiceList}`,
+  {
+    source: 'CANONICAL',
+    exactCanonicalServiceListText: canonicalServiceList,
+    flowState: { flowId: 'flow-v2', fixedByProofVersion: {} },
+  }
+);
+assert.equal(
+  licensedCanonicalReading.safe,
+  true,
+  `leitura canônica com 2 serviços + lista não é falso positivo: ${licensedCanonicalReading.reasonCodes.join(',')}`
+);
+  assert.equal(
+    licensedCanonicalReading.reasonCodes.includes('UNLICENSED_SERVICE_LIST'),
+    false
+  );
+  const handoffListCopy =
+    `Vou avisar a equipe responsável pelo atendimento.\n\n${canonicalServiceList}`;
+  const unrecordedHandoffList = boundary(handoffListCopy, {
+    source: 'CANONICAL',
+    exactCanonicalServiceListText: canonicalServiceList,
+  });
+  assert.equal(
+    unrecordedHandoffList.reasonCodes.includes('UNRECORDED_HANDOFF'),
+    true,
+    'IA-16d: handoff + lista sem evidência continua UNRECORDED_HANDOFF'
+  );
+  const recordedHandoffList = boundary(handoffListCopy, {
+    source: 'CANONICAL',
+    exactCanonicalServiceListText: canonicalServiceList,
+    actionRecorded: true,
+    outboundEvidence: {
+      authoritativeEscalationQuestionId: 'question-authoritative-fixture',
+    },
+  });
+  assert.equal(
+    recordedHandoffList.safe,
+    true,
+    `IA-16d: handoff registrado + lista passa: ${recordedHandoffList.reasonCodes.join(',')}`
+  );
+  assert.equal(
+    recordedHandoffList.reasonCodes.includes('UNRECORDED_HANDOFF'),
+    false
+  );
+  const overCeiling = boundary('x'.repeat(SERVICE_LIST_TRANSPORT_CEILING_V2 + 1));
+assert.equal(
+  overCeiling.reasonCodes.includes('PAYLOAD_EXCEEDS_TRANSPORT'),
+  true
 );
 
 const temporal = normalizeTemporalAssertionsV2(

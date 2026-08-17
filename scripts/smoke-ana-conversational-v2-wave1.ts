@@ -101,6 +101,17 @@ function frame(input: {
   };
 }
 
+function deliveryEvidence(payload: string, terminalAt: Date) {
+  return {
+    payload,
+    terminalAt: terminalAt.toISOString(),
+    conversationCommitOutcome: 'committed' as const,
+    pendingCommitOutcome: 'preserved' as const,
+    copyVariant: 'canonical' as const,
+    transition: { kind: 'preserve' as const },
+  };
+}
+
 async function main(): Promise<void> {
   const [
     dateModule,
@@ -117,6 +128,8 @@ async function main(): Promise<void> {
     workflowModule,
     voiceModule,
     readModule,
+    pendingModule,
+    serviceListModule,
   ] = await Promise.all([
     import('../src/services/conversationalV2/currentDateResolution'),
     import('../src/services/conversationalV2/flowSession'),
@@ -132,6 +145,8 @@ async function main(): Promise<void> {
     import('../src/services/conversationalV2/workflowLanguage'),
     import('../src/services/conversationalV2/voice'),
     import('../src/services/conversationalV2/readFastPaths'),
+    import('../src/services/conversationalV2/pendingQuestion'),
+    import('../src/services/conversationalV2/serviceList'),
   ]);
 
   const corrected = dateModule.resolveCurrentInboundDateV2({
@@ -1984,6 +1999,375 @@ async function main(): Promise<void> {
     copyVariant: firstVariant.variant,
     result: 'accepted_for_delivery',
   });
+
+  // Exec IA-16 — F7 weekday elíptico + F-LIST enumeração.
+  const ia16Now = new Date('2026-08-17T16:00:00.000Z');
+  const ia16Tz = 'America/Sao_Paulo';
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-terca'],
+      inboundTextsById: { 'in-terca': 'E terça, tem?' },
+      now: ia16Now,
+      timezone: ia16Tz,
+    }),
+    { kind: 'resolved', date: '2026-08-18', mentions: ['2026-08-18'] },
+    'F7: e terça? re-resolve no civil (17/08=segunda → terça=18/08)'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-quinta'],
+      inboundTextsById: { 'in-quinta': 'e quinta?' },
+      now: ia16Now,
+      timezone: ia16Tz,
+    }),
+    { kind: 'resolved', date: '2026-08-20', mentions: ['2026-08-20'] },
+    'F7: e quinta?'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-entao'],
+      inboundTextsById: { 'in-entao': 'terça então' },
+      now: ia16Now,
+      timezone: ia16Tz,
+    }),
+    { kind: 'resolved', date: '2026-08-18', mentions: ['2026-08-18'] },
+    'F7: terça então'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-depois'],
+      inboundTextsById: { 'in-depois': 'e depois de amanhã?' },
+      now: ia16Now,
+      timezone: ia16Tz,
+    }),
+    { kind: 'resolved', date: '2026-08-19', mentions: ['2026-08-19'] },
+    'F7: e depois de amanhã? = 19/08'
+  );
+  assert.equal(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-eai'],
+      inboundTextsById: { 'in-eai': 'e aí?' },
+      now: ia16Now,
+      timezone: ia16Tz,
+    }).kind,
+    'none',
+    'F7: e aí? não tem token civil'
+  );
+  assert.equal(dateModule.inboundHasCivilDateTokenV2('E terça, tem?'), true);
+  assert.equal(dateModule.inboundHasCivilDateTokenV2('e aí?'), false);
+  assert.equal(dateModule.inboundHasCivilDateTokenV2('segunda opção'), false);
+  assert.equal(
+    dateModule.inboundHasCivilDateTokenV2('segunda opção, na terça'),
+    true,
+    'IA-16b: mascara só o span ordinal e deixa terça visível'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-ordinal-terca'],
+      inboundTextsById: { 'in-ordinal-terca': 'segunda opção, na terça' },
+      now: ia16Now,
+      timezone: ia16Tz,
+    }),
+    { kind: 'resolved', date: '2026-08-18', mentions: ['2026-08-18'] },
+    'IA-16b: segunda opção, na terça resolve terça sem residual de segunda-feira'
+  );
+  assert.equal(
+    fastPaths.__strictOrdinalForSmokeV2('e a segunda opção?'),
+    2,
+    'IA-16b: e inicial no ordinal resolve posição 2'
+  );
+  assert.deepEqual(
+    dateModule.resolveCurrentInboundDateV2({
+      currentInboundIds: ['in-direct-terca'],
+      inboundTextsById: {
+        'in-direct-terca': 'Quero agendar uma drenagem pra terça',
+      },
+      now: ia16Now,
+      timezone: ia16Tz,
+    }),
+    { kind: 'resolved', date: '2026-08-18', mentions: ['2026-08-18'] },
+    'IA-7: weekday em entrada direta continua resolvendo no civil'
+  );
+
+  const ia16DatePending = pending({
+    kind: 'DATE',
+    askedAt: ia16Now.toISOString(),
+    options: [{ position: 1, entityId: 'date-freeform', displayName: 'dia desejado' }],
+  });
+  const ia16DateFrame = frame({
+    pending: ia16DatePending,
+    flowState: {
+      flowId: ia16DatePending.flowId,
+      lastOperationalAt: ia16Now.toISOString(),
+      fixedServiceId: 'svc-drenagem',
+      fixedProfessionalId: 'prof-carla',
+      fixedByProofVersion: { fixedServiceId: 1, fixedProfessionalId: 1 },
+    },
+  });
+  const empty18 = pendingModule.emptyAvailabilityDayCopyV2('2026-08-18');
+  let ia16LoopGuardReads = 0;
+  const loopGuard = await progressModule.resolveDateSlotsFastPathV2({
+    frame: ia16DateFrame,
+    dateResolution: {
+      kind: 'resolved',
+      date: '2026-08-18',
+      mentions: ['2026-08-18'],
+    },
+    currentInboundText: 'E terça, tem?',
+    servicesResult: services,
+    config,
+    now: ia16Now,
+    lastAcceptedDelivery: deliveryEvidence(empty18, ia16Now),
+    executeTool: async () => {
+      ia16LoopGuardReads += 1;
+      throw new Error('F7 loop guard não relê o mesmo dia vazio');
+    },
+  });
+  assert.equal(ia16LoopGuardReads, 0, 'F7: guarda de loop não chama getAvailableSlots');
+  assert.equal(loopGuard.kind, 'resolved');
+  if (loopGuard.kind !== 'resolved') throw new Error('F7 loop guard');
+  assert.equal(loopGuard.result.reply, pendingModule.EXPLICIT_DAY_QUESTION_V2);
+  assert.equal(loopGuard.result.pendingTransitionCandidate.kind, 'preserve');
+  assert.notEqual(loopGuard.result.reply, empty18);
+
+  const tenMinLater = new Date(ia16Now.getTime() + 10 * 60 * 1000);
+  let ia16RefreshReads = 0;
+  const loopGuardRefresh = await progressModule.resolveDateSlotsFastPathV2({
+    frame: ia16DateFrame,
+    dateResolution: {
+      kind: 'resolved',
+      date: '2026-08-18',
+      mentions: ['2026-08-18'],
+    },
+    currentInboundText: 'E terça, tem?',
+    servicesResult: services,
+    config,
+    now: tenMinLater,
+    lastAcceptedDelivery: deliveryEvidence(empty18, ia16Now),
+    executeTool: async (name, args) => {
+      assert.equal(name, 'getAvailableSlots');
+      assert.equal(args.date, '2026-08-18');
+      ia16RefreshReads += 1;
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '16:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(ia16RefreshReads, 1, 'IA-16b: após 10min relê o dia');
+  assert.equal(loopGuardRefresh.kind, 'resolved');
+  if (loopGuardRefresh.kind !== 'resolved') throw new Error('IA-16b 10min');
+  assert.match(loopGuardRefresh.result.reply, /10h/u);
+  assert.match(loopGuardRefresh.result.reply, /16h/u);
+
+  let ia16QuintaDate: unknown;
+  const quintaRead = await progressModule.resolveDateSlotsFastPathV2({
+    frame: ia16DateFrame,
+    dateResolution: {
+      kind: 'resolved',
+      date: '2026-08-20',
+      mentions: ['2026-08-20'],
+    },
+    currentInboundText: 'e quinta?',
+    servicesResult: services,
+    config,
+    now: ia16Now,
+    lastAcceptedDelivery: deliveryEvidence(empty18, ia16Now),
+    executeTool: async (name, args) => {
+      assert.equal(name, 'getAvailableSlots');
+      ia16QuintaDate = args.date;
+      return JSON.stringify({
+        success: true,
+        slots: ['10:00', '11:00'],
+        professionalId: 'prof-carla',
+      });
+    },
+  });
+  assert.equal(ia16QuintaDate, '2026-08-20', 'F7: e quinta? lê 20/08, não o 18/08 negado');
+  assert.equal(quintaRead.kind, 'resolved');
+
+  const eaiSlots = await progressModule.resolveDateSlotsFastPathV2({
+    frame: ia16DateFrame,
+    dateResolution: { kind: 'none', mentions: [] },
+    currentInboundText: 'e aí?',
+    servicesResult: services,
+    config,
+    now: ia16Now,
+    lastAcceptedDelivery: deliveryEvidence(empty18, ia16Now),
+    executeTool: async () => {
+      throw new Error('e aí? sem token não relê residual');
+    },
+  });
+  assert.equal(eaiSlots.kind, 'continue_model', 'F7: e aí? mantém comportamento atual');
+
+  const reuseBlocked = await readModule.resolveReadFastPathV2({
+    frame: {
+      ...ia16DateFrame,
+      flowState: {
+        ...ia16DateFrame.flowState,
+        resolvedDate: '2026-08-18',
+      },
+    },
+    inboundText: 'E terça, tem horário?',
+    servicesResult: services,
+    config,
+    dateResolution: { kind: 'none', mentions: [] },
+    now: ia16Now,
+    executeTool: async () => {
+      throw new Error('token civil presente não reusa resolvedDate residual');
+    },
+  });
+  assert.equal(
+    reuseBlocked.kind,
+    'continue_model',
+    'F7: read-fast-path não reusa resolvedDate quando o inbound tem token civil'
+  );
+
+  const roseFrankenstein =
+    'Unha encravada - Necessário avaliação profissional. Valor a partir de';
+  const roseCatalog: ServicesResult = {
+    success: true,
+    services: [
+      { id: 'r1', name: 'Pé', durationMinutes: 30, price: 50, priceFormatted: 'R$ 50' },
+      { id: 'r2', name: 'Mão', durationMinutes: 30, price: 40, priceFormatted: 'R$ 40' },
+      { id: 'r3', name: roseFrankenstein, durationMinutes: 40, price: null, priceFormatted: null },
+      { id: 'r4', name: 'Spa dos pés', durationMinutes: 45, price: 80, priceFormatted: 'R$ 80' },
+      { id: 'r5', name: 'Esmaltação', durationMinutes: 20, price: 30, priceFormatted: 'R$ 30' },
+      { id: 'r6', name: 'Blindagem', durationMinutes: 40, price: 70, priceFormatted: 'R$ 70' },
+      { id: 'r7', name: 'Fibra', durationMinutes: 60, price: 90, priceFormatted: 'R$ 90' },
+    ],
+    professionals: [{ id: 'prof-rose', name: 'Rose' }],
+  };
+  const roseList = serviceListModule.materializeServiceListCopyV2(roseCatalog);
+  assert.equal(roseList?.includes(roseFrankenstein), true, 'F-LIST: frankenstein VERBATIM');
+  assert.equal(roseList?.includes('R$ 50'), false, 'F-LIST: sem preço anexado');
+  assert.equal(roseList?.includes('30 min'), false, 'F-LIST: sem duração anexada');
+  assert.equal(
+    serviceListModule.decideServiceListV2({
+      inboundText: 'Oi! Quais serviços vocês fazem?',
+      servicesResult: roseCatalog,
+    }).decision.kind,
+    'answer'
+  );
+  assert.equal(
+    serviceListModule.matchServiceListQuestionV2('que serviços vocês tem').matched,
+    true
+  );
+  assert.equal(
+    serviceListModule.matchServiceListQuestionV2('o que vocês atendem').matched,
+    true
+  );
+  assert.equal(
+    serviceListModule.matchServiceListQuestionV2('lista de serviços').matched,
+    true
+  );
+  assert.equal(
+    serviceListModule.matchServiceListQuestionV2('não quero saber quais serviços').matched,
+    false
+  );
+  const hugeCatalog: ServicesResult = {
+    success: true,
+    services: Array.from({ length: 103 }, (_, index) => ({
+      id: `svc-${index + 1}`,
+      name: index === 0 ? 'Corte' : `Serviço ${index + 1}`,
+      durationMinutes: 30,
+      price: 10,
+      priceFormatted: 'R$ 10',
+    })),
+    professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
+  };
+  const hugeCopy = serviceListModule.materializeServiceListCopyV2(hugeCatalog);
+  assert.match(hugeCopy ?? '', /Corte, Serviço 2, Serviço 3, Serviço 4, Serviço 5, Serviço 6, Serviço 7, Serviço 8 e mais 95 outros!/u);
+  assert.doesNotMatch(hugeCopy ?? '', /Serviço 9\b/u);
+  const longNames = Array.from(
+    { length: 103 },
+    (_, index) => `Procedimento Estético Completo ${index + 1} ${'x'.repeat(500)}`
+  );
+  const hugeLongCatalog: ServicesResult = {
+    success: true,
+    services: longNames.map((name, index) => ({
+      id: `svc-long-${index + 1}`,
+      name,
+      durationMinutes: 30,
+      price: 10,
+      priceFormatted: 'R$ 10',
+    })),
+    professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
+  };
+  const hugeLongCopy =
+    serviceListModule.materializeServiceListCopyV2(hugeLongCatalog);
+  assert.ok(hugeLongCopy);
+  const listedLong = longNames.filter((name) => hugeLongCopy!.includes(name));
+  assert.ok(listedLong.length >= 1, 'IA-16b: pelo menos um nome inteiro cabe');
+  assert.ok(
+    listedLong.length < 8,
+    'IA-16b: nomes longos não cabem 8 no teto de transporte'
+  );
+  assert.match(
+    hugeLongCopy ?? '',
+    new RegExp(`e mais ${103 - listedLong.length} outros!`, 'u')
+  );
+  assert.ok(
+    (hugeLongCopy?.length ?? Infinity) <=
+      serviceListModule.SERVICE_LIST_TRANSPORT_CEILING_V2
+  );
+  for (const name of listedLong) {
+    assert.equal(
+      hugeLongCopy!.includes(name),
+      true,
+      'IA-16b: nome entra verbatim, nunca truncado'
+    );
+  }
+  const canonicalList = serviceListModule.materializeServiceListCopyV2(services);
+  assert.ok(canonicalList);
+  const solProbe = boundaryModule.evaluateBoundaryV2({
+    rawCandidate: `As opções são Botox e Drenagem Linfática\n\n${canonicalList}`,
+    servicesResult: services,
+    flowState: {
+      flowId: 'flow-wave1',
+      fixedServiceId: 'svc-drenagem',
+      fixedByProofVersion: { fixedServiceId: 1 },
+    },
+    pendingTransitionCandidate: { kind: 'preserve' },
+    source: 'GENERATED',
+    exactCanonicalServiceListText: canonicalList,
+  });
+  assert.equal(
+    solProbe.reasonCodes.includes('UNLICENSED_SERVICE_LIST'),
+    true,
+    'IA-16b: sonda Sol bloqueia enumeração gerada + lista canônica'
+  );
+  const canonicalReading = boundaryModule.evaluateBoundaryV2({
+    rawCandidate: `Encontrei estes agendamentos: Drenagem Linfática em 20/08/2026 às 10:00 com Carla Mendes; Limpeza de Pele Profunda em 21/08/2026 às 14:00 com Carla Mendes.\n\n${canonicalList}`,
+    servicesResult: services,
+    flowState: {
+      flowId: 'flow-wave1',
+      fixedByProofVersion: {},
+    },
+    pendingTransitionCandidate: { kind: 'preserve' },
+    source: 'CANONICAL',
+    exactCanonicalServiceListText: canonicalList,
+  });
+  assert.equal(
+    canonicalReading.safe,
+    true,
+    `IA-16c: leitura canônica com 2 serviços + lista passa: ${canonicalReading.reasonCodes.join(',')}`
+  );
+  assert.equal(
+    canonicalReading.reasonCodes.includes('UNLICENSED_SERVICE_LIST'),
+    false
+  );
+  const vitiCopy = serviceListModule.materializeServiceListCopyV2(services);
+  assert.match(
+    vitiCopy ?? '',
+    /Por aqui: Drenagem Linfática e Limpeza de Pele Profunda\. Algum desses te interessa\?/u
+  );
+  const socialList = serviceListModule.composeServiceListComponentV2({
+    componentText: vitiCopy!,
+    socialGreeting: 'Oi! Como posso ajudar?',
+  });
+  assert.match(socialList, /^Oi! Como posso ajudar\?\n\nPor aqui:/u);
 
   console.log('smoke-ana-conversational-v2-wave1: PASS');
 }

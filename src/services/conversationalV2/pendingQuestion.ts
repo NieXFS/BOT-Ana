@@ -6,10 +6,53 @@ import {
   buildCanonicalBookingSummaryV2,
   displayDateV2,
 } from './lifecycleReducer';
+import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 
 export const PENDING_REANCHOR_GAP_MS_V2 = 15 * 60 * 1000;
+/** Loop-breaker de dia vazio: só na janela [0, 2min] após o terminalAt. */
+export const EMPTY_AVAILABILITY_LOOP_WINDOW_MS_V2 = 2 * 60 * 1000;
 
 export const DATE_PENDING_QUESTION_V2 = 'Qual dia você prefere?';
+
+/** Segunda ocorrência da mesma copy de sem-horários no mesmo dia. */
+export const EXPLICIT_DAY_QUESTION_V2 =
+  'Qual dia você prefere? Pode me falar o nome do dia ou a data.';
+
+export function emptyAvailabilityDayCopyV2(date: string): string {
+  return `Não encontrei horários para ${displayDateV2(date)}. Qual outro dia você prefere?`;
+}
+
+function normalizeCopy(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+/**
+ * Loop-breaker de dia vazio: igualdade de copy/data E
+ * 0 ≤ now − terminalAt ≤ 2min. Fora da janela, relê.
+ */
+export function isRepeatedEmptyAvailabilityDayV2(
+  lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null | undefined,
+  date: string,
+  now: Date
+): boolean {
+  const payload = lastAcceptedDelivery?.payload;
+  const terminalAtRaw = lastAcceptedDelivery?.terminalAt;
+  if (!payload?.trim() || !terminalAtRaw) return false;
+  const terminalAt = Date.parse(terminalAtRaw);
+  if (!Number.isFinite(terminalAt)) return false;
+  const delta = now.getTime() - terminalAt;
+  if (delta < 0 || delta > EMPTY_AVAILABILITY_LOOP_WINDOW_MS_V2) return false;
+  const previous = normalizeCopy(payload);
+  const dated = normalizeCopy(emptyAvailabilityDayCopyV2(date));
+  if (previous.includes(dated) || previous === dated) return true;
+  const display = normalizeCopy(displayDateV2(date));
+  return previous.includes(`nao encontrei horarios para ${display}`);
+}
 
 export const DUPLICATE_RESOLUTION_OPTIONS_V2 = [
   {

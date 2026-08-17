@@ -18,7 +18,7 @@ export const BUSINESS_ADDRESS_AFTER_CONFIRMATION_COPY_ID_V2 =
 const CITY_TEAM_CONFIRMS_SENTENCE_V2 =
   'O endereço completo a equipe confirma com você no contato.';
 const AFTER_CONFIRMATION_SENTENCE_V2 =
-  'assim que seu agendamento estiver confirmado te passo o endereço completinho.';
+  'Assim que seu agendamento estiver confirmado te passo o endereço completinho.';
 
 const ADDRESS_QUESTION_RE =
   /\b(?:endereco|localizacao|onde\s+ficam?|onde\s+voces\s+ficam?|como\s+cheg(?:o|ar)|qual\s+(?:e\s+)?(?:o\s+)?local)\b/u;
@@ -146,9 +146,9 @@ export function materializeCityBusinessAddressCopyV2(
 export function materializeAfterConfirmationBusinessAddressCopyV2(
   address: TenantBusinessAddress
 ): string | null {
-  const cityCopy = materializeCityBusinessAddressCopyV2(address);
-  if (!cityCopy) return null;
-  return `${cityCopy} ${AFTER_CONFIRMATION_SENTENCE_V2}`;
+  const cityState = joinCityState(address);
+  if (!cityState) return null;
+  return `Estamos em ${cityState}. ${AFTER_CONFIRMATION_SENTENCE_V2}`;
 }
 
 function isActiveFutureAppointmentV2(

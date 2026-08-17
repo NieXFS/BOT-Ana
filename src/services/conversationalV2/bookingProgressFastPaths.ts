@@ -43,8 +43,12 @@ import {
   DATE_PENDING_QUESTION_V2,
   DUPLICATE_RESOLUTION_CHOICE_QUESTION_V2,
   DUPLICATE_RESOLUTION_OPTIONS_V2,
+  emptyAvailabilityDayCopyV2,
+  EXPLICIT_DAY_QUESTION_V2,
+  isRepeatedEmptyAvailabilityDayV2,
   validatedBookingDraftForPendingV2,
 } from './pendingQuestion';
+import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 
 export type BookingProgressFastPathV2 =
   | {
@@ -280,18 +284,22 @@ function clearTemporalState(flowState: FlowStateV2): FlowStateV2 {
 
 function dateQuestionResult(
   frame: TurnFrameV2,
-  reply: string
+  reply: string,
+  transition: 'open' | 'preserve' = 'open'
 ): ModelTurnResultV2 {
   return {
     schemaVersion: 2,
     reply,
     replyPurpose: 'DATE_TIME_QUESTION',
-    pendingTransitionCandidate: {
-      kind: 'open',
-      pendingKind: 'DATE',
-      flowId: frame.flowState.flowId,
-      optionEntityIds: ['date-freeform'],
-    },
+    pendingTransitionCandidate:
+      transition === 'preserve'
+        ? { kind: 'preserve' }
+        : {
+            kind: 'open',
+            pendingKind: 'DATE',
+            flowId: frame.flowState.flowId,
+            optionEntityIds: ['date-freeform'],
+          },
     resolutionCandidate: null,
     unknownServiceEvidence: null,
   };
@@ -451,6 +459,7 @@ export async function resolveDateSlotsFastPathV2(input: {
   servicesResult: ServicesResult;
   config: TenantBotConfig;
   now: Date;
+  lastAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<BookingProgressFastPathV2> {
   const entitlement = dateSlotsEntitlementV2({
@@ -494,6 +503,26 @@ export async function resolveDateSlotsFastPathV2(input: {
     serviceId,
     entitlement.professionalId
   );
+  if (isRepeatedEmptyAvailabilityDayV2(input.lastAcceptedDelivery, date, input.now)) {
+    const alreadyAskingDate = input.frame.pending?.kind === 'DATE';
+    return {
+      kind: 'resolved',
+      result: dateQuestionResult(
+        input.frame,
+        EXPLICIT_DAY_QUESTION_V2,
+        alreadyAskingDate ? 'preserve' : 'open'
+      ),
+      loop: loopForReads([]),
+      proof: null,
+      nextFlowState: alreadyAskingDate
+        ? withFixedServiceState(
+            input.frame.flowState,
+            serviceId,
+            entitlement.professionalId
+          )
+        : baseState,
+    };
+  }
   if (date < civilToday(input.now, input.config.timezone)) {
     return {
       kind: 'resolved',
@@ -616,7 +645,7 @@ export async function resolveDateSlotsFastPathV2(input: {
     }
   }
   const reply = slots && slots.length === 0
-    ? `Não encontrei horários para ${displayDateV2(date)}. Qual outro dia você prefere?`
+    ? emptyAvailabilityDayCopyV2(date)
     : canonicalReadFailureCopyV2(
         'availability',
         read.parsed?.success === true ? 'invalid_payload' : readReason(read.parsed)

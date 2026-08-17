@@ -44,7 +44,7 @@ type BoundaryContextV2 = Omit<
   | 'unknownServiceEvidence'
   | 'replyPurpose'
   | 'source'
-  | 'serviceRelistExempt'
+  | 'exactCanonicalServiceListText'
 >;
 
 export interface RecoveryCoordinatorInputV2 {
@@ -216,8 +216,7 @@ export async function coordinateRecoveryV2(
   const boundaryAttempts: RecoveryBoundaryAttemptV2[] = [];
   const evaluate = (
     result: ModelTurnResultV2,
-    source: 'GENERATED' | 'CANONICAL',
-    serviceRelistExempt = false
+    source: 'GENERATED' | 'CANONICAL'
   ): BoundaryEvaluation => {
     const evaluation = evaluateBoundaryV2({
       ...input.boundaryContext,
@@ -228,7 +227,6 @@ export async function coordinateRecoveryV2(
       unknownServiceEvidence: result.unknownServiceEvidence,
       replyPurpose: result.replyPurpose,
       source,
-      serviceRelistExempt,
       route: input.boundaryContext.route ?? 'model',
       pendingAnaOpen:
         input.boundaryContext.pendingAnaOpen ?? input.frame.pending !== null,
@@ -415,11 +413,7 @@ export async function coordinateRecoveryV2(
     resolutionCandidate: null,
     unknownServiceEvidence: null,
   };
-  let fallbackEvaluation = evaluate(
-    fallbackResult,
-    'CANONICAL',
-    directedFallback.pendingQuestion
-  );
+  let fallbackEvaluation = evaluate(fallbackResult, 'CANONICAL');
   if (!boundaryAccepted(fallbackEvaluation)) {
     const rejectedFallback = fallbackResult.reply;
     fallbackResult.reply = [

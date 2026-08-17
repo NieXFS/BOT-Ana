@@ -87,7 +87,7 @@ const ANAPHORIC_PROCEDURE_RE =
 const COURTESY_ACK_RE =
   /\b(?:muito\s+)?(?:obrigad[oa]|agradeco|valeu|vlw)\b/u;
 const ADDITIONAL_OPERATIONAL_RE =
-  /\b(?:tem\s+vaga|tem\s+horario|disponibilidade|agenda(?:r|mento)?|marcar|remarcar|cancelar|desmarcar|pagamento|pagar|pix|cartao|preco|valor|quanto\s+custa|profissional|amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}(?::\d{2}|h\d{0,2})?|endereco|localizacao|onde\s+ficam?|como\s+cheg(?:o|ar)|qual\s+(?:o\s+)?local)\b/u;
+  /\b(?:tem\s+vaga|tem\s+horario|disponibilidade|agenda(?:r|mento)?|marcar|remarcar|cancelar|desmarcar|pagamento|pagar|pix|cartao|preco|valor|quanto\s+custa|profissional|amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}(?::\d{2}|h\d{0,2})?|endereco|localizacao|onde\s+ficam?|como\s+cheg(?:o|ar)|qual\s+(?:o\s+)?local|quais\s+servicos|lista\s+de\s+servicos|que\s+servicos|o\s+que\s+voces\s+(?:fazem|atendem|oferecem|tem))\b/u;
 
 function coveredFacetsFromLicense(
   service: NonNullable<ServicesResult['services']>[number]

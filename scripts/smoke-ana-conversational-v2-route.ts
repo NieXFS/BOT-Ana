@@ -388,6 +388,7 @@ async function main(): Promise<void> {
 
   assert.equal(__strictOrdinalForSmokeV2('2'), 2);
   assert.equal(__strictOrdinalForSmokeV2('a segunda opção'), 2);
+  assert.equal(__strictOrdinalForSmokeV2('e a segunda opção?'), 2);
   assert.equal(__strictOrdinalForSmokeV2('opção 2'), 2);
   assert.equal(__strictOrdinalForSmokeV2('segunda'), null);
   assert.equal(__strictOrdinalForSmokeV2('a última'), null);
@@ -406,6 +407,18 @@ async function main(): Promise<void> {
   });
   assert.equal(ordinal.kind, 'resolved');
   assert.equal(ordinal.kind === 'resolved' && ordinal.proof.kind, 'pending_option');
+  const discursiveOrdinal = resolveSelectionFastPathV2({
+    frame: matrixFrame,
+    inboundId: 'inbound-prompt-e',
+    inboundText: 'e a segunda opção?',
+    catalog: services,
+    now,
+  });
+  assert.equal(discursiveOrdinal.kind, 'resolved');
+  if (discursiveOrdinal.kind === 'resolved') {
+    assert.equal(discursiveOrdinal.proof.kind, 'pending_option');
+    assert.equal(discursiveOrdinal.proof.entityId, 'svc-peeling');
+  }
   assert.equal(
     resolveSelectionFastPathV2({
       frame: matrixFrame,
@@ -4136,6 +4149,771 @@ async function main(): Promise<void> {
   });
   assert.equal(ia10BookDelivery.receipt.pendingCommitOutcome, 'resolved');
   assert.equal((await ia10Store.loadLatestState(ia10Key, ia10Now(3))).pending, null);
+
+  // Exec IA-16 — F7 weekday elíptico (Jackeline) + F-LIST enumeração (Rose/viti/103).
+  const ia16Now = new Date('2026-08-17T16:00:00.000Z');
+  const ia16EscovaServices: ServicesResult = {
+    success: true,
+    services: [
+      {
+        id: 'svc-escova',
+        name: 'Escova',
+        durationMinutes: 40,
+        price: 80,
+        priceFormatted: 'R$ 80,00',
+        professionalIds: ['prof-julia'],
+      },
+    ],
+    professionals: services.professionals,
+  };
+  const ia16EmptySlots = async (name: string, args: Record<string, unknown>) => {
+    assert.equal(name, 'getAvailableSlots');
+    assert.equal(typeof args.date, 'string');
+    return JSON.stringify({
+      success: true,
+      slots: [],
+      professionalId: 'prof-julia',
+    });
+  };
+  const ia16Deliver = async (
+    prepared: Awaited<ReturnType<typeof getReceptionistReplyV2>>,
+    store: MemoryConversationalV2StateStore,
+    sequence: number,
+    at: Date
+  ) => {
+    await deliverPreparedReceptionistTurnV2(prepared, {
+      store,
+      id: nextId,
+      now: () => at,
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: sequence,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    });
+  };
+
+  const ia16TercaStore = new MemoryConversationalV2StateStore();
+  const ia16TercaPhone = '5511000001617';
+  const ia16TercaKey = `${config.phoneNumberId}:${ia16TercaPhone}`;
+  ia16TercaStore.setInputSequence(ia16TercaKey, 1);
+  const ia16AmanhaDates: unknown[] = [];
+  const ia16Amanha = await getReceptionistReplyV2({
+    phone: ia16TercaPhone,
+    userMessage: 'Tem horário pra escova amanhã?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Tem horário pra escova amanhã?' }),
+    deps: {
+      ...baseDeps(ia16TercaStore),
+      now: () => ia16Now,
+      loadServices: async () => ia16EscovaServices,
+      executeTool: async (name, args) => {
+        ia16AmanhaDates.push(args.date);
+        return ia16EmptySlots(name, args);
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-16 amanhã não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16Amanha.planReceipt.route, 'fast_path');
+  assert.deepEqual(ia16AmanhaDates, ['2026-08-18']);
+  assert.match(ia16Amanha.payload ?? '', /18\/08\/2026/);
+  await ia16Deliver(ia16Amanha, ia16TercaStore, 1, ia16Now);
+  ia16TercaStore.setInputSequence(ia16TercaKey, 2);
+  let ia16TercaReads = 0;
+  const ia16Terca = await getReceptionistReplyV2({
+    phone: ia16TercaPhone,
+    userMessage: 'E terça, tem?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'E terça, tem?', sequence: 2 }),
+    deps: {
+      ...baseDeps(ia16TercaStore),
+      now: () => new Date(ia16Now.getTime() + 1_000),
+      loadServices: async () => ia16EscovaServices,
+      executeTool: async (name) => {
+        ia16TercaReads += 1;
+        throw new Error(`IA-16 terça não relê o mesmo dia: ${name}`);
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-16 E terça, tem? não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16Terca.planReceipt.route, 'fast_path');
+  assert.equal(ia16TercaReads, 0, 'F7: terça no mesmo dia civil não relê 18/08');
+  assert.match(ia16Terca.payload ?? '', /Qual dia você prefere\? Pode me falar o nome do dia ou a data/u);
+  assert.doesNotMatch(ia16Terca.payload ?? '', /Não encontrei horários para 18\/08\/2026/u);
+  assert.equal(ia16Terca.planReceipt.pendingTransitionCandidate.kind, 'preserve');
+
+  const ia16RefreshStore = new MemoryConversationalV2StateStore();
+  const ia16RefreshPhone = '5511000001625';
+  const ia16RefreshKey = `${config.phoneNumberId}:${ia16RefreshPhone}`;
+  ia16RefreshStore.setInputSequence(ia16RefreshKey, 1);
+  const ia16RefreshFirst = await getReceptionistReplyV2({
+    phone: ia16RefreshPhone,
+    userMessage: 'Tem horário pra escova amanhã?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Tem horário pra escova amanhã?' }),
+    deps: {
+      ...baseDeps(ia16RefreshStore),
+      now: () => ia16Now,
+      loadServices: async () => ia16EscovaServices,
+      executeTool: ia16EmptySlots,
+      runModelLoop: async () => {
+        throw new Error('IA-16b 10min T1 não chama modelo');
+      },
+    },
+  });
+  await ia16Deliver(ia16RefreshFirst, ia16RefreshStore, 1, ia16Now);
+  ia16RefreshStore.setInputSequence(ia16RefreshKey, 2);
+  const ia16RefreshDates: unknown[] = [];
+  const ia16Refresh = await getReceptionistReplyV2({
+    phone: ia16RefreshPhone,
+    userMessage: 'E terça, tem?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'E terça, tem?', sequence: 2 }),
+    deps: {
+      ...baseDeps(ia16RefreshStore),
+      now: () => new Date(ia16Now.getTime() + 10 * 60 * 1000),
+      loadServices: async () => ia16EscovaServices,
+      executeTool: async (name, args) => {
+        assert.equal(name, 'getAvailableSlots');
+        ia16RefreshDates.push(args.date);
+        return JSON.stringify({
+          success: true,
+          slots: ['09:00', '16:00'],
+          professionalId: 'prof-julia',
+        });
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-16b 10min T2 não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16Refresh.planReceipt.route, 'fast_path');
+  assert.deepEqual(ia16RefreshDates, ['2026-08-18']);
+  assert.match(ia16Refresh.payload ?? '', /9h/u);
+  assert.match(ia16Refresh.payload ?? '', /16h/u);
+
+  const ia16QuintaStore = new MemoryConversationalV2StateStore();
+  const ia16QuintaPhone = '5511000001618';
+  const ia16QuintaKey = `${config.phoneNumberId}:${ia16QuintaPhone}`;
+  ia16QuintaStore.setInputSequence(ia16QuintaKey, 1);
+  const ia16QuintaFirst = await getReceptionistReplyV2({
+    phone: ia16QuintaPhone,
+    userMessage: 'Tem horário pra escova amanhã?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Tem horário pra escova amanhã?' }),
+    deps: {
+      ...baseDeps(ia16QuintaStore),
+      now: () => ia16Now,
+      loadServices: async () => ia16EscovaServices,
+      executeTool: ia16EmptySlots,
+      runModelLoop: async () => {
+        throw new Error('IA-16 quinta T1 não chama modelo');
+      },
+    },
+  });
+  await ia16Deliver(ia16QuintaFirst, ia16QuintaStore, 1, ia16Now);
+  ia16QuintaStore.setInputSequence(ia16QuintaKey, 2);
+  const ia16QuintaDates: unknown[] = [];
+  const ia16Quinta = await getReceptionistReplyV2({
+    phone: ia16QuintaPhone,
+    userMessage: 'e quinta?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'e quinta?', sequence: 2 }),
+    deps: {
+      ...baseDeps(ia16QuintaStore),
+      now: () => new Date(ia16Now.getTime() + 1_000),
+      loadServices: async () => ia16EscovaServices,
+      executeTool: async (name, args) => {
+        assert.equal(name, 'getAvailableSlots');
+        ia16QuintaDates.push(args.date);
+        return JSON.stringify({
+          success: true,
+          slots: ['10:00', '14:00'],
+          professionalId: 'prof-julia',
+        });
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-16 e quinta? não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16Quinta.planReceipt.route, 'fast_path');
+  assert.deepEqual(ia16QuintaDates, ['2026-08-20']);
+  assert.match(ia16Quinta.payload ?? '', /20\/08\/2026/);
+
+  const ia16EntaoStore = new MemoryConversationalV2StateStore();
+  const ia16EntaoPhone = '5511000001619';
+  const ia16EntaoKey = `${config.phoneNumberId}:${ia16EntaoPhone}`;
+  ia16EntaoStore.setInputSequence(ia16EntaoKey, 1);
+  const ia16EntaoFirst = await getReceptionistReplyV2({
+    phone: ia16EntaoPhone,
+    userMessage: 'Tem horário pra escova amanhã?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Tem horário pra escova amanhã?' }),
+    deps: {
+      ...baseDeps(ia16EntaoStore),
+      now: () => ia16Now,
+      loadServices: async () => ia16EscovaServices,
+      executeTool: ia16EmptySlots,
+      runModelLoop: async () => {
+        throw new Error('IA-16 terça então T1 não chama modelo');
+      },
+    },
+  });
+  await ia16Deliver(ia16EntaoFirst, ia16EntaoStore, 1, ia16Now);
+  ia16EntaoStore.setInputSequence(ia16EntaoKey, 2);
+  let ia16EntaoReads = 0;
+  const ia16Entao = await getReceptionistReplyV2({
+    phone: ia16EntaoPhone,
+    userMessage: 'terça então',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'terça então', sequence: 2 }),
+    deps: {
+      ...baseDeps(ia16EntaoStore),
+      now: () => new Date(ia16Now.getTime() + 1_000),
+      loadServices: async () => ia16EscovaServices,
+      executeTool: async () => {
+        ia16EntaoReads += 1;
+        throw new Error('IA-16 terça então não relê o mesmo dia');
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-16 terça então não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16Entao.planReceipt.route, 'fast_path');
+  assert.equal(ia16EntaoReads, 0);
+  assert.match(ia16Entao.payload ?? '', /Pode me falar o nome do dia ou a data/u);
+
+  const ia16DepoisStore = new MemoryConversationalV2StateStore();
+  const ia16DepoisPhone = '5511000001620';
+  const ia16DepoisKey = `${config.phoneNumberId}:${ia16DepoisPhone}`;
+  ia16DepoisStore.setInputSequence(ia16DepoisKey, 1);
+  const ia16DepoisFirst = await getReceptionistReplyV2({
+    phone: ia16DepoisPhone,
+    userMessage: 'Tem horário pra escova amanhã?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Tem horário pra escova amanhã?' }),
+    deps: {
+      ...baseDeps(ia16DepoisStore),
+      now: () => ia16Now,
+      loadServices: async () => ia16EscovaServices,
+      executeTool: ia16EmptySlots,
+      runModelLoop: async () => {
+        throw new Error('IA-16 depois-de-amanhã T1 não chama modelo');
+      },
+    },
+  });
+  await ia16Deliver(ia16DepoisFirst, ia16DepoisStore, 1, ia16Now);
+  ia16DepoisStore.setInputSequence(ia16DepoisKey, 2);
+  const ia16DepoisDates: unknown[] = [];
+  const ia16Depois = await getReceptionistReplyV2({
+    phone: ia16DepoisPhone,
+    userMessage: 'e depois de amanhã?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'e depois de amanhã?', sequence: 2 }),
+    deps: {
+      ...baseDeps(ia16DepoisStore),
+      now: () => new Date(ia16Now.getTime() + 1_000),
+      loadServices: async () => ia16EscovaServices,
+      executeTool: async (name, args) => {
+        assert.equal(name, 'getAvailableSlots');
+        ia16DepoisDates.push(args.date);
+        return JSON.stringify({
+          success: true,
+          slots: ['09:00'],
+          professionalId: 'prof-julia',
+        });
+      },
+      runModelLoop: async () => {
+        throw new Error('IA-16 e depois de amanhã? não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16Depois.planReceipt.route, 'fast_path');
+  assert.deepEqual(ia16DepoisDates, ['2026-08-19'], 'F7: depois de amanhã lê 19/08');
+  assert.match(ia16Depois.payload ?? '', /19\/08\/2026/);
+
+  const ia16EaiStore = new MemoryConversationalV2StateStore();
+  const ia16EaiPhone = '5511000001621';
+  const ia16EaiKey = `${config.phoneNumberId}:${ia16EaiPhone}`;
+  ia16EaiStore.setInputSequence(ia16EaiKey, 1);
+  const ia16EaiFirst = await getReceptionistReplyV2({
+    phone: ia16EaiPhone,
+    userMessage: 'Tem horário pra escova amanhã?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Tem horário pra escova amanhã?' }),
+    deps: {
+      ...baseDeps(ia16EaiStore),
+      now: () => ia16Now,
+      loadServices: async () => ia16EscovaServices,
+      executeTool: ia16EmptySlots,
+      runModelLoop: async () => {
+        throw new Error('IA-16 e aí T1 não chama modelo');
+      },
+    },
+  });
+  await ia16Deliver(ia16EaiFirst, ia16EaiStore, 1, ia16Now);
+  ia16EaiStore.setInputSequence(ia16EaiKey, 2);
+  let ia16EaiReads = 0;
+  const ia16Eai = await getReceptionistReplyV2({
+    phone: ia16EaiPhone,
+    userMessage: 'e aí?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'e aí?', sequence: 2 }),
+    deps: {
+      ...baseDeps(ia16EaiStore),
+      now: () => new Date(ia16Now.getTime() + 1_000),
+      loadServices: async () => ia16EscovaServices,
+      executeTool: async (name) => {
+        ia16EaiReads += 1;
+        throw new Error(`IA-16 e aí? não consulta agenda: ${name}`);
+      },
+      composeSocial: async () => ({
+        ok: true,
+        candidate: 'Oi! Estou por aqui.',
+        providerCalls: 1 as const,
+      }),
+      runModelLoop: async () => ({
+        rawReply: JSON.stringify(
+          flatResult({
+            reply: 'Qual dia você prefere?',
+            nextPending: 'DATE',
+            chosenOptionText: null,
+          })
+        ),
+        exhausted: false,
+        provider: 'openai' as const,
+        model: 'gpt-4o-mini',
+        providerReportedModels: ['gpt-4o-mini'],
+        rounds: 1,
+        messages: [],
+        toolTrace: [],
+        usage: [],
+      }),
+    },
+  });
+  assert.equal(ia16EaiReads, 0, 'F7: e aí? mantém comportamento atual, zero getAvailableSlots');
+  assert.notEqual(ia16Eai.planReceipt.route, 'fast_path');
+
+  const ia16ListViti = await getReceptionistReplyV2({
+    phone: '5511000001622',
+    userMessage: 'Oi! Quais serviços vocês fazem?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Oi! Quais serviços vocês fazem?' }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      runModelLoop: async () => {
+        throw new Error('F-LIST catálogo 3 não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16ListViti.planReceipt.route, 'fast_path');
+  assert.match(
+    ia16ListViti.payload ?? '',
+    /Oi! Como posso ajudar\?\n\nPor aqui: Drenagem Linfática, Peeling Facial e Massagem Especial\. Algum desses te interessa\?/u
+  );
+  assert.doesNotMatch(ia16ListViti.payload ?? '', /R\$/u);
+  assert.equal(
+    ia16ListViti.planReceipt.boundaryAttempts[0]?.reasonCodes.length ?? 1,
+    0
+  );
+
+  const roseFrankenstein =
+    'Unha encravada - Necessário avaliação profissional. Valor a partir de';
+  const roseCatalog: ServicesResult = {
+    success: true,
+    services: [
+      { id: 'r1', name: 'Pé', durationMinutes: 30, price: 50, priceFormatted: 'R$ 50,00', professionalIds: ['prof-julia'] },
+      { id: 'r2', name: 'Mão', durationMinutes: 30, price: 40, priceFormatted: 'R$ 40,00', professionalIds: ['prof-julia'] },
+      { id: 'r3', name: roseFrankenstein, durationMinutes: 40, price: null, priceFormatted: null, professionalIds: ['prof-julia'] },
+      { id: 'r4', name: 'Spa dos pés', durationMinutes: 45, price: 80, priceFormatted: 'R$ 80,00', professionalIds: ['prof-julia'] },
+      { id: 'r5', name: 'Esmaltação', durationMinutes: 20, price: 30, priceFormatted: 'R$ 30,00', professionalIds: ['prof-julia'] },
+      { id: 'r6', name: 'Blindagem', durationMinutes: 40, price: 70, priceFormatted: 'R$ 70,00', professionalIds: ['prof-julia'] },
+      { id: 'r7', name: 'Fibra', durationMinutes: 60, price: 90, priceFormatted: 'R$ 90,00', professionalIds: ['prof-julia'] },
+    ],
+    professionals: services.professionals,
+  };
+  const ia16ListRose = await getReceptionistReplyV2({
+    phone: '5511000001623',
+    userMessage: 'Oi! Quais serviços vocês fazem?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Oi! Quais serviços vocês fazem?' }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      loadServices: async () => roseCatalog,
+      runModelLoop: async () => {
+        throw new Error('F-LIST Rose 7 não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16ListRose.planReceipt.route, 'fast_path');
+  assert.equal(ia16ListRose.payload?.includes(roseFrankenstein), true);
+  assert.match(ia16ListRose.payload ?? '', /Por aqui: Pé, Mão,/u);
+  assert.match(
+    ia16ListRose.payload ?? '',
+    /Blindagem e Fibra\. Algum desses te interessa\?/u
+  );
+  assert.doesNotMatch(ia16ListRose.payload ?? '', /R\$ 50/u);
+
+  const hugeCatalog: ServicesResult = {
+    success: true,
+    services: Array.from({ length: 103 }, (_, index) => ({
+      id: `svc-huge-${index + 1}`,
+      name: index === 0 ? 'Corte' : `Serviço ${index + 1}`,
+      durationMinutes: 30,
+      price: 10,
+      priceFormatted: 'R$ 10,00',
+      professionalIds: ['prof-julia'],
+    })),
+    professionals: services.professionals,
+  };
+  const ia16ListHuge = await getReceptionistReplyV2({
+    phone: '5511000001624',
+    userMessage: 'lista de serviços',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'lista de serviços' }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      loadServices: async () => hugeCatalog,
+      runModelLoop: async () => {
+        throw new Error('F-LIST 103 não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16ListHuge.planReceipt.route, 'fast_path');
+  assert.match(
+    ia16ListHuge.payload ?? '',
+    /Por aqui: Corte, Serviço 2, Serviço 3, Serviço 4, Serviço 5, Serviço 6, Serviço 7, Serviço 8 e mais 95 outros! Algum desses te interessa\? Me fala o nome que eu vejo os detalhes\./u
+  );
+  assert.doesNotMatch(ia16ListHuge.payload ?? '', /Serviço 9\b/u);
+
+  const longNames = Array.from(
+    { length: 103 },
+    (_, index) => `Procedimento Estético Completo ${index + 1} ${'x'.repeat(500)}`
+  );
+  const hugeLongCatalog: ServicesResult = {
+    success: true,
+    services: longNames.map((name, index) => ({
+      id: `svc-long-${index + 1}`,
+      name,
+      durationMinutes: 30,
+      price: 10,
+      priceFormatted: 'R$ 10,00',
+      professionalIds: ['prof-julia'],
+    })),
+    professionals: services.professionals,
+  };
+  const ia16ListHugeLong = await getReceptionistReplyV2({
+    phone: '5511000001626',
+    userMessage: 'lista de serviços',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'lista de serviços' }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      loadServices: async () => hugeLongCatalog,
+      runModelLoop: async () => {
+        throw new Error('F-LIST 103 longos não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16ListHugeLong.planReceipt.route, 'fast_path');
+  const longPayload = ia16ListHugeLong.payload ?? '';
+  const listedLong = longNames.filter((name) => longPayload.includes(name));
+  assert.ok(listedLong.length >= 1);
+  assert.match(longPayload, new RegExp(`e mais ${103 - listedLong.length} outros!`, 'u'));
+  assert.ok(longPayload.length <= 4096, 'IA-16b: payload dentro do teto de transporte');
+  assert.equal(
+    ia16ListHugeLong.planReceipt.boundaryAttempts[0]?.reasonCodes.length ?? 1,
+    0
+  );
+
+  const ia16cGeneratedText =
+    'quais serviços vocês fazem e quanto custa?';
+  const ia16cGenerated = await getReceptionistReplyV2({
+    phone: '5511000001627',
+    userMessage: ia16cGeneratedText,
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: ia16cGeneratedText }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      runModelLoop: async () => ({
+        rawReply: JSON.stringify(
+          flatResult({
+            reply: 'As opções são Drenagem Linfática e Peeling Facial',
+            nextPending: 'PRESERVE',
+            chosenOptionText: null,
+          })
+        ),
+        exhausted: false,
+        provider: 'openai' as const,
+        model: 'gpt-4o-mini',
+        providerReportedModels: ['gpt-4o-mini'],
+        rounds: 1,
+        messages: [],
+        toolTrace: [],
+        usage: [],
+      }),
+    },
+  });
+  assert.doesNotMatch(
+    ia16cGenerated.payload ?? '',
+    /As opções são/u,
+    'IA-16c: fallback não reclassifica enumeração gerada como canônica'
+  );
+  assert.match(
+    ia16cGenerated.payload ?? '',
+    /Por aqui: Drenagem Linfática, Peeling Facial e Massagem Especial\. Algum desses te interessa\?/u
+  );
+  assert.equal(
+    ia16cGenerated.planReceipt.boundaryAttempts.some((entry) =>
+      entry.reasonCodes.includes('UNLICENSED_SERVICE_LIST')
+    ),
+    true,
+    'IA-16c: primeira avaliação do misto gerado marca UNLICENSED_SERVICE_LIST'
+  );
+  assert.equal(
+    ia16cGenerated.planReceipt.boundaryAttempts.at(-1)?.reasonCodes.length ?? 1,
+    0,
+    'IA-16c: fallback entrega só a lista canônica sem throw'
+  );
+  assert.equal(ia16cGenerated.transition.kind, 'preserve');
+
+  const ia16cCanonicalText =
+    'quais serviços vocês fazem e quais são meus agendamentos amanhã?';
+  const ia16cCanonical = await getReceptionistReplyV2({
+    phone: '5511000001628',
+    userMessage: ia16cCanonicalText,
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: ia16cCanonicalText }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      executeProactiveDuplicateRead: async () =>
+        JSON.stringify({
+          success: true,
+          appointments: [
+            {
+              id: 'appointment-drenagem',
+              startTime: '2026-08-20T13:00:00.000Z',
+              endTime: '2026-08-20T14:00:00.000Z',
+              serviceName: 'Drenagem Linfática',
+              professionalName: 'Júlia',
+            },
+            {
+              id: 'appointment-peeling',
+              startTime: '2026-08-21T17:00:00.000Z',
+              endTime: '2026-08-21T18:00:00.000Z',
+              serviceName: 'Peeling Facial',
+              professionalName: 'Marina',
+            },
+          ],
+        }),
+      runModelLoop: async () => {
+        throw new Error('IA-16c leitura canônica + lista não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia16cCanonical.planReceipt.route, 'fast_path');
+  assert.match(
+    ia16cCanonical.payload ?? '',
+    /Encontrei estes agendamentos: Drenagem Linfática em /u
+  );
+  assert.match(ia16cCanonical.payload ?? '', /Peeling Facial em /u);
+  assert.match(
+    ia16cCanonical.payload ?? '',
+    /Por aqui: Drenagem Linfática, Peeling Facial e Massagem Especial\. Algum desses te interessa\?/u
+  );
+  assert.equal(
+    ia16cCanonical.planReceipt.boundaryAttempts.some((entry) =>
+      entry.reasonCodes.includes('UNLICENSED_SERVICE_LIST')
+    ),
+    false,
+    'IA-16c: leitura canônica mencionando 2 serviços + lista não é falso positivo'
+  );
+
+  const ia16dGeneratedEnumeration =
+    'As opções são Drenagem Linfática e Peeling Facial';
+  const ia16dListCopy =
+    'Por aqui: Drenagem Linfática, Peeling Facial e Massagem Especial. Algum desses te interessa?';
+  const ia16dGeneratedLoop = async () => ({
+    rawReply: JSON.stringify(
+      flatResult({
+        reply: ia16dGeneratedEnumeration,
+        nextPending: 'PRESERVE',
+        chosenOptionText: null,
+      })
+    ),
+    exhausted: false,
+    provider: 'openai' as const,
+    model: 'gpt-4o-mini',
+    providerReportedModels: ['gpt-4o-mini'],
+    rounds: 1,
+    messages: [],
+    toolTrace: [],
+    usage: [],
+  });
+  const ia16dClinicalExact = 'É seguro para gestantes.';
+  const ia16dClinicalConfig = {
+    ...config,
+    contractVersion: 2,
+    descriptionTermAcceptance: {
+      clauseVersion: 'responsibility-v1',
+      acceptedAt: '2026-08-15T01:00:00.000Z',
+    },
+    authoritativeCatalog: {
+      ...config.authoritativeCatalog,
+      services: services.services!.map((service) =>
+        service.id === 'svc-drenagem'
+          ? {
+              ...service,
+              licensedDescription: {
+                sourceHash: 'a'.repeat(64),
+                policyVersion: 'licensed-service-description-v1' as const,
+                clauses: [
+                  {
+                    clauseId: 'drenagem-clinical-what',
+                    facet: 'WHAT_IT_IS' as const,
+                    exactText: ia16dClinicalExact,
+                  },
+                ],
+              },
+            }
+          : service
+      ),
+    },
+  } as TenantBotConfig;
+  const ia16dClinicalText =
+    'o que é a drenagem e quais serviços vocês fazem?';
+  const ia16dClinical = await getReceptionistReplyV2({
+    phone: '5511000001629',
+    userMessage: ia16dClinicalText,
+    userName: 'Cliente',
+    config: ia16dClinicalConfig,
+    turnRuntime: turnRuntime({ text: ia16dClinicalText }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      runModelLoop: ia16dGeneratedLoop,
+    },
+  });
+  assert.doesNotMatch(
+    ia16dClinical.payload ?? '',
+    /As opções são/u,
+    'IA-16d: fallback não reclassifica enumeração gerada como canônica'
+  );
+  assert.match(
+    ia16dClinical.payload ?? '',
+    new RegExp(ia16dClinicalExact.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u'),
+    'IA-16d: fallback conserva a descrição clínica licenciada'
+  );
+  assert.match(ia16dClinical.payload ?? '', new RegExp(ia16dListCopy, 'u'));
+  assert.equal(
+    ia16dClinical.planReceipt.boundaryAttempts.some((entry) =>
+      entry.reasonCodes.includes('UNLICENSED_SERVICE_LIST')
+    ),
+    true,
+    'IA-16d: primeira avaliação do misto gerado marca UNLICENSED_SERVICE_LIST'
+  );
+  assert.equal(
+    ia16dClinical.planReceipt.boundaryAttempts.some((entry) =>
+      entry.reasonCodes.includes('UNAUTHORIZED_CLINICAL_PROMISE')
+    ),
+    false,
+    'IA-16d: evidência clínica atravessa a 1ª avaliação e o fallback da lista'
+  );
+  assert.equal(
+    ia16dClinical.planReceipt.boundaryAttempts.at(-1)?.reasonCodes.length ?? 1,
+    0,
+    'IA-16d: fallback entrega descrição licenciada + lista sem throw'
+  );
+  assert.equal(ia16dClinical.transition.kind, 'preserve');
+
+  const ia16dHandoffText =
+    'como funciona a drenagem e quais serviços vocês fazem?';
+  const ia16dHandoff = await getReceptionistReplyV2({
+    phone: '5511000001630',
+    userMessage: ia16dHandoffText,
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: ia16dHandoffText }),
+    deps: {
+      ...baseDeps(new MemoryConversationalV2StateStore()),
+      now: () => ia16Now,
+      runModelLoop: ia16dGeneratedLoop,
+      escalateProcedure: async () => ({
+        matched: true,
+        reply: 'Vou avisar a equipe responsável pelo atendimento.',
+        actionRecorded: true,
+        questionId: 'question-procedure-ia16d',
+        outcome: 'created' as const,
+      }),
+    },
+  });
+  assert.doesNotMatch(
+    ia16dHandoff.payload ?? '',
+    /As opções são/u,
+    'IA-16d: fallback da escalada não reclassifica enumeração gerada'
+  );
+  assert.match(
+    ia16dHandoff.payload ?? '',
+    /Vou avisar a equipe responsável pelo atendimento\./u,
+    'IA-16d: fallback conserva o handoff procedural registrado'
+  );
+  assert.match(ia16dHandoff.payload ?? '', new RegExp(ia16dListCopy, 'u'));
+  assert.equal(
+    ia16dHandoff.planReceipt.boundaryAttempts.some((entry) =>
+      entry.reasonCodes.includes('UNLICENSED_SERVICE_LIST')
+    ),
+    true,
+    'IA-16d: primeira avaliação do misto gerado + handoff marca UNLICENSED_SERVICE_LIST'
+  );
+  assert.equal(
+    ia16dHandoff.planReceipt.boundaryAttempts.some((entry) =>
+      entry.reasonCodes.includes('UNRECORDED_HANDOFF')
+    ),
+    false,
+    'IA-16d: evidência de handoff atravessa a 1ª avaliação e o fallback da lista'
+  );
+  assert.equal(
+    ia16dHandoff.planReceipt.boundaryAttempts.at(-1)?.reasonCodes.length ?? 1,
+    0,
+    'IA-16d: fallback entrega handoff registrado + lista sem throw'
+  );
+  assert.equal(
+    ia16dHandoff.authoritativeEscalationQuestionId,
+    'question-procedure-ia16d'
+  );
+  assert.equal(ia16dHandoff.transition.kind, 'preserve');
 
   console.log('smoke ana conversational v2 route: OK');
 }

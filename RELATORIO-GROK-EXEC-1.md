@@ -2041,3 +2041,213 @@ HEAD permaneceu `02e8859` destacado. Sem commit.
 | `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
 
 HEAD permaneceu `2223387` destacado. Sem commit.
+
+## Exec IA-16 — F7 (weekday elíptico em follow-up de data) + F-LIST (enumeração determinística)
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `e0330fe` (= produção atual). Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Origem: dois achados E2E reais nas clínicas recém-ativadas no v2 (Rose e Jackeline — linhas vivas).
+
+### F7 — "E terça, tem?" relia o `resolvedDate` antigo
+
+**Causa.** Jackeline (103 serviços): "Tem horário pra escova amanhã?" leu `2026-08-18` (vazio, 12 agendamentos reais) e perguntou "Qual outro dia você prefere?". Follow-up "E terça, tem?" entrou no fast-path de slots, chamou `getAvailableSlots` de novo no **mesmo** `18/08`, `pendingTransition=preserve`, e repetiu a copy de sem-horários.
+
+O resolvedor civil do IA-7 já fazia o certo: 17/08 é segunda, então `amanhã` **e** `terça` caem no mesmo dia civil `18/08`. A leitura de `19/08` no enunciado é um desconto de calendário (quarta = `depois de amanhã`). O furo vivo era **re-read do mesmo dia vazio** + fallback do read-path para `flowState.resolvedDate` residual quando o inbound traz token civil que o lote não resolveu. Não havia guarda de loop.
+
+**Entrega.**
+
+1. `inboundHasCivilDateTokenV2` detecta weekday/relativo/absoluto no inbound atual (com/sem acento e `-feira`). `segunda opção` continua vetado. Não consulta `resolvedDate`.
+2. Fast-path de DATE e read de disponibilidade usam **somente** `resolveCurrentInboundDateV2` do lote atual **antes** de qualquer `getAvailableSlots`. Token civil presente + resolução `none`/`ambiguous` **não** reutiliza residual.
+3. Guarda de loop: se a última entrega aceita já foi a copy canônica de sem-horários do **mesmo** dia, zero tool calls; copy vira `Qual dia você prefere? Pode me falar o nome do dia ou a data.`; DATE já aberta → `preserve`.
+4. Token ausente (`e aí?`) mantém o comportamento atual: sem re-read, sem fast-path de slots. Weekday em entrada direta (IA-7) intacto.
+
+**Calendário âncora 2026-08-17 (segunda):** `e terça?` / `terça então` → 18/08 (loop-guard se 18/08 já veio vazio); `e quinta?` → 20/08; `e depois de amanhã?` → 19/08.
+
+### F-LIST — enumeração de serviços determinística
+
+**Causa.** Rose (7 serviços): "Oi! Quais serviços vocês fazem?" gerou 2 candidatos vetados por `UNKNOWN_SERVICE_OFFER` (modelo parafraseou nomes) e caiu em fallback. Catálogo real não enumerava via modelo.
+
+**Entrega.** Fast-path server-owned (`serviceList.ts`): matcher polarizado (`quais serviços`, `que serviços vocês tem/fazem`, `o que vocês fazem/atendem/oferecem`, `lista de serviços`). Copy canônica `Por aqui:` + nomes **VERBATIM** na ordem do catálogo testemunhado (prefixo evita `temos`/`fazemos` do detector de oferta). Teto de 8; restante vira `e mais N outros! Algum desses te interessa? Me fala o nome que eu vejo os detalhes.` Sem preço/duração anexados. 1 mensagem. Boundary `CANONICAL` + `serviceRelistExempt`. Prefix social (R8) compõe. Misto operacional anexa a lista depois da resposta operacional. Nome-frankenstein da Rose entra verbatim.
+
+### Arquivos
+
+- `src/services/conversationalV2/serviceList.ts` (novo)
+- `src/services/conversationalV2/currentDateResolution.ts`
+- `src/services/conversationalV2/pendingQuestion.ts`
+- `src/services/conversationalV2/bookingProgressFastPaths.ts`
+- `src/services/conversationalV2/readFastPaths.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `scripts/smoke-ana-conversational-v2-wave1.ts`
+- `scripts/smoke-ana-conversational-v2-route.ts`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | tokens civis; loop-guard zero reads; quinta=20/08; residual bloqueado; Rose/103; social R8; IA-7 weekday direto |
+| `npm run smoke:ana-conversational-v2-route` | 0 | amanhã→18/08 vazio → `E terça, tem?` preserve sem re-read; `e quinta?` 20/08; `depois de amanhã` 19/08; `e aí?` zero slots; listas 3/7/103 |
+| `npm run smoke:booking-reasons` | 0 | 33 checks |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | IA-5/IA-6/IA-13 intactos |
+| `npm run smoke:ana-conversational-v2-business-address` | 0 | |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | IA-11/IA-12 intactos |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `e0330fe` destacado. Sem commit.
+
+## Exec IA-16b — 4 correções mínimas do Sol sobre o IA-16
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `e0330fe` + working tree IA-16. Sem commit, troca de branch, deploy ou push. Executor: Cursor Grok 4.6.
+
+### 1. Loop-guard com janela temporal
+
+O breaker lia só o payload da última entrega. Agora recebe `AcceptedDeliveryEvidenceV2` completo e só dispara quando copy/data batem **e** `0 ≤ now − terminalAt ≤ 2min`. Repetição imediata de `E terça, tem?` após 18/08 vazio: zero `getAvailableSlots`. Após 10min: nova leitura; slots `10h`/`16h` (wave1) e `9h`/`16h` (rota) chegam à resposta.
+
+### 2. Ordinal com marcador discursivo
+
+`strictOrdinal` aceita `e` inicial: `"e a segunda opção?"` resolve posição 2. O resolvedor civil mascara só o span `"segunda opção"` / `"opção N"`; `"segunda opção, na terça"` resolve `2026-08-18` sem residual de segunda-feira. `"segunda opção"` nua continua sem token civil.
+
+### 3. `serviceRelistExempt` → testemunho tipado
+
+Boolean removido. A boundary exige `exactCanonicalServiceListText`: o texto tem de aparecer **uma** vez como segmento server-owned (`\n\n`); só esse segmento sai da checagem de relistagem. Base GENERATED não ganha isenção. Reason novo `UNLICENSED_SERVICE_LIST` para enumeração residual no caminho da lista. Sonda do Sol (`As opções são Botox e Drenagem Linfática` + lista canônica) bloqueia. Lista canônica testemunhada continua aceita.
+
+### 4. Orçamento total da lista
+
+Nomes inteiros/verbatim até o teto WhatsApp `4096` (e até 8 nomes). O omitido é recalculado; nome nunca é truncado. Em misto, orçamento = teto − base − greeting − `\n\n`. Boundary final emite `PAYLOAD_EXCEEDS_TRANSPORT` acima do teto. Fixture: 103 nomes longos (~500 chars), contagem `e mais N outros!` certa, payload ≤ 4096.
+
+### Arquivos
+
+- `src/services/conversationalV2/serviceList.ts`
+- `src/services/conversationalV2/pendingQuestion.ts`
+- `src/services/conversationalV2/bookingProgressFastPaths.ts`
+- `src/services/conversationalV2/readFastPaths.ts`
+- `src/services/conversationalV2/currentDateResolution.ts`
+- `src/services/conversationalV2/fastPaths.ts`
+- `src/services/conversationalV2/boundary.ts`
+- `src/services/conversationalV2/contracts.ts`
+- `src/services/conversationalV2/recoveryCoordinator.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `scripts/smoke-ana-conversational-v2-wave1.ts`
+- `scripts/smoke-ana-conversational-v2-route.ts`
+- `scripts/smoke-ana-conversational-v2-boundary.ts`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | 2min zero reads; 10min relê 10h/16h; `e a segunda opção?`=2; terça sem residual; sonda Sol; 103 longos |
+| `npm run smoke:ana-conversational-v2-route` | 0 | imediato zero reads; 10min 9h/16h; ordinal discursivo; 103 longos ≤4096 |
+| `npm run smoke:ana-conversational-v2-boundary` | 0 | sonda Sol `UNLICENSED_SERVICE_LIST`; teto `PAYLOAD_EXCEEDS_TRANSPORT` |
+| `npm run smoke:ana-conversational-v2-business-address` | 0 | |
+| `npm run smoke:booking-confirmation-gate` | 0 | |
+| `npm run smoke:ana-v2-elicitor-matcher-contract` | 0 | |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `e0330fe` destacado. Sem commit.
+
+## Exec IA-16c — proveniência no fallback misto da lista + copy APOS_CONFIRMACAO
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `e0330fe` + working tree IA-16/16b. Sem commit, troca de branch, deploy ou push. Executor: Cursor Grok 4.6. As 4 correções do 16b passaram nas sondas do Sol; o bloqueante novo era o caminho misto da lista.
+
+### 1. Fallback reclassificava GENERATED como CANONICAL
+
+**Causa.** Base gerada + lista canônica ⇒ primeira avaliação `safe:false` / `UNLICENSED_SERVICE_LIST` (correto). O fallback preservava o **mesmo** `deliveredPayload` rejeitado (`requiresOperationalContinuation`) e só trocava `source` para `CANONICAL`. A boundary aplica o reason no remainder depois de retirar o segmento da lista, independente da etiqueta — a segunda avaliação falhava de novo e o runtime lançava. A mesma checagem sem proveniência também bloqueava leitura **realmente** canônica que mencionava dois serviços do catálogo.
+
+**Entrega (instrução mínima do Sol).**
+
+1. A proveniência do segmento não-lista é preservada na primeira avaliação; texto gerado nunca é reclassificado como canônico.
+2. `UNLICENSED_SERVICE_LIST` só no remainder `source === 'GENERATED'` (ausente trata-se como gerado). Remainder CANONICAL não herda o reason.
+3. Composição gerada rejeitada ⇒ o fallback **remove** o `baseText` rejeitado e entrega só a lista canônica + segmentos server-owned já autorizados (procedimento/endereço aceitos, greeting). Estado `preserve`.
+4. Duas regressões de rota: enumeração gerada de 2 serviços + lista ⇒ entrega canônica sem throw; leitura canônica autorizada (`getUpcomingAppointments`) mencionando 2 serviços + lista ⇒ passa sem falso positivo.
+
+### 2. Copy APOS_CONFIRMACAO sem upcoming
+
+Defeito vivo na linha da Rose: a copy de cidade (frase da equipe) era emendada com a sentença de “assim que…”, minúscula e redundante.
+
+Copy única, capitalizada, com `city`/`state` do payload:
+
+`Estamos em Tietê - SP. Assim que seu agendamento estiver confirmado te passo o endereço completinho.`
+
+A frase “O endereço completo a equipe confirma com você no contato.” permanece só em `SO_CIDADE`.
+
+### Arquivos
+
+- `src/services/conversationalV2/boundary.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `src/services/conversationalV2/businessAddress.ts`
+- `scripts/smoke-ana-conversational-v2-route.ts`
+- `scripts/smoke-ana-conversational-v2-boundary.ts`
+- `scripts/smoke-ana-conversational-v2-wave1.ts`
+- `scripts/smoke-ana-conversational-v2-business-address.ts`
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-route` | 0 | 2 regressões novas: gerada+lista sem throw; leitura canônica 2 serviços sem falso positivo |
+| `npm run smoke:ana-conversational-v2-business-address` | 0 | âncora Tietê; APOS sem frase da equipe |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | sonda Sol intacta; leitura canônica + lista |
+| `npm run smoke:ana-conversational-v2-boundary` | 0 | `UNLICENSED_SERVICE_LIST` só em GENERATED |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `e0330fe` destacado. Sem commit.
+
+## Exec IA-16d — segmentos server-owned tipados com evidência
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `e0330fe` + working tree IA-16/16b/16c. Sem commit, troca de branch, deploy ou push. Executor: Cursor Grok 4.6. Os 3 consertos do 16c passaram; o bloqueio restante era perda de evidência no fallback da lista.
+
+### Causa
+
+`authorizedServerOwnedNonListSegments` era `string[]`. Descrição procedural e handoff entravam só como texto; a avaliação da lista carregava evidência de endereço, mas não `licensedServiceDescription` / `authoritativeEscalationQuestionId` / `actionRecorded`. O fallback recompunha o componente autorizado como prosa nua: descrição clínica + lista → `UNAUTHORIZED_CLINICAL_PROMISE`; handoff registrado + lista → `UNRECORDED_HANDOFF` → throw → flush de erro.
+
+### Entrega (instrução mínima do Sol)
+
+1. Segmentos tipados `{ texto, source, evidência }` no compositor da lista.
+2. Essas evidências são mescladas na **primeira** avaliação da lista e no fallback.
+3. Fallback continua removendo a enumeração gerada, conserva o componente autorizado e entrega a lista, sem throw.
+4. Pergunta de enumeração (`quais serviços` / `lista de serviços`) é continuação operacional da decisão procedural — senão o misto short-circuitava antes da lista.
+
+Duas regressões de rota: (1) descrição clínica licenciada + enumeração gerada + lista; (2) escalada procedural registrada + enumeração gerada + lista. Ambas caem no fallback, conservam o componente autorizado, entregam a lista, sem `UNAUTHORIZED_CLINICAL_PROMISE` / `UNRECORDED_HANDOFF`.
+
+### Arquivos
+
+- `src/services/conversationalV2/runtime.ts`
+- `src/services/conversationalV2/procedureInfo.ts`
+- `scripts/smoke-ana-conversational-v2-route.ts`
+- `scripts/smoke-ana-conversational-v2-boundary.ts`
+- `scripts/smoke-ana-conversational-v2-procedure-info.ts`
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-conversational-v2-route` | 0 | 2 regressões novas: clínica licenciada+lista; handoff registrado+lista; ambas sem throw |
+| `npm run smoke:ana-conversational-v2-boundary` | 0 | handoff+lista sem evidência bloqueia; com evidência passa |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | |
+| `npm run smoke:ana-conversational-v2-business-address` | 0 | |
+| `npm run smoke:ana-conversational-v2-procedure-info` | 0 | lista é continuação operacional da descrição/escalada |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `e0330fe` destacado. Sem commit.

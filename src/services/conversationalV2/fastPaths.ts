@@ -59,7 +59,7 @@ function strictOrdinal(value: string): number | null {
     quinto: 5,
   };
   const match = text.match(
-    /^(?:a )?(?:(primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa]) opcao|opcao (?:numero )?([1-9]\d*|primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa]))(?: por favor)?$/
+    /^(?:e )?(?:a )?(?:(primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa]) opcao|opcao (?:numero )?([1-9]\d*|primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa]))(?: por favor)?$/
   );
   const token = match?.[1] ?? match?.[2];
   if (!token) return null;
