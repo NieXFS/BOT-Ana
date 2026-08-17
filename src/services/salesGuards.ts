@@ -735,21 +735,24 @@ function assistantFallbackTrack(
 
 function isDirectModalityQuestion(text: string): boolean {
   const normalized = normalize(text);
-  if (!normalized || LEGACY_ANNUAL_RE.test(normalized)) return false;
-  const tracks = mentionedTracks(normalized);
+  if (!normalized) return false;
+  // Menção da trilha aposentada na fala da Renata não é sinal da lead e não
+  // desqualifica a pergunta direta de modalidade no mesmo turno.
+  const questionText = normalized.replace(LEGACY_ANNUAL_RE, ' ');
+  const tracks = mentionedTracks(questionText);
   if (!tracks.includes('flexivel') || !tracks.includes('fidelidade')) {
     return false;
   }
   const hasPreferenceCue =
     /\b(?:prefere|preferem|preferencia|escolhe|escolher|escolha)\b/.test(
-      normalized
+      questionText
     );
   const hasBinaryOr =
     /\b(?:mensal|flexivel)\b.{0,48}\bou\b.{0,48}\b(?:anual|fidelidade)\b/.test(
-      normalized
+      questionText
     ) ||
     /\b(?:anual|fidelidade)\b.{0,48}\bou\b.{0,48}\b(?:mensal|flexivel)\b/.test(
-      normalized
+      questionText
     );
   if (!hasPreferenceCue && !(hasBinaryOr && /\?/.test(text))) return false;
   return countActionableSalesQuestions(text) <= 1;

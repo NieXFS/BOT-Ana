@@ -78,6 +78,56 @@ deve(
     return d?.plan === 'essencial' && d?.track === 'flexivel';
   })()
 );
+deve(
+  'explica trilha aposentada e "Mensal" => essencial+flexivel',
+  (() => {
+    const d = decisao([
+      h('user', 'quero o Essencial anual a vista'),
+      h(
+        'assistant',
+        'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?'
+      ),
+      h('user', 'Mensal'),
+    ]);
+    return d?.plan === 'essencial' && d?.track === 'flexivel';
+  })()
+);
+deve(
+  'explica trilha aposentada e "Anual" => essencial+fidelidade',
+  (() => {
+    const d = decisao([
+      h('user', 'quero o Essencial anual a vista'),
+      h(
+        'assistant',
+        'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?'
+      ),
+      h('user', 'Anual'),
+    ]);
+    return d?.plan === 'essencial' && d?.track === 'fidelidade';
+  })()
+);
+deve(
+  'explica trilha aposentada e "Prefiro ver depois" => null',
+  decisao([
+    h('user', 'quero o Essencial anual a vista'),
+    h(
+      'assistant',
+      'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?'
+    ),
+    h('user', 'Prefiro ver depois'),
+  ]) === null
+);
+deve(
+  'explica trilha aposentada e "os dois" => null',
+  decisao([
+    h('user', 'quero o Essencial anual a vista'),
+    h(
+      'assistant',
+      'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?'
+    ),
+    h('user', 'os dois'),
+  ]) === null
+);
 
 console.log('\n--- GATE DE E-MAIL: não pode ter regredido ---');
 const EMAIL = 'cristina@gmail.com';

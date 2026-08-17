@@ -1234,6 +1234,30 @@ assert.deepEqual(
   ]),
   { plan: 'essencial', track: 'fidelidade', evidenceIndex: 2 }
 );
+assert.deepEqual(
+  decided([
+    { role: 'user', content: 'quero o Essencial anual a vista' },
+    {
+      role: 'assistant',
+      content:
+        'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?',
+    },
+    { role: 'user', content: 'Mensal' },
+  ]),
+  { plan: 'essencial', track: 'flexivel', evidenceIndex: 2 }
+);
+assert.deepEqual(
+  decided([
+    { role: 'user', content: 'quero o Essencial anual a vista' },
+    {
+      role: 'assistant',
+      content:
+        'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?',
+    },
+    { role: 'user', content: 'Anual' },
+  ]),
+  { plan: 'essencial', track: 'fidelidade', evidenceIndex: 2 }
+);
 assert.equal(
   decided(userTurns(['Quero o Essencial anual a vista', 'Mensal'])),
   null
@@ -1294,6 +1318,30 @@ assert.equal(
       content: 'Você prefere Mensal ou Anual? Qual o nome da clínica?',
     },
     { role: 'user', content: 'Mensal' },
+  ]),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'quero o Essencial anual a vista' },
+    {
+      role: 'assistant',
+      content:
+        'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?',
+    },
+    { role: 'user', content: 'Prefiro ver depois' },
+  ]),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'quero o Essencial anual a vista' },
+    {
+      role: 'assistant',
+      content:
+        'O anual a vista foi aposentado. Voce prefere Mensal ou Anual?',
+    },
+    { role: 'user', content: 'os dois' },
   ]),
   null
 );
