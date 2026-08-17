@@ -17,36 +17,19 @@ function pendingFreshV2(pending: PendingFrameSnapshotV2, now: Date): boolean {
   );
 }
 
-/**
- * Prova de entrega committed da pendência atual. Extraída do cancelamento
- * (fonte correta): transição open idêntica ao PendingFrame, versão/flow/
- * opções/timestamps frescos e payload igual à copy canônica materializada.
- */
-export function diagnoseDeliveryMatchPendingV2(input: {
-  pending: PendingFrameSnapshotV2;
-  lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
-  now: Date;
-  expectedCopy: string;
-}):
-  | { ok: true }
-  | { ok: false; reason: PendingDeliveryMatchDeclineV2 } {
-  const delivery = input.lastAcceptedDelivery;
-  const transition = delivery?.transition;
-  if (!delivery || !transition) {
-    return { ok: false, reason: 'delivery_missing' };
-  }
-  if (
-    delivery.conversationCommitOutcome !== 'committed' ||
-    delivery.pendingCommitOutcome !== 'opened' ||
-    transition.kind !== 'open' ||
-    transition.frame.questionId !== input.pending.questionId ||
-    transition.frame.version !== input.pending.version ||
-    transition.frame.flowId !== input.pending.flowId ||
-    transition.frame.askedAt !== input.pending.askedAt ||
-    transition.frame.kind !== input.pending.kind ||
-    transition.frame.options.length !== input.pending.options.length ||
-    transition.frame.options.some((option, index) => {
-      const current = input.pending.options[index];
+function pendingFrameMatchesOpeningV2(
+  pending: PendingFrameSnapshotV2,
+  frame: PendingFrameSnapshotV2
+): boolean {
+  return (
+    frame.questionId === pending.questionId &&
+    frame.version === pending.version &&
+    frame.flowId === pending.flowId &&
+    frame.askedAt === pending.askedAt &&
+    frame.kind === pending.kind &&
+    frame.options.length === pending.options.length &&
+    !frame.options.some((option, index) => {
+      const current = pending.options[index];
       return (
         !current ||
         option.position !== current.position ||
@@ -54,11 +37,78 @@ export function diagnoseDeliveryMatchPendingV2(input: {
         option.displayName !== current.displayName
       );
     })
-  ) {
-    return { ok: false, reason: 'delivery_not_current_pending' };
+  );
+}
+
+/**
+ * A entrega que ABRIU a versão atual do PendingFrame: committed + open +
+ * version/flowId/questionId/opções idênticos. Preserve posterior da mesma
+ * copy não entra aqui — é o loop-breaker, não a prova de abertura.
+ */
+export function findCommittedOpeningDeliveryV2(input: {
+  pending: PendingFrameSnapshotV2;
+  deliveries: readonly (AcceptedDeliveryEvidenceV2 | null | undefined)[];
+}): AcceptedDeliveryEvidenceV2 | null {
+  for (const delivery of input.deliveries) {
+    if (!delivery) continue;
+    const transition = delivery.transition;
+    if (
+      delivery.conversationCommitOutcome === 'committed' &&
+      delivery.pendingCommitOutcome === 'opened' &&
+      transition.kind === 'open' &&
+      pendingFrameMatchesOpeningV2(input.pending, transition.frame)
+    ) {
+      return delivery;
+    }
+  }
+  return null;
+}
+
+function deliveriesForPendingMatchV2(input: {
+  lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  openingAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
+  acceptedDeliveries?: readonly (AcceptedDeliveryEvidenceV2 | null | undefined)[];
+}): (AcceptedDeliveryEvidenceV2 | null | undefined)[] {
+  return [
+    ...(input.acceptedDeliveries ?? []),
+    input.openingAcceptedDelivery,
+    input.lastAcceptedDelivery,
+  ];
+}
+
+/**
+ * Prova de entrega committed da versão atual da pendência. A âncora é a
+ * transição `open` que abriu esse version/flowId/questionId — lookup no
+ * histórico de recibos, não a última transição. Preserve que re-apresenta a
+ * mesma copy canônica não invalida. Sem nenhum open committed da versão
+ * atual, a confirmação falha fechada (furo original: "sim" após fallback
+ * preserve de pendência nunca-entregue).
+ */
+export function diagnoseDeliveryMatchPendingV2(input: {
+  pending: PendingFrameSnapshotV2;
+  lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  openingAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
+  acceptedDeliveries?: readonly (AcceptedDeliveryEvidenceV2 | null | undefined)[];
+  now: Date;
+  expectedCopy: string;
+}):
+  | { ok: true }
+  | { ok: false; reason: PendingDeliveryMatchDeclineV2 } {
+  const deliveries = deliveriesForPendingMatchV2(input);
+  const opening = findCommittedOpeningDeliveryV2({
+    pending: input.pending,
+    deliveries,
+  });
+  if (!opening) {
+    return {
+      ok: false,
+      reason: deliveries.some(Boolean)
+        ? 'delivery_not_current_pending'
+        : 'delivery_missing',
+    };
   }
   const askedAge = input.now.getTime() - Date.parse(input.pending.askedAt);
-  const terminalAge = input.now.getTime() - Date.parse(delivery.terminalAt);
+  const terminalAge = input.now.getTime() - Date.parse(opening.terminalAt);
   if (
     !Number.isFinite(askedAge) ||
     !Number.isFinite(terminalAge) ||
@@ -70,7 +120,7 @@ export function diagnoseDeliveryMatchPendingV2(input: {
   ) {
     return { ok: false, reason: 'delivery_expired' };
   }
-  return normalizeCustomerReplyStyle(delivery.payload) ===
+  return normalizeCustomerReplyStyle(opening.payload) ===
     normalizeCustomerReplyStyle(input.expectedCopy)
     ? { ok: true }
     : { ok: false, reason: 'delivery_payload_mismatch' };
@@ -79,6 +129,8 @@ export function diagnoseDeliveryMatchPendingV2(input: {
 export function deliveryMatchesPendingV2(input: {
   pending: PendingFrameSnapshotV2;
   lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  openingAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
+  acceptedDeliveries?: readonly (AcceptedDeliveryEvidenceV2 | null | undefined)[];
   now: Date;
   expectedCopy: string;
 }): boolean {

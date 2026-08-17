@@ -150,6 +150,7 @@ export async function resolveBookingConfirmationWriteFastPathV2(input: {
   history: readonly { role: string; content?: unknown }[];
   servicesResult: ServicesResult;
   lastAcceptedDelivery: V2BookingConfirmationContext['lastAcceptedDelivery'];
+  openingAcceptedDelivery?: V2BookingConfirmationContext['openingAcceptedDelivery'];
   now: Date;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
   onGateDecline?: V2BookingConfirmationContext['onGateDecline'];
@@ -163,6 +164,7 @@ export async function resolveBookingConfirmationWriteFastPathV2(input: {
     flowState: input.frame.flowState,
     catalog: input.servicesResult,
     lastAcceptedDelivery: input.lastAcceptedDelivery,
+    openingAcceptedDelivery: input.openingAcceptedDelivery,
     now: input.now,
     ...(input.onGateDecline ? { onGateDecline: input.onGateDecline } : {}),
   };
@@ -917,6 +919,7 @@ export async function resolveConfirmationDuplicatePreflightV2(input: {
   config: TenantBotConfig;
   now: Date;
   lastAcceptedDelivery: V2BookingConfirmationContext['lastAcceptedDelivery'];
+  openingAcceptedDelivery?: V2BookingConfirmationContext['openingAcceptedDelivery'];
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
 }): Promise<BookingProgressFastPathV2> {
   const pending = input.frame.pending;
@@ -935,6 +938,7 @@ export async function resolveConfirmationDuplicatePreflightV2(input: {
     flowState: input.frame.flowState,
     catalog: input.servicesResult,
     lastAcceptedDelivery: input.lastAcceptedDelivery,
+    openingAcceptedDelivery: input.openingAcceptedDelivery,
     now: input.now,
   };
   if (hasTypedKeepBothEvidenceV2(context)) {

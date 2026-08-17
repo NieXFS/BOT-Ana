@@ -160,6 +160,8 @@ export interface V2BookingConfirmationContext {
   flowState: FlowStateV2;
   catalog: PendingQuestionCatalogV2;
   lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  /** Open committed da versão atual; preserve posterior não a invalida. */
+  openingAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   now: Date;
   onGateDecline?: (decline: GateDeclineV2) => void;
 }
@@ -431,6 +433,7 @@ export function diagnoseV2ConfirmationDeliveryProof(input: {
   const match = diagnoseDeliveryMatchPendingV2({
     pending,
     lastAcceptedDelivery: input.context.lastAcceptedDelivery,
+    openingAcceptedDelivery: input.context.openingAcceptedDelivery,
     now: input.context.now,
     expectedCopy: buildCanonicalBookingSummaryV2({
       draft,

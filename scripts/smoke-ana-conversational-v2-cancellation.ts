@@ -7,6 +7,7 @@ import type {
 } from '../src/services/calendarService';
 import type {
   CancellationFlowV2,
+  FlowStateV2,
   ModelTurnResultV2,
   PendingFrameSnapshotV2,
   TurnFrameV2,
@@ -564,6 +565,153 @@ async function main(): Promise<void> {
     assert.equal(confirm.hasCommittedWrite, true);
     assert.equal(confirm.transition.kind, 'resolve');
     assertNoTechnicalIdLeak(confirm.payload ?? '', [SUNDAY_AUTO.id], 'payload 2');
+  }
+
+  // 2b. IA-15c: re-ask preserve da mesma versão NÃO invalida o cancel.
+  {
+    const conv = openConversation();
+    const ask = await conv.prepare('quero cancelar domingo as 10h');
+    await conv.deliver(ask);
+    const afterOpen = await conv.store.loadLatestState(
+      conv.conversationKey,
+      NOW
+    );
+    assert.equal(afterOpen.openingAcceptedDelivery?.transition.kind, 'open');
+    const preserveTurnId = nextId();
+    const preserveNow = new Date(NOW.getTime() + 1_000);
+    await conv.deliver(
+      {
+        ...ask,
+        frame: {
+          ...ask.frame,
+          turnId: preserveTurnId,
+          inputSequence: 2,
+          pending: afterOpen.pending?.snapshot ?? ask.frame.pending,
+        },
+        planReceipt: {
+          ...ask.planReceipt,
+          planReceiptId: nextId(),
+          turnId: preserveTurnId,
+          pendingTransitionCandidate: { kind: 'preserve' },
+        },
+        transition: {
+          kind: 'preserve',
+          expectedQuestionId: afterOpen.pending?.snapshot.questionId ?? null,
+          expectedVersion: afterOpen.pending?.snapshot.version ?? null,
+          nextFlowState: afterOpen.flowState ?? ask.frame.flowState,
+        },
+      },
+      preserveNow
+    );
+    const afterPreserve = await conv.store.loadLatestState(
+      conv.conversationKey,
+      preserveNow
+    );
+    assert.equal(
+      afterPreserve.lastAcceptedDelivery?.transition.kind,
+      'preserve'
+    );
+    assert.equal(
+      afterPreserve.openingAcceptedDelivery?.transition.kind,
+      'open'
+    );
+    const confirm = await conv.prepare('sim');
+    assert.equal(
+      conv.posts.length,
+      1,
+      'IA-15c cancel: re-ask preserve da pergunta não invalida'
+    );
+    assert.equal(confirm.hasCommittedWrite, true);
+  }
+
+  // 2c. IA-15c predicado compartilhado no gate de cancel.
+  {
+    const token = sundayCandidates[0]!.token;
+    const cancelPending = {
+      questionId: 'q-cancel-ia15c',
+      askedAt: NOW.toISOString(),
+      kind: 'CANCEL_CONFIRMATION' as const,
+      flowId: 'flow-cancel-ia15c',
+      version: 1,
+      options: [
+        {
+          position: 1,
+          entityId: token,
+          displayName: sundayDisplay!,
+        },
+      ],
+    };
+    const cancelFlowState: FlowStateV2 = {
+      flowId: cancelPending.flowId,
+      fixedByProofVersion: {},
+      cancellation: {
+        flowId: cancelPending.flowId,
+        sourceReadTurnId: 'turn-read-cancel-ia15c',
+        selectedToken: token,
+        candidates: [...sundayCandidates],
+      },
+    };
+    const cancelOpenDelivery = {
+      payload: confirmationCopy,
+      terminalAt: NOW.toISOString(),
+      conversationCommitOutcome: 'committed' as const,
+      pendingCommitOutcome: 'opened' as const,
+      copyVariant: 'canonical' as const,
+      transition: {
+        kind: 'open' as const,
+        frame: cancelPending,
+        expectedQuestionId: null,
+        expectedVersion: null,
+        nextFlowState: cancelFlowState,
+      },
+    };
+    const cancelPreserveDelivery = {
+      payload: confirmationCopy,
+      terminalAt: NOW.toISOString(),
+      conversationCommitOutcome: 'committed' as const,
+      pendingCommitOutcome: 'preserved' as const,
+      copyVariant: 'canonical' as const,
+      transition: {
+        kind: 'preserve' as const,
+        nextFlowState: cancelFlowState,
+      },
+    };
+    assert.equal(
+      flow.cancelConfirmationGateV2({
+        currentInboundBatchText: 'sim',
+        pending: cancelPending,
+        flowState: cancelFlowState,
+        lastAcceptedDelivery: cancelPreserveDelivery,
+        openingAcceptedDelivery: cancelOpenDelivery,
+        now: NOW,
+      }).ok,
+      true,
+      'IA-15c cancel: open committed + re-ask preserve + sim licencia'
+    );
+    assert.equal(
+      flow.cancelConfirmationGateV2({
+        currentInboundBatchText: 'sim',
+        pending: cancelPending,
+        flowState: cancelFlowState,
+        lastAcceptedDelivery: cancelPreserveDelivery,
+        openingAcceptedDelivery: null,
+        now: NOW,
+      }).ok,
+      false,
+      'IA-15c cancel: preserve sem open committed da versão não licencia'
+    );
+    assert.equal(
+      flow.cancelConfirmationGateV2({
+        currentInboundBatchText: 'sim',
+        pending: { ...cancelPending, version: 2 },
+        flowState: cancelFlowState,
+        lastAcceptedDelivery: cancelOpenDelivery,
+        openingAcceptedDelivery: null,
+        now: NOW,
+      }).ok,
+      false,
+      'IA-15c cancel: open da versão anterior não licencia pending v2'
+    );
   }
 
   // 3. Confirmação não entregue / expirada / pausada → zero writes.

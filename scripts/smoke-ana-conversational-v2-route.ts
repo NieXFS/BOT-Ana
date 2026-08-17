@@ -1855,7 +1855,49 @@ async function main(): Promise<void> {
       v2ConfirmationContext,
     }).ok,
     false,
-    'sim após fallback-preserve não fura a prova de entrega'
+    'IA-15c: sim após preserve SEM open committed da versão não licencia'
+  );
+  const v2LivePreserveContext = {
+    ...v2HappyConfirmationContext,
+    lastAcceptedDelivery: {
+      payload: canonicalConfirmationSummary,
+      terminalAt: now.toISOString(),
+      conversationCommitOutcome: 'committed' as const,
+      pendingCommitOutcome: 'preserved' as const,
+      copyVariant: 'canonical' as const,
+      transition: {
+        kind: 'preserve' as const,
+        nextFlowState: confirmationFlowState,
+      },
+    },
+    openingAcceptedDelivery: v2HappyConfirmationContext.lastAcceptedDelivery,
+  };
+  assert.equal(
+    bookingConfirmationGate({
+      currentUserMessage: 'Certo',
+      history: confirmationHistory,
+      confirmedDuplicate: false,
+      expectedBooking,
+      v2ConfirmationContext: v2LivePreserveContext,
+    }).ok,
+    true,
+    'IA-15c caso vivo: open committed + re-ask preserve + Certo licencia'
+  );
+  assert.equal(
+    bookingConfirmationGate({
+      currentUserMessage: 'sim',
+      history: confirmationHistory,
+      confirmedDuplicate: false,
+      expectedBooking,
+      v2ConfirmationContext: {
+        ...v2ConfirmationContext,
+        pending: { ...confirmationPending, version: confirmationPending.version + 1 },
+        lastAcceptedDelivery: v2HappyConfirmationContext.lastAcceptedDelivery,
+        openingAcceptedDelivery: null,
+      },
+    }).ok,
+    false,
+    'IA-15c: open da versão anterior não licencia pending atual sem open'
   );
   for (const message of ['sim', 'Certo', 'uhum'] as const) {
     assert.equal(
@@ -1870,6 +1912,166 @@ async function main(): Promise<void> {
       `${message} com recibo open/committed da versão atual licencia a escrita`
     );
   }
+
+  const ia15cStore = new MemoryConversationalV2StateStore();
+  const ia15cPhone = '5511000000091';
+  const ia15cKey = `${config.phoneNumberId}:${ia15cPhone}`;
+  const ia15cTimePending = pending({
+    kind: 'TIME',
+    options: [
+      { position: 1, entityId: '15:00', displayName: '15:00' },
+      { position: 2, entityId: '16:00', displayName: '16:00' },
+    ],
+  });
+  seedPending(ia15cStore, ia15cKey, ia15cTimePending, {
+    flowId: ia15cTimePending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-julia',
+    resolvedDate: '2026-08-14',
+    slotEvidence: {
+      turnId: 'turn-ia15c-slots',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-julia',
+      date: '2026-08-14',
+      slots: ['15:00', '16:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  });
+  ia15cStore.setInputSequence(ia15cKey, 1);
+  const ia15cNoConflictRead = async () =>
+    JSON.stringify({
+      success: true,
+      appointments: [
+        {
+          id: 'appointment-ia15c-other-day',
+          startTime: '2026-08-15T16:00:00.000Z',
+          endTime: '2026-08-15T17:00:00.000Z',
+          serviceName: 'Peeling Facial',
+          professionalName: 'Marina',
+        },
+      ],
+    });
+  const ia15cOpen = await getReceptionistReplyV2({
+    phone: ia15cPhone,
+    userMessage: '15h',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: '15h' }),
+    deps: {
+      ...baseDeps(ia15cStore),
+      executeProactiveDuplicateRead: ia15cNoConflictRead,
+      runModelLoop: async () => {
+        throw new Error('TIME validado não chama modelo');
+      },
+    },
+  });
+  assert.equal(ia15cOpen.transition.kind, 'open');
+  if (ia15cOpen.transition.kind !== 'open') {
+    throw new Error('IA-15c: resumo não abriu CONFIRMATION');
+  }
+  assert.equal(ia15cOpen.transition.frame.kind, 'CONFIRMATION');
+  await deliverPreparedReceptionistTurnV2(ia15cOpen, {
+    store: ia15cStore,
+    id: nextId,
+    now: () => now,
+    checkpoint: async () => ({
+      paused: false,
+      latestInputSequence: 1,
+      successorInputSequence: null,
+      successorInboundMessageIds: [],
+    }),
+    sendTransport: async () => ({ providerMessageId: nextId() }),
+  });
+  const ia15cAfterOpen = await ia15cStore.loadLatestState(ia15cKey, now);
+  const ia15cPreserveNow = new Date(now.getTime() + 1_000);
+  const ia15cPreserveTurnId = nextId();
+  await deliverPreparedReceptionistTurnV2(
+    {
+      ...ia15cOpen,
+      frame: {
+        ...ia15cOpen.frame,
+        turnId: ia15cPreserveTurnId,
+        inputSequence: 2,
+        pending: ia15cAfterOpen.pending?.snapshot ?? ia15cOpen.frame.pending,
+      },
+      planReceipt: {
+        ...ia15cOpen.planReceipt,
+        planReceiptId: nextId(),
+        turnId: ia15cPreserveTurnId,
+        pendingTransitionCandidate: { kind: 'preserve' },
+      },
+      transition: {
+        kind: 'preserve',
+        expectedQuestionId: ia15cAfterOpen.pending?.snapshot.questionId ?? null,
+        expectedVersion: ia15cAfterOpen.pending?.snapshot.version ?? null,
+        nextFlowState: ia15cOpen.transition.nextFlowState,
+      },
+    },
+    {
+      store: ia15cStore,
+      id: nextId,
+      now: () => ia15cPreserveNow,
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 2,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({ providerMessageId: nextId() }),
+    }
+  );
+  const ia15cAfterPreserve = await ia15cStore.loadLatestState(ia15cKey, now);
+  assert.equal(
+    ia15cAfterPreserve.lastAcceptedDelivery?.transition.kind,
+    'preserve',
+    'IA-15c: última transição do canário é preserve da CONFIRMATION'
+  );
+  assert.equal(
+    ia15cAfterPreserve.openingAcceptedDelivery?.transition.kind,
+    'open',
+    'IA-15c: store ancora na open que abriu a versão atual'
+  );
+  ia15cStore.setInputSequence(ia15cKey, 3);
+  let ia15cPosts = 0;
+  const ia15cConfirm = await getReceptionistReplyV2({
+    phone: ia15cPhone,
+    userMessage: 'Certo',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Certo', sequence: 3 }),
+    deps: {
+      ...baseDeps(ia15cStore),
+      executeProactiveDuplicateRead: ia15cNoConflictRead,
+      loadHistory: async () => [
+        { role: 'assistant', content: ia15cOpen.payload! },
+        { role: 'user', content: 'Certo' },
+      ],
+      executeTool: async (name, args) => {
+        assert.equal(name, 'bookAppointment');
+        assert.equal(args.time, '15:00');
+        ia15cPosts += 1;
+        return JSON.stringify({
+          success: true,
+          message:
+            'Agendado com sucesso para 14/08/2026 às 15:00 com Júlia para Drenagem Linfática.',
+        });
+      },
+      runModelLoop: async () => {
+        throw new Error('Certo pós-preserve com open committed não chama modelo');
+      },
+    },
+  });
+  assert.equal(
+    ia15cPosts,
+    1,
+    'IA-15c caso vivo: open committed + re-ask preserve + Certo ⇒ posts=1'
+  );
+  assert.equal(ia15cConfirm.planReceipt.route, 'fast_path');
+  assert.equal(ia15cConfirm.planReceipt.gateDecline, undefined);
 
   // Rodada 9d: TIME validado entrega resumo + abre CONFIRMATION; o modal
   // seguinte executa o write server-owned sem nenhuma completion do modelo.

@@ -225,6 +225,68 @@ assert.deepEqual(
   { ok: true, consumesCancellationEvidence: false },
   'caso vivo: Certo após Posso marcar? confirma o write'
 );
+
+const scopedOpeningDelivery = {
+  ...scopedContext.lastAcceptedDelivery,
+  copyVariant: 'canonical' as const,
+};
+const scopedPreserveDelivery = {
+  payload: scopedCanonicalSummary,
+  terminalAt: '2026-08-13T14:30:00.000Z',
+  conversationCommitOutcome: 'committed' as const,
+  pendingCommitOutcome: 'preserved' as const,
+  copyVariant: 'canonical' as const,
+  transition: {
+    kind: 'preserve' as const,
+    nextFlowState: scopedFlowState,
+  },
+};
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage: 'Certo',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: {
+      ...scopedContext,
+      lastAcceptedDelivery: scopedPreserveDelivery,
+      openingAcceptedDelivery: scopedOpeningDelivery,
+    },
+  }),
+  { ok: true, consumesCancellationEvidence: false },
+  'IA-15c caso vivo: open committed + re-ask preserve + Certo confirma'
+);
+assert.equal(
+  bookingConfirmationGate({
+    currentUserMessage: 'sim',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: {
+      ...scopedContext,
+      lastAcceptedDelivery: scopedPreserveDelivery,
+      openingAcceptedDelivery: null,
+    },
+  }).ok,
+  false,
+  'IA-15c: preserve sem open committed da versão não confirma'
+);
+assert.equal(
+  bookingConfirmationGate({
+    currentUserMessage: 'sim',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: {
+      ...scopedContext,
+      pending: { ...scopedPending, version: scopedPending.version + 1 },
+      lastAcceptedDelivery: scopedOpeningDelivery,
+      openingAcceptedDelivery: null,
+    },
+  }).ok,
+  false,
+  'IA-15c: open committed da versão anterior não licencia pending atual'
+);
 assert.deepEqual(
   bookingConfirmationGate({
     currentUserMessage: 'uhum',

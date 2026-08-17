@@ -167,14 +167,24 @@ export interface ReceiptReconciliationV2 {
   duplicateDeliveryForPlanCount: number;
 }
 
+export interface ConversationalV2LatestState {
+  pending: PendingFrameRecordV2 | null;
+  flowState: FlowStateV2 | null;
+  lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  /**
+   * Recibo committed da transição `open` que abriu a PendingFrame OPEN atual
+   * (mesmo version/flowId/questionId). Preserve posterior não substitui.
+   */
+  openingAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+}
+
 export interface ConversationalV2StateStore {
   savePlanReceipt(receipt: TurnPlanReceiptV2): Promise<void>;
   saveTerminalDeliveryReceipt(receipt: TurnDeliveryReceiptV2): Promise<void>;
-  loadLatestState(conversationKey: string, now?: Date): Promise<{
-    pending: PendingFrameRecordV2 | null;
-    flowState: FlowStateV2 | null;
-    lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
-  }>;
+  loadLatestState(
+    conversationKey: string,
+    now?: Date
+  ): Promise<ConversationalV2LatestState>;
   getInputSequence(conversationKey: string): Promise<number>;
   prepareOutbound(input: {
     deliveryAttemptId: string;
@@ -236,6 +246,71 @@ function isExpired(snapshot: PendingFrameSnapshotV2, now: Date): boolean {
   return !Number.isFinite(askedAt) || now.getTime() - askedAt >= PENDING_FRAME_TTL_MS_V2;
 }
 
+function acceptedDeliveryEvidenceFromOutbox(
+  record: OutboundOutboxRecordV2
+): AcceptedDeliveryEvidenceV2 | null {
+  const commit = record.commitPayload;
+  if (
+    record.state !== 'accepted_by_provider' ||
+    !commit ||
+    commit.deliveryReceipt.transportOutcome !== 'accepted_by_provider'
+  ) {
+    return null;
+  }
+  return {
+    payload: record.payload,
+    terminalAt: commit.deliveryReceipt.terminalAt,
+    transition: clone(record.transition),
+    conversationCommitOutcome: commit.deliveryReceipt.conversationCommitOutcome,
+    pendingCommitOutcome: commit.deliveryReceipt.pendingCommitOutcome,
+    copyVariant: commit.copyVariant ?? 'canonical',
+  };
+}
+
+function isAcceptedProviderOutbox(record: OutboundOutboxRecordV2): boolean {
+  return (
+    record.state === 'accepted_by_provider' &&
+    record.commitPayload?.deliveryReceipt.transportOutcome ===
+      'accepted_by_provider'
+  );
+}
+
+function compareAcceptedOutboxByTerminal(
+  left: OutboundOutboxRecordV2,
+  right: OutboundOutboxRecordV2,
+  direction: 'asc' | 'desc'
+): number {
+  const sign = direction === 'desc' ? -1 : 1;
+  const terminalDelta =
+    Date.parse(left.commitPayload!.deliveryReceipt.terminalAt) -
+    Date.parse(right.commitPayload!.deliveryReceipt.terminalAt);
+  return (
+    sign * terminalDelta ||
+    sign * (Date.parse(left.updatedAt) - Date.parse(right.updatedAt))
+  );
+}
+
+function isCommittedOpeningOutboxForPending(
+  record: OutboundOutboxRecordV2,
+  pending: PendingFrameSnapshotV2
+): boolean {
+  if (record.transition.kind !== 'open') return false;
+  const evidence = acceptedDeliveryEvidenceFromOutbox(record);
+  if (
+    !evidence ||
+    evidence.conversationCommitOutcome !== 'committed' ||
+    evidence.pendingCommitOutcome !== 'opened'
+  ) {
+    return false;
+  }
+  const frame = record.transition.frame;
+  return (
+    frame.questionId === pending.questionId &&
+    frame.version === pending.version &&
+    frame.flowId === pending.flowId
+  );
+}
+
 function reconstructedPending(
   conversationKey: string,
   transition: MaterializedPendingTransitionV2,
@@ -279,11 +354,10 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
     return rows;
   }
 
-  async loadLatestState(conversationKey: string, now = new Date()): Promise<{
-    pending: PendingFrameRecordV2 | null;
-    flowState: FlowStateV2 | null;
-    lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
-  }> {
+  async loadLatestState(
+    conversationKey: string,
+    now = new Date()
+  ): Promise<ConversationalV2LatestState> {
     const rows = this.rows(conversationKey);
     for (const row of rows) {
       if (row.state === 'OPEN' && isExpired(row.snapshot, now)) {
@@ -294,38 +368,34 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
     }
     const latest = rows.at(-1) ?? null;
     const open = [...rows].reverse().find((row) => row.state === 'OPEN') ?? null;
-    const lastAccepted = [...this.outbox.values()]
-      .filter(
-        (record) =>
-          record.conversationKey === conversationKey &&
-          record.state === 'accepted_by_provider' &&
-          record.commitPayload?.deliveryReceipt.transportOutcome ===
-            'accepted_by_provider'
-      )
-      .sort((left, right) => {
-        const terminalDelta =
-          Date.parse(right.commitPayload!.deliveryReceipt.terminalAt) -
-          Date.parse(left.commitPayload!.deliveryReceipt.terminalAt);
-        return terminalDelta || Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
-      })[0];
+    const accepted = [...this.outbox.values()].filter(
+      (record) =>
+        record.conversationKey === conversationKey &&
+        isAcceptedProviderOutbox(record)
+    );
+    const lastAccepted = [...accepted].sort((left, right) =>
+      compareAcceptedOutboxByTerminal(left, right, 'desc')
+    )[0];
+    const openingAccepted = open
+      ? [...accepted]
+          .filter((record) =>
+            isCommittedOpeningOutboxForPending(record, open.snapshot)
+          )
+          .sort((left, right) =>
+            compareAcceptedOutboxByTerminal(left, right, 'asc')
+          )[0]
+      : undefined;
     return {
       pending: open ? clone(open) : null,
       // Uma linha EXPIRED continua física por auditoria, mas nunca ressuscita
       // o flowState operacional da sessão encerrada.
       flowState:
         latest && latest.state !== 'EXPIRED' ? clone(latest.flowState) : null,
-      lastAcceptedDelivery: lastAccepted?.commitPayload
-        ? {
-            payload: lastAccepted.payload,
-            terminalAt: lastAccepted.commitPayload.deliveryReceipt.terminalAt,
-            transition: clone(lastAccepted.transition),
-            conversationCommitOutcome:
-              lastAccepted.commitPayload.deliveryReceipt
-                .conversationCommitOutcome,
-            pendingCommitOutcome:
-              lastAccepted.commitPayload.deliveryReceipt.pendingCommitOutcome,
-            copyVariant: lastAccepted.commitPayload.copyVariant ?? 'canonical',
-          }
+      lastAcceptedDelivery: lastAccepted
+        ? acceptedDeliveryEvidenceFromOutbox(lastAccepted)
+        : null,
+      openingAcceptedDelivery: openingAccepted
+        ? acceptedDeliveryEvidenceFromOutbox(openingAccepted)
         : null,
     };
   }
@@ -1177,7 +1247,7 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
       [conversationKey, now]
     );
     const open = await selectOpenPending(pool as unknown as PoolClient, conversationKey);
-    const latest = await pool.query<RawPendingRowV2>(
+    const latest = pool.query<RawPendingRowV2>(
       `SELECT conversation_key, flow_id, question_id, state, asked_at,
               pending_kind, options_json, version::text, flow_state_json, updated_at
        FROM ana_v2_pending_frames
@@ -1186,7 +1256,7 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
        LIMIT 1`,
       [conversationKey]
     );
-    const accepted = await pool.query<RawOutboxRowV2>(
+    const accepted = pool.query<RawOutboxRowV2>(
       `SELECT *
        FROM ana_v2_outbound_outbox
        WHERE conversation_key = $1
@@ -1201,27 +1271,58 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
        LIMIT 1`,
       [conversationKey]
     );
-    const lastAccepted = accepted.rows[0]
-      ? outboxFromRow(accepted.rows[0])
+    const opening = open
+      ? pool.query<RawOutboxRowV2>(
+          `SELECT *
+           FROM ana_v2_outbound_outbox
+           WHERE conversation_key = $1
+             AND state = 'accepted_by_provider'
+             AND commit_payload_json->'deliveryReceipt'->>'transportOutcome' =
+                 'accepted_by_provider'
+             AND commit_payload_json->'deliveryReceipt'->>'conversationCommitOutcome' =
+                 'committed'
+             AND commit_payload_json->'deliveryReceipt'->>'pendingCommitOutcome' =
+                 'opened'
+             AND transition_json->>'kind' = 'open'
+             AND transition_json->'frame'->>'questionId' = $2
+             AND transition_json->'frame'->>'flowId' = $3
+             AND transition_json->'frame'->>'version' = $4
+           ORDER BY COALESCE(
+                      NULLIF(commit_payload_json->'deliveryReceipt'->>'terminalAt', '')::timestamptz,
+                      updated_at
+                    ) ASC,
+                    updated_at ASC
+           LIMIT 1`,
+          [
+            conversationKey,
+            open.snapshot.questionId,
+            open.snapshot.flowId,
+            String(open.snapshot.version),
+          ]
+        )
+      : Promise.resolve({ rows: [] as RawOutboxRowV2[] });
+    const [latestResult, acceptedResult, openingResult] = await Promise.all([
+      latest,
+      accepted,
+      opening,
+    ]);
+    const lastAccepted = acceptedResult.rows[0]
+      ? outboxFromRow(acceptedResult.rows[0])
+      : null;
+    const openingAccepted = openingResult.rows[0]
+      ? outboxFromRow(openingResult.rows[0])
       : null;
     return {
       pending: open,
       flowState:
-        latest.rows[0] && latest.rows[0].state !== 'EXPIRED'
-          ? latest.rows[0].flow_state_json
+        latestResult.rows[0] && latestResult.rows[0].state !== 'EXPIRED'
+          ? latestResult.rows[0].flow_state_json
           : null,
-      lastAcceptedDelivery: lastAccepted?.commitPayload
-        ? {
-            payload: lastAccepted.payload,
-            terminalAt: lastAccepted.commitPayload.deliveryReceipt.terminalAt,
-            transition: lastAccepted.transition,
-            conversationCommitOutcome:
-              lastAccepted.commitPayload.deliveryReceipt
-                .conversationCommitOutcome,
-            pendingCommitOutcome:
-              lastAccepted.commitPayload.deliveryReceipt.pendingCommitOutcome,
-            copyVariant: lastAccepted.commitPayload.copyVariant ?? 'canonical',
-          }
+      lastAcceptedDelivery: lastAccepted
+        ? acceptedDeliveryEvidenceFromOutbox(lastAccepted)
+        : null,
+      openingAcceptedDelivery: openingAccepted
+        ? acceptedDeliveryEvidenceFromOutbox(openingAccepted)
         : null,
     };
   },

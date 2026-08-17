@@ -1404,16 +1404,24 @@ async function main(): Promise<void> {
     lastAcceptedDelivery: Parameters<
       typeof progressModule.resolveBookingConfirmationWriteFastPathV2
     >[0]['lastAcceptedDelivery'];
+    openingAcceptedDelivery?: Parameters<
+      typeof progressModule.resolveBookingConfirmationWriteFastPathV2
+    >[0]['openingAcceptedDelivery'];
+    pending?: typeof ia15Pending;
     now?: Date;
   }): Promise<{ posts: number; kind: string; reply?: string; resolvedWrite?: boolean }> {
     let posts = 0;
     const result =
       await progressModule.resolveBookingConfirmationWriteFastPathV2({
-        frame: frame({ pending: ia15Pending, flowState: ia15FlowState }),
+        frame: frame({
+          pending: input.pending ?? ia15Pending,
+          flowState: ia15FlowState,
+        }),
         inboundText: input.inboundText,
         history: [{ role: 'assistant', content: ia15Summary }],
         servicesResult: services,
         lastAcceptedDelivery: input.lastAcceptedDelivery,
+        openingAcceptedDelivery: input.openingAcceptedDelivery,
         now: input.now ?? now,
         executeTool: async (name, args) => {
           if (name === 'bookAppointment') {
@@ -1448,6 +1456,49 @@ async function main(): Promise<void> {
   });
   assert.equal(ia15Uhum.posts, 1, 'uhum com recibo compatível ⇒ posts=1');
   assert.equal(ia15Uhum.kind, 'resolved');
+
+  const ia15PreserveDelivery = {
+    payload: ia15Summary,
+    terminalAt: now.toISOString(),
+    conversationCommitOutcome: 'committed' as const,
+    pendingCommitOutcome: 'preserved' as const,
+    copyVariant: 'canonical' as const,
+    transition: {
+      kind: 'preserve' as const,
+      nextFlowState: ia15FlowState,
+    },
+  };
+  const ia15cLive = await confirmationWritePosts({
+    inboundText: 'Certo',
+    lastAcceptedDelivery: ia15PreserveDelivery,
+    openingAcceptedDelivery: ia15Delivery,
+  });
+  assert.equal(
+    ia15cLive.posts,
+    1,
+    'IA-15c caso vivo: open committed v1 + re-ask preserve + Certo ⇒ posts=1'
+  );
+  const ia15cNeverOpen = await confirmationWritePosts({
+    inboundText: 'sim',
+    lastAcceptedDelivery: ia15PreserveDelivery,
+    openingAcceptedDelivery: null,
+  });
+  assert.equal(
+    ia15cNeverOpen.posts,
+    0,
+    'IA-15c: nenhum open committed da versão + sim ⇒ posts=0'
+  );
+  const ia15cPriorVersion = await confirmationWritePosts({
+    inboundText: 'sim',
+    pending: { ...ia15Pending, version: ia15Pending.version + 1 },
+    lastAcceptedDelivery: ia15Delivery,
+    openingAcceptedDelivery: null,
+  });
+  assert.equal(
+    ia15cPriorVersion.posts,
+    0,
+    'IA-15c: open committed da versão anterior + pending v2 sem open ⇒ posts=0'
+  );
 
   const blockedDeliveries: ReadonlyArray<{
     label: string;

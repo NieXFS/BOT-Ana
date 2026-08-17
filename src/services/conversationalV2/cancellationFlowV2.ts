@@ -603,6 +603,7 @@ export function cancelConfirmationGateV2(input: {
   pending: PendingFrameSnapshotV2 | null;
   flowState: FlowStateV2;
   lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  openingAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   now: Date;
 }): CancelConfirmationGateDecisionV2 {
   const pending = input.pending;
@@ -630,6 +631,7 @@ export function cancelConfirmationGateV2(input: {
     !deliveryMatchesPendingV2({
       pending,
       lastAcceptedDelivery: input.lastAcceptedDelivery,
+      openingAcceptedDelivery: input.openingAcceptedDelivery,
       now: input.now,
       expectedCopy,
     })
@@ -717,6 +719,7 @@ export function planCancellationIntentV2(input: {
   flowState: FlowStateV2;
   candidates: readonly CancellationCandidateV2[] | null;
   lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  openingAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   forcePlan?: boolean;
   sourceReadTurnId: string;
 }): CancellationPlanV2 {
@@ -732,6 +735,7 @@ export function planCancellationIntentV2(input: {
       pending,
       flowState: input.flowState,
       lastAcceptedDelivery: input.lastAcceptedDelivery,
+      openingAcceptedDelivery: input.openingAcceptedDelivery,
       now: input.now,
     });
     const flow = input.flowState.cancellation;

@@ -198,6 +198,7 @@ export async function resolveCancellationPlannerV2(input: {
   config: TenantBotConfig;
   now: Date;
   lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
+  openingAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   phone: string;
   inboundId: string;
   forcePlan?: boolean;
@@ -283,6 +284,7 @@ export async function resolveCancellationPlannerV2(input: {
     flowState: input.frame.flowState,
     candidates,
     lastAcceptedDelivery: input.lastAcceptedDelivery,
+    openingAcceptedDelivery: input.openingAcceptedDelivery,
     forcePlan: input.forcePlan,
     sourceReadTurnId: input.frame.turnId,
   });

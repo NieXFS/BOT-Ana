@@ -1992,3 +1992,52 @@ HEAD permaneceu `02e8859` destacado. Sem commit.
 | `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
 
 HEAD permaneceu `02e8859` destacado. Sem commit.
+
+## Exec IA-15c — predicado de entrega ancora na abertura da versão, não na última transição
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `2223387` (= produção). Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Origem: falso negativo AO VIVO pós-IA-15b — canário, resumo canônico entregue, `Certo` → `gateDecline {gate:"booking_confirmation", reason:"scoped_modal_delivery_not_current_pending"}` → regen re-pergunta em loop. As duas últimas entregas do resumo tinham `transition_json {"kind":"preserve", nextFlowState:{...bookingDraft 15:00...}}`: re-apresentação de CONFIRMATION já aberta. A `open` dessa versão estava turnos antes. O predicado do IA-15b exigia `kind:open` na entrega *corrente* e recusava confirmação legítima após qualquer re-ask.
+
+### Causa
+
+`diagnoseDeliveryMatchPendingV2` lia só `lastAcceptedDelivery`. Preserve do loop-breaker (mesma copy canônica, mesma versão) falhava `transition.kind !== 'open'` e mapeava para `scoped_modal_delivery_not_current_pending`. A regressão de rota do Sol ("sim após preserve não licencia") estava correta para pendência **nunca aberta**, mas o enunciado era largo demais e cobria também o re-ask da versão já entregue.
+
+### Entrega
+
+1. **Âncora = a `open` que abriu a versão ATUAL** (`version`/`flowId`/`questionId` + opções/askedAt). Lookup no histórico de outbox (`openingAcceptedDelivery` em `loadLatestState`, memória e Postgres). O predicado prova transporte `committed` + `pendingCommitOutcome:opened` dessa abertura, pending OPEN/fresco, payload da abertura = copy canônica. Preserve posterior da mesma copy **não invalida**.
+2. **O que continua bloqueando:** versão sem nenhum open committed (furo original do Sol); open de versão anterior com pending v2 sem open; payload da abertura ≠ canônico; expiração; recibo ausente/`accepted_uncommitted`.
+3. **Rota reescrita.** Preserve SEM open committed da mesma versão ⇒ `sim` bloqueia. Preserve COM open committed anterior ⇒ `Certo`/`sim` licenciam (`posts=1` no caso vivo).
+4. **Cancelamento** usa o mesmo predicado: re-ask preserve da pergunta de cancel não invalida; preserve sem open da versão continua fail-closed.
+
+### Arquivos
+
+- `src/services/conversationalV2/deliveryEvidence.ts`
+- `src/services/conversationalV2/stateStore.ts`
+- `src/services/bookingConfirmationGate.ts`
+- `src/services/conversationalV2/cancellationFlowV2.ts`
+- `src/services/conversationalV2/cancellationPlannerV2.ts`
+- `src/services/conversationalV2/bookingProgressFastPaths.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `scripts/smoke-booking-confirmation-gate.ts`
+- `scripts/smoke-ana-conversational-v2-wave1.ts`
+- `scripts/smoke-ana-conversational-v2-route.ts`
+- `scripts/smoke-ana-conversational-v2-cancellation.ts`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-v2-elicitor-matcher-contract` | 0 | contrato elicitor↔matcher intacto |
+| `npm run smoke:ana-conversational-v2-contracts` | 0 | |
+| `npm run smoke:booking-confirmation-gate` | 0 | vivo open+preserve+Certo; preserve sem open; versão anterior |
+| `npm run smoke:ana-conversational-v2-route` | 0 | canário TIME→open→preserve→Certo `posts=1`; preserve sem open bloqueia |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | `Certo` posts=1 no vivo; `sim` posts=0 nos dois furos |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | re-ask preserve não invalida; predicado compartilhado; IA-11/IA-12 intactos |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `2223387` destacado. Sem commit.

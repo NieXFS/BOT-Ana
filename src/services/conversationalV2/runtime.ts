@@ -1142,6 +1142,7 @@ export async function getReceptionistReplyV2(input: {
             pending: groundingFrame.pending,
             catalog: services,
             lastAcceptedDelivery: stored.lastAcceptedDelivery,
+            openingAcceptedDelivery: stored.openingAcceptedDelivery,
             now: startedAt,
             onGateDecline: (decline) => {
               selectedGateDecline = decline;
@@ -1748,6 +1749,7 @@ export async function getReceptionistReplyV2(input: {
           config: input.config,
           now: startedAt,
           lastAcceptedDelivery: stored.lastAcceptedDelivery,
+          openingAcceptedDelivery: stored.openingAcceptedDelivery,
           executeTool: executeDuplicatePreflightRead,
         })
       : { kind: 'continue_model' as const, reason: 'earlier_fast_path_resolved' };
@@ -1790,6 +1792,7 @@ export async function getReceptionistReplyV2(input: {
           history: modelHistory,
           servicesResult: services,
           lastAcceptedDelivery: stored.lastAcceptedDelivery,
+          openingAcceptedDelivery: stored.openingAcceptedDelivery,
           now: startedAt,
           executeTool: executeToolForFrame(confirmationFrame),
           onGateDecline: (decline) => {
@@ -1817,6 +1820,7 @@ export async function getReceptionistReplyV2(input: {
     config: input.config,
     now: startedAt,
     lastAcceptedDelivery: stored.lastAcceptedDelivery,
+    openingAcceptedDelivery: stored.openingAcceptedDelivery,
     phone: input.phone,
     inboundId,
     executeUpcomingRead: () =>
