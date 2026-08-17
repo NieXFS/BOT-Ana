@@ -18,6 +18,8 @@ import { buildCanonicalBookingSummaryV2 } from './lifecycleReducer';
 import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
 import { hasPositiveExplicitBookingVerbV2 } from './flowSession';
 import type { CurrentDateResolutionV2 } from './currentDateResolution';
+import { isNaturalAffirmativeReplyV2 } from './naturalAffirmative';
+import { DATE_PENDING_QUESTION_V2 } from './pendingQuestion';
 import {
   clauseMatchHasPositivePolarityV2,
 } from './polarity';
@@ -79,6 +81,29 @@ function compactAffirmative(value: string): boolean {
   return /^(?:sim+|isso|ok+|certo|pode ser|fechado|combinado|confirmo|beleza|perfeito|ta(?: bom)?)(?: por favor)?$/.test(
     normalize(value)
   );
+}
+
+function compactPendingAffirmativePosition(
+  inboundText: string,
+  frame: TurnFrameV2
+): number | null {
+  if (!frame.pending || frame.pending.options.length !== 1) return null;
+  const option = frame.pending.options[0]!;
+  if (frame.pending.kind === 'CONFIRMATION') {
+    const entityId = option.entityId;
+    if (
+      entityId.startsWith('duplicate-resolution:') ||
+      entityId.startsWith('booking-reentry:')
+    ) {
+      return null;
+    }
+    if (inboundLooksInterrogativeV2(inboundText)) return null;
+    return isNaturalAffirmativeReplyV2(inboundText) ||
+      compactAffirmative(inboundText)
+      ? option.position
+      : null;
+  }
+  return compactAffirmative(inboundText) ? option.position : null;
 }
 
 function pendingFresh(frame: TurnFrameV2, now: Date): boolean {
@@ -427,7 +452,7 @@ function displayPendingTime(value: string): string {
     : `${Number(match[1])}h${match[2]}`;
 }
 
-function buildBareHourDisambiguationV2(
+export function buildBareHourDisambiguationV2(
   options: readonly PendingOptionV2[]
 ): string {
   const displayed = options.map((option) => displayPendingTime(option.entityId));
@@ -472,6 +497,9 @@ function activeHalfHourClarificationPositionV2(input: {
   const halfHour = temporal.find((entry) => entry.minute === 30)!;
   if (answer === String(wholeHour.hour)) return wholeHour.option.position;
   if (['meia', 'e meia', '30'].includes(answer)) return halfHour.option.position;
+  if (/^(?:a )?primeir[oa]$/u.test(answer)) {
+    return pending.options[0]!.position;
+  }
   return null;
 }
 
@@ -536,9 +564,7 @@ export function resolvePendingOptionProofV2(input: {
     pendingOrdinalPosition(inboundText, frame.pending.kind) ??
     exactPendingNamePosition(inboundText, frame) ??
     canonicalPendingEntityPosition(inboundText, frame, input.catalog) ??
-    (frame.pending.options.length === 1 && compactAffirmative(inboundText)
-      ? frame.pending.options[0]!.position
-      : null);
+    compactPendingAffirmativePosition(inboundText, frame);
   if (position === null) return null;
   const option = frame.pending.options.find(
     (entry) => entry.position === position
@@ -689,7 +715,7 @@ function serviceFollowUp(
       nextFlowState,
       result: {
         schemaVersion: 2,
-        reply: 'Perfeito. Qual dia você prefere?',
+        reply: `Perfeito. ${DATE_PENDING_QUESTION_V2}`,
         replyPurpose: 'DATE_TIME_QUESTION',
         pendingTransitionCandidate: {
           kind: 'open',
@@ -821,7 +847,7 @@ function professionalFollowUp(
     nextFlowState,
     result: {
       schemaVersion: 2,
-      reply: 'Perfeito. Qual dia você prefere?',
+      reply: `Perfeito. ${DATE_PENDING_QUESTION_V2}`,
       replyPurpose: 'DATE_TIME_QUESTION',
       pendingTransitionCandidate: {
         kind: 'open',

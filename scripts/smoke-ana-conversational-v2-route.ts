@@ -1854,9 +1854,22 @@ async function main(): Promise<void> {
       expectedBooking,
       v2ConfirmationContext,
     }).ok,
-    true,
-    'o sim seguinte ao fallback-resumo licencia a escrita e encerra o loop'
+    false,
+    'sim após fallback-preserve não fura a prova de entrega'
   );
+  for (const message of ['sim', 'Certo', 'uhum'] as const) {
+    assert.equal(
+      bookingConfirmationGate({
+        currentUserMessage: message,
+        history: confirmationHistory,
+        confirmedDuplicate: false,
+        expectedBooking,
+        v2ConfirmationContext: v2HappyConfirmationContext,
+      }).ok,
+      true,
+      `${message} com recibo open/committed da versão atual licencia a escrita`
+    );
+  }
 
   // Rodada 9d: TIME validado entrega resumo + abre CONFIRMATION; o modal
   // seguinte executa o write server-owned sem nenhuma completion do modelo.

@@ -1347,6 +1347,166 @@ async function main(): Promise<void> {
     'keep-both volta ao resumo e abre confirmação normal nova'
   );
 
+  const ia15Pending = pending({
+    kind: 'CONFIRMATION',
+    options: [
+      {
+        position: 1,
+        entityId: 'booking-confirmation:flow-wave1',
+        displayName: 'opção apresentada',
+      },
+    ],
+  });
+  const ia15FlowState = {
+    flowId: ia15Pending.flowId,
+    lastOperationalAt: now.toISOString(),
+    fixedServiceId: 'svc-drenagem',
+    fixedProfessionalId: 'prof-carla',
+    resolvedDate: '2026-08-14',
+    bookingDraft: {
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-carla',
+      date: '2026-08-14',
+      time: '14:00',
+      slotEvidenceTurnId: 'turn-slots',
+    },
+    slotEvidence: {
+      turnId: 'turn-slots',
+      serviceId: 'svc-drenagem',
+      professionalId: 'prof-carla',
+      date: '2026-08-14',
+      slots: ['14:00'],
+    },
+    fixedByProofVersion: {
+      fixedServiceId: 1,
+      fixedProfessionalId: 1,
+      resolvedDate: 1,
+    },
+  };
+  const ia15Summary =
+    'Confirmando: Drenagem Linfática, em 14/08/2026, às 14h, com Carla Mendes. Posso marcar?';
+  const ia15Delivery = {
+    payload: ia15Summary,
+    terminalAt: now.toISOString(),
+    conversationCommitOutcome: 'committed' as const,
+    pendingCommitOutcome: 'opened' as const,
+    copyVariant: 'canonical' as const,
+    transition: {
+      kind: 'open' as const,
+      frame: ia15Pending,
+      expectedQuestionId: null,
+      expectedVersion: null,
+      nextFlowState: ia15FlowState,
+    },
+  };
+  async function confirmationWritePosts(input: {
+    inboundText: string;
+    lastAcceptedDelivery: Parameters<
+      typeof progressModule.resolveBookingConfirmationWriteFastPathV2
+    >[0]['lastAcceptedDelivery'];
+    now?: Date;
+  }): Promise<{ posts: number; kind: string; reply?: string; resolvedWrite?: boolean }> {
+    let posts = 0;
+    const result =
+      await progressModule.resolveBookingConfirmationWriteFastPathV2({
+        frame: frame({ pending: ia15Pending, flowState: ia15FlowState }),
+        inboundText: input.inboundText,
+        history: [{ role: 'assistant', content: ia15Summary }],
+        servicesResult: services,
+        lastAcceptedDelivery: input.lastAcceptedDelivery,
+        now: input.now ?? now,
+        executeTool: async (name, args) => {
+          if (name === 'bookAppointment') {
+            posts += 1;
+            assert.equal(args.serviceId, 'svc-drenagem');
+            assert.equal(args.date, '2026-08-14');
+            assert.equal(args.time, '14:00');
+          }
+          return JSON.stringify({ success: true });
+        },
+      });
+    return {
+      posts,
+      kind: result.kind,
+      reply: result.kind === 'resolved' ? result.result.reply : undefined,
+      resolvedWrite:
+        result.kind === 'resolved' &&
+        result.result.pendingTransitionCandidate.kind === 'resolve',
+    };
+  }
+  const ia15Write = await confirmationWritePosts({
+    inboundText: 'Certo',
+    lastAcceptedDelivery: ia15Delivery,
+  });
+  assert.equal(ia15Write.posts, 1, 'Certo com recibo compatível ⇒ posts=1');
+  assert.equal(ia15Write.kind, 'resolved', 'caso vivo: Certo pós-resumo CONFIRMA');
+  assert.equal(ia15Write.resolvedWrite, true);
+  assert.match(ia15Write.reply ?? '', /confirmado com sucesso/u);
+  const ia15Uhum = await confirmationWritePosts({
+    inboundText: 'uhum',
+    lastAcceptedDelivery: ia15Delivery,
+  });
+  assert.equal(ia15Uhum.posts, 1, 'uhum com recibo compatível ⇒ posts=1');
+  assert.equal(ia15Uhum.kind, 'resolved');
+
+  const blockedDeliveries: ReadonlyArray<{
+    label: string;
+    lastAcceptedDelivery: Parameters<
+      typeof progressModule.resolveBookingConfirmationWriteFastPathV2
+    >[0]['lastAcceptedDelivery'];
+    now?: Date;
+  }> = [
+    { label: 'recibo null', lastAcceptedDelivery: null },
+    {
+      label: 'accepted_uncommitted',
+      lastAcceptedDelivery: {
+        ...ia15Delivery,
+        conversationCommitOutcome: 'accepted_uncommitted',
+      },
+    },
+    {
+      label: 'transição divergente',
+      lastAcceptedDelivery: {
+        ...ia15Delivery,
+        transition: {
+          ...ia15Delivery.transition,
+          frame: { ...ia15Pending, version: 99 },
+        },
+      },
+    },
+    {
+      label: 'payload divergente',
+      lastAcceptedDelivery: {
+        ...ia15Delivery,
+        payload: 'Você confirma essa opção?',
+      },
+    },
+    {
+      label: 'expirado',
+      lastAcceptedDelivery: ia15Delivery,
+      now: new Date(now.getTime() + 5 * 60 * 60 * 1000),
+    },
+  ];
+  for (const inboundText of ['Certo', 'uhum'] as const) {
+    for (const blocked of blockedDeliveries) {
+      const got = await confirmationWritePosts({
+        inboundText,
+        lastAcceptedDelivery: blocked.lastAcceptedDelivery,
+        now: blocked.now,
+      });
+      assert.equal(
+        got.posts,
+        0,
+        `${inboundText} ${blocked.label} ⇒ posts=0`
+      );
+      assert.equal(
+        got.kind,
+        'continue_model',
+        `${inboundText} ${blocked.label} não resolve write`
+      );
+    }
+  }
+
   const reentryPending = pending({
     kind: 'TIME',
     options: [

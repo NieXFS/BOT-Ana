@@ -1895,3 +1895,100 @@ HEAD permaneceu `a8241cb` destacado. Sem commit.
 | `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
 
 HEAD permaneceu `3cbcf4f` destacado. Sem commit.
+
+## Exec IA-15 — Família afirmativa generosa em pendings entregues + contrato elicitor↔matcher
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `02e8859` (= produção, incluindo o gate próprio da Renata). Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Origem: a sessão da Renata provou a classe do bug — todo gate é um par texto-que-ensina + matcher-que-julga, e a ponte entre os dois não tem dono. Prova viva no canário (driver, 2026-08-16): resumo canônico `Posso marcar?` respondido com `Certo` re-perguntava em loop. O norte do Victor (naturalidade): afirmativa natural DEPOIS de pergunta de confirmação ENTREGUE confirma.
+
+### Entrega
+
+1. **Família afirmativa allow-only**, só em CONFIRMATION de booking e CANCEL_CONFIRMATION, com pending OPEN e delivery aceito. Além do léxico `pode` já existente: certo, tá certo, ta certo, certinho, tudo certo, isso, isso mesmo, isso aí, perfeito, fechado, combinado, beleza, blz, show, ótimo, otimo, claro, com certeza, positivo, uhum, aham, ok, okay, okk. Fonte única em `naturalAffirmative.ts`.
+2. **Guardas inegociáveis.** Polaridade negativa sempre vence (`não tá certo` nunca confirma). Interrogativa nunca confirma (`certo?` / `sim?` / `ok?`) — sinal do texto ORIGINAL (IA-8/Q5). A família não seleciona DATE/TIME/SERVICE nem turno livre: `claro` com DATE aberto devolve null.
+3. **Matcher legado.** `isExplicitBookingConfirmation` ganha a mesma família e as mesmas guardas. `CONFIRMATION_HINT` agora ensina `"certo"` entre aspas, junto de `"sim"`, `"confirmo"` e `"pode marcar"` — o hint que pedia “está tudo certo?” deixa de rejeitar `certo`.
+4. **Write intacto.** Checkpoint, delivery-aware e 1 write/turno não mudam. O caso vivo `Certo` pós-resumo dispara `bookAppointment` e fecha a CONFIRMATION.
+5. **Contrato elicitor↔matcher.** Tabela declarativa em `elicitorMatcherContract.ts` (copies reais importadas, nunca string duplicada). Linhas: resumo canônico; CANCEL_CONFIRMATION; as 4 opções da duplicidade com e sem cortesia; clarificador `17h ou 17h30?` (`17h` / `17` / `a primeira`); `Qual dia você prefere?`; legado × `CONFIRMATION_HINT`. Asserções: (a) palavras entre aspas do elicitor o matcher aceita; (b) respostas naturais; (c) negações rejeitadas; (d) interrogativas rejeitadas.
+
+### Arquivos
+
+- `src/services/conversationalV2/naturalAffirmative.ts`
+- `src/services/conversationalV2/elicitorMatcherContract.ts`
+- `src/services/bookingConfirmationGate.ts`
+- `src/services/conversationalV2/fastPaths.ts`
+- `src/services/conversationalV2/pendingQuestion.ts`
+- `src/services/conversationalV2/bookingProgressFastPaths.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `src/services/conversationalV2/powerZeroInterpreter.ts`
+- `scripts/smoke-ana-v2-elicitor-matcher-contract.ts`
+- `scripts/smoke-booking-confirmation-gate.ts`
+- `scripts/smoke-ana-conversational-v2-wave1.ts`
+- `package.json`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-v2-elicitor-matcher-contract` | 0 | quotes do hint, família, negações, interrogativas, `Certo` pós-resumo, turno livre |
+| `npm run smoke:booking-confirmation-gate` | 0 | `Certo` após `Posso marcar?`; `certo?` / `não tá certo` rejeitados |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `npm run smoke:ana-conversational-v2-route` | 0 | |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | write `bookAppointment` com inbound `Certo` |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | IA-11/IA-12 intactos |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+| `npm run smoke:onboarding-gate` | 0 | detector compartilhado intacto (`fechado` / `pode ser` / adversativa) |
+
+HEAD permaneceu `02e8859` destacado. Sem commit.
+
+## Exec IA-15b — prova de entrega ANTES de toda confirmação lexical de CONFIRMATION
+
+**Status:** implementado e validado localmente sobre `HEAD` destacado `02e8859` + working tree IA-15. Sem commit, troca de branch, deploy, push ou `--real`. Executor: Cursor Grok 4.6. Origem: sonda do Sol — CONFIRMATION válida + resumo no histórico + `lastAcceptedDelivery:null` → `posts=1`. O modal `"pode"` já percorria a checagem de entrega; `"Certo"` / `"sim"` / `"uhum"` caíam no retorno lexical genérico de `isExplicitBookingConfirmation` (`bookingConfirmationGate.ts`, o antigo early-return da família) e furavam o write.
+
+### Causa
+
+`isExplicitConfirmationForGate` só desviava para `diagnoseScopedV2ModalEchoConfirmation` quando o lote era o modal `"pode"`. Qualquer outro aceite da família (sim, certo, uhum, aham, …) retornava `isExplicitBookingConfirmation === true` sem olhar o recibo. Com resumo no histórico, `bookingConfirmationGate` autorizava `bookAppointment`. O contrato elicitor↔matcher sempre injetava recibo válido no matcher de booking, então a tabela não detectava o furo.
+
+### Entrega
+
+1. **Predicado único extraído.** `deliveryMatchesPendingV2` / `diagnoseDeliveryMatchPendingV2` em `deliveryEvidence.ts`: entrega `committed`, transição `open` idêntica ao PendingFrame atual, versão/flow/opções/timestamps frescos, payload igual à copy canônica materializada. O cancelamento importa o mesmo predicado; o booking mapeia os declines para os reasons `scoped_modal_*` já emitidos no recibo.
+2. **A prova antecede TODA confirmação lexical da CONFIRMATION v2** — sim, certo, uhum, aham, a família inteira e o modal `"pode"`. Sem contexto v2 o gate legado (histórico + léxico, usado fora do booking v2) permanece.
+3. **Fast-path real.** `"Certo"` e `"uhum"` com recibo `null`, `accepted_uncommitted`, transição/payload divergentes ou expirados ⇒ `posts=0` / `continue_model`; recibo open/committed compatível ⇒ `posts=1` / `resolved`.
+4. **Contrato em dois lados.** A tabela deixa de injetar recibo válido sempre: linha `resumo canônico booking — recibo compatível` (família autoriza) e linha `resumo canônico booking — recibo ausente` (`respostasNaturaisAutorizam: false`, a mesma família bloqueia).
+5. **Rota.** A asserção antiga `"o sim seguinte ao fallback-resumo licencia a escrita"` era o próprio furo (fallback `preserve` não é a entrega que abriu a pendência). Agora `sim` após preserve falha; `sim`/`Certo`/`uhum` com recibo `open`/`committed` da versão atual passam.
+
+### Pendência declarada (fora de escopo)
+
+`onboardingConfirmationGate` continua com semântica legada compartilhada: `uhum` autoriza `upsertService` após proposta com fingerprint, **sem** delivery-aware. Não foi mexido neste exec. Coordenador: levar ao painel se a mesma prova de entrega deve valer no onboarding.
+
+### Arquivos
+
+- `src/services/conversationalV2/deliveryEvidence.ts` (novo)
+- `src/services/conversationalV2/cancellationFlowV2.ts`
+- `src/services/bookingConfirmationGate.ts`
+- `src/services/conversationalV2/elicitorMatcherContract.ts`
+- `scripts/smoke-ana-v2-elicitor-matcher-contract.ts`
+- `scripts/smoke-booking-confirmation-gate.ts`
+- `scripts/smoke-ana-conversational-v2-wave1.ts`
+- `scripts/smoke-ana-conversational-v2-route.ts`
+- `RELATORIO-GROK-EXEC-1.md`
+
+### Validação final (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | sem whitespace inválido |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `npm run smoke:ana-v2-elicitor-matcher-contract` | 0 | dois lados do recibo; `Certo`/`uhum`/`sim` com null bloqueiam |
+| `npm run smoke:booking-confirmation-gate` | 0 | família + null/uncommitted/expirado/payload/transição |
+| `npm run smoke:ana-conversational-v2-route` | 0 | `sim` após preserve não fura; recibo open licencia |
+| `npm run smoke:ana-conversational-v2-wave1` | 0 | `Certo`/`uhum` posts=1 compatível; posts=0 nos furos |
+| `npm run smoke:ana-conversational-v2-cancellation` | 0 | predicado compartilhado; IA-11/IA-12 intactos |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `npm run smoke:ana-v2-behavioral-receipt` | 0 | schema 5 intacto |
+| `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
+
+HEAD permaneceu `02e8859` destacado. Sem commit.

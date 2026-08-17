@@ -39,7 +39,12 @@ import {
 } from './readFastPaths';
 import { hasPositiveExplicitBookingVerbV2 } from './flowSession';
 import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
-import { validatedBookingDraftForPendingV2 } from './pendingQuestion';
+import {
+  DATE_PENDING_QUESTION_V2,
+  DUPLICATE_RESOLUTION_CHOICE_QUESTION_V2,
+  DUPLICATE_RESOLUTION_OPTIONS_V2,
+  validatedBookingDraftForPendingV2,
+} from './pendingQuestion';
 
 export type BookingProgressFastPathV2 =
   | {
@@ -460,7 +465,7 @@ export async function resolveDateSlotsFastPathV2(input: {
       kind: 'resolved',
       result: dateQuestionResult(
         input.frame,
-        'Qual dia você prefere?'
+        DATE_PENDING_QUESTION_V2
       ),
       loop: loopForReads([]),
       proof: null,
@@ -845,7 +850,7 @@ export async function resolveDuplicateKeepBothFastPathV2(input: {
   };
 }
 
-function duplicateQuestion(
+export function buildDuplicateResolutionQuestionV2(
   appointment: UpcomingAppointment,
   timezone: string
 ): string {
@@ -857,7 +862,7 @@ function duplicateQuestion(
     : '';
   return `Vi que você já tem outro agendamento de ${appointment.serviceName} em ${
     start ? displayDateV2(start.date) : 'uma data próxima'
-  } às ${time}. Quer manter os dois, remarcar, só cancelar o anterior ou decidir depois?`;
+  } às ${time}. ${DUPLICATE_RESOLUTION_CHOICE_QUESTION_V2}`;
 }
 
 function withNoConflictClearanceV2(input: {
@@ -1042,18 +1047,18 @@ export async function resolveConfirmationDuplicatePreflightV2(input: {
     kind: 'resolved',
     result: {
       schemaVersion: 2,
-      reply: duplicateQuestion(conflicts[0]!, input.config.timezone),
+      reply: buildDuplicateResolutionQuestionV2(
+        conflicts[0]!,
+        input.config.timezone
+      ),
       replyPurpose: 'OPERATIONAL_ANSWER',
       pendingTransitionCandidate: {
         kind: 'open',
         pendingKind: 'CONFIRMATION',
         flowId: input.frame.flowState.flowId,
-        optionEntityIds: [
-          'duplicate-resolution:keep-both',
-          'duplicate-resolution:reschedule',
-          'duplicate-resolution:cancel-only',
-          'duplicate-resolution:decide-later',
-        ],
+        optionEntityIds: DUPLICATE_RESOLUTION_OPTIONS_V2.map(
+          (option) => option.entityId
+        ),
       },
       resolutionCandidate: null,
       unknownServiceEvidence: null,
@@ -1172,18 +1177,18 @@ export async function resolveTimeDuplicatePreflightV2(input: {
     kind: 'resolved',
     result: {
       schemaVersion: 2,
-      reply: duplicateQuestion(conflicts[0]!, input.config.timezone),
+      reply: buildDuplicateResolutionQuestionV2(
+        conflicts[0]!,
+        input.config.timezone
+      ),
       replyPurpose: 'OPERATIONAL_ANSWER',
       pendingTransitionCandidate: {
         kind: 'open',
         pendingKind: 'CONFIRMATION',
         flowId: input.frame.flowState.flowId,
-        optionEntityIds: [
-          'duplicate-resolution:keep-both',
-          'duplicate-resolution:reschedule',
-          'duplicate-resolution:cancel-only',
-          'duplicate-resolution:decide-later',
-        ],
+        optionEntityIds: DUPLICATE_RESOLUTION_OPTIONS_V2.map(
+          (option) => option.entityId
+        ),
       },
       resolutionCandidate: null,
       unknownServiceEvidence: null,

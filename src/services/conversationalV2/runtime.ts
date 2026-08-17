@@ -155,6 +155,7 @@ import {
 } from './lifecycleReducer';
 import {
   BOOKING_REENTRY_OPTION_IDS_V2,
+  DUPLICATE_RESOLUTION_OPTIONS_V2,
   buildPendingQuestionV2,
   shouldReanchorPendingQuestionV2,
 } from './pendingQuestion';
@@ -393,12 +394,11 @@ function optionsForTransition(
           entityId.startsWith('duplicate-resolution:')
         )))
   ) {
-    return [
-      { position: 1, entityId: 'duplicate-resolution:keep-both', displayName: 'manter os dois' },
-      { position: 2, entityId: 'duplicate-resolution:reschedule', displayName: 'remarcar' },
-      { position: 3, entityId: 'duplicate-resolution:cancel-only', displayName: 'só cancelar o anterior' },
-      { position: 4, entityId: 'duplicate-resolution:decide-later', displayName: 'decidir depois' },
-    ];
+    return DUPLICATE_RESOLUTION_OPTIONS_V2.map((option, index) => ({
+      position: index + 1,
+      entityId: option.entityId,
+      displayName: option.displayName,
+    }));
   }
   if (
     (candidate.pendingKind === 'CANCEL_TARGET' ||

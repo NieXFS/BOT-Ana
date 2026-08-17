@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   bookingConfirmationGate,
   cancellationIntentGate,
+  CONFIRMATION_HINT,
   diagnoseScopedV2ModalEchoConfirmation,
   ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION,
   isExplicitBookingConfirmation,
@@ -56,6 +57,16 @@ const colloquialAcceptances = [
   'manda ver',
   'ok',
   'okay',
+  'Certo',
+  'certo',
+  'tá certo',
+  'certinho',
+  'isso aí',
+  'ótimo',
+  'claro',
+  'com certeza',
+  'positivo',
+  'okk',
   'pode ser sim',
   'pode ser, pode marcar',
   'pode ser então',
@@ -93,6 +104,11 @@ const ambiguousOrCorrective = [
   'Sim, só que mais tarde.',
   'Na verdade prefiro outro dia.',
   'Pode sim, mas muda o horário.',
+  'Certo?',
+  'sim?',
+  'ok?',
+  'não tá certo',
+  'Não certo.',
 ];
 
 for (const message of ambiguousOrCorrective) {
@@ -198,6 +214,66 @@ assert.deepEqual(
   { ok: true, consumesCancellationEvidence: false },
   'resumo aceito que abriu a versão atual licencia o caminho feliz real'
 );
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage: 'Certo',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: scopedContext,
+  }),
+  { ok: true, consumesCancellationEvidence: false },
+  'caso vivo: Certo após Posso marcar? confirma o write'
+);
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage: 'uhum',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: scopedContext,
+  }),
+  { ok: true, consumesCancellationEvidence: false },
+  'uhum após Posso marcar? confirma o write com recibo compatível'
+);
+
+for (const message of ['Certo', 'uhum', 'sim', 'aham', 'pode']) {
+  assert.equal(
+    bookingConfirmationGate({
+      currentUserMessage: message,
+      history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+      confirmedDuplicate: false,
+      expectedBooking,
+      v2ConfirmationContext: {
+        ...scopedContext,
+        lastAcceptedDelivery: null,
+      },
+    }).ok,
+    false,
+    `${message} com lastAcceptedDelivery null não confirma`
+  );
+}
+assert.deepEqual(
+  bookingConfirmationGate({
+    currentUserMessage: 'Certo',
+    history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+    confirmedDuplicate: false,
+    expectedBooking,
+    v2ConfirmationContext: {
+      ...scopedContext,
+      lastAcceptedDelivery: {
+        ...scopedContext.lastAcceptedDelivery,
+        conversationCommitOutcome: 'accepted_uncommitted',
+      },
+    },
+  }),
+  {
+    ok: false,
+    hintMessage: CONFIRMATION_HINT,
+    reason: 'scoped_modal_delivery_not_current_pending',
+  },
+  'Certo com accepted_uncommitted não confirma'
+);
 
 for (const [label, currentUserMessage, context] of [
   [
@@ -235,6 +311,58 @@ for (const [label, currentUserMessage, context] of [
     false,
     label
   );
+}
+
+for (const message of ['Certo', 'uhum'] as const) {
+  for (const [label, context, reason] of [
+    [
+      'payload diverge do resumo canônico',
+      {
+        ...scopedContext,
+        lastAcceptedDelivery: {
+          ...scopedContext.lastAcceptedDelivery,
+          payload: 'Você confirma essa opção?',
+        },
+      },
+      'scoped_modal_payload_mismatch',
+    ],
+    [
+      'janela de quatro horas expirou',
+      {
+        ...scopedContext,
+        now: new Date('2026-08-13T19:00:02.000Z'),
+      },
+      'scoped_modal_expired',
+    ],
+    [
+      'transição open diverge da pendência atual',
+      {
+        ...scopedContext,
+        lastAcceptedDelivery: {
+          ...scopedContext.lastAcceptedDelivery,
+          transition: {
+            ...scopedContext.lastAcceptedDelivery.transition,
+            frame: { ...scopedPending, version: 99 },
+          },
+        },
+      },
+      'scoped_modal_delivery_not_current_pending',
+    ],
+  ] as const) {
+    const decision = bookingConfirmationGate({
+      currentUserMessage: message,
+      history: [{ role: 'assistant', content: scopedCanonicalSummary }],
+      confirmedDuplicate: false,
+      expectedBooking,
+      v2ConfirmationContext: context,
+    });
+    assert.equal(decision.ok, false, `${message}: ${label}`);
+    assert.equal(
+      decision.ok ? '' : decision.reason,
+      reason,
+      `${message}: ${label} reason`
+    );
+  }
 }
 
 const duplicateScopedPending = {

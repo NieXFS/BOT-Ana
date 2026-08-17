@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { isExplicitBookingConfirmation } from '../bookingConfirmationGate';
-import { normalizeCustomerReplyStyle } from '../customerReplyGuard';
+import { deliveryMatchesPendingV2 } from './deliveryEvidence';
 import { PENDING_FAST_PATH_MAX_AGE_MS } from './modelResultParser';
 import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 import type { CurrentDateResolutionV2 } from './currentDateResolution';
@@ -596,56 +596,6 @@ export function resolveCancellationPendingSelectionV2(input: {
 function pendingFreshV2(pending: PendingFrameSnapshotV2, now: Date): boolean {
   const askedAt = Date.parse(pending.askedAt);
   return Number.isFinite(askedAt) && now.getTime() - askedAt <= PENDING_FAST_PATH_MAX_AGE_MS;
-}
-
-function deliveryMatchesPendingV2(input: {
-  pending: PendingFrameSnapshotV2;
-  lastAcceptedDelivery: AcceptedDeliveryEvidenceV2 | null;
-  now: Date;
-  expectedCopy: string;
-}): boolean {
-  const delivery = input.lastAcceptedDelivery;
-  const transition = delivery?.transition;
-  if (!delivery || !transition) return false;
-  if (
-    delivery.conversationCommitOutcome !== 'committed' ||
-    delivery.pendingCommitOutcome !== 'opened' ||
-    transition.kind !== 'open' ||
-    transition.frame.questionId !== input.pending.questionId ||
-    transition.frame.version !== input.pending.version ||
-    transition.frame.flowId !== input.pending.flowId ||
-    transition.frame.askedAt !== input.pending.askedAt ||
-    transition.frame.kind !== input.pending.kind ||
-    transition.frame.options.length !== input.pending.options.length ||
-    transition.frame.options.some((option, index) => {
-      const current = input.pending.options[index];
-      return (
-        !current ||
-        option.position !== current.position ||
-        option.entityId !== current.entityId ||
-        option.displayName !== current.displayName
-      );
-    })
-  ) {
-    return false;
-  }
-  const askedAge = input.now.getTime() - Date.parse(input.pending.askedAt);
-  const terminalAge = input.now.getTime() - Date.parse(delivery.terminalAt);
-  if (
-    !Number.isFinite(askedAge) ||
-    !Number.isFinite(terminalAge) ||
-    askedAge < 0 ||
-    terminalAge < 0 ||
-    askedAge > PENDING_FAST_PATH_MAX_AGE_MS ||
-    terminalAge > PENDING_FAST_PATH_MAX_AGE_MS ||
-    !pendingFreshV2(input.pending, input.now)
-  ) {
-    return false;
-  }
-  return (
-    normalizeCustomerReplyStyle(delivery.payload) ===
-    normalizeCustomerReplyStyle(input.expectedCopy)
-  );
 }
 
 export function cancelConfirmationGateV2(input: {

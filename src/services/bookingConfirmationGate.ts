@@ -3,13 +3,19 @@ import type {
   GateDeclineV2,
   PendingFrameSnapshotV2,
 } from './conversationalV2/contracts';
-import { normalizeCustomerReplyStyle } from './customerReplyGuard';
+import {
+  diagnoseDeliveryMatchPendingV2,
+  type PendingDeliveryMatchDeclineV2,
+} from './conversationalV2/deliveryEvidence';
 import { buildCanonicalBookingSummaryV2 } from './conversationalV2/lifecycleReducer';
-import { PENDING_FAST_PATH_MAX_AGE_MS } from './conversationalV2/modelResultParser';
 import {
   validatedBookingDraftForPendingV2,
   type PendingQuestionCatalogV2,
 } from './conversationalV2/pendingQuestion';
+import {
+  confirmationUtteranceBlockedV2,
+  isNaturalAffirmativeReplyV2,
+} from './conversationalV2/naturalAffirmative';
 import type { AcceptedDeliveryEvidenceV2 } from './conversationalV2/stateStore';
 
 type ConversationMessage = {
@@ -132,7 +138,7 @@ export type CancellationIntentDecision =
   | { ok: false; hintMessage: string };
 
 export const CONFIRMATION_HINT =
-  'INTERNAL_HINT: O cliente ainda não confirmou o resumo de forma inequívoca. Faça ou repita o resumo com serviço, data, horário e profissional; pergunte se está tudo certo e só chame bookAppointment depois de uma resposta explícita como "sim", "confirmo" ou "pode marcar".';
+  'INTERNAL_HINT: O cliente ainda não confirmou o resumo de forma inequívoca. Faça ou repita o resumo com serviço, data, horário e profissional; pergunte se está tudo certo e só chame bookAppointment depois de uma resposta explícita como "sim", "confirmo", "pode marcar" ou "certo".';
 
 export const DUPLICATE_CONFIRMATION_HINT =
   'INTERNAL_HINT: confirmedDuplicate só pode ser usado depois que a Ana apresentou o conflito de agendamentos e o cliente escolheu explicitamente manter os dois ou remarcar. Se a escolha foi remarcar, o cancelamento anterior precisa ter concluído com sucesso antes do novo agendamento.';
@@ -168,6 +174,9 @@ function normalize(value: string): string {
 }
 
 export function isExplicitBookingConfirmation(message: string): boolean {
+  if (confirmationUtteranceBlockedV2(message)) return false;
+  if (isNaturalAffirmativeReplyV2(message)) return true;
+
   const normalized = normalize(message);
   if (!normalized) return false;
 
@@ -365,20 +374,32 @@ function normalizedModalEcho(message: string): boolean {
   return /^(?:pode|pode sim|pode marcar)$/u.test(value);
 }
 
+function mapDeliveryMatchReason(
+  reason: PendingDeliveryMatchDeclineV2
+): BookingConfirmationDeclineReason {
+  switch (reason) {
+    case 'delivery_missing':
+      return 'scoped_modal_delivery_missing';
+    case 'delivery_not_current_pending':
+      return 'scoped_modal_delivery_not_current_pending';
+    case 'delivery_expired':
+      return 'scoped_modal_expired';
+    case 'delivery_payload_mismatch':
+      return 'scoped_modal_payload_mismatch';
+  }
+}
+
 /**
- * Modal curto só ecoa a pergunta canônica da pendência CONFIRMATION atual.
- * A função é pura para o smoke; o gate só a consulta quando a constante acima
- * estiver ativa.
+ * Prova de entrega da CONFIRMATION v2: o mesmo predicado do cancelamento,
+ * mais draft/booking válidos. Antecede TODA confirmação lexical — não só o
+ * modal "pode".
  */
-export function diagnoseScopedV2ModalEchoConfirmation(input: {
+export function diagnoseV2ConfirmationDeliveryProof(input: {
   currentUserMessage: string;
   history: ConversationMessage[];
   expectedBooking?: BookingProposal;
   context?: V2BookingConfirmationContext;
 }): { ok: true } | { ok: false; reason: BookingConfirmationDeclineReason } {
-  if (!normalizedModalEcho(input.currentUserMessage)) {
-    return { ok: false, reason: 'scoped_modal_not_modal' };
-  }
   const pending = input.context?.pending;
   const flowState = input.context?.flowState;
   const catalog = input.context?.catalog;
@@ -407,62 +428,35 @@ export function diagnoseScopedV2ModalEchoConfirmation(input: {
     return { ok: false, reason: 'scoped_modal_booking_mismatch' };
   }
 
-  const delivery = input.context.lastAcceptedDelivery;
-  const transition = delivery?.transition;
-  if (!delivery) {
-    return { ok: false, reason: 'scoped_modal_delivery_missing' };
-  }
-  if (
-    delivery.conversationCommitOutcome !== 'committed' ||
-    delivery.pendingCommitOutcome !== 'opened' ||
-    transition?.kind !== 'open' ||
-    transition.frame.questionId !== pending.questionId ||
-    transition.frame.version !== pending.version ||
-    transition.frame.flowId !== pending.flowId ||
-    transition.frame.askedAt !== pending.askedAt ||
-    transition.frame.kind !== pending.kind ||
-    transition.frame.options.length !== pending.options.length ||
-    transition.frame.options.some((option, index) => {
-      const current = pending.options[index];
-      return (
-        !current ||
-        option.position !== current.position ||
-        option.entityId !== current.entityId ||
-        option.displayName !== current.displayName
-      );
-    })
-  ) {
-    return {
-      ok: false,
-      reason: 'scoped_modal_delivery_not_current_pending',
-    };
-  }
-
-  const nowMs = input.context.now.getTime();
-  const askedAtMs = Date.parse(pending.askedAt);
-  const terminalAtMs = Date.parse(delivery.terminalAt);
-  const askedAge = nowMs - askedAtMs;
-  const terminalAge = nowMs - terminalAtMs;
-  if (
-    !Number.isFinite(nowMs) ||
-    !Number.isFinite(askedAtMs) ||
-    !Number.isFinite(terminalAtMs) ||
-    askedAge < 0 ||
-    terminalAge < 0 ||
-    askedAge > PENDING_FAST_PATH_MAX_AGE_MS ||
-    terminalAge > PENDING_FAST_PATH_MAX_AGE_MS
-  ) {
-    return { ok: false, reason: 'scoped_modal_expired' };
-  }
-
-  const canonicalCopy = buildCanonicalBookingSummaryV2({
-    draft,
-    services: catalog,
+  const match = diagnoseDeliveryMatchPendingV2({
+    pending,
+    lastAcceptedDelivery: input.context.lastAcceptedDelivery,
+    now: input.context.now,
+    expectedCopy: buildCanonicalBookingSummaryV2({
+      draft,
+      services: catalog,
+    }),
   });
-  return normalizeCustomerReplyStyle(delivery.payload) ===
-    normalizeCustomerReplyStyle(canonicalCopy)
+  return match.ok
     ? { ok: true }
-    : { ok: false, reason: 'scoped_modal_payload_mismatch' };
+    : { ok: false, reason: mapDeliveryMatchReason(match.reason) };
+}
+
+/**
+ * Modal curto só ecoa a pergunta canônica da pendência CONFIRMATION atual.
+ * A função é pura para o smoke; o gate só a consulta quando a constante acima
+ * estiver ativa. A prova de entrega é a mesma da família lexical inteira.
+ */
+export function diagnoseScopedV2ModalEchoConfirmation(input: {
+  currentUserMessage: string;
+  history: ConversationMessage[];
+  expectedBooking?: BookingProposal;
+  context?: V2BookingConfirmationContext;
+}): { ok: true } | { ok: false; reason: BookingConfirmationDeclineReason } {
+  if (!normalizedModalEcho(input.currentUserMessage)) {
+    return { ok: false, reason: 'scoped_modal_not_modal' };
+  }
+  return diagnoseV2ConfirmationDeliveryProof(input);
 }
 
 export function matchesScopedV2ModalEchoConfirmation(input: {
@@ -474,25 +468,34 @@ export function matchesScopedV2ModalEchoConfirmation(input: {
   return diagnoseScopedV2ModalEchoConfirmation(input).ok;
 }
 
+function isV2LexicalConfirmation(input: {
+  currentUserMessage: string;
+  v2ConfirmationContext?: V2BookingConfirmationContext;
+}): boolean {
+  if (isExplicitBookingConfirmation(input.currentUserMessage)) return true;
+  return (
+    ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION &&
+    Boolean(input.v2ConfirmationContext) &&
+    normalizedModalEcho(input.currentUserMessage)
+  );
+}
+
 function isExplicitConfirmationForGate(input: {
   currentUserMessage: string;
   history: ConversationMessage[];
   expectedBooking?: BookingProposal;
   v2ConfirmationContext?: V2BookingConfirmationContext;
 }): boolean {
-  if (
-    ENABLE_V2_SCOPED_MODAL_ECHO_CONFIRMATION &&
-    input.v2ConfirmationContext &&
-    normalizedModalEcho(input.currentUserMessage)
-  ) {
-    return matchesScopedV2ModalEchoConfirmation({
-      currentUserMessage: input.currentUserMessage,
-      history: input.history,
-      expectedBooking: input.expectedBooking,
-      context: input.v2ConfirmationContext,
-    });
+  if (!isV2LexicalConfirmation(input)) return false;
+  if (!input.v2ConfirmationContext) {
+    return isExplicitBookingConfirmation(input.currentUserMessage);
   }
-  return isExplicitBookingConfirmation(input.currentUserMessage);
+  return diagnoseV2ConfirmationDeliveryProof({
+    currentUserMessage: input.currentUserMessage,
+    history: input.history,
+    expectedBooking: input.expectedBooking,
+    context: input.v2ConfirmationContext,
+  }).ok;
 }
 
 function historyContainsConfirmedProposal(
@@ -748,6 +751,30 @@ export function bookingConfirmationGate(input: {
     )
   ) {
     return { ok: true, consumesCancellationEvidence: false };
+  }
+
+  if (
+    input.v2ConfirmationContext &&
+    isV2LexicalConfirmation(input)
+  ) {
+    const deliveryDiagnostic = diagnoseV2ConfirmationDeliveryProof({
+      currentUserMessage: input.currentUserMessage,
+      history: input.history,
+      expectedBooking: input.expectedBooking,
+      context: input.v2ConfirmationContext,
+    });
+    if (!deliveryDiagnostic.ok) {
+      return {
+        ok: false,
+        hintMessage: CONFIRMATION_HINT,
+        reason: deliveryDiagnostic.reason,
+      };
+    }
+    return {
+      ok: false,
+      hintMessage: CONFIRMATION_HINT,
+      reason: 'explicit_confirmation_missing',
+    };
   }
 
   const modalDiagnostic = diagnoseScopedV2ModalEchoConfirmation({

@@ -24,6 +24,10 @@ import {
   type ModelResultValidationContextV2,
 } from './modelResultParser';
 import {
+  inboundLooksInterrogativeOriginalV2,
+  isNaturalAffirmativeReplyV2,
+} from './naturalAffirmative';
+import {
   findClauseMatchesV2,
   normalizeClauseTextV2,
   splitClausesV2,
@@ -323,7 +327,9 @@ export function buildPowerZeroInterpreterPlanV2(
 ): PowerZeroInterpreterPlanV2 {
   if (
     input.frame.pending?.kind === 'CONFIRMATION' &&
-    compactAcknowledgement(input.inboundText)
+    !inboundLooksInterrogativeOriginalV2(input.inboundText) &&
+    (compactAcknowledgement(input.inboundText) ||
+      isNaturalAffirmativeReplyV2(input.inboundText))
   ) {
     return {
       shouldInvoke: false,

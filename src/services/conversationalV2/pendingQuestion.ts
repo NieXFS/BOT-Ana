@@ -9,6 +9,34 @@ import {
 
 export const PENDING_REANCHOR_GAP_MS_V2 = 15 * 60 * 1000;
 
+export const DATE_PENDING_QUESTION_V2 = 'Qual dia você prefere?';
+
+export const DUPLICATE_RESOLUTION_OPTIONS_V2 = [
+  {
+    entityId: 'duplicate-resolution:keep-both',
+    displayName: 'manter os dois',
+  },
+  {
+    entityId: 'duplicate-resolution:reschedule',
+    displayName: 'remarcar',
+  },
+  {
+    entityId: 'duplicate-resolution:cancel-only',
+    displayName: 'só cancelar o anterior',
+  },
+  {
+    entityId: 'duplicate-resolution:decide-later',
+    displayName: 'decidir depois',
+  },
+] as const;
+
+export const DUPLICATE_RESOLUTION_CHOICE_QUESTION_V2 = `Quer ${DUPLICATE_RESOLUTION_OPTIONS_V2.slice(
+  0,
+  -1
+)
+  .map((option) => option.displayName)
+  .join(', ')} ou ${DUPLICATE_RESOLUTION_OPTIONS_V2.at(-1)!.displayName}?`;
+
 export function shouldReanchorPendingQuestionV2(input: {
   pending: PendingFrameSnapshotV2 | null;
   flowState: FlowStateV2;
@@ -176,7 +204,7 @@ export function buildPendingQuestionV2(input: {
         ? `Qual profissional você prefere: ${names.join(', ')}?`
         : 'Você prefere algum profissional específico?';
     case 'DATE':
-      return 'Qual dia você prefere?';
+      return DATE_PENDING_QUESTION_V2;
     case 'TIME': {
       const service = input.catalog.services?.find(
         (entry) => entry.id === input.flowState.fixedServiceId
