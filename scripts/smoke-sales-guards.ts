@@ -17,6 +17,7 @@ import {
   normalizeSalesReplyStyle,
   resolveRequiredCommonSignup,
   resolveConfirmedSalesPrefill,
+  resolveSalesCommercialDecision,
   requiresImmediateTerminalHandoff,
   salesToolSucceeded,
   type SalesToolTraceLike,
@@ -994,5 +995,500 @@ assert.equal(
   2
 );
 console.log('  ✓ retórica curta não mascara duas perguntas substantivas');
+
+console.log('▶ decisão comercial versionada');
+function userTurns(texts: string[]) {
+  return texts.map((content) => ({ role: 'user' as const, content }));
+}
+function decided(history: Array<{ role: string; content: string }>) {
+  return resolveSalesCommercialDecision(history);
+}
+function decidedPlan(history: Array<{ role: string; content: string }>) {
+  return decided(history)?.plan ?? null;
+}
+assert.equal(
+  decidedPlan(
+    userTurns(['qual a diferença do Pro e do Essencial?', 'quero o Essencial'])
+  ),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['quero o Pro, não o Essencial'])),
+  'pro'
+);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'não quero o Pro'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'também olhei o Pro'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'o Pro tem prontuário?'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['quero o Pro ou o Essencial?'])),
+  null
+);
+assert.equal(decidedPlan(userTurns(['vou pensar no Pro'])), null);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'quero saber mais sobre o Pro'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['não tenho dúvidas, quero o Pro'])),
+  'pro'
+);
+assert.equal(
+  decidedPlan(userTurns(['quero comparar Pro e Essencial'])),
+  null
+);
+assert.equal(
+  decidedPlan(
+    userTurns(['quero o Essencial', 'quero comparar Pro e Essencial'])
+  ),
+  'essencial'
+);
+assert.equal(decidedPlan(userTurns(['não quero o Pro'])), null);
+assert.equal(
+  decided(userTurns(['quero o Essencial Mensal', 'o Anual tem desconto?']))
+    ?.track,
+  'flexivel'
+);
+assert.deepEqual(
+  decided(userTurns(['quero o Essencial Mensal', 'não quero fidelidade'])),
+  { plan: 'essencial', track: 'flexivel', evidenceIndex: 0 }
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial Mensal', 'não quero o Mensal'])),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'oi' },
+    { role: 'assistant', content: '   ' },
+    { role: 'user', content: 'quero o Essencial' },
+  ])?.evidenceIndex,
+  2
+);
+assert.equal(
+  decidedPlan(userTurns(['não quero o Pro, quero o Essencial'])),
+  'essencial'
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial', 'quero Anual, não Mensal']))?.track,
+  'fidelidade'
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial', 'quero Mensal, não Anual']))?.track,
+  'flexivel'
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial Mensal', 'Mensal ou Anual?']))?.track,
+  'flexivel'
+);
+assert.equal(decidedPlan(userTurns(['não quero assinar o Pro'])), null);
+assert.equal(decidedPlan(userTurns(['não vou contratar o Pro'])), null);
+assert.equal(decidedPlan(userTurns(['não dá para contratar o Pro'])), null);
+assert.equal(
+  decidedPlan(userTurns(['não quero o Pro, não o Essencial'])),
+  null
+);
+assert.equal(
+  decidedPlan(userTurns(['não quero o Pro nem o Essencial'])),
+  null
+);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'não quero o Pro nem o Essencial'])),
+  null
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial', 'não quero assinar Anual']))?.track,
+  'flexivel'
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial Mensal', 'não quero Anual, não Mensal'])),
+  null
+);
+assert.equal(decidedPlan(userTurns(['Pro'])), 'pro');
+assert.equal(decidedPlan(userTurns(['o Essencial'])), 'essencial');
+assert.equal(decidedPlan(userTurns(['Pro?'])), null);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'quero informações sobre o Pro'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['quero uma explicação do Pro'])),
+  null
+);
+assert.equal(
+  decidedPlan(userTurns(['não tenho dúvidas quero o Pro'])),
+  'pro'
+);
+assert.equal(
+  decidedPlan(userTurns(['não tenho objeção, prefiro o Essencial'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['não tenho objeção prefiro o Essencial'])),
+  'essencial'
+);
+assert.equal(decidedPlan(userTurns(['não sei se quero o Pro'])), null);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'não sei se quero o Pro'])),
+  'essencial'
+);
+assert.equal(decidedPlan(userTurns(['ainda não decidi o Pro'])), null);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'ainda não decidi o Pro'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(
+    userTurns(['quero o Essencial', 'não quero saber mais sobre o Pro'])
+  ),
+  'essencial'
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial Mensal', 'não sei se quero Anual']))
+    ?.track,
+  'flexivel'
+);
+assert.equal(
+  decidedPlan(userTurns(['não quero o Pro e quero o Essencial'])),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(
+    userTurns(['quero o Pro', 'não quero o Pro e quero o Essencial'])
+  ),
+  'essencial'
+);
+assert.equal(
+  decidedPlan(userTurns(['não quero o Pro e não quero o Essencial'])),
+  null
+);
+assert.equal(
+  decidedPlan(
+    userTurns(['quero o Essencial', 'não quero o Pro e não quero o Essencial'])
+  ),
+  null
+);
+assert.equal(
+  decidedPlan(userTurns(['não quero o Pro e nem o Essencial'])),
+  null
+);
+assert.equal(
+  decidedPlan(
+    userTurns(['quero o Essencial', 'não quero o Pro e nem o Essencial'])
+  ),
+  null
+);
+assert.equal(
+  decidedPlan(userTurns(['quero o Pro e não o Essencial'])),
+  'pro'
+);
+assert.equal(decidedPlan(userTurns(['quero o Pro e o Essencial'])), null);
+assert.equal(
+  decidedPlan(userTurns(['quero o Essencial', 'quero o Pro e o Essencial'])),
+  'essencial'
+);
+assert.equal(
+  decided(
+    userTurns(['quero o Essencial Anual', 'não quero Anual e quero Mensal'])
+  )?.track,
+  'flexivel'
+);
+assert.equal(
+  decided(userTurns(['quero o Essencial Mensal', 'Anual e Mensal']))?.track,
+  'flexivel'
+);
+assert.equal(decided(userTurns(['Anual e Mensal'])), null);
+assert.equal(
+  decided(userTurns(['Quero o Essencial anual a vista'])),
+  null
+);
+assert.deepEqual(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    { role: 'assistant', content: 'Você prefere Mensal ou Anual?' },
+    { role: 'user', content: 'Mensal' },
+  ]),
+  { plan: 'essencial', track: 'flexivel', evidenceIndex: 2 }
+);
+assert.deepEqual(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    { role: 'assistant', content: 'Mensal ou Anual?' },
+    { role: 'user', content: 'Mensal' },
+  ]),
+  { plan: 'essencial', track: 'flexivel', evidenceIndex: 2 }
+);
+assert.deepEqual(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    { role: 'assistant', content: 'Você prefere Mensal ou Anual?' },
+    { role: 'user', content: 'Anual' },
+  ]),
+  { plan: 'essencial', track: 'fidelidade', evidenceIndex: 2 }
+);
+assert.equal(
+  decided(userTurns(['Quero o Essencial anual a vista', 'Mensal'])),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    {
+      role: 'assistant',
+      content: 'Só confirma: maria@clinica.com.br, certo?',
+    },
+    { role: 'user', content: 'Mensal' },
+  ]),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    { role: 'user', content: 'não quero o Essencial' },
+    { role: 'assistant', content: 'Você prefere Mensal ou Anual?' },
+    { role: 'user', content: 'Mensal' },
+  ]),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    { role: 'assistant', content: 'Você prefere Mensal ou Anual?' },
+    { role: 'user', content: 'Mensal ou Anual?' },
+  ]),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    { role: 'assistant', content: 'Você prefere Mensal ou Anual?' },
+    { role: 'user', content: 'quero comparar Mensal e Anual' },
+  ]),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    {
+      role: 'assistant',
+      content:
+        'No Mensal o valor é recorrente e no Anual há fidelidade. Ficou claro?',
+    },
+    { role: 'user', content: 'Mensal' },
+  ]),
+  null
+);
+assert.equal(
+  decided([
+    { role: 'user', content: 'Quero o Essencial anual a vista' },
+    {
+      role: 'assistant',
+      content: 'Você prefere Mensal ou Anual? Qual o nome da clínica?',
+    },
+    { role: 'user', content: 'Mensal' },
+  ]),
+  null
+);
+console.log(
+  '  ✓ polaridade: escolha, recusa, exploração, pergunta e comparação'
+);
+console.log(
+  '  ✓ anual à vista isolado fica null; resposta à pergunta direta recompõe'
+);
+
+console.log('▶ airbag requiresPrefilledSignup');
+const dedicatedPlusCerto = [
+  {
+    role: 'user',
+    content: 'Quero o Essencial. Meu e-mail é maria@clinica.com.br.',
+  },
+  {
+    role: 'assistant',
+    content: 'Só confirma: maria@clinica.com.br, certo?',
+  },
+  { role: 'user', content: 'Certo' },
+];
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Perfeito, só um instante.',
+    [],
+    dedicatedPlusCerto
+  ).reasons.includes('required_prefill_missing'),
+  true
+);
+assert.deepEqual(resolveConfirmedSalesPrefill(dedicatedPlusCerto), {
+  email: 'maria@clinica.com.br',
+  plan: 'essencial',
+  track: 'flexivel',
+});
+console.log('  ✓ acende com proposta dedicada + "Certo" no turno imediatamente anterior');
+
+const dedicatedThenBlankThenCerto = [
+  {
+    role: 'user',
+    content: 'Quero o Essencial. Meu e-mail é maria@clinica.com.br.',
+  },
+  {
+    role: 'assistant',
+    content: 'Só confirma: maria@clinica.com.br, certo?',
+  },
+  { role: 'assistant', content: '   ' },
+  { role: 'user', content: 'Certo' },
+];
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Perfeito, só um instante.',
+    [],
+    dedicatedThenBlankThenCerto
+  ).reasons.includes('required_prefill_missing'),
+  false
+);
+console.log('  ✓ não acende com turno intermediário vazio entre proposta e Certo');
+
+const staleConfirmationLoosePlan = [
+  {
+    role: 'user',
+    content: 'Quero o Essencial. Meu e-mail é maria@clinica.com.br.',
+  },
+  {
+    role: 'assistant',
+    content: 'Só confirma: maria@clinica.com.br, certo?',
+  },
+  { role: 'user', content: 'Certo' },
+  { role: 'assistant', content: 'Qual é o nome da clínica?' },
+  { role: 'user', content: 'Studio Lia' },
+  { role: 'assistant', content: 'Quantas profissionais atendem aí?' },
+  { role: 'user', content: 'Duas' },
+  { role: 'assistant', content: 'Perfeito, e o horário de funcionamento?' },
+  { role: 'user', content: 'O Essencial atende bem a gente.' },
+];
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Combinado, fico por aqui.',
+    [],
+    staleConfirmationLoosePlan
+  ).reasons.includes('required_prefill_missing'),
+  false
+);
+console.log('  ✓ não acende com confirmação antiga + menção solta de plano');
+
+const onlyRenataNamedThePlan = [
+  { role: 'user', content: 'Meu e-mail é maria@clinica.com.br.' },
+  {
+    role: 'assistant',
+    content:
+      'O Essencial cabe bem aí. Só confirma: maria@clinica.com.br, certo?',
+  },
+  { role: 'user', content: 'Certo' },
+];
+assert.equal(
+  inspectSalesReplyActionClaims(
+    'Perfeito, só um instante.',
+    [],
+    onlyRenataNamedThePlan
+  ).reasons.includes('required_prefill_missing'),
+  true
+);
+assert.deepEqual(resolveConfirmedSalesPrefill(onlyRenataNamedThePlan), {
+  email: 'maria@clinica.com.br',
+  plan: 'essencial',
+  track: 'flexivel',
+});
+console.log('  ✓ acende mesmo quando só a Renata nomeou o plano');
+
+const onlyRenataNamedEssencialAnual = [
+  { role: 'user', content: 'Meu e-mail é maria@clinica.com.br.' },
+  {
+    role: 'assistant',
+    content:
+      'O Essencial Anual cabe bem aí. Só confirma: maria@clinica.com.br, certo?',
+  },
+  { role: 'user', content: 'Certo' },
+];
+assert.deepEqual(resolveSalesCommercialDecision(onlyRenataNamedEssencialAnual), {
+  plan: 'essencial',
+  track: 'fidelidade',
+  evidenceIndex: 1,
+});
+assert.deepEqual(
+  resolveConfirmedSalesPrefill(onlyRenataNamedEssencialAnual),
+  {
+    email: 'maria@clinica.com.br',
+    plan: 'essencial',
+    track: 'fidelidade',
+  }
+);
+console.log('  ✓ fallback dedicado da Renata preserva Anual/fidelidade');
+
+console.log('▶ authorizeSalesToolCall contra a decisão vigente');
+const matchingPrefill = authorizeSalesToolCall({
+  toolName: 'sendPrefilledSignup',
+  toolInput: {
+    email: 'maria@clinica.com.br',
+    plan: 'essencial',
+    track: 'flexivel',
+  },
+  history: confirmedPurchaseHistory,
+});
+assert.equal(matchingPrefill.ok, true);
+const divergentPlan = authorizeSalesToolCall({
+  toolName: 'sendPrefilledSignup',
+  toolInput: {
+    email: 'maria@clinica.com.br',
+    plan: 'pro',
+    track: 'flexivel',
+  },
+  history: confirmedPurchaseHistory,
+});
+assert.equal(divergentPlan.ok, false);
+assert.equal(
+  divergentPlan.ok ? '' : divergentPlan.reason,
+  'commercial_decision_mismatch'
+);
+const divergentTrack = authorizeSalesToolCall({
+  toolName: 'sendSignupLink',
+  toolInput: { plan: 'essencial', track: 'fidelidade' },
+  history: confirmedPurchaseHistory,
+});
+assert.equal(divergentTrack.ok, false);
+assert.equal(
+  divergentTrack.ok ? '' : divergentTrack.reason,
+  'commercial_decision_mismatch'
+);
+const commercialArgsWithoutDecision = authorizeSalesToolCall({
+  toolName: 'sendSignupLink',
+  toolInput: { plan: 'pro', track: 'fidelidade' },
+  history: [{ role: 'user', content: 'Oi, quero entender o produto.' }],
+});
+assert.equal(commercialArgsWithoutDecision.ok, false);
+assert.equal(
+  commercialArgsWithoutDecision.ok ? '' : commercialArgsWithoutDecision.reason,
+  'commercial_decision_mismatch'
+);
+for (const toolInput of [
+  { plan: 123 },
+  { plan: '' },
+  { track: {} },
+] as Array<Record<string, unknown>>) {
+  const invalidCommercial = authorizeSalesToolCall({
+    toolName: 'sendSignupLink',
+    toolInput,
+    history: confirmedPurchaseHistory,
+  });
+  assert.equal(invalidCommercial.ok, false);
+  assert.equal(
+    invalidCommercial.ok ? '' : invalidCommercial.reason,
+    'commercial_decision_mismatch'
+  );
+}
+console.log('  ✓ argumentos divergentes de plano/track são rejeitados');
 
 console.log('\n✅ smoke-sales-guards OK');

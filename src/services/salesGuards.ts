@@ -8,11 +8,20 @@ export type SalesToolTraceLike = {
   result: string;
 };
 
+export type SalesPlan = 'essencial' | 'pro';
+export type SalesTrack = 'flexivel' | 'fidelidade';
+
+export interface SalesCommercialDecision {
+  plan: SalesPlan;
+  track: SalesTrack;
+  evidenceIndex: number;
+}
+
 export type SalesToolGuardDecision =
   | { ok: true }
   | {
       ok: false;
-      reason: 'email_confirmation_required';
+      reason: 'email_confirmation_required' | 'commercial_decision_mismatch';
       hintMessage: string;
     };
 
@@ -301,21 +310,706 @@ export function hasConfirmedSalesEmail(
   return false;
 }
 
+export const EMAIL_CONFIRMATION_REQUIRED_HINT =
+  'INTERNAL_HINT: o link pré-preenchido NÃO foi gerado porque o e-mail ainda não tem confirmação inequívoca em um turno posterior. Faça uma única proposta dedicada com o e-mail exato e aguarde uma resposta afirmativa da lead (por exemplo: "Certo", "Tá certinho", "Sim pode", "Pode mandar" ou "Já confirmei"); não exija que ela repita o e-mail. Correção de e-mail exige uma nova confirmação; não prometa que enviou link.';
+
+const COMMERCIAL_DECISION_MISMATCH_HINT =
+  'INTERNAL_HINT: plano/modalidade da ferramenta diverge da decisão comercial vigente da lead. Use o plano e o track já escolhidos; recusa nunca resolve para o plano recusado. Não gere o link de um plano que ela recusou.';
+
+const LEGACY_ANNUAL_RE =
+  /\banual\b.{0,24}\b(?:a vista|adiantad[oa]|pago (?:de uma vez|integralmente))\b/;
+const CHOOSE_PLAN_CUE_RE =
+  /\b(?:quero|prefiro|escolho|fecho|fechar|assinar|contratar|pode ser|fica com|ficar com|vou de|fica no|vou querer|vou ficar(?:\s+com)?|vamos de|vamos fechar)\b/;
+const EPISTEMIC_QUERO_RE =
+  /\b(?:quero|queria)\s+(?:(?:uma|uns|umas)\s+)?(?:saber|entender|conhecer|ver|olhar|comparar|pensar|informac(?:ao|oes)|explicac(?:ao|oes)|detalhes)\b/;
+const EXPLORE_PLAN_CUE_RE =
+  /\b(?:tambem|tbm)\b.{0,40}\b(?:olhei|olhando|vi|vendo|consultei|verifiquei|dei uma olhada)\b|\bvou\s+pensar\b|\bcompar(?:ar|o|ando)\b/;
+const INDECISION_PLAN_CUE_RE =
+  /\b(?:estou entre|nao sei|em duvida|ainda nao decidi|nao decidi)\b/;
+const QUESTION_STARTER_RE =
+  /\b(?:qual|quais|como|quanto|quando|onde|por que|porque|o que|quem)\b/;
+const PLAN_QUESTION_BODY_RE =
+  /\b(?:tem|tinha|inclui|cobre|vem com|aceita|faz|prontuario|diferenca|desconto)\b/;
+const CONJOINED_PLANS_RE =
+  /\b(?:essencial|pro)\b.{0,48}\b(?:e|ou)\b(?!\s+(?:quero|queria|prefiro|escolho|nao|nunca|nem|assinar|contratar|fecho|fechar|vou|vamos))\s*(?:o\s+|a\s+|plano\s+)?(?:essencial|pro)\b/;
+const CLAUSE_SHIFT_RE =
+  /\b(?:e|mas)\s+(?=quero|queria|prefiro|escolho|fecho|fechar|assinar|contratar|nao|nunca|nem|vou\b|vamos\b|pode ser|fica(?:r)?(?:\s+com)?)/g;
+const CONTRASTIVE_CHOICE_CUE =
+  '(?:quero|prefiro|escolho|fecho|fechar|assinar|contratar|pode ser|fica com|ficar com|vou de|fica no|vou querer|vamos de|vamos fechar)';
+const CONTRASTIVE_PLAN_RE = new RegExp(
+  `\\b${CONTRASTIVE_CHOICE_CUE}\\b.{0,40}\\b(essencial|pro)\\b.{0,40}\\bnao\\b.{0,24}\\b(essencial|pro)\\b`
+);
+const CONTRASTIVE_TRACK_RE = new RegExp(
+  `\\b${CONTRASTIVE_CHOICE_CUE}\\b.{0,40}\\b(mensal|flexivel|anual|fidelidade)\\b.{0,40}\\bnao\\b.{0,24}\\b(mensal|flexivel|anual|fidelidade)\\b`
+);
+const TRACK_ATTACH_RE = /\b(?:no|na|em)\s*$/;
+const UNRELATED_NEGATION_HEAD_RE =
+  /^(?:tenho\s+(?:duvidas?|objec(?:ao|oes)|certeza)|ha\s+(?:duvidas?|objec(?:ao|oes)|problema))\b/;
+const EXPLORATORY_NEGATION_HEAD_RE = /^(?:sei|decidi)\b/;
+const EPISTEMIC_QUERO_HEAD_RE = new RegExp(
+  `^(?:quero|queria)\\s+(?:(?:uma|uns|umas)\\s+)?(?:saber|entender|conhecer|ver|olhar|comparar|pensar|informac(?:ao|oes)|explicac(?:ao|oes)|detalhes)\\b`
+);
+const COMMERCIAL_REFUSAL_HEAD_RE =
+  /^(?:da(?:\s+para|\s+pra)?\s+)?(?:(?:vou|vamos)\s+)?(?:quero|queria|prefiro|escolho|assino|assinar|contrato|contratar|fecho|fechar|ficar(?:\s+com)?)\b/;
+const COMMERCIAL_REFUSAL_MODAL_RE =
+  /^(?:da(?:\s+para|\s+pra)|vou|vamos)\s+(?:contratar|assinar|fechar|querer|ficar|de)\b/;
+const COMMERCIAL_REFUSAL_BARE_RE = /^(?:(?:e|eh)\s*)?(?:o|a|plano)?$/;
+
+function isSalesPlan(value: string): value is SalesPlan {
+  return value === 'essencial' || value === 'pro';
+}
+
+function mentionedPlans(text: string): SalesPlan[] {
+  const found = [...text.matchAll(/\b(essencial|pro)\b/g)]
+    .map((match) => match[1] ?? '')
+    .filter((plan): plan is SalesPlan => isSalesPlan(plan));
+  return [...new Set(found)];
+}
+
+function localClausePrefix(haystack: string, start: number): string {
+  const before = haystack.slice(0, start);
+  CLAUSE_SHIFT_RE.lastIndex = 0;
+  let shiftBoundary = -1;
+  for (const match of before.matchAll(CLAUSE_SHIFT_RE)) {
+    if (match.index == null) continue;
+    shiftBoundary = match.index + match[0].length - 1;
+  }
+  const boundary = Math.max(
+    before.lastIndexOf('.'),
+    before.lastIndexOf('!'),
+    before.lastIndexOf('?'),
+    before.lastIndexOf(';'),
+    before.lastIndexOf(':'),
+    before.lastIndexOf('\n'),
+    before.lastIndexOf(','),
+    shiftBoundary
+  );
+  return before.slice(boundary + 1);
+}
+
+interface UserPlanPolarity {
+  chosen: SalesPlan[];
+  refused: SalesPlan[];
+  comparisonWithoutWinner: boolean;
+  exercisedChoiceOrRefusal: boolean;
+}
+
+function lastNegationRemainder(prefix: string): string | null {
+  const matches = [...prefix.matchAll(/\b(?:nao|nunca|nem)\b/g)];
+  const last = matches.at(-1);
+  if (!last || last.index == null) return null;
+  return prefix.slice(last.index + last[0].length);
+}
+
+function remainderIsUnrelatedNegation(after: string): boolean {
+  return UNRELATED_NEGATION_HEAD_RE.test(after.trim());
+}
+
+function remainderIsExploratoryNegation(after: string): boolean {
+  const trimmed = after.trim();
+  return (
+    EXPLORATORY_NEGATION_HEAD_RE.test(trimmed) ||
+    EPISTEMIC_QUERO_HEAD_RE.test(trimmed)
+  );
+}
+
+function remainderIsCommercialRefusal(after: string): boolean {
+  const trimmed = after.trim();
+  if (remainderIsExploratoryNegation(trimmed)) return false;
+  if (remainderIsUnrelatedNegation(trimmed)) return false;
+  return (
+    COMMERCIAL_REFUSAL_BARE_RE.test(trimmed) ||
+    COMMERCIAL_REFUSAL_HEAD_RE.test(trimmed) ||
+    COMMERCIAL_REFUSAL_MODAL_RE.test(trimmed)
+  );
+}
+
+/** Recusa comercial do item que segue o prefixo; `não` de dúvida/saber/objeção não conta. */
+function prefixRefusesMention(prefix: string): boolean {
+  const after = lastNegationRemainder(prefix);
+  return after != null && remainderIsCommercialRefusal(after);
+}
+
+function contrastivePlanChoice(
+  normalized: string
+): { chosen: SalesPlan; refused: SalesPlan } | null {
+  const match = normalized.match(CONTRASTIVE_PLAN_RE);
+  if (!match || match.index == null) return null;
+  const chosen = match[1];
+  const refused = match[2];
+  if (
+    !chosen ||
+    !refused ||
+    !isSalesPlan(chosen) ||
+    !isSalesPlan(refused) ||
+    chosen === refused
+  ) {
+    return null;
+  }
+  const firstPlanRel = match[0].search(/\b(?:essencial|pro)\b/);
+  if (firstPlanRel < 0) return null;
+  const prefix = localClausePrefix(normalized, match.index + firstPlanRel);
+  if (
+    prefixExploresPlan(prefix) ||
+    prefixRefusesMention(prefix) ||
+    !prefixChoosesPlan(prefix)
+  ) {
+    return null;
+  }
+  return { chosen, refused };
+}
+
+function isPlanQuestion(
+  prefix: string,
+  suffix: string,
+  hasQuestionMark: boolean
+): boolean {
+  if (QUESTION_STARTER_RE.test(prefix)) return true;
+  if (!hasQuestionMark) return false;
+  if (CHOOSE_PLAN_CUE_RE.test(prefix) && !EPISTEMIC_QUERO_RE.test(prefix)) {
+    return false;
+  }
+  if (prefixRefusesMention(prefix)) return false;
+  return PLAN_QUESTION_BODY_RE.test(suffix) || prefix.trim().length <= 3;
+}
+
+function prefixExploresPlan(prefix: string): boolean {
+  if (
+    EXPLORE_PLAN_CUE_RE.test(prefix) ||
+    EPISTEMIC_QUERO_RE.test(prefix) ||
+    INDECISION_PLAN_CUE_RE.test(prefix)
+  ) {
+    return true;
+  }
+  const after = lastNegationRemainder(prefix);
+  return after != null && remainderIsExploratoryNegation(after);
+}
+
+function prefixChoosesPlan(prefix: string): boolean {
+  return (
+    CHOOSE_PLAN_CUE_RE.test(prefix) &&
+    !EPISTEMIC_QUERO_RE.test(prefix) &&
+    !prefixExploresPlan(prefix) &&
+    !prefixRefusesMention(prefix)
+  );
+}
+
+function isAnchoredShortPlanReply(text: string): SalesPlan | null {
+  if (/\?/.test(text)) return null;
+  const compact = withoutEdgePunctuation(normalize(text));
+  const match = compact.match(/^(?:o\s+|plano\s+)?(essencial|pro)$/);
+  const plan = match?.[1];
+  return plan && isSalesPlan(plan) ? plan : null;
+}
+
+function userPlanPolarity(text: string): UserPlanPolarity {
+  const shortPlan = isAnchoredShortPlanReply(text);
+  if (shortPlan) {
+    return {
+      chosen: [shortPlan],
+      refused: [],
+      comparisonWithoutWinner: false,
+      exercisedChoiceOrRefusal: true,
+    };
+  }
+
+  const normalized = normalize(text);
+  const contrastive = contrastivePlanChoice(normalized);
+  if (contrastive) {
+    return {
+      chosen: [contrastive.chosen],
+      refused: [contrastive.refused],
+      comparisonWithoutWinner: false,
+      exercisedChoiceOrRefusal: true,
+    };
+  }
+
+  const plans = mentionedPlans(normalized);
+  const comparisonWithoutWinner =
+    plans.length >= 2 &&
+    (CONJOINED_PLANS_RE.test(normalized) ||
+      INDECISION_PLAN_CUE_RE.test(normalized) ||
+      /\bcompar(?:ar|o|ando)\b/.test(normalized));
+  if (comparisonWithoutWinner) {
+    return {
+      chosen: [],
+      refused: [],
+      comparisonWithoutWinner: true,
+      exercisedChoiceOrRefusal: false,
+    };
+  }
+
+  const hasQuestionMark = /\?/.test(text);
+  const chosen = new Set<SalesPlan>();
+  const refused = new Set<SalesPlan>();
+  const mentions: Array<{ plan: SalesPlan; start: number; end: number }> = [];
+  for (const match of normalized.matchAll(/\b(essencial|pro)\b/g)) {
+    const plan = match[1] ?? '';
+    if (!isSalesPlan(plan)) continue;
+    const start = match.index ?? 0;
+    mentions.push({ plan, start, end: start + match[0].length });
+  }
+
+  for (let index = 0; index < mentions.length; index += 1) {
+    const mention = mentions[index];
+    const prefix = localClausePrefix(normalized, mention.start);
+    const suffixEnd =
+      index + 1 < mentions.length
+        ? mentions[index + 1].start
+        : normalized.length;
+    const suffix = normalized.slice(mention.end, suffixEnd);
+
+    if (prefixExploresPlan(prefix)) {
+      continue;
+    }
+    if (prefixRefusesMention(prefix)) {
+      refused.add(mention.plan);
+      continue;
+    }
+    if (isPlanQuestion(prefix, suffix, hasQuestionMark)) {
+      continue;
+    }
+    if (prefixChoosesPlan(prefix)) {
+      chosen.add(mention.plan);
+    }
+  }
+
+  const uniqueChosen = [...chosen].filter((plan) => !refused.has(plan));
+
+  return {
+    chosen: uniqueChosen.length === 1 ? uniqueChosen : [],
+    refused: [...refused],
+    comparisonWithoutWinner: uniqueChosen.length > 1,
+    exercisedChoiceOrRefusal: uniqueChosen.length === 1 || refused.size > 0,
+  };
+}
+
+function tokenToTrack(token: string): SalesTrack | null {
+  if (token === 'mensal' || token === 'flexivel') return 'flexivel';
+  if (token === 'anual' || token === 'fidelidade') return 'fidelidade';
+  return null;
+}
+
+function mentionedTracks(text: string): SalesTrack[] {
+  const found = [...text.matchAll(/\b(mensal|flexivel|anual|fidelidade)\b/g)]
+    .map((match) => tokenToTrack(match[1] ?? ''))
+    .filter((track): track is SalesTrack => track !== null);
+  return [...new Set(found)];
+}
+
+interface UserTrackPolarity {
+  chosen: SalesTrack | null;
+  refused: SalesTrack[];
+  comparisonWithoutWinner: boolean;
+  questionOrExplore: boolean;
+  legacy: boolean;
+}
+
+function contrastiveTrackChoice(
+  normalized: string
+): { chosen: SalesTrack; refused: SalesTrack } | null {
+  const match = normalized.match(CONTRASTIVE_TRACK_RE);
+  if (!match || match.index == null) return null;
+  const chosen = tokenToTrack(match[1] ?? '');
+  const refused = tokenToTrack(match[2] ?? '');
+  if (!chosen || !refused || chosen === refused) return null;
+  const firstTrackRel = match[0].search(
+    /\b(?:mensal|flexivel|anual|fidelidade)\b/
+  );
+  if (firstTrackRel < 0) return null;
+  const prefix = localClausePrefix(normalized, match.index + firstTrackRel);
+  if (
+    prefixExploresPlan(prefix) ||
+    prefixRefusesMention(prefix) ||
+    !prefixChoosesPlan(prefix)
+  ) {
+    return null;
+  }
+  return { chosen, refused };
+}
+
+function userTrackPolarity(text: string): UserTrackPolarity {
+  const normalized = normalize(text);
+  if (LEGACY_ANNUAL_RE.test(normalized)) {
+    return {
+      chosen: null,
+      refused: [],
+      comparisonWithoutWinner: false,
+      questionOrExplore: false,
+      legacy: true,
+    };
+  }
+
+  const contrastive = contrastiveTrackChoice(normalized);
+  if (contrastive) {
+    return {
+      chosen: contrastive.chosen,
+      refused: [contrastive.refused],
+      comparisonWithoutWinner: false,
+      questionOrExplore: false,
+      legacy: false,
+    };
+  }
+
+  const hasQuestionMark = /\?/.test(text);
+  const refused: SalesTrack[] = [];
+  let chosen: SalesTrack | null = null;
+  let questionOrExplore = false;
+  const uniqueTracks = mentionedTracks(normalized);
+
+  for (const match of normalized.matchAll(
+    /\b(mensal|flexivel|anual|fidelidade)\b/g
+  )) {
+    const track = tokenToTrack(match[1] ?? '');
+    if (!track) continue;
+    const start = match.index ?? 0;
+    const prefix = localClausePrefix(normalized, start);
+    const trimmedPrefix = prefix.trim();
+    const suffix = normalized.slice(start + match[0].length);
+
+    if (prefixExploresPlan(prefix)) {
+      questionOrExplore = true;
+      continue;
+    }
+    if (prefixRefusesMention(prefix)) {
+      refused.push(track);
+      continue;
+    }
+    if (
+      QUESTION_STARTER_RE.test(prefix) ||
+      (hasQuestionMark &&
+        !prefixChoosesPlan(prefix) &&
+        !TRACK_ATTACH_RE.test(trimmedPrefix))
+    ) {
+      questionOrExplore = true;
+      continue;
+    }
+    if (PLAN_QUESTION_BODY_RE.test(suffix) && hasQuestionMark) {
+      questionOrExplore = true;
+      continue;
+    }
+    if (
+      prefixChoosesPlan(prefix) ||
+      TRACK_ATTACH_RE.test(trimmedPrefix) ||
+      (/^(?:o\s+|a\s+)?$/.test(trimmedPrefix) &&
+        suffix.replace(/[.!?,;:\s]+/g, '').length === 0)
+    ) {
+      chosen = track;
+    }
+  }
+
+  const uniqueRefused = [...new Set(refused)];
+  if (chosen && uniqueRefused.includes(chosen)) {
+    chosen = null;
+  }
+
+  const comparisonWithoutWinner =
+    uniqueTracks.length >= 2 &&
+    chosen == null &&
+    uniqueRefused.length < uniqueTracks.length;
+
+  return {
+    chosen,
+    refused: uniqueRefused,
+    comparisonWithoutWinner,
+    questionOrExplore,
+    legacy: false,
+  };
+}
+
+function assistantFallbackPlan(text: string): SalesPlan | null {
+  const plans = mentionedPlans(normalize(text));
+  return plans.length === 1 ? plans[0] : null;
+}
+
+/** Modalidade nomeada na proposta dedicada da Renata, sem polaridade de pergunta. */
+function assistantFallbackTrack(
+  text: string
+): SalesTrack | 'conflict' | 'legacy' | null {
+  const normalized = normalize(text);
+  if (LEGACY_ANNUAL_RE.test(normalized)) return 'legacy';
+  const tracks = mentionedTracks(normalized);
+  if (tracks.length >= 2) return 'conflict';
+  return tracks.length === 1 ? tracks[0] : null;
+}
+
+function isDirectModalityQuestion(text: string): boolean {
+  const normalized = normalize(text);
+  if (!normalized || LEGACY_ANNUAL_RE.test(normalized)) return false;
+  const tracks = mentionedTracks(normalized);
+  if (!tracks.includes('flexivel') || !tracks.includes('fidelidade')) {
+    return false;
+  }
+  const hasPreferenceCue =
+    /\b(?:prefere|preferem|preferencia|escolhe|escolher|escolha)\b/.test(
+      normalized
+    );
+  const hasBinaryOr =
+    /\b(?:mensal|flexivel)\b.{0,48}\bou\b.{0,48}\b(?:anual|fidelidade)\b/.test(
+      normalized
+    ) ||
+    /\b(?:anual|fidelidade)\b.{0,48}\bou\b.{0,48}\b(?:mensal|flexivel)\b/.test(
+      normalized
+    );
+  if (!hasPreferenceCue && !(hasBinaryOr && /\?/.test(text))) return false;
+  return countActionableSalesQuestions(text) <= 1;
+}
+
+function precedingDirectModalityQuestion(
+  history: ConversationMessage[],
+  beforeIndex: number
+): boolean {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const message = history[index];
+    const text = contentText(message.content);
+    if (!text.trim()) continue;
+    return message.role === 'assistant' && isDirectModalityQuestion(text);
+  }
+  return false;
+}
+
+function trackForNewPlanChoice(
+  text: string,
+  trackPolarity: UserTrackPolarity
+): SalesTrack | null {
+  if (trackPolarity.legacy || trackPolarity.comparisonWithoutWinner) {
+    return null;
+  }
+  if (trackPolarity.questionOrExplore) return 'flexivel';
+  const mentioned = mentionedTracks(normalize(text));
+  const onlyMentioned: SalesTrack | undefined = mentioned[0];
+  const attached: SalesTrack | null =
+    trackPolarity.chosen ??
+    (mentioned.length === 1 &&
+    onlyMentioned &&
+    !trackPolarity.refused.includes(onlyMentioned)
+      ? onlyMentioned
+      : null);
+  const nextTrack: SalesTrack = attached ?? 'flexivel';
+  if (trackPolarity.refused.includes(nextTrack) && trackPolarity.chosen == null) {
+    return null;
+  }
+  return nextTrack;
+}
+
+/**
+ * Plano e modalidade como uma única decisão versionada. Recusa nunca resolve
+ * para o plano recusado; pergunta, exploração e comparação sem vencedor não
+ * sobrescrevem a escolha vigente. evidenceIndex é o índice no `history`
+ * original, inclusive entradas vazias. Modalidade aposentada (anual à vista)
+ * não fecha decisão no próprio turno; só a resposta explícita à pergunta
+ * direta de modalidade da Renata recompõe o plano vigente ainda não recusado.
+ */
+export function resolveSalesCommercialDecision(
+  history: ConversationMessage[]
+): SalesCommercialDecision | null {
+  let decision: SalesCommercialDecision | null = null;
+  let pendingPlan: SalesPlan | null = null;
+  let leadExercisedChoiceOrRefusal = false;
+
+  for (let index = 0; index < history.length; index += 1) {
+    const message = history[index];
+    const text = contentText(message.content);
+    if (!text.trim()) continue;
+
+    if (message.role === 'user') {
+      const polarity = userPlanPolarity(text);
+      const trackPolarity = userTrackPolarity(text);
+
+      if (polarity.exercisedChoiceOrRefusal) {
+        leadExercisedChoiceOrRefusal = true;
+      }
+
+      if (trackPolarity.legacy) {
+        const chosenPlan: SalesPlan | undefined = polarity.chosen[0];
+        if (polarity.chosen.length === 1 && chosenPlan) {
+          pendingPlan = chosenPlan;
+        } else if (decision) {
+          pendingPlan = decision.plan;
+        }
+        if (pendingPlan && polarity.refused.includes(pendingPlan)) {
+          pendingPlan = null;
+        }
+        decision = null;
+        continue;
+      }
+
+      if (polarity.chosen.length === 1) {
+        const chosenPlan: SalesPlan | undefined = polarity.chosen[0];
+        if (!chosenPlan) continue;
+        const nextTrack = trackForNewPlanChoice(text, trackPolarity);
+        if (!nextTrack) {
+          pendingPlan = chosenPlan;
+          decision = null;
+          continue;
+        }
+        const next: SalesCommercialDecision = {
+          plan: chosenPlan,
+          track: nextTrack,
+          evidenceIndex: index,
+        };
+        decision = next;
+        pendingPlan = null;
+        continue;
+      }
+
+      if (polarity.comparisonWithoutWinner) {
+        continue;
+      }
+
+      if (polarity.refused.length > 0) {
+        if (decision && polarity.refused.includes(decision.plan)) {
+          decision = null;
+        }
+        if (pendingPlan && polarity.refused.includes(pendingPlan)) {
+          pendingPlan = null;
+        }
+        continue;
+      }
+
+      if (trackPolarity.comparisonWithoutWinner) {
+        continue;
+      }
+
+      if (
+        trackPolarity.chosen &&
+        !trackPolarity.refused.includes(trackPolarity.chosen)
+      ) {
+        if (decision) {
+          leadExercisedChoiceOrRefusal = true;
+          const next: SalesCommercialDecision = {
+            plan: decision.plan,
+            track: trackPolarity.chosen,
+            evidenceIndex: index,
+          };
+          decision = next;
+          pendingPlan = null;
+        } else if (
+          pendingPlan &&
+          precedingDirectModalityQuestion(history, index)
+        ) {
+          leadExercisedChoiceOrRefusal = true;
+          const next: SalesCommercialDecision = {
+            plan: pendingPlan,
+            track: trackPolarity.chosen,
+            evidenceIndex: index,
+          };
+          decision = next;
+          pendingPlan = null;
+        }
+        continue;
+      }
+
+      if (trackPolarity.questionOrExplore) {
+        continue;
+      }
+
+      if (trackPolarity.refused.length > 0) {
+        leadExercisedChoiceOrRefusal = true;
+        if (decision && trackPolarity.refused.includes(decision.track)) {
+          decision = null;
+        }
+        continue;
+      }
+
+      continue;
+    }
+
+    if (message.role !== 'assistant' || leadExercisedChoiceOrRefusal) {
+      continue;
+    }
+    const proposalEmails = emailsIn(text);
+    const dedicated = proposalEmails.some((email) =>
+      isDedicatedEmailConfirmationProposal(text, email)
+    );
+    if (!dedicated) continue;
+    const plan = assistantFallbackPlan(text);
+    if (!plan) continue;
+    const fallbackTrack = assistantFallbackTrack(text);
+    if (fallbackTrack === 'legacy' || fallbackTrack === 'conflict') continue;
+    const next: SalesCommercialDecision = {
+      plan,
+      track: fallbackTrack ?? 'flexivel',
+      evidenceIndex: index,
+    };
+    decision = next;
+  }
+
+  return decision;
+}
+
+function parseProvidedPlan(value: unknown): SalesPlan | null {
+  if (typeof value !== 'string') return null;
+  const slug = value.trim().toLowerCase();
+  return isSalesPlan(slug) ? slug : null;
+}
+
+function parseProvidedTrack(value: unknown): SalesTrack | null {
+  if (typeof value !== 'string') return null;
+  const slug = value.trim().toLowerCase();
+  if (slug === 'fidelidade' || slug === 'flexivel') return slug;
+  return null;
+}
+
+function hasOwnCommercialKey(
+  toolInput: Record<string, unknown>,
+  key: 'plan' | 'track'
+): boolean {
+  return Object.prototype.hasOwnProperty.call(toolInput, key);
+}
+
+function hasCommercialSignupArgs(toolInput: Record<string, unknown>): boolean {
+  return (
+    hasOwnCommercialKey(toolInput, 'plan') ||
+    hasOwnCommercialKey(toolInput, 'track')
+  );
+}
+
+function commercialArgsMatchDecision(
+  toolInput: Record<string, unknown>,
+  decision: SalesCommercialDecision
+): boolean {
+  if (!hasOwnCommercialKey(toolInput, 'plan')) return false;
+  const plan = parseProvidedPlan(toolInput.plan);
+  if (plan !== decision.plan) return false;
+  if (hasOwnCommercialKey(toolInput, 'track')) {
+    return parseProvidedTrack(toolInput.track) === decision.track;
+  }
+  return decision.track === 'flexivel';
+}
+
 export function authorizeSalesToolCall(input: {
   toolName: string;
   toolInput: Record<string, unknown>;
   history: ConversationMessage[];
 }): SalesToolGuardDecision {
-  if (input.toolName !== 'sendPrefilledSignup') return { ok: true };
-  if (hasConfirmedSalesEmail(input.toolInput.email, input.history)) {
+  const isSignupTool =
+    input.toolName === 'sendPrefilledSignup' ||
+    input.toolName === 'sendSignupLink';
+
+  if (input.toolName === 'sendPrefilledSignup') {
+    if (!hasConfirmedSalesEmail(input.toolInput.email, input.history)) {
+      return {
+        ok: false,
+        reason: 'email_confirmation_required',
+        hintMessage: EMAIL_CONFIRMATION_REQUIRED_HINT,
+      };
+    }
+  } else if (!isSignupTool) {
     return { ok: true };
   }
-  return {
-    ok: false,
-    reason: 'email_confirmation_required',
-    hintMessage:
-      'INTERNAL_HINT: o link pré-preenchido NÃO foi gerado porque o e-mail ainda não tem confirmação inequívoca em um turno posterior. Faça uma única proposta dedicada com o e-mail exato e aguarde uma resposta afirmativa da lead (por exemplo: "Certo", "Tá certinho", "Sim pode", "Pode mandar" ou "Já confirmei"); não exija que ela repita o e-mail. Correção de e-mail exige uma nova confirmação; não prometa que enviou link.',
-  };
+
+  const decision = resolveSalesCommercialDecision(input.history);
+  if (hasCommercialSignupArgs(input.toolInput)) {
+    if (!decision || !commercialArgsMatchDecision(input.toolInput, decision)) {
+      return {
+        ok: false,
+        reason: 'commercial_decision_mismatch',
+        hintMessage: COMMERCIAL_DECISION_MISMATCH_HINT,
+      };
+    }
+  }
+  return { ok: true };
 }
 
 function parsedResult(result: string): Record<string, unknown> | null {
@@ -404,13 +1098,20 @@ export function salesToolSucceeded(
   );
 }
 
+function isSalesToolGuardBlock(result: Record<string, unknown> | null): boolean {
+  return (
+    result?.code === 'email_confirmation_required' ||
+    result?.code === 'commercial_decision_mismatch'
+  );
+}
+
 function toolHadAuthorizedAttempt(
   trace: SalesToolTraceLike[],
   name: string
 ): boolean {
   return trace.some((entry) => {
     if (entry.name !== name) return false;
-    return parsedResult(entry.result)?.code !== 'email_confirmation_required';
+    return !isSalesToolGuardBlock(parsedResult(entry.result));
   });
 }
 
@@ -452,7 +1153,7 @@ function hasCompletedHandoffClaim(normalized: string): boolean {
   );
 }
 
-function requiresHandoff(history: ConversationMessage[]): boolean {
+export function requiresHandoff(history: ConversationMessage[]): boolean {
   const latestUser = conversationalMessages(history)
     .filter((message) => message.role === 'user')
     .at(-1)?.text;
@@ -503,45 +1204,61 @@ function requiresScheduleDemo(history: ConversationMessage[]): boolean {
   );
 }
 
+function hasImmediateDedicatedEmailConfirmation(
+  history: ConversationMessage[]
+): boolean {
+  let lastUserIndex = -1;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    if (
+      history[index].role === 'user' &&
+      contentText(history[index].content).trim()
+    ) {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  if (lastUserIndex <= 0) return false;
+  const previous = history[lastUserIndex - 1];
+  if (previous.role !== 'assistant') return false;
+  const previousText = contentText(previous.content);
+  if (!previousText.trim()) return false;
+  const latestUser = contentText(history[lastUserIndex].content);
+  return emailsIn(previousText).some(
+    (email) =>
+      isDedicatedEmailConfirmationProposal(previousText, email) &&
+      classifyEmailConfirmationReply(latestUser, email)
+  );
+}
+
+function hasExplicitSignupBuyingSignal(latestUser: string): boolean {
+  return /\b(?:quero (?:contratar|assinar)|(?:pode|consegue|ja pode)\s+gerar(?:\s+(?:o\s+)?(?:link|cadastro))?(?:\s+agora)?|(?:pode|consegue|ja pode)\s+(?:mandar|enviar)(?:\s+(?:o\s+)?(?:link|cadastro))?|manda\s+(?:o\s+)?(?:link|cadastro)|envia\s+(?:o\s+)?(?:link|cadastro)|(?:pode|consegue|ja pode)\s+(?:seguir|prosseguir)\s+(?:com\s+)?(?:o\s+)?cadastro)\b/.test(
+    latestUser
+  );
+}
+
 function requiresPrefilledSignup(history: ConversationMessage[]): boolean {
   const messages = conversationalMessages(history);
   const userText = messages
     .filter((message) => message.role === 'user')
     .map((message) => message.text)
     .join('\n');
-  const normalized = normalize(userText);
   const latestUser = normalize(
     messages.filter((message) => message.role === 'user').at(-1)?.text ?? ''
   );
-  // A intenção comercial precisa estar no pedido atual, com plano e e-mail
-  // confirmados no contexto. Isso inclui "Quero o Essencial" seguido de
-  // "Pode gerar agora", sem confundir curiosidade sobre o produto com compra.
-  const hasBuyingSignal =
-    /\b(?:quero (?:contratar|assinar)|(?:pode|consegue|ja pode)\s+gerar(?:\s+(?:o\s+)?(?:link|cadastro))?(?:\s+agora)?|(?:pode|consegue|ja pode)\s+(?:mandar|enviar)(?:\s+(?:o\s+)?(?:link|cadastro))?|manda\s+(?:o\s+)?(?:link|cadastro)|envia\s+(?:o\s+)?(?:link|cadastro)|(?:pode|consegue|ja pode)\s+(?:seguir|prosseguir)\s+(?:com\s+)?(?:o\s+)?cadastro)\b/.test(
-      latestUser
-    );
-  const hasKnownPlan = /\b(?:essencial|pro)\b/.test(normalized);
+  if (resolveSalesCommercialDecision(history) === null) return false;
+  if (!emailsIn(userText).some((email) => hasConfirmedSalesEmail(email, history))) {
+    return false;
+  }
   return (
-    hasBuyingSignal &&
-    hasKnownPlan &&
-    emailsIn(userText).some((email) => hasConfirmedSalesEmail(email, history))
+    hasImmediateDedicatedEmailConfirmation(history) ||
+    hasExplicitSignupBuyingSignal(latestUser)
   );
 }
 
 function singleKnownPlanFromHistory(
   history: ConversationMessage[]
-): 'essencial' | 'pro' | null {
-  const plans = [
-    ...new Set(
-      conversationalMessages(history)
-        .filter((message) => message.role === 'user')
-        .flatMap((message) => normalize(message.text).match(/\b(?:essencial|pro)\b/g) ?? [])
-    ),
-  ].filter(
-    (plan): plan is 'essencial' | 'pro' =>
-      plan === 'essencial' || plan === 'pro'
-  );
-  return plans.length === 1 ? plans[0] : null;
+): SalesPlan | null {
+  return resolveSalesCommercialDecision(history)?.plan ?? null;
 }
 
 /**
@@ -573,7 +1290,7 @@ function requiresCommonSignupLink(history: ConversationMessage[]): boolean {
 
 export function resolveRequiredCommonSignup(
   history: ConversationMessage[]
-): { plan: 'essencial' | 'pro' } | null {
+): { plan: SalesPlan } | null {
   const plan = singleKnownPlanFromHistory(history);
   return requiresCommonSignupLink(history) && plan ? { plan } : null;
 }
@@ -640,17 +1357,50 @@ export function isPausedAiPlanRequest(
   );
 }
 
+/**
+ * Prefill terminal consome a decisão versionada (plano+track da mesma
+ * evidência). Não reabre a unicidade global de planos no histórico — quem
+ * compara e depois escolhe continua resolvendo. O fail-closed pré-existente
+ * vale só para menção posterior ambígua de outro plano (exploração, pergunta
+ * ou comparação sem vencedor depois da evidência vigente), como em
+ * "Também olhei o Pro" após uma compra já confirmada.
+ */
+function laterAmbiguousOtherPlanMention(
+  history: ConversationMessage[],
+  decision: SalesCommercialDecision
+): boolean {
+  for (let index = decision.evidenceIndex + 1; index < history.length; index += 1) {
+    const message = history[index];
+    if (message.role !== 'user') continue;
+    const text = contentText(message.content);
+    if (!text.trim()) continue;
+    const polarity = userPlanPolarity(text);
+    const otherPlans = mentionedPlans(normalize(text)).filter(
+      (plan) => plan !== decision.plan
+    );
+    if (otherPlans.length === 0) continue;
+    if (polarity.chosen.length === 1) continue;
+    const refusedOnlyTheOthers =
+      polarity.refused.length > 0 &&
+      !polarity.refused.includes(decision.plan) &&
+      otherPlans.every((plan) => polarity.refused.includes(plan));
+    if (refusedOnlyTheOthers) continue;
+    return true;
+  }
+  return false;
+}
+
 export function resolveConfirmedSalesPrefill(
   history: ConversationMessage[]
 ): {
   email: string;
-  plan: 'essencial' | 'pro';
-  track: 'flexivel' | 'fidelidade';
+  plan: SalesPlan;
+  track: SalesTrack;
 } | null {
-  const userMessages = conversationalMessages(history).filter(
-    (message) => message.role === 'user'
-  );
-  const userText = userMessages.map((message) => message.text).join('\n');
+  const userText = conversationalMessages(history)
+    .filter((message) => message.role === 'user')
+    .map((message) => message.text)
+    .join('\n');
   const confirmedEmails = [
     ...new Set(
       emailsIn(userText).filter((email) =>
@@ -658,38 +1408,14 @@ export function resolveConfirmedSalesPrefill(
       )
     ),
   ];
-  const plans = [
-    ...new Set(
-      normalize(userText).match(/\b(?:essencial|pro)\b/g) ?? []
-    ),
-  ].filter(
-    (plan): plan is 'essencial' | 'pro' =>
-      plan === 'essencial' || plan === 'pro'
-  );
-  if (confirmedEmails.length !== 1 || plans.length !== 1) return null;
-
-  // Ausência de escolha explícita preserva o default técnico flexivel (Mensal).
-  // Procura a mensagem mais recente que nomeia uma opção, aceitando também os
-  // nomes antigos; se ela menciona as duas, falha fechado. "Anual à vista"
-  // continua sendo a oferta legada aposentada e nunca autoriza fidelidade.
-  let track: 'flexivel' | 'fidelidade' = 'flexivel';
-  for (const message of [...userMessages].reverse()) {
-    const normalized = normalize(message.text);
-    const mentionsMonthly = /\b(?:mensal|flexivel)\b/.test(normalized);
-    const mentionsAnnual = /\b(?:anual|fidelidade)\b/.test(normalized);
-    const requestsLegacyAnnual =
-      /\banual\b.{0,24}\b(?:a vista|adiantad[oa]|pago (?:de uma vez|integralmente))\b/.test(
-        normalized
-      );
-    if (requestsLegacyAnnual) return null;
-    if (mentionsMonthly && mentionsAnnual) return null;
-    if (mentionsAnnual) {
-      track = 'fidelidade';
-      break;
-    }
-    if (mentionsMonthly) break;
-  }
-  return { email: confirmedEmails[0], plan: plans[0], track };
+  const decision = resolveSalesCommercialDecision(history);
+  if (confirmedEmails.length !== 1 || !decision) return null;
+  if (laterAmbiguousOtherPlanMention(history, decision)) return null;
+  return {
+    email: confirmedEmails[0],
+    plan: decision.plan,
+    track: decision.track,
+  };
 }
 
 export function buildDeterministicSalesGuardReply(

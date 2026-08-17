@@ -97,6 +97,7 @@
     "smoke:sales-registry": "npx tsx scripts/smoke-sales-brain-registry.ts",
     "smoke:sales-provider": "npx tsx scripts/smoke-sales-provider.ts",
     "smoke:sales-guards": "npx tsx scripts/smoke-sales-guards.ts",
+    "smoke:sales-elicitor-contract": "npx tsx scripts/smoke-sales-elicitor-matcher-contract.ts",
     "smoke:sales-tools": "npx tsx scripts/smoke-sales-tools.ts",
     "smoke:sales-recovery": "npx tsx scripts/smoke-sales-recovery.ts",
     "smoke:sales-followups": "npx tsx scripts/smoke-sales-followups.ts",
@@ -115,7 +116,8 @@
     "smoke:renata-voice-storage": "npx tsx scripts/smoke-renata-voice-storage.ts",
     "smoke:renata-sales-openers": "npx tsx scripts/smoke-renata-sales-openers.ts",
     "smoke:renata-partner-mention": "npx tsx scripts/smoke-renata-partner-mention.ts",
-    "smoke:renata-demo-video": "npx tsx scripts/smoke-renata-demo-video.ts"
+    "smoke:renata-demo-video": "npx tsx scripts/smoke-renata-demo-video.ts",
+    "smoke:sales-commercial-adversarial": "npx tsx scripts/smoke-sales-commercial-adversarial.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",

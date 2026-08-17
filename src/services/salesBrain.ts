@@ -146,6 +146,9 @@ Use somente como pista para CONFIRMAR a trilha provável (sistema, IA ou ambos),
   return volatileBlocks.join('\n\n');
 }
 
+export const HANDOFF_TO_HUMAN_DESCRIPTION =
+  'Transfere a conversa pro Victor (humano). Use em: pedido explícito de falar com pessoa, negociação de preço/desconto/condição, migração técnica de dados, reclamação ou imprensa/parceria/revenda. Sinal de compra NÃO é handoff: mande o link na hora. Avise o lead que o Victor responde por aqui já já.';
+
 export const SALES_TOOLS: Anthropic.Tool[] = [
   {
     name: 'getAvailableSlots',
@@ -289,8 +292,7 @@ export const SALES_TOOLS: Anthropic.Tool[] = [
   },
   {
     name: 'handoffToHuman',
-    description:
-      'Transfere a conversa pro Victor (humano). Use em: pedido explícito de falar com pessoa, negociação de preço/desconto/condição, migração técnica de dados, reclamação ou imprensa/parceria/revenda. Sinal de compra NÃO é handoff: mande o link na hora. Avise o lead que o Victor responde por aqui já já.',
+    description: HANDOFF_TO_HUMAN_DESCRIPTION,
     input_schema: {
       type: 'object',
       properties: {
