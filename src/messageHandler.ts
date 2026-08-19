@@ -1619,6 +1619,12 @@ export async function reprocessDurableSuccessorBatchV2(
   );
   if (!isAnaConversationalV2Enabled(config.tenantSlug)) return;
 
+  const resume = await evaluateAnaResumeForInbound({
+    config,
+    customerPhone: batch.customerPhone,
+  });
+  if (!resume.allowed) return;
+
   const persisted = await getPersistedInboundBatch(
     batch.conversationKey,
     batch.inboundMessageIds
@@ -1670,6 +1676,11 @@ export async function deliverDurableSuccessorFallbackV2(
   try {
     const config = await getTenantConfig(batch.phoneNumberId);
     if (!config || config.botRole === 'sales') return;
+    const resume = await evaluateAnaResumeForInbound({
+      config,
+      customerPhone: batch.customerPhone,
+    });
+    if (!resume.allowed) return;
     await withConversationLock(
       batch.phoneNumberId,
       batch.customerPhone,

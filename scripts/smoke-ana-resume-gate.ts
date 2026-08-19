@@ -1,9 +1,15 @@
 process.env.NODE_ENV = 'development';
 process.env.DATABASE_URL ||= 'postgres://smoke:smoke@127.0.0.1:5432/smoke';
-process.env.ANA_RESUME_GATE_ENABLED = 'true';
+process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS = 'tenant-seguro';
+delete process.env.ANA_RESUME_GATE_ENABLED;
+delete process.env.ANA_RESUME_GATE_TENANT_SLUGS;
+delete process.env.ANA_RESUME_GATE_EXCLUDED_TENANT_SLUGS;
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import type { TenantBotConfig } from '../src/configProvider';
+import { isAnaConversationalV2Enabled } from '../src/services/conversationalV2/featureFlag';
 
 const config: TenantBotConfig = {
   tenantSlug: 'tenant-seguro',
@@ -39,6 +45,69 @@ const history = [
     createdAt: '2026-08-11T12:08:00.000Z',
   },
 ];
+
+const g3History = [
+  {
+    role: 'assistant' as const,
+    content: '[atendente] te mandei o lembrete da sexta às 13h',
+    createdAt: '2026-08-11T11:37:00.000Z',
+  },
+  {
+    role: 'user' as const,
+    content: 'Confirmado',
+    createdAt: '2026-08-11T12:08:00.000Z',
+  },
+];
+
+const keepHumanClassification = {
+  decision: 'KEEP_HUMAN' as const,
+  reasonCode: 'HUMAN_HANDLED_REQUEST' as const,
+  model: 'deepseek-v4-flash' as const,
+  latencyMs: 12,
+  contextHash: 'b'.repeat(64),
+};
+
+const resumeAnaClassification = {
+  decision: 'RESUME_ANA' as const,
+  reasonCode: 'NEW_INDEPENDENT_REQUEST' as const,
+  model: 'deepseek-v4-flash' as const,
+  latencyMs: 15,
+  contextHash: 'c'.repeat(64),
+};
+
+function incomingDeps(
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    persistInbound: async (input: { customerPhone: string; messageId: string }) => ({
+      fresh: true,
+      conversationKey: `PN-RESUME:${input.customerPhone}`,
+      sequence: 1,
+    }),
+    deliverInbound: async () => ({
+      delivered: true,
+      attempts: 1,
+      terminal: false,
+      fastRetryAllowed: false,
+    }),
+    updateInboundContent: async () => {},
+    markTranscriptionFailed: async () => {},
+    downloadAudio: async () => Buffer.alloc(0),
+    transcribeAudio: async () => '',
+    handleOptOut: async () => false,
+    shouldSuspend: async () => false,
+    isPaused: async () => false,
+    sendReply: async () => {
+      throw new Error('outbound não deveria ocorrer neste fixture');
+    },
+    withConversationLock: async (
+      _phoneNumberId: string,
+      _customerPhone: string,
+      work: () => Promise<void>
+    ) => work(),
+    ...overrides,
+  };
+}
 
 async function main() {
   const classifier = await import('../src/services/anaResumeClassifier');
@@ -318,40 +387,73 @@ async function main() {
   assert.equal(unavailable.reasonCode, 'TRANSCRIPTION_UNAVAILABLE');
   assert.equal(providerCalls, 0);
 
-  assert.equal(gate.isAnaResumeGateEnabled(config), true);
-  assert.equal(
-    gate.isAnaResumeGateEnabled(config, {
-      NODE_ENV: 'production',
-      ANA_RESUME_GATE_ENABLED: 'true',
-      ANA_RESUME_GATE_TENANT_SLUGS: '',
-    }),
-    false
+  const parseBegin = gate.parseAnaResumeGateBeginResponse;
+  const parseFinalize = gate.parseAnaResumeGateFinalizeResponse;
+  const gateSource = readFileSync(
+    path.join(process.cwd(), 'src/services/anaResumeGate.ts'),
+    'utf8'
   );
+  assert.equal(gateSource.includes('ANA_RESUME_GATE_ENABLED'), false);
+  assert.equal(gateSource.includes('ANA_RESUME_GATE_TENANT_SLUGS'), false);
+  assert.equal(gateSource.includes('ANA_RESUME_GATE_EXCLUDED'), false);
+  assert.match(
+    gateSource,
+    /isAnaConversationalV2Enabled\(config\.tenantSlug\)/
+  );
+  assert.equal(gateSource.includes('conversationPausedUntil'), false);
   assert.equal(
-    gate.isAnaResumeGateEnabled(config, {
-      NODE_ENV: 'production',
-      ANA_RESUME_GATE_ENABLED: 'true',
-      ANA_RESUME_GATE_TENANT_SLUGS: 'tenant-seguro',
-    }),
+    gate.isAnaResumeGateEnabled.length,
+    1,
+    'isAnaResumeGateEnabled não aceita env/allowlist própria'
+  );
+
+  const salesConfig: TenantBotConfig = { ...config, botRole: 'sales' };
+  const previousV2 = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS;
+  try {
+    process.env.ANA_RESUME_GATE_ENABLED = 'true';
+    process.env.ANA_RESUME_GATE_TENANT_SLUGS = '*';
+    process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS = 'tenant-seguro';
+    assert.equal(isAnaConversationalV2Enabled(config.tenantSlug), true);
+    assert.equal(gate.isAnaResumeGateEnabled(config), true);
+    assert.equal(gate.isAnaResumeGateEnabled(salesConfig), false);
+
+    process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS = 'outro-slug';
+    assert.equal(isAnaConversationalV2Enabled(config.tenantSlug), false);
+    assert.equal(gate.isAnaResumeGateEnabled(config), false);
+
+    process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS = '*';
+    assert.equal(isAnaConversationalV2Enabled(config.tenantSlug), false);
+    assert.equal(gate.isAnaResumeGateEnabled(config), false);
+
+    delete process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS;
+    assert.equal(isAnaConversationalV2Enabled(config.tenantSlug), false);
+    assert.equal(gate.isAnaResumeGateEnabled(config), false);
+  } finally {
+    process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS = previousV2;
+    delete process.env.ANA_RESUME_GATE_ENABLED;
+    delete process.env.ANA_RESUME_GATE_TENANT_SLUGS;
+  }
+
+  assert.equal(parseBegin({ action: 'PROCEED' })?.action, 'PROCEED');
+  assert.equal(
+    parseBegin({
+      action: 'KEEP_SILENT',
+      reason: 'CLASSIFICATION_IN_FLIGHT',
+    })?.reason,
+    'CLASSIFICATION_IN_FLIGHT'
+  );
+  assert.equal(parseBegin({ action: 'WAT' }), null);
+  assert.equal(parseBegin({ action: 'EVALUATE', expectedVersion: 1 }), null);
+  assert.equal(parseBegin({ ok: true }), null);
+  assert.equal(parseFinalize({ success: true }), null);
+  assert.equal(
+    parseFinalize({
+      applied: true,
+      action: 'PROCEED',
+      version: 8,
+      pausedUntil: null,
+    })?.applied,
     true
-  );
-  assert.equal(
-    gate.isAnaResumeGateEnabled(config, {
-      NODE_ENV: 'production',
-      ANA_RESUME_GATE_ENABLED: 'true',
-      ANA_RESUME_GATE_TENANT_SLUGS: '*',
-      ANA_RESUME_GATE_EXCLUDED_TENANT_SLUGS: '',
-    }),
-    true
-  );
-  assert.equal(
-    gate.isAnaResumeGateEnabled(config, {
-      NODE_ENV: 'production',
-      ANA_RESUME_GATE_ENABLED: 'true',
-      ANA_RESUME_GATE_TENANT_SLUGS: '*',
-      ANA_RESUME_GATE_EXCLUDED_TENANT_SLUGS: 'outro, tenant-seguro',
-    }),
-    false
   );
 
   const noModelDeps = {
@@ -512,6 +614,106 @@ async function main() {
   );
   assert.equal(unexpectedClassifierFailure, false);
 
+  let historyClassifyCalls = 0;
+  const historyFailure = await gate.shouldAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      begin: async () => ({
+        action: 'EVALUATE',
+        expectedVersion: 3,
+        leaseUntil: '2026-08-11T15:01:00.000Z',
+      }),
+      loadHistory: async () => {
+        throw new Error('simulado');
+      },
+      classify: async () => {
+        historyClassifyCalls += 1;
+        throw new Error('não deve classificar sem histórico');
+      },
+      finalize: async () => {
+        throw new Error('não deve finalizar sem histórico');
+      },
+    }
+  );
+  assert.equal(historyFailure, false);
+  assert.equal(historyClassifyCalls, 0);
+
+  const beginFailure = await gate.shouldAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      ...noModelDeps,
+      begin: async () => {
+        throw new Error('simulado');
+      },
+    }
+  );
+  assert.equal(beginFailure, false);
+
+  const jsonFailure = await gate.shouldAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      begin: async () => ({
+        action: 'EVALUATE',
+        expectedVersion: 3,
+        leaseUntil: '2026-08-11T15:01:00.000Z',
+      }),
+      loadHistory: async () => g3History,
+      classify: async (input) =>
+        classifier.classifyAnaResume(input, {
+          now: () => 1_000,
+          complete: async () => 'não é json',
+        }),
+      finalize: async () => ({
+        applied: true,
+        action: 'PROCEED',
+        version: 4,
+        pausedUntil: null,
+      }),
+    }
+  );
+  assert.equal(jsonFailure, false, 'JSON inválido não libera fala mesmo se o CAS mentir PROCEED');
+
+  const finalizeFailure = await gate.shouldAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      begin: async () => ({
+        action: 'EVALUATE',
+        expectedVersion: 3,
+        leaseUntil: '2026-08-11T15:01:00.000Z',
+      }),
+      loadHistory: async () => g3History,
+      classify: async () => resumeAnaClassification,
+      finalize: async () => {
+        throw new Error('simulado');
+      },
+    }
+  );
+  assert.equal(finalizeFailure, false);
+
+  const ambiguousBegin = await gate.shouldAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      ...noModelDeps,
+      begin: async () => ({ ok: true }) as never,
+    }
+  );
+  assert.equal(ambiguousBegin, false);
+
+  const ambiguousFinalize = await gate.shouldAnaResumeForInbound(
+    { config, customerPhone: '5511999999999' },
+    {
+      begin: async () => ({
+        action: 'EVALUATE',
+        expectedVersion: 3,
+        leaseUntil: '2026-08-11T15:01:00.000Z',
+      }),
+      loadHistory: async () => g3History,
+      classify: async () => resumeAnaClassification,
+      finalize: async () => ({ success: true }) as never,
+    }
+  );
+  assert.equal(ambiguousFinalize, false);
+
   let integrationGateCalls = 0;
   await messageHandler.handleIncomingMessage(
     {
@@ -602,6 +804,507 @@ async function main() {
     true,
     'RESUME_ANA aplica e o inbound segue ao buffer'
   );
+  messageHandler.__resetFlushStateForTest();
+
+  const g3Conversation = 'PN-RESUME:5511900000001';
+  const g3Counts = {
+    persist: 0,
+    optOut: 0,
+    begin: 0,
+    history: 0,
+    classify: 0,
+    finalize: 0,
+    brain: 0,
+    outbound: 0,
+    fallback: 0,
+    pauseChecks: 0,
+  };
+  await messageHandler.handleIncomingMessage(
+    {
+      from: '5511900000001',
+      id: 'wamid.g3-confirmado',
+      timestamp: '1786453300',
+      type: 'text',
+      text: { body: 'Confirmado' },
+    },
+    { profile: { name: 'Cliente' } },
+    config,
+    incomingDeps({
+      persistInbound: async () => {
+        g3Counts.persist += 1;
+        return {
+          fresh: true,
+          conversationKey: g3Conversation,
+          sequence: 1,
+        };
+      },
+      handleOptOut: async () => {
+        g3Counts.optOut += 1;
+        return false;
+      },
+      isPaused: async () => {
+        g3Counts.pauseChecks += 1;
+        return false;
+      },
+      sendReply: async () => {
+        g3Counts.outbound += 1;
+        return 'sent';
+      },
+      evaluateResume: (input: {
+        config: TenantBotConfig;
+        customerPhone: string;
+        customerName?: string | null;
+      }) =>
+        gate.evaluateAnaResumeForInbound(input, {
+          begin: async () => {
+            g3Counts.begin += 1;
+            return {
+              action: 'EVALUATE' as const,
+              expectedVersion: 4,
+              leaseUntil: '2026-08-18T23:10:00.000Z',
+            };
+          },
+          loadHistory: async () => {
+            g3Counts.history += 1;
+            return g3History;
+          },
+          classify: async (classifyInput) => {
+            g3Counts.classify += 1;
+            return classifier.classifyAnaResume(classifyInput, {
+              now: () => 2_000,
+              complete: async () =>
+                '{"decision":"KEEP_HUMAN","reasonCode":"HUMAN_HANDLED_REQUEST"}',
+            });
+          },
+          finalize: async ({ classification }) => {
+            g3Counts.finalize += 1;
+            assert.equal(classification.decision, 'KEEP_HUMAN');
+            return {
+              applied: true,
+              action: 'KEEP_SILENT',
+              version: 5,
+              pausedUntil: null,
+            };
+          },
+        }),
+    }) as never
+  );
+  assert.equal(g3Counts.persist, 1);
+  assert.equal(g3Counts.optOut, 1);
+  assert.equal(g3Counts.begin, 1, 'pause-state nulo não dispensa begin');
+  assert.equal(g3Counts.history, 1);
+  assert.equal(g3Counts.classify, 1);
+  assert.equal(g3Counts.finalize, 1);
+  assert.equal(
+    messageHandler.__hasBufferForTest(g3Conversation),
+    false,
+    'G3: Confirmado após lembrete humano não abre buffer'
+  );
+  await messageHandler.flushBuffer(g3Conversation, {
+    getReply: async () => {
+      g3Counts.brain += 1;
+      return 'não deveria gerar resposta';
+    },
+    sendReply: async () => {
+      g3Counts.outbound += 1;
+    },
+    sendReplyPlain: async () => {
+      g3Counts.fallback += 1;
+      return 'sent';
+    },
+    isPaused: async () => false,
+  });
+  assert.equal(g3Counts.brain, 0);
+  assert.equal(g3Counts.outbound, 0);
+  assert.equal(g3Counts.fallback, 0);
+  messageHandler.__resetFlushStateForTest();
+
+  const racePhone = '5511900000002';
+  const raceKey = `PN-RESUME:${racePhone}`;
+  const race = {
+    begin: 0,
+    classify: 0,
+    finalize: 0,
+    outbound: 0,
+    leaseHeld: false,
+  };
+  const raceDeps = incomingDeps({
+    persistInbound: async (input: { messageId: string }) => ({
+      fresh: true,
+      conversationKey: raceKey,
+      sequence: 1,
+    }),
+    sendReply: async () => {
+      race.outbound += 1;
+      return 'sent';
+    },
+    evaluateResume: (input: {
+      config: TenantBotConfig;
+      customerPhone: string;
+      customerName?: string | null;
+    }) =>
+      gate.evaluateAnaResumeForInbound(input, {
+        begin: async () => {
+          race.begin += 1;
+          if (race.leaseHeld) {
+            return {
+              action: 'KEEP_SILENT' as const,
+              reason: 'CLASSIFICATION_IN_FLIGHT' as const,
+            };
+          }
+          race.leaseHeld = true;
+          return {
+            action: 'EVALUATE' as const,
+            expectedVersion: 9,
+            leaseUntil: '2026-08-18T23:11:00.000Z',
+          };
+        },
+        loadHistory: async () => g3History,
+        classify: async () => {
+          race.classify += 1;
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          return keepHumanClassification;
+        },
+        finalize: async () => {
+          race.finalize += 1;
+          race.leaseHeld = false;
+          return {
+            applied: true,
+            action: 'KEEP_SILENT',
+            version: 10,
+            pausedUntil: null,
+          };
+        },
+      }),
+  });
+  await Promise.all([
+    messageHandler.handleIncomingMessage(
+      {
+        from: racePhone,
+        id: 'wamid.race-a',
+        timestamp: '1786453400',
+        type: 'text',
+        text: { body: 'Confirmado' },
+      },
+      { profile: { name: 'Cliente' } },
+      config,
+      raceDeps as never
+    ),
+    messageHandler.handleIncomingMessage(
+      {
+        from: racePhone,
+        id: 'wamid.race-b',
+        timestamp: '1786453401',
+        type: 'text',
+        text: { body: 'Confirmado' },
+      },
+      { profile: { name: 'Cliente' } },
+      config,
+      raceDeps as never
+    ),
+  ]);
+  assert.equal(race.begin, 2);
+  assert.equal(race.classify, 1, 'somente o dono do lease classifica');
+  assert.equal(race.finalize, 1);
+  assert.equal(race.outbound, 0);
+  assert.equal(messageHandler.__hasBufferForTest(raceKey), false);
+  messageHandler.__resetFlushStateForTest();
+
+  const resumePhone = '5511900000003';
+  const resumeKey = `PN-RESUME:${resumePhone}`;
+  const resumeTurn = { begin: 0, brain: 0, outbound: 0 };
+  await messageHandler.handleIncomingMessage(
+    {
+      from: resumePhone,
+      id: 'wamid.resume-ana',
+      timestamp: '1786453500',
+      type: 'text',
+      text: { body: 'Quero horários de terça' },
+    },
+    { profile: { name: 'Cliente' } },
+    config,
+    incomingDeps({
+      persistInbound: async () => ({
+        fresh: true,
+        conversationKey: resumeKey,
+        sequence: 1,
+      }),
+      sendReply: async () => {
+        resumeTurn.outbound += 1;
+        return 'sent';
+      },
+      evaluateResume: (input: {
+        config: TenantBotConfig;
+        customerPhone: string;
+        customerName?: string | null;
+      }) =>
+        gate.evaluateAnaResumeForInbound(input, {
+          begin: async () => {
+            resumeTurn.begin += 1;
+            return {
+              action: 'EVALUATE' as const,
+              expectedVersion: 11,
+              leaseUntil: '2026-08-18T23:12:00.000Z',
+            };
+          },
+          loadHistory: async () => history,
+          classify: async () => resumeAnaClassification,
+          finalize: async () => ({
+            applied: true,
+            action: 'PROCEED',
+            version: 12,
+            pausedUntil: null,
+          }),
+        }),
+    }) as never
+  );
+  assert.equal(resumeTurn.begin, 1);
+  assert.equal(messageHandler.__hasBufferForTest(resumeKey), true);
+  await messageHandler.flushBuffer(resumeKey, {
+    getReply: async () => {
+      resumeTurn.brain += 1;
+      return 'Posso te mostrar os horários de terça.';
+    },
+    sendReply: async () => {
+      resumeTurn.outbound += 1;
+      return 'sent';
+    },
+    isPaused: async () => false,
+    withConversationLock: async (_pnid, _phone, work) => work(),
+  });
+  assert.equal(resumeTurn.brain, 1);
+  assert.equal(resumeTurn.outbound, 1);
+  messageHandler.__resetFlushStateForTest();
+
+  const echoPhone = '5511900000004';
+  const echoKey = `PN-RESUME:${echoPhone}`;
+  const echoRace = { brain: 0, outbound: 0, brainDone: false };
+  await messageHandler.handleIncomingMessage(
+    {
+      from: echoPhone,
+      id: 'wamid.echo-after-finalize',
+      timestamp: '1786453600',
+      type: 'text',
+      text: { body: 'Quero horários de terça' },
+    },
+    { profile: { name: 'Cliente' } },
+    config,
+    incomingDeps({
+      persistInbound: async () => ({
+        fresh: true,
+        conversationKey: echoKey,
+        sequence: 1,
+      }),
+      evaluateResume: (input: {
+        config: TenantBotConfig;
+        customerPhone: string;
+        customerName?: string | null;
+      }) =>
+        gate.evaluateAnaResumeForInbound(input, {
+          begin: async () => ({
+            action: 'EVALUATE' as const,
+            expectedVersion: 13,
+            leaseUntil: '2026-08-18T23:13:00.000Z',
+          }),
+          loadHistory: async () => history,
+          classify: async () => resumeAnaClassification,
+          finalize: async () => ({
+            applied: true,
+            action: 'PROCEED',
+            version: 14,
+            pausedUntil: null,
+          }),
+        }),
+    }) as never
+  );
+  await messageHandler.flushBuffer(echoKey, {
+    getReply: async () => {
+      echoRace.brain += 1;
+      echoRace.brainDone = true;
+      return 'Posso te mostrar os horários de terça.';
+    },
+    sendReply: async () => {
+      echoRace.outbound += 1;
+      return 'sent';
+    },
+    isPaused: async () => echoRace.brainDone,
+    recordPausedInbound: async () => undefined,
+    withConversationLock: async (_pnid, _phone, work) => work(),
+  });
+  assert.equal(echoRace.brain, 1);
+  assert.equal(
+    echoRace.outbound,
+    0,
+    'echo após finalize(PROCEED) vence a revalidação e suprime o transporte'
+  );
+  messageHandler.__resetFlushStateForTest();
+
+  const salesCalls = { evaluate: 0, resumeGate: 0, begin: 0 };
+  const salesCfg: TenantBotConfig = {
+    ...config,
+    botRole: 'sales',
+    tenantSlug: 'receps-vendas',
+    phoneNumberId: 'PN-SALES',
+  };
+  await messageHandler.handleIncomingMessage(
+    {
+      from: '5511900000005',
+      id: 'wamid.sales-no-gate',
+      timestamp: '1786453700',
+      type: 'text',
+      text: { body: 'Quero conhecer o Receps' },
+    },
+    { profile: { name: 'Cliente' } },
+    salesCfg,
+    incomingDeps({
+      persistInbound: async () => {
+        throw new Error('sales não persiste pelo intake da recepcionista');
+      },
+      evaluateResume: async () => {
+        salesCalls.evaluate += 1;
+        throw new Error('sales não chama evaluateResume');
+      },
+      resumeGate: async () => {
+        salesCalls.resumeGate += 1;
+        throw new Error('sales não chama resumeGate');
+      },
+      isPaused: async () => false,
+    }) as never
+  );
+  assert.equal(salesCalls.evaluate, 0);
+  assert.equal(salesCalls.resumeGate, 0);
+  assert.equal(
+    await gate.shouldAnaResumeForInbound(
+      { config: salesCfg, customerPhone: '5511900000005' },
+      {
+        begin: async () => {
+          salesCalls.begin += 1;
+          return { action: 'PROCEED' };
+        },
+        loadHistory: async () => {
+          throw new Error('sales não lê histórico do gate');
+        },
+        classify: async () => {
+          throw new Error('sales não classifica');
+        },
+        finalize: async () => {
+          throw new Error('sales não finaliza');
+        },
+      }
+    ),
+    true
+  );
+  assert.equal(salesCalls.begin, 0);
+  messageHandler.__resetFlushStateForTest();
+
+  const outsideCounts = { outbound: 0, begin: 0 };
+  const outsideCfg: TenantBotConfig = {
+    ...config,
+    botIsAlwaysActive: false,
+    botActiveStart: '23:59',
+    botActiveEnd: '23:59',
+    phoneNumberId: 'PN-OUTSIDE-G3',
+  };
+  await messageHandler.handleIncomingMessage(
+    {
+      from: '5511900000006',
+      id: 'wamid.outside-g3',
+      timestamp: '1786453800',
+      type: 'text',
+      text: { body: 'Boa noite' },
+    },
+    { profile: { name: 'Cliente' } },
+    outsideCfg,
+    incomingDeps({
+      persistInbound: async () => ({
+        fresh: true,
+        conversationKey: 'PN-OUTSIDE-G3:5511900000006',
+        sequence: 1,
+      }),
+      sendReply: async () => {
+        outsideCounts.outbound += 1;
+        return 'sent';
+      },
+      evaluateResume: (input: {
+        config: TenantBotConfig;
+        customerPhone: string;
+        customerName?: string | null;
+      }) =>
+        gate.evaluateAnaResumeForInbound(input, {
+          begin: async () => {
+            outsideCounts.begin += 1;
+            return {
+              action: 'KEEP_SILENT' as const,
+              reason: 'PAUSE_ACTIVE' as const,
+            };
+          },
+          loadHistory: async () => {
+            throw new Error('KEEP_SILENT não lê histórico');
+          },
+          classify: async () => {
+            throw new Error('KEEP_SILENT não classifica');
+          },
+          finalize: async () => {
+            throw new Error('KEEP_SILENT não finaliza');
+          },
+        }),
+    }) as never
+  );
+  assert.equal(outsideCounts.begin, 1);
+  assert.equal(outsideCounts.outbound, 0, 'fora de horário não fura o gate');
+  messageHandler.__resetFlushStateForTest();
+
+  const audioCounts = { outbound: 0, begin: 0 };
+  await messageHandler.handleIncomingMessage(
+    {
+      from: '5511900000007',
+      id: 'wamid.audio-g3',
+      timestamp: '1786453900',
+      type: 'audio',
+      audio: { id: 'media-g3', mime_type: 'audio/ogg' },
+    },
+    { profile: { name: 'Cliente' } },
+    config,
+    incomingDeps({
+      persistInbound: async () => ({
+        fresh: true,
+        conversationKey: 'PN-RESUME:5511900000007',
+        sequence: 1,
+      }),
+      transcribeAudio: async () => {
+        throw new Error('InboundAudioTranscriptionEmpty');
+      },
+      sendReply: async () => {
+        audioCounts.outbound += 1;
+        return 'sent';
+      },
+      evaluateResume: (input: {
+        config: TenantBotConfig;
+        customerPhone: string;
+        customerName?: string | null;
+      }) =>
+        gate.evaluateAnaResumeForInbound(input, {
+          begin: async () => {
+            audioCounts.begin += 1;
+            return {
+              action: 'KEEP_SILENT' as const,
+              reason: 'PAUSE_ACTIVE' as const,
+            };
+          },
+          loadHistory: async () => {
+            throw new Error('KEEP_SILENT não lê histórico');
+          },
+          classify: async () => {
+            throw new Error('KEEP_SILENT não classifica');
+          },
+          finalize: async () => {
+            throw new Error('KEEP_SILENT não finaliza');
+          },
+        }),
+    }) as never
+  );
+  assert.equal(audioCounts.begin, 1);
+  assert.equal(audioCounts.outbound, 0, 'fallback de transcrição não fura o gate');
   messageHandler.__resetFlushStateForTest();
 
   console.log('✅ smoke-ana-resume-gate: todos os checks passaram');

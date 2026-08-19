@@ -7,6 +7,7 @@ import {
   classifyAnaResume,
   type AnaResumeClassification,
 } from './anaResumeClassifier';
+import { isAnaConversationalV2Enabled } from './conversationalV2/featureFlag';
 import { getHistoryWithTimestamps } from './contextManager';
 import type {
   HumanControlDisposition,
@@ -17,10 +18,7 @@ import type {
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
 const REQUEST_TIMEOUT_MS = 10_000;
-export const ANA_RESUME_GATE_ENABLED_ENV = 'ANA_RESUME_GATE_ENABLED';
-export const ANA_RESUME_GATE_TENANTS_ENV = 'ANA_RESUME_GATE_TENANT_SLUGS';
-export const ANA_RESUME_GATE_EXCLUDED_TENANTS_ENV =
-  'ANA_RESUME_GATE_EXCLUDED_TENANT_SLUGS';
+const KEEP_SILENT_REASONS = ['PAUSE_ACTIVE', 'CLASSIFICATION_IN_FLIGHT'] as const;
 
 export type AnaResumeGateBeginResponse =
   | { action: 'PROCEED' }
@@ -52,34 +50,73 @@ export interface AnaResumeGateDeps {
   }) => Promise<AnaResumeGateFinalizeResponse>;
 }
 
-export function isAnaResumeGateEnabled(
-  config: TenantBotConfig,
-  env: NodeJS.ProcessEnv = process.env
-): boolean {
+/**
+ * A ativação herda a allowlist única da v2. Sales nunca entra; `*` continua
+ * proibido pela fonte `isAnaConversationalV2Enabled`.
+ */
+export function isAnaResumeGateEnabled(config: TenantBotConfig): boolean {
   if (config.botRole === 'sales') return false;
-  if (env[ANA_RESUME_GATE_ENABLED_ENV]?.trim().toLowerCase() !== 'true') {
-    return false;
-  }
-  const allowlist = (env[ANA_RESUME_GATE_TENANTS_ENV] ?? '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const excludedTenants = new Set(
-    (env[ANA_RESUME_GATE_EXCLUDED_TENANTS_ENV] ?? '')
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean)
-  );
+  return isAnaConversationalV2Enabled(config.tenantSlug);
+}
 
-  // Produção exige escopo explícito: slugs individuais ou `*`. Em DEV, a lista
-  // vazia facilita smokes e o harness sintético sem alterar tenants reais.
-  if (env.NODE_ENV === 'production' && allowlist.length === 0) return false;
-  if (excludedTenants.has(config.tenantSlug)) return false;
-  return (
-    allowlist.length === 0 ||
-    allowlist.includes('*') ||
-    allowlist.includes(config.tenantSlug)
-  );
+export function parseAnaResumeGateBeginResponse(
+  data: unknown
+): AnaResumeGateBeginResponse | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const record = data as Record<string, unknown>;
+  if (record.action === 'PROCEED') return { action: 'PROCEED' };
+  if (record.action === 'KEEP_SILENT') {
+    if (
+      record.reason !== 'PAUSE_ACTIVE' &&
+      record.reason !== 'CLASSIFICATION_IN_FLIGHT'
+    ) {
+      return null;
+    }
+    return {
+      action: 'KEEP_SILENT',
+      reason: record.reason as (typeof KEEP_SILENT_REASONS)[number],
+    };
+  }
+  if (record.action === 'EVALUATE') {
+    if (
+      typeof record.expectedVersion !== 'number' ||
+      !Number.isFinite(record.expectedVersion) ||
+      typeof record.leaseUntil !== 'string' ||
+      !record.leaseUntil.trim()
+    ) {
+      return null;
+    }
+    return {
+      action: 'EVALUATE',
+      expectedVersion: record.expectedVersion,
+      leaseUntil: record.leaseUntil,
+    };
+  }
+  return null;
+}
+
+export function parseAnaResumeGateFinalizeResponse(
+  data: unknown
+): AnaResumeGateFinalizeResponse | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const record = data as Record<string, unknown>;
+  if (typeof record.applied !== 'boolean') return null;
+  if (record.action !== 'PROCEED' && record.action !== 'KEEP_SILENT') return null;
+  if (
+    record.version !== null &&
+    (typeof record.version !== 'number' || !Number.isFinite(record.version))
+  ) {
+    return null;
+  }
+  if (record.pausedUntil !== null && typeof record.pausedUntil !== 'string') {
+    return null;
+  }
+  return {
+    applied: record.applied,
+    action: record.action,
+    version: record.version,
+    pausedUntil: record.pausedUntil,
+  };
 }
 
 async function callResumeGate<T>(body: unknown): Promise<T> {
@@ -189,11 +226,17 @@ export async function evaluateAnaResumeForInbound(
     };
   }
 
-  let begin: AnaResumeGateBeginResponse;
+  let beginRaw: unknown;
   try {
-    begin = await deps.begin(input.config.phoneNumberId, input.customerPhone);
+    beginRaw = await deps.begin(input.config.phoneNumberId, input.customerPhone);
   } catch (error) {
     capture(error, input.config, 'begin');
+    return silentHuman('KEEP_SILENT');
+  }
+
+  const begin = parseAnaResumeGateBeginResponse(beginRaw);
+  if (!begin) {
+    capture(new Error('ana resume gate failed closed'), input.config, 'begin');
     return silentHuman('KEEP_SILENT');
   }
 
@@ -206,7 +249,7 @@ export async function evaluateAnaResumeForInbound(
   }
   if (begin.action === 'KEEP_SILENT') return silentHuman('KEEP_SILENT');
 
-  let history: Awaited<ReturnType<typeof getHistoryWithTimestamps>> = [];
+  let history: Awaited<ReturnType<typeof getHistoryWithTimestamps>>;
   try {
     history = await deps.loadHistory(
       input.config.phoneNumberId,
@@ -214,6 +257,7 @@ export async function evaluateAnaResumeForInbound(
     );
   } catch (error) {
     capture(error, input.config, 'load_history');
+    return silentHuman('KEEP_SILENT');
   }
 
   let classification: AnaResumeClassification;
@@ -232,32 +276,34 @@ export async function evaluateAnaResumeForInbound(
   }
 
   try {
-    const finalized = await deps.finalize({
-      phoneNumberId: input.config.phoneNumberId,
-      customerPhone: input.customerPhone,
-      expectedVersion: begin.expectedVersion,
-      classification,
-    });
-    if (!finalized.applied) {
+    const finalized = parseAnaResumeGateFinalizeResponse(
+      await deps.finalize({
+        phoneNumberId: input.config.phoneNumberId,
+        customerPhone: input.customerPhone,
+        expectedVersion: begin.expectedVersion,
+        classification,
+      })
+    );
+    if (!finalized) {
+      capture(new Error('ana resume gate failed closed'), input.config, 'finalize');
+      return silentHuman('KEEP_SILENT');
+    }
+    if (
+      !finalized.applied ||
+      finalized.action !== 'PROCEED' ||
+      classification.decision !== 'RESUME_ANA'
+    ) {
       return silentHuman(
         classification.decision === 'RESUME_ANA'
           ? 'KEEP_SILENT'
           : classification.decision
       );
     }
-    if (finalized.action === 'PROCEED') {
-      return {
-        allowed: true,
-        disposition: 'RESUME_APPROVED',
-        resumeDecision:
-          classification.decision === 'RESUME_ANA' ? 'RESUME_ANA' : 'PROCEED',
-      };
-    }
-    return silentHuman(
-      classification.decision === 'RESUME_ANA'
-        ? 'KEEP_SILENT'
-        : classification.decision
-    );
+    return {
+      allowed: true,
+      disposition: 'RESUME_APPROVED',
+      resumeDecision: 'RESUME_ANA',
+    };
   } catch (error) {
     capture(error, input.config, 'finalize');
     return silentHuman('KEEP_SILENT');
