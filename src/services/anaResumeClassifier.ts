@@ -38,10 +38,16 @@ export const ANA_RESUME_REASON_CODES = [
 
 export type AnaResumeReasonCode = (typeof ANA_RESUME_REASON_CODES)[number];
 
+export const ANA_RESUME_DETERMINISTIC_MODEL = 'deterministic' as const;
+
+export type AnaResumeTelemetryModel =
+  | typeof ANA_RESUME_DETERMINISTIC_MODEL
+  | typeof DEEPSEEK_V4_FLASH_MODEL;
+
 export interface AnaResumeClassification {
   decision: AnaResumeDecision;
   reasonCode: AnaResumeReasonCode;
-  model: typeof DEEPSEEK_V4_FLASH_MODEL;
+  model: AnaResumeTelemetryModel;
   latencyMs: number;
   contextHash: string;
   /** JSON curto devolvido pelo classificador; nunca inclui reasoning_content. */
@@ -158,22 +164,62 @@ function normalizeIntentText(value: string): string {
     .trim();
 }
 
+const ANA_RESUME_REQUEST_PATTERNS = [
+  /\bana\s+(?:pode|poderia|consegue)\s+(?:continuar|assumir|voltar|retomar)\b/,
+  /\b(?:pode|poderia|consegue)\s+(?:continuar|assumir|voltar|retomar)\s+(?:com\s+)?(?:a\s+)?ana\b/,
+  /\bquero\s+(?:falar|ser atendid[oa])\s+(?:com|pela)\s+(?:a\s+)?ana\b/,
+  /\b(?:deixa|deixe|passa|passe)\s+(?:a\s+)?ana\s+(?:continuar|assumir|atender|voltar|retomar)\b/,
+  /\bana\s+(?:volta|volte|continue|continua|assume|retoma)\b/,
+] as const;
+
+/**
+ * Pedido direto da cliente para a Ana retomar. Fonte única para o begin
+ * (`explicitAnaResumeRequest`) e para o ramo determinístico do classificador.
+ */
+export function isExplicitAnaResumeRequest(text: string): boolean {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  if (/\bana\s+(?:nao|nunca)\b/.test(normalized)) return false;
+  if (/\b(?:nao|nunca)\s+(?:quero|preciso)\s+.{0,40}\bana\b/.test(normalized)) {
+    return false;
+  }
+  if (/\bsera que\b/.test(normalized)) return false;
+  if (
+    /\b(?:quem|o que|oque|qual|quando|onde|porque|por que)\b/.test(normalized)
+  ) {
+    return false;
+  }
+  if (
+    /\ba ana\s+(?:esta|ta|fica|ficou)\s+(?:pausad|ocupad|offline|desligad)/.test(
+      normalized
+    )
+  ) {
+    return false;
+  }
+  return ANA_RESUME_REQUEST_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function isHumanReleaseOfAna(text: string): boolean {
+  const human = normalizeIntentText(text);
+  return (
+    !/\bana\s+(?:nao|nunca)\b/.test(human) &&
+    (/\bana\s+(?:pode|vai)\s+(?:continuar|assumir|atender)\b/.test(human) ||
+      /\b(?:deixo|passo)\s+(?:com|para)\s+(?:a\s+)?ana\b/.test(human))
+  );
+}
+
+function hasOperationalCustomerRequest(text: string): boolean {
+  return /\b(?:agend|marc|horari|servic|dispon|cancel|remarc|preco|valor|dia|semana)\w*/.test(
+    normalizeIntentText(text)
+  );
+}
+
 export function hasExplicitAnaResumeAuthorization(
   timeline: readonly AnaResumeTimelineEvent[]
 ): boolean {
   const last = timeline[timeline.length - 1];
   if (!last || last.speaker !== 'CUSTOMER') return false;
-  const customer = normalizeIntentText(last.text);
-  const customerNegatesAna = /\bana\s+(?:nao|nunca)\b/.test(customer);
-  const customerDirect =
-    !customerNegatesAna &&
-    (/\bana\s+(?:pode|poderia)\s+(?:continuar|assumir|atender)\b/.test(
-      customer
-    ) ||
-      /\bquero\s+(?:falar|ser atendid[oa])\s+(?:com|pela)\s+(?:a\s+)?ana\b/.test(
-        customer
-      ));
-  if (customerDirect) return true;
+  if (isExplicitAnaResumeRequest(last.text)) return true;
 
   let lastHumanIndex = -1;
   for (let index = timeline.length - 2; index >= 0; index -= 1) {
@@ -183,16 +229,10 @@ export function hasExplicitAnaResumeAuthorization(
     }
   }
   if (lastHumanIndex === -1) return false;
-  const human = normalizeIntentText(timeline[lastHumanIndex]!.text);
-  const humanReleases =
-    !/\bana\s+(?:nao|nunca)\b/.test(human) &&
-    (/\bana\s+(?:pode|vai)\s+(?:continuar|assumir|atender)\b/.test(human) ||
-      /\b(?:deixo|passo)\s+(?:com|para)\s+(?:a\s+)?ana\b/.test(human));
-  const customerHasOperationalRequest =
-    /\b(?:agend|marc|horari|servic|dispon|cancel|remarc|preco|valor|dia|semana)\w*/.test(
-      customer
-    );
-  return humanReleases && customerHasOperationalRequest;
+  return (
+    isHumanReleaseOfAna(timeline[lastHumanIndex]!.text) &&
+    hasOperationalCustomerRequest(last.text)
+  );
 }
 
 export function parseAnaResumeClassifierOutput(raw: string): {
@@ -243,39 +283,38 @@ export async function classifyAnaResume(input: {
 }, deps: AnaResumeClassifierDeps = defaultDeps): Promise<AnaResumeClassification> {
   const timeline = buildAnaResumeTimeline(input);
   const contextHash = hashAnaResumeTimeline(timeline);
-  const startedAt = deps.now();
+  const last = timeline[timeline.length - 1];
   const deterministic = (
+    decision: AnaResumeDecision,
     reasonCode: AnaResumeReasonCode,
     rawOutput?: string
   ): AnaResumeClassification => ({
-    decision: 'UNCERTAIN',
+    decision,
     reasonCode,
-    model: DEEPSEEK_V4_FLASH_MODEL,
-    latencyMs: Math.max(0, deps.now() - startedAt),
+    model: ANA_RESUME_DETERMINISTIC_MODEL,
+    latencyMs: 0,
     contextHash,
     ...(rawOutput === undefined ? {} : { rawOutput }),
   });
 
+  if (last?.speaker === 'CUSTOMER' && isExplicitAnaResumeRequest(last.text)) {
+    return deterministic('RESUME_ANA', 'DIRECT_ANA_REQUEST');
+  }
   if (!timeline.some((event) => event.speaker === 'HUMAN')) {
-    return deterministic('AMBIGUOUS_CONTEXT');
+    return deterministic('UNCERTAIN', 'AMBIGUOUS_CONTEXT');
   }
   if (
     timeline.some((event) =>
       event.text.includes(HUMAN_AUDIO_TRANSCRIPTION_UNAVAILABLE)
     )
   ) {
-    return deterministic('TRANSCRIPTION_UNAVAILABLE');
+    return deterministic('UNCERTAIN', 'TRANSCRIPTION_UNAVAILABLE');
   }
   if (hasExplicitAnaResumeAuthorization(timeline)) {
-    return {
-      decision: 'RESUME_ANA',
-      reasonCode: 'DIRECT_ANA_REQUEST',
-      model: DEEPSEEK_V4_FLASH_MODEL,
-      latencyMs: Math.max(0, deps.now() - startedAt),
-      contextHash,
-    };
+    return deterministic('RESUME_ANA', 'DIRECT_ANA_REQUEST');
   }
 
+  const startedAt = deps.now();
   let raw: string;
   try {
     raw = await deps.complete([
@@ -286,10 +325,10 @@ export async function classifyAnaResume(input: {
       },
     ]);
   } catch {
-    return deterministic('PROVIDER_FAILURE');
+    return deterministic('UNCERTAIN', 'PROVIDER_FAILURE');
   }
   const parsed = parseAnaResumeClassifierOutput(raw);
-  if (!parsed) return deterministic('INVALID_MODEL_OUTPUT', raw);
+  if (!parsed) return deterministic('UNCERTAIN', 'INVALID_MODEL_OUTPUT', raw);
 
   return {
     ...parsed,

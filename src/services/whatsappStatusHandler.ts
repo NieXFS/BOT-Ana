@@ -7,7 +7,10 @@ import {
   technicalHash,
 } from '../observability/safeRuntime';
 import { pool } from './contextManager';
-import { sanitizeFailureCode } from './questionReplyService';
+import {
+  repairUnrecordedQuestionReplyHumanHistory,
+  sanitizeFailureCode,
+} from './questionReplyService';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -314,6 +317,7 @@ export interface WhatsAppStatusDeps {
   postCallback: (payload: QuestionReplyStatusCallbackPayload) => Promise<void>;
   wait: (ms: number) => Promise<void>;
   now?: () => number;
+  repairHumanHistory?: (providerMessageId?: string) => Promise<void>;
 }
 
 const defaultDeps: WhatsAppStatusDeps = {
@@ -321,6 +325,11 @@ const defaultDeps: WhatsAppStatusDeps = {
   postCallback: postStatusCallback,
   wait: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   now: Date.now,
+  repairHumanHistory: async (providerMessageId) => {
+    await repairUnrecordedQuestionReplyHumanHistory(
+      providerMessageId ? { providerMessageId } : {}
+    );
+  },
 };
 
 function callbackFailureCode(error: unknown): string {
@@ -432,6 +441,13 @@ export async function handleWhatsAppStatuses(
         );
         continue;
       }
+      if (
+        event.statusEvent === 'sent' ||
+        event.statusEvent === 'delivered' ||
+        event.statusEvent === 'read'
+      ) {
+        await deps.repairHumanHistory?.(event.providerMessageId);
+      }
       if (local.kind === 'noop') {
         ignoredTransitionCount += 1;
         continue;
@@ -473,6 +489,18 @@ export async function sweepWhatsAppStatusCallbacks(
       obligation.attempts + 1
     );
     if (result.delivered) acknowledged += 1;
+  }
+  try {
+    await deps.repairHumanHistory?.();
+  } catch (error) {
+    Sentry.captureException(new Error('question reply human history sweep failed'), {
+      level: 'warning',
+      tags: {
+        service: 'whatsapp_status_handler',
+        operation: 'human_history_repair',
+        error_kind: runtimeErrorKind(error),
+      },
+    });
   }
   return { attempted: obligations.length, acknowledged };
 }

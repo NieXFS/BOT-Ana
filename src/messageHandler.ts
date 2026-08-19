@@ -13,6 +13,7 @@ import {
 import { tryHandleOptOut } from './services/optOutService';
 import {
   isConversationPaused,
+  isConversationPausedFresh,
   isConversationPausedForEscalationAcknowledgement,
 } from './services/pauseService';
 import {
@@ -177,6 +178,15 @@ export interface FlushDeps {
     config: TenantBotConfig
   ) => Promise<void | ConfiguredReplyDelivery>;
   isPaused?: (phoneNumberId: string, customerPhone: string) => Promise<boolean>;
+  /**
+   * Fronteira final sob lock, imediatamente antes do POST. Default: leitura
+   * fresca de `/pause-state` (ignora o TTL de 25s). Checagens anteriores
+   * continuam em `isPaused`. Ausente nos smokes → cai em `isPaused`.
+   */
+  isPausedBeforeTransport?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
   isPausedForEscalationAck?: (
     phoneNumberId: string,
     customerPhone: string,
@@ -230,7 +240,7 @@ export interface ConfiguredReplyDeps {
     text: string,
     config: TenantBotConfig
   ) => Promise<void>;
-  /** Revalidação imediatamente após a digitação e antes do POST. */
+  /** GET fresco de `/pause-state` imediatamente após a digitação e antes do POST. */
   isPausedBeforeTransport?: (
     phoneNumberId: string,
     customerPhone: string
@@ -247,7 +257,7 @@ const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
   sendSalesText: async (from, text, config) => {
     await sendFreeformMessageWithReceipt(from, text, config);
   },
-  isPausedBeforeTransport: isConversationPaused,
+  isPausedBeforeTransport: isConversationPausedFresh,
 };
 
 /** Seam do ponto de entrega: permite provar o caminho byte-idêntico da recepção. */
@@ -316,7 +326,7 @@ const defaultFlushDeps: FlushDeps = {
       );
       if (!outbound.originalAccepted) return 'suppressed';
       if (typingSimEnabled(config)) await typingDelay(outbound.payload);
-      if (await isConversationPaused(config.phoneNumberId, from)) {
+      if (await isConversationPausedFresh(config.phoneNumberId, from)) {
         return 'suppressed';
       }
       return (await deliverValidatedReceptionistText(from, outbound, config))
@@ -331,6 +341,7 @@ const defaultFlushDeps: FlushDeps = {
     return 'sent';
   },
   isPaused: isConversationPaused,
+  isPausedBeforeTransport: isConversationPausedFresh,
   isPausedForEscalationAck:
     isConversationPausedForEscalationAcknowledgement,
   recordPausedInbound: recordInboundWhilePaused,
@@ -348,6 +359,26 @@ function safeSalesContext(config: TenantBotConfig, from: string): string {
 
 function errorKind(error: unknown): string {
   return runtimeErrorKind(error);
+}
+
+function resolvePauseBeforeTransport(deps: {
+  isPausedBeforeTransport?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
+  isPaused?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
+}): (
+  phoneNumberId: string,
+  customerPhone: string
+) => Promise<boolean> {
+  return (
+    deps.isPausedBeforeTransport ??
+    deps.isPaused ??
+    isConversationPausedFresh
+  );
 }
 
 /**
@@ -385,7 +416,7 @@ async function emitFlushFallback(
           _customerPhone: string,
           work: () => Promise<void>
         ) => work());
-      const isPaused = deps.isPaused ?? isConversationPaused;
+      const isPaused = resolvePauseBeforeTransport(deps);
       await serialize(config.phoneNumberId, from, async () => {
         if (await isPaused(config.phoneNumberId, from)) {
           sent = false;
@@ -507,19 +538,22 @@ async function resolveInboundTurnControl(
   config: TenantBotConfig,
   customerPhone: string,
   customerName: string | undefined,
-  deps: IncomingMessageDeps
+  deps: IncomingMessageDeps,
+  inboundText: string
 ): Promise<AnaResumeGateEvaluation> {
   if (deps.evaluateResume) {
     return deps.evaluateResume({
       config,
       customerPhone,
       customerName,
+      inboundText,
     });
   }
   const allowed = await (deps.resumeGate ?? shouldAnaResumeForInbound)({
     config,
     customerPhone,
     customerName,
+    inboundText,
   });
   return allowed
     ? {
@@ -827,7 +861,8 @@ export async function flushBuffer(
                       from,
                       preparedV2.authoritativeEscalationQuestionId!
                     )
-          : () => (deps.isPaused ?? isConversationPaused)(config.phoneNumberId, from);
+          : () =>
+              resolvePauseBeforeTransport(deps)(config.phoneNumberId, from);
         if (
           await suppressFlushIfPaused({
             bufferKey,
@@ -1172,6 +1207,11 @@ export interface IncomingMessageDeps {
   handleOptOut: typeof tryHandleOptOut;
   shouldSuspend: typeof shouldSuspendForPendingInbound;
   isPaused: typeof isConversationPaused;
+  /**
+   * Revalidação da fronteira final nos caminhos diretos (áudio ilegível,
+   * fora de horário). Default: GET fresco. Ausente nos smokes → `isPaused`.
+   */
+  isPausedBeforeTransport?: typeof isConversationPausedFresh;
   resumeGate?: typeof shouldAnaResumeForInbound;
   evaluateResume?: typeof evaluateAnaResumeForInbound;
   sendReply?: typeof sendConfiguredReply;
@@ -1192,6 +1232,7 @@ const defaultIncomingMessageDeps: IncomingMessageDeps = {
   handleOptOut: tryHandleOptOut,
   shouldSuspend: shouldSuspendForPendingInbound,
   isPaused: isConversationPaused,
+  isPausedBeforeTransport: isConversationPausedFresh,
   resumeGate: shouldAnaResumeForInbound,
   evaluateResume: evaluateAnaResumeForInbound,
   sendReply: sendConfiguredReply,
@@ -1209,7 +1250,10 @@ export async function sendDirectReceptionistReplyIfUnpaused(
   from: string,
   reply: ValidatedReceptionistOutbound,
   config: TenantBotConfig,
-  deps: Pick<IncomingMessageDeps, 'isPaused' | 'sendReply' | 'withConversationLock'>
+  deps: Pick<
+    IncomingMessageDeps,
+    'isPaused' | 'isPausedBeforeTransport' | 'sendReply' | 'withConversationLock'
+  >
 ): Promise<ConfiguredReplyDelivery> {
   const serialize = deps.withConversationLock ??
     (async (
@@ -1221,7 +1265,9 @@ export async function sendDirectReceptionistReplyIfUnpaused(
   let delivery: ConfiguredReplyDelivery = 'suppressed';
 
   await serialize(config.phoneNumberId, from, async () => {
-    if (await deps.isPaused(config.phoneNumberId, from)) return;
+    if (await resolvePauseBeforeTransport(deps)(config.phoneNumberId, from)) {
+      return;
+    }
     const result = await sendReply(from, reply, config);
     delivery = result ?? 'sent';
   });
@@ -1367,7 +1413,8 @@ export async function handleIncomingMessage(
           config,
           from,
           name,
-          deps
+          deps,
+          text
         );
         if (resumeEvaluation.allowed) {
           await sendDirectReceptionistReplyIfUnpaused(
@@ -1436,7 +1483,8 @@ export async function handleIncomingMessage(
       config,
       from,
       name,
-      deps
+      deps,
+      text
     );
     if (!resumeEvaluation.allowed) {
       console.log(
@@ -1619,12 +1667,6 @@ export async function reprocessDurableSuccessorBatchV2(
   );
   if (!isAnaConversationalV2Enabled(config.tenantSlug)) return;
 
-  const resume = await evaluateAnaResumeForInbound({
-    config,
-    customerPhone: batch.customerPhone,
-  });
-  if (!resume.allowed) return;
-
   const persisted = await getPersistedInboundBatch(
     batch.conversationKey,
     batch.inboundMessageIds
@@ -1638,6 +1680,13 @@ export async function reprocessDurableSuccessorBatchV2(
   ) {
     throw new Error('Lote sucessor v2 incompleto no histórico durável.');
   }
+
+  const resume = await evaluateAnaResumeForInbound({
+    config,
+    customerPhone: batch.customerPhone,
+    inboundText: persisted.at(-1)?.content ?? '',
+  });
+  if (!resume.allowed) return;
 
   const buffer: MessageBuffer = {
     texts: persisted.map((entry) => entry.content),
@@ -1676,16 +1725,27 @@ export async function deliverDurableSuccessorFallbackV2(
   try {
     const config = await getTenantConfig(batch.phoneNumberId);
     if (!config || config.botRole === 'sales') return;
+    let inboundText = '';
+    try {
+      const persisted = await getPersistedInboundBatch(
+        batch.conversationKey,
+        batch.inboundMessageIds
+      );
+      inboundText = persisted.at(-1)?.content ?? '';
+    } catch {
+      inboundText = '';
+    }
     const resume = await evaluateAnaResumeForInbound({
       config,
       customerPhone: batch.customerPhone,
+      inboundText,
     });
     if (!resume.allowed) return;
     await withConversationLock(
       batch.phoneNumberId,
       batch.customerPhone,
       async () => {
-        if (await isConversationPaused(batch.phoneNumberId, batch.customerPhone)) {
+        if (await isConversationPausedFresh(batch.phoneNumberId, batch.customerPhone)) {
           return;
         }
         await sendConfiguredReply(

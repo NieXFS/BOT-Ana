@@ -43,6 +43,7 @@
     "smoke:cancel-appointment-guard": "ts-node -T scripts/smoke-cancel-appointment-guard.ts",
     "smoke:config-rejection-cache": "ts-node -T scripts/smoke-config-rejection-cache.ts",
     "smoke:pause-decision": "npx tsx scripts/smoke-pause-decision.ts",
+    "smoke:ana-pause-fresh-frontier": "npx tsx scripts/smoke-ana-pause-fresh-frontier.ts",
     "smoke:echo-handler": "npx tsx scripts/smoke-echo-handler.ts",
     "smoke:ana-resume-gate": "npx tsx scripts/smoke-ana-resume-gate.ts",
     "smoke:ana-conversational-v2-contracts": "ts-node -T scripts/smoke-ana-conversational-v2-contracts.ts",

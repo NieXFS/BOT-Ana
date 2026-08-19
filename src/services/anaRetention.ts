@@ -123,6 +123,7 @@ async function executeAnaRetention(
        WHERE created_at < $1`,
       [cutoff]
     );
+    // human_history_payload/accepted_at/recorded_at saem com a linha.
 
     // Sequência só deixa de existir quando nenhuma superfície operacional da
     // conversa a justifica. É bulk e independente da quantidade de conversas.

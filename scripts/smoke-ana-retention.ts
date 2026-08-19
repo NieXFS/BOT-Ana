@@ -115,6 +115,17 @@ async function main(): Promise<void> {
     sql.includes('DELETE FROM sent_question_replies') &&
       result.sentQuestionReplies === 3
   );
+  const schemaSource = readFileSync('src/services/anaWave2Store.ts', 'utf8');
+  const purgeSource = readFileSync('src/services/privacyPurge.ts', 'utf8');
+  check(
+    'snapshot human_history vive em sent_question_replies e cai no purge/retenção',
+    schemaSource.includes('human_history_payload') &&
+      schemaSource.includes('human_history_accepted_at') &&
+      schemaSource.includes('human_history_recorded_at') &&
+      sql.includes('DELETE FROM sent_question_replies') &&
+      purgeSource.includes('DELETE FROM sent_question_replies') &&
+      !schemaSource.includes('CREATE TABLE IF NOT EXISTS question_reply_human')
+  );
   check(
     'seq órfã é removida',
     seqSql.includes('DELETE FROM ana_conversation_seq')

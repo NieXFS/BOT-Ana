@@ -14,6 +14,15 @@ import {
 } from './conversationOrder';
 import type { QuestionReplyStatus } from './anaWave2Store';
 import {
+  listUnrepairedQuestionReplyHumanHistory,
+  persistQuestionReplyHumanHistoryAtomically,
+  questionReplyProvisionalMessageId,
+  withdrawQuestionReplyHumanIntention,
+} from './anaWave2Store';
+import { HUMAN_ECHO_PREFIX } from './humanConversationContext';
+import { Sentry } from '../observability/sentry';
+import { runtimeErrorKind, technicalHash } from '../observability/safeRuntime';
+import {
   buildReceptionistEnvelope,
   validateReceptionistOutbound,
   type AuthoritativeOutboundCatalog,
@@ -52,6 +61,14 @@ export interface QuestionReplyRow {
   providerStatusAt: Date | null;
   providerFailureCode: string | null;
   callbackPending: boolean;
+  humanHistoryPayload: string | null;
+  humanHistoryAcceptedAt: Date | null;
+  humanHistoryRecordedAt: Date | null;
+}
+
+export interface QuestionReplyAcceptanceSnapshot {
+  payload: string;
+  acceptedAt: Date;
 }
 
 interface RawQuestionReplyRow {
@@ -69,6 +86,9 @@ interface RawQuestionReplyRow {
   provider_status_at: Date | null;
   provider_failure_code: string | null;
   callback_pending: boolean;
+  human_history_payload: string | null;
+  human_history_accepted_at: Date | null;
+  human_history_recorded_at: Date | null;
 }
 
 function mapRow(row: RawQuestionReplyRow): QuestionReplyRow {
@@ -87,8 +107,36 @@ function mapRow(row: RawQuestionReplyRow): QuestionReplyRow {
     providerStatusAt: row.provider_status_at,
     providerFailureCode: row.provider_failure_code,
     callbackPending: row.callback_pending,
+    humanHistoryPayload: row.human_history_payload ?? null,
+    humanHistoryAcceptedAt: row.human_history_accepted_at ?? null,
+    humanHistoryRecordedAt: row.human_history_recorded_at ?? null,
   };
 }
+
+export function questionReplyHumanHistoryContent(validatedPayload: string): string {
+  return `${HUMAN_ECHO_PREFIX}${validatedPayload}`;
+}
+
+export function questionReplyNeedsHumanHistoryProjection(
+  row: Pick<
+    QuestionReplyRow,
+    | 'status'
+    | 'humanHistoryPayload'
+    | 'humanHistoryAcceptedAt'
+    | 'humanHistoryRecordedAt'
+  >
+): boolean {
+  return (
+    row.humanHistoryRecordedAt == null &&
+    row.humanHistoryPayload != null &&
+    row.humanHistoryAcceptedAt != null &&
+    (row.status === 'in_flight' ||
+      row.status === 'sent' ||
+      row.status === 'confirmation_pending')
+  );
+}
+
+export { questionReplyProvisionalMessageId };
 
 export interface QuestionReplyStore {
   reserve: (row: {
@@ -102,7 +150,8 @@ export interface QuestionReplyStore {
     idempotencyKey: string,
     status: QuestionReplyStatus,
     providerMessageId: string | null,
-    failureCode: string | null
+    failureCode: string | null,
+    acceptanceSnapshot?: QuestionReplyAcceptanceSnapshot | null
   ) => Promise<QuestionReplyRow>;
   get: (idempotencyKey: string) => Promise<QuestionReplyRow | null>;
 }
@@ -131,16 +180,34 @@ export const pgQuestionReplyStore: QuestionReplyStore = {
     if (!existing) throw new Error('question reply reservation disappeared');
     return { inserted: false, row: existing };
   },
-  async update(idempotencyKey, status, providerMessageId, failureCode) {
+  async update(
+    idempotencyKey,
+    status,
+    providerMessageId,
+    failureCode,
+    acceptanceSnapshot
+  ) {
     const result = await pool.query<RawQuestionReplyRow>(
       `UPDATE sent_question_replies
        SET status = $2,
            provider_message_id = COALESCE($3, provider_message_id),
            failure_code = $4,
+           human_history_payload = COALESCE(human_history_payload, $5),
+           human_history_accepted_at = CASE
+             WHEN $3::text IS NOT NULL AND $6::timestamptz IS NOT NULL THEN $6
+             ELSE COALESCE(human_history_accepted_at, $6)
+           END,
            updated_at = now()
        WHERE idempotency_key = $1
        RETURNING *`,
-      [idempotencyKey, status, providerMessageId, failureCode]
+      [
+        idempotencyKey,
+        status,
+        providerMessageId,
+        failureCode,
+        acceptanceSnapshot?.payload ?? null,
+        acceptanceSnapshot?.acceptedAt ?? null,
+      ]
     );
     if (!result.rows[0]) throw new Error('question reply reservation not found');
     return mapRow(result.rows[0]);
@@ -242,6 +309,15 @@ async function getLatestSourceWithClient(
   return result.rows[0]?.last_inbound_message_id ?? null;
 }
 
+export interface QuestionReplyHumanHistoryInput {
+  idempotencyKey: string;
+  conversationKey: string;
+  phoneNumberId: string;
+  providerMessageId: string | null;
+  payload: string;
+  acceptedAt: Date;
+}
+
 export interface QuestionReplyDeps {
   store: QuestionReplyStore;
   now: () => number;
@@ -263,6 +339,123 @@ export interface QuestionReplyDeps {
     text: string,
     config: WhatsAppTenantConfig
   ) => Promise<{ providerMessageId: string }>;
+  projectHumanHistory: (
+    input: QuestionReplyHumanHistoryInput
+  ) => Promise<'recorded' | 'already_recorded'>;
+  withdrawHumanHistory: (input: {
+    idempotencyKey: string;
+    conversationKey: string;
+  }) => Promise<void>;
+}
+
+async function projectHumanHistoryDefault(
+  input: QuestionReplyHumanHistoryInput
+): Promise<'recorded' | 'already_recorded'> {
+  return persistQuestionReplyHumanHistoryAtomically({
+    idempotencyKey: input.idempotencyKey,
+    conversationKey: input.conversationKey,
+    content: questionReplyHumanHistoryContent(input.payload),
+    createdAt: input.acceptedAt,
+    providerMessageId: input.providerMessageId,
+    payload: input.payload,
+  });
+}
+
+async function withdrawHumanHistoryDefault(input: {
+  idempotencyKey: string;
+  conversationKey: string;
+}): Promise<void> {
+  await withdrawQuestionReplyHumanIntention(
+    input.idempotencyKey,
+    input.conversationKey
+  );
+}
+
+function captureHumanHistoryProjectionFailure(
+  error: unknown,
+  phoneNumberId: string,
+  providerMessageId: string | null
+): void {
+  Sentry.captureException(new Error('question reply human history projection failed'), {
+    level: 'warning',
+    tags: {
+      service: 'question_reply',
+      operation: 'project_human_history',
+      phoneNumberHash: technicalHash(phoneNumberId),
+      providerMessageHash: technicalHash(providerMessageId ?? 'unattached'),
+      error_kind: runtimeErrorKind(error),
+    },
+  });
+}
+
+async function withdrawHumanHistorySafely(
+  deps: QuestionReplyDeps,
+  idempotencyKey: string,
+  conversationKey: string
+): Promise<void> {
+  try {
+    await deps.withdrawHumanHistory({ idempotencyKey, conversationKey });
+  } catch (error) {
+    Sentry.captureException(new Error('question reply human history withdraw failed'), {
+      level: 'warning',
+      tags: {
+        service: 'question_reply',
+        operation: 'withdraw_human_history',
+        error_kind: runtimeErrorKind(error),
+      },
+    });
+  }
+}
+
+export async function projectQuestionReplyHumanHistory(
+  input: QuestionReplyHumanHistoryInput,
+  project: (
+    input: QuestionReplyHumanHistoryInput
+  ) => Promise<'recorded' | 'already_recorded'> = projectHumanHistoryDefault
+): Promise<'recorded' | 'already_recorded' | 'skipped'> {
+  try {
+    return await project(input);
+  } catch (error) {
+    captureHumanHistoryProjectionFailure(
+      error,
+      input.phoneNumberId,
+      input.providerMessageId
+    );
+    return 'skipped';
+  }
+}
+
+export async function repairUnrecordedQuestionReplyHumanHistory(
+  options: {
+    providerMessageId?: string;
+    limit?: number;
+    project?: (
+      input: QuestionReplyHumanHistoryInput
+    ) => Promise<'recorded' | 'already_recorded'>;
+    listUnrepaired?: typeof listUnrepairedQuestionReplyHumanHistory;
+  } = {}
+): Promise<{ attempted: number; recorded: number }> {
+  const unrepaired = await (options.listUnrepaired ??
+    listUnrepairedQuestionReplyHumanHistory)(
+    options.limit ?? 100,
+    options.providerMessageId
+  );
+  let recorded = 0;
+  for (const row of unrepaired) {
+    const result = await projectQuestionReplyHumanHistory(
+      {
+        idempotencyKey: row.idempotencyKey,
+        conversationKey: row.conversationKey,
+        phoneNumberId: row.phoneNumberId,
+        providerMessageId: row.providerMessageId,
+        payload: row.payload,
+        acceptedAt: row.acceptedAt,
+      },
+      options.project ?? projectHumanHistoryDefault
+    );
+    if (result !== 'skipped') recorded += 1;
+  }
+  return { attempted: unrepaired.length, recorded };
 }
 
 const defaultDeps: QuestionReplyDeps = {
@@ -273,6 +466,8 @@ const defaultDeps: QuestionReplyDeps = {
   getLatestSource: getLatestSourceWithClient,
   getLastInboundAtMs: getLastInboundAtMsWithClient,
   sendReceipt: sendFreeformMessageWithReceipt,
+  projectHumanHistory: projectHumanHistoryDefault,
+  withdrawHumanHistory: withdrawHumanHistoryDefault,
 };
 
 export function createQuestionReplyDeps(
@@ -309,6 +504,42 @@ function resultFromExisting(row: QuestionReplyRow): QuestionReplyResult {
     status: row.status === 'in_flight' ? 'in_flight' : 'confirmation_pending',
     providerMessageId: row.providerMessageId,
   };
+}
+
+function questionReplyShouldProjectHumanHistory(
+  row: Pick<
+    QuestionReplyRow,
+    'status' | 'humanHistoryPayload' | 'humanHistoryAcceptedAt'
+  >
+): boolean {
+  if (row.status === 'failed_pre_send' || row.status === 'stale_source') {
+    return false;
+  }
+  return (
+    row.humanHistoryPayload != null &&
+    row.humanHistoryAcceptedAt != null &&
+    (row.status === 'in_flight' ||
+      row.status === 'sent' ||
+      row.status === 'confirmation_pending')
+  );
+}
+
+async function maybeProjectAcceptedReply(
+  row: QuestionReplyRow,
+  deps: QuestionReplyDeps
+): Promise<void> {
+  if (!questionReplyShouldProjectHumanHistory(row)) return;
+  await projectQuestionReplyHumanHistory(
+    {
+      idempotencyKey: row.idempotencyKey,
+      conversationKey: row.conversationKey,
+      phoneNumberId: row.phoneNumberId,
+      providerMessageId: row.providerMessageId,
+      payload: row.humanHistoryPayload!,
+      acceptedAt: row.humanHistoryAcceptedAt!,
+    },
+    deps.projectHumanHistory
+  );
 }
 
 export async function sendQuestionReply(
@@ -368,6 +599,7 @@ export async function sendQuestionReply(
       row.phoneNumberId === input.phoneNumberId &&
       row.conversationKey === conversationKey;
     if (!samePayload) return { kind: 'conflict' };
+    await maybeProjectAcceptedReply(row, deps);
     return resultFromExisting(row);
   }
 
@@ -386,6 +618,10 @@ export async function sendQuestionReply(
   let transportAttempted = false;
   let transportKnownPreSend = false;
   let acceptedProviderMessageId: string | null = null;
+  const snapshotFor = (): QuestionReplyAcceptanceSnapshot => ({
+    payload: transportInput.text,
+    acceptedAt: new Date(deps.now()),
+  });
   try {
     return await deps.withLock(
       input.phoneNumberId,
@@ -420,6 +656,31 @@ export async function sendQuestionReply(
           return { kind: 'failed_pre_send', failureCode: row.failureCode };
         }
 
+        const intended = snapshotFor();
+        try {
+          await deps.projectHumanHistory({
+            idempotencyKey: input.idempotencyKey,
+            conversationKey,
+            phoneNumberId: input.phoneNumberId,
+            providerMessageId: null,
+            payload: intended.payload,
+            acceptedAt: intended.acceptedAt,
+          });
+        } catch {
+          const row = await deps.store.update(
+            input.idempotencyKey,
+            'failed_pre_send',
+            null,
+            'HUMAN_INTENTION_FAILED'
+          );
+          await withdrawHumanHistorySafely(
+            deps,
+            input.idempotencyKey,
+            conversationKey
+          );
+          return { kind: 'failed_pre_send', failureCode: row.failureCode };
+        }
+
         try {
           transportAttempted = true;
           const receipt = await deps.sendReceipt(
@@ -428,26 +689,52 @@ export async function sendQuestionReply(
             waConfig
           );
           acceptedProviderMessageId = receipt.providerMessageId;
+          const snapshot = snapshotFor();
           try {
             const sent = await deps.store.update(
               input.idempotencyKey,
               'sent',
               receipt.providerMessageId,
-              null
+              null,
+              snapshot
             );
+            await maybeProjectAcceptedReply(sent, deps);
             return {
               kind: 'sent',
               providerMessageId: receipt.providerMessageId,
               sentAt: sent.updatedAt.toISOString(),
             };
           } catch {
-            // A Meta aceitou, mas a confirmação local falhou/colidiu. Nunca retry.
-            await deps.store.update(
-              input.idempotencyKey,
-              'confirmation_pending',
-              receipt.providerMessageId,
-              'RECEIPT_PERSIST_FAILED'
-            );
+            // A Meta aceitou, mas a confirmação local falhou/colidiu. Nunca retry
+            // e nunca rebaixa o aceite para failed_pre_send. A intenção HUMAN
+            // pré-Meta permanece mesmo se o promote do wamid falhar.
+            let pending: QuestionReplyRow | null = null;
+            try {
+              pending = await deps.store.update(
+                input.idempotencyKey,
+                'confirmation_pending',
+                receipt.providerMessageId,
+                'RECEIPT_PERSIST_FAILED',
+                snapshot
+              );
+            } catch {
+              pending = null;
+            }
+            if (pending) {
+              await maybeProjectAcceptedReply(pending, deps);
+            } else {
+              await projectQuestionReplyHumanHistory(
+                {
+                  idempotencyKey: input.idempotencyKey,
+                  conversationKey,
+                  phoneNumberId: input.phoneNumberId,
+                  providerMessageId: receipt.providerMessageId,
+                  payload: snapshot.payload,
+                  acceptedAt: snapshot.acceptedAt,
+                },
+                deps.projectHumanHistory
+              );
+            }
             return {
               kind: 'pending',
               status: 'confirmation_pending',
@@ -464,6 +751,11 @@ export async function sendQuestionReply(
             classified.failureCode
           );
           if (classified.status === 'failed_pre_send') {
+            await withdrawHumanHistorySafely(
+              deps,
+              input.idempotencyKey,
+              conversationKey
+            );
             return { kind: 'failed_pre_send', failureCode: row.failureCode };
           }
           return {
@@ -483,15 +775,24 @@ export async function sendQuestionReply(
     const failureCode = transportAttempted && !transportKnownPreSend
       ? 'TRANSPORT_OUTCOME_UNKNOWN'
       : 'LOCAL_PRE_SEND_FAILED';
+    const snapshot =
+      acceptedProviderMessageId != null ? snapshotFor() : undefined;
     const row = await deps.store.update(
       input.idempotencyKey,
       status,
       acceptedProviderMessageId,
-      failureCode
+      failureCode,
+      snapshot
     );
     if (status === 'failed_pre_send') {
+      await withdrawHumanHistorySafely(
+        deps,
+        input.idempotencyKey,
+        conversationKey
+      );
       return { kind: 'failed_pre_send', failureCode: row.failureCode };
     }
+    await maybeProjectAcceptedReply(row, deps);
     return {
       kind: 'pending',
       status: 'confirmation_pending',

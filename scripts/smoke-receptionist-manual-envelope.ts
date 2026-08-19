@@ -9,13 +9,23 @@ async function main() {
     async reserve(input) {
       const existing = rows.get(input.idempotencyKey);
       if (existing) return { inserted: false, row: existing };
-      const row = { ...input, status: 'in_flight', providerMessageId: null, failureCode: null, providerStatus: null, providerStatusAt: null, providerFailureCode: null, callbackPending: false, createdAt: new Date(), updatedAt: new Date() };
+      const row = { ...input, status: 'in_flight', providerMessageId: null, failureCode: null, providerStatus: null, providerStatusAt: null, providerFailureCode: null, callbackPending: false, humanHistoryPayload: null, humanHistoryAcceptedAt: null, humanHistoryRecordedAt: null, createdAt: new Date(), updatedAt: new Date() };
       rows.set(input.idempotencyKey, row);
       return { inserted: true, row };
     },
-    async update(key, status, providerMessageId, failureCode) {
+    async update(key, status, providerMessageId, failureCode, snapshot) {
       const row = rows.get(key);
-      Object.assign(row, { status, providerMessageId: providerMessageId ?? row.providerMessageId, failureCode, updatedAt: new Date() });
+      Object.assign(row, {
+        status,
+        providerMessageId: providerMessageId ?? row.providerMessageId,
+        failureCode,
+        updatedAt: new Date(),
+        humanHistoryPayload: row.humanHistoryPayload ?? snapshot?.payload ?? null,
+        humanHistoryAcceptedAt:
+          providerMessageId && snapshot?.acceptedAt
+            ? snapshot.acceptedAt
+            : row.humanHistoryAcceptedAt ?? snapshot?.acceptedAt ?? null,
+      });
       return row;
     },
     async get(key) { return rows.get(key) ?? null; },
@@ -27,6 +37,8 @@ async function main() {
     getLatestSource: async () => 'wamid-source',
     getLastInboundAtMs: async () => Date.now(),
     sendReceipt: async (_to, text) => { sent.push(text); return { providerMessageId: `wamid-${sent.length}` }; },
+    projectHumanHistory: async () => 'recorded',
+    withdrawHumanHistory: async () => undefined,
   });
   const base = { phoneNumberId: 'pn', customerPhone: '5511999999999', sourceInboundMessageId: 'wamid-source' };
   const valid = 'Resposta da equipe:\nA avaliação indica que isso cura a condição.';

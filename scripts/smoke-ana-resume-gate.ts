@@ -144,6 +144,35 @@ async function main() {
     ]),
     false
   );
+  assert.equal(classifier.isExplicitAnaResumeRequest('Ana, pode continuar'), true);
+  assert.equal(
+    classifier.isExplicitAnaResumeRequest('Ana, pode continuar e ver os horários?'),
+    true
+  );
+  assert.equal(
+    classifier.isExplicitAnaResumeRequest('Quero ser atendida pela Ana'),
+    true
+  );
+  assert.equal(
+    classifier.isExplicitAnaResumeRequest('Ana não pode continuar'),
+    false
+  );
+  assert.equal(classifier.isExplicitAnaResumeRequest('confirmado'), false);
+  assert.equal(classifier.isExplicitAnaResumeRequest('Confirmado'), false);
+  assert.equal(classifier.isExplicitAnaResumeRequest('pode continuar'), false);
+  assert.equal(
+    classifier.isExplicitAnaResumeRequest('A Ana está pausada agora'),
+    false
+  );
+  assert.equal(classifier.isExplicitAnaResumeRequest('Quem é a Ana?'), false);
+  assert.equal(
+    classifier.isExplicitAnaResumeRequest('A Ana pode atender terça?'),
+    false
+  );
+  assert.equal(
+    classifier.isExplicitAnaResumeRequest('Será que a Ana pode continuar?'),
+    false
+  );
 
   const human = await import('../src/services/humanConversationContext');
   const poisonResumeText =
@@ -274,6 +303,8 @@ async function main() {
   );
   assert.equal(markerClassification.decision, 'RESUME_ANA');
   assert.equal(markerClassification.reasonCode, 'DIRECT_ANA_REQUEST');
+  assert.equal(markerClassification.model, 'deterministic');
+  assert.equal(markerClassification.latencyMs, 0);
   assert.equal(markerProviderCalls, 0);
 
   let resumeProviderBlob = '';
@@ -343,6 +374,7 @@ async function main() {
   );
   assert.equal(keep.decision, 'KEEP_HUMAN');
   assert.equal(keep.reasonCode, 'HUMAN_HANDLED_REQUEST');
+  assert.equal(keep.model, 'deepseek-v4-flash');
   assert.equal(providerCalls, 1);
 
   const invalid = await classifier.classifyAnaResume(
@@ -351,6 +383,8 @@ async function main() {
   );
   assert.equal(invalid.decision, 'UNCERTAIN');
   assert.equal(invalid.reasonCode, 'INVALID_MODEL_OUTPUT');
+  assert.equal(invalid.model, 'deterministic');
+  assert.equal(invalid.latencyMs, 0);
 
   const providerFailure = await classifier.classifyAnaResume(
     { history, config },
@@ -362,6 +396,8 @@ async function main() {
     }
   );
   assert.equal(providerFailure.reasonCode, 'PROVIDER_FAILURE');
+  assert.equal(providerFailure.model, 'deterministic');
+  assert.equal(providerFailure.latencyMs, 0);
 
   providerCalls = 0;
   const unavailable = await classifier.classifyAnaResume(
@@ -385,7 +421,59 @@ async function main() {
     }
   );
   assert.equal(unavailable.reasonCode, 'TRANSCRIPTION_UNAVAILABLE');
+  assert.equal(unavailable.model, 'deterministic');
+  assert.equal(unavailable.latencyMs, 0);
   assert.equal(providerCalls, 0);
+
+  let missingHumanProvider = 0;
+  const explicitWithoutHuman = await classifier.classifyAnaResume(
+    {
+      history: [
+        {
+          role: 'user',
+          content: 'Ana, pode continuar',
+          createdAt: '2026-08-11T12:08:00.000Z',
+        },
+      ],
+      config,
+    },
+    {
+      now: () => 1_000,
+      complete: async () => {
+        missingHumanProvider += 1;
+        return '{"decision":"KEEP_HUMAN","reasonCode":"HUMAN_CONVERSATION_CONTINUES"}';
+      },
+    }
+  );
+  assert.equal(explicitWithoutHuman.decision, 'RESUME_ANA');
+  assert.equal(explicitWithoutHuman.reasonCode, 'DIRECT_ANA_REQUEST');
+  assert.equal(explicitWithoutHuman.model, 'deterministic');
+  assert.equal(explicitWithoutHuman.latencyMs, 0);
+  assert.equal(missingHumanProvider, 0);
+
+  const ambiguousWithoutHuman = await classifier.classifyAnaResume(
+    {
+      history: [
+        {
+          role: 'user',
+          content: 'Quero horários de terça',
+          createdAt: '2026-08-11T12:08:00.000Z',
+        },
+      ],
+      config,
+    },
+    {
+      now: () => 1_000,
+      complete: async () => {
+        missingHumanProvider += 1;
+        return '{"decision":"RESUME_ANA","reasonCode":"NEW_INDEPENDENT_REQUEST"}';
+      },
+    }
+  );
+  assert.equal(ambiguousWithoutHuman.decision, 'UNCERTAIN');
+  assert.equal(ambiguousWithoutHuman.reasonCode, 'AMBIGUOUS_CONTEXT');
+  assert.equal(ambiguousWithoutHuman.model, 'deterministic');
+  assert.equal(missingHumanProvider, 0);
 
   const parseBegin = gate.parseAnaResumeGateBeginResponse;
   const parseFinalize = gate.parseAnaResumeGateFinalizeResponse;
@@ -401,6 +489,26 @@ async function main() {
     /isAnaConversationalV2Enabled\(config\.tenantSlug\)/
   );
   assert.equal(gateSource.includes('conversationPausedUntil'), false);
+  const pauseSource = readFileSync(
+    path.join(process.cwd(), 'src/services/pauseService.ts'),
+    'utf8'
+  );
+  const releaseStart = pauseSource.indexOf(
+    'export function releaseLocalEchoPauseAfterAnaResume'
+  );
+  const releaseFn = pauseSource.slice(
+    releaseStart,
+    pauseSource.indexOf('\nfunction capture', releaseStart)
+  );
+  assert.equal(releaseFn.includes('echoLatchByConversation.delete'), true);
+  assert.equal(releaseFn.includes('globalUntilMs: existing.globalUntilMs'), true);
+  assert.equal(releaseFn.includes('scheduleUntilMs: existing.scheduleUntilMs'), true);
+  assert.equal(releaseFn.includes('clearEscalation'), false);
+  assert.equal(releaseFn.includes('technicalMaintenance'), false);
+  assert.match(
+    gateSource,
+    /explicitAnaResumeRequest/
+  );
   assert.equal(
     gate.isAnaResumeGateEnabled.length,
     1,
@@ -441,6 +549,13 @@ async function main() {
       reason: 'CLASSIFICATION_IN_FLIGHT',
     })?.reason,
     'CLASSIFICATION_IN_FLIGHT'
+  );
+  assert.equal(
+    parseBegin({
+      action: 'KEEP_SILENT',
+      reason: 'OUTBOUND_ECHO_PENDING',
+    })?.reason,
+    'OUTBOUND_ECHO_PENDING'
   );
   assert.equal(parseBegin({ action: 'WAT' }), null);
   assert.equal(parseBegin({ action: 'EVALUATE', expectedVersion: 1 }), null);
@@ -484,6 +599,20 @@ async function main() {
         begin: async () => ({
           action: 'KEEP_SILENT' as const,
           reason: 'PAUSE_ACTIVE' as const,
+        }),
+      }
+    ),
+    false
+  );
+
+  assert.equal(
+    await gate.shouldAnaResumeForInbound(
+      { config, customerPhone: '5511999999999' },
+      {
+        ...noModelDeps,
+        begin: async () => ({
+          action: 'KEEP_SILENT' as const,
+          reason: 'OUTBOUND_ECHO_PENDING' as const,
         }),
       }
     ),
@@ -856,8 +985,9 @@ async function main() {
         customerName?: string | null;
       }) =>
         gate.evaluateAnaResumeForInbound(input, {
-          begin: async () => {
+          begin: async (_phoneNumberId, _customerPhone, explicit) => {
             g3Counts.begin += 1;
+            assert.equal(explicit, false, 'Confirmado não é pedido explícito');
             return {
               action: 'EVALUATE' as const,
               expectedVersion: 4,
@@ -870,11 +1000,14 @@ async function main() {
           },
           classify: async (classifyInput) => {
             g3Counts.classify += 1;
-            return classifier.classifyAnaResume(classifyInput, {
+            const classified = await classifier.classifyAnaResume(classifyInput, {
               now: () => 2_000,
               complete: async () =>
                 '{"decision":"KEEP_HUMAN","reasonCode":"HUMAN_HANDLED_REQUEST"}',
             });
+            assert.equal(classified.decision, 'KEEP_HUMAN');
+            assert.equal(classified.model, 'deepseek-v4-flash');
+            return classified;
           },
           finalize: async ({ classification }) => {
             g3Counts.finalize += 1;
@@ -1138,6 +1271,250 @@ async function main() {
     'echo após finalize(PROCEED) vence a revalidação e suprime o transporte'
   );
   messageHandler.__resetFlushStateForTest();
+
+  const pause = await import('../src/services/pauseService');
+  const escalation = await import('../src/services/escalationCache');
+  const technical = await import('../src/services/technicalMaintenanceCache');
+  pause.__resetPauseCacheForTest();
+  escalation.__resetEscalationCacheForTest();
+  technical.__resetTechnicalMaintenanceCacheForTest();
+
+  const explicitPhone = '5511900000010';
+  const explicitKey = `PN-RESUME:${explicitPhone}`;
+  const explicitNow = Date.UTC(2026, 7, 19, 13, 0, 0);
+  await pause.pauseConversationByEcho(config.phoneNumberId, explicitPhone, {
+    now: () => explicitNow,
+    persistPause: async () => new Date(explicitNow + 60 * 60_000).toISOString(),
+  });
+  assert.equal(
+    pause.peekLocalEchoLatch(config.phoneNumberId, explicitPhone, explicitNow) !=
+      null,
+    true,
+    'pausa ECHO local ativa antes do pedido explícito'
+  );
+  const explicitCounts = {
+    begin: 0,
+    provider: 0,
+    finalize: 0,
+    outbound: 0,
+    brain: 0,
+    explicit: false,
+  };
+  const idlePauseState = {
+    globalPausedUntil: null,
+    conversationPausedUntil: null,
+    schedulePausedUntil: null,
+  };
+  const echoPauseDeps = {
+    now: () => explicitNow + 1_000,
+    fetchState: async () => idlePauseState,
+  };
+  await messageHandler.handleIncomingMessage(
+    {
+      from: explicitPhone,
+      id: 'wamid.explicit-resume',
+      timestamp: '1786454000',
+      type: 'text',
+      text: { body: 'Ana, pode continuar' },
+    },
+    { profile: { name: 'Cliente' } },
+    config,
+    incomingDeps({
+      persistInbound: async () => ({
+        fresh: true,
+        conversationKey: explicitKey,
+        sequence: 1,
+      }),
+      isPaused: (phoneNumberId: string, customerPhone: string) =>
+        pause.isConversationPaused(phoneNumberId, customerPhone, echoPauseDeps),
+      evaluateResume: (input: {
+        config: TenantBotConfig;
+        customerPhone: string;
+        customerName?: string | null;
+        inboundText?: string | null;
+      }) =>
+        gate.evaluateAnaResumeForInbound(input, {
+          begin: async (_phoneNumberId, _customerPhone, explicit) => {
+            explicitCounts.begin += 1;
+            explicitCounts.explicit = explicit;
+            return {
+              action: 'EVALUATE' as const,
+              expectedVersion: 21,
+              leaseUntil: '2026-08-19T16:01:00.000Z',
+            };
+          },
+          loadHistory: async () => [
+            {
+              role: 'assistant' as const,
+              content: '[atendente] te atendo já',
+              createdAt: '2026-08-19T12:00:00.000Z',
+            },
+            {
+              role: 'user' as const,
+              content: 'Ana, pode continuar',
+              createdAt: '2026-08-19T13:00:00.000Z',
+            },
+          ],
+          classify: async (classifyInput) =>
+            classifier.classifyAnaResume(classifyInput, {
+              now: () => explicitNow,
+              complete: async () => {
+                explicitCounts.provider += 1;
+                return '{"decision":"KEEP_HUMAN","reasonCode":"HUMAN_CONVERSATION_CONTINUES"}';
+              },
+            }),
+          finalize: async ({ classification }) => {
+            explicitCounts.finalize += 1;
+            assert.equal(classification.decision, 'RESUME_ANA');
+            assert.equal(classification.reasonCode, 'DIRECT_ANA_REQUEST');
+            assert.equal(classification.model, 'deterministic');
+            assert.equal(classification.latencyMs, 0);
+            return {
+              applied: true,
+              action: 'PROCEED',
+              version: 22,
+              pausedUntil: null,
+            };
+          },
+        }),
+    }) as never
+  );
+  assert.equal(explicitCounts.begin, 1);
+  assert.equal(explicitCounts.explicit, true, 'begin recebe explicitAnaResumeRequest');
+  assert.equal(explicitCounts.provider, 0, 'pedido direto não chama DeepSeek');
+  assert.equal(explicitCounts.finalize, 1);
+  assert.equal(
+    pause.peekLocalEchoLatch(
+      config.phoneNumberId,
+      explicitPhone,
+      explicitNow + 1_000
+    ),
+    null,
+    'finalize PROCEED limpa só o latch ECHO'
+  );
+  assert.equal(messageHandler.__hasBufferForTest(explicitKey), true);
+  await messageHandler.flushBuffer(explicitKey, {
+    getReply: async () => {
+      explicitCounts.brain += 1;
+      return 'Claro, sigo com você.';
+    },
+    sendReply: async () => {
+      explicitCounts.outbound += 1;
+      return 'sent';
+    },
+    isPaused: (phoneNumberId, customerPhone) =>
+      pause.isConversationPaused(phoneNumberId, customerPhone, echoPauseDeps),
+    withConversationLock: async (_pnid, _phone, work) => work(),
+  });
+  assert.equal(explicitCounts.brain, 1);
+  assert.equal(explicitCounts.outbound, 1, 'pedido explícito gera exatamente um outbound');
+  messageHandler.__resetFlushStateForTest();
+
+  pause.__resetPauseCacheForTest();
+  assert.equal(
+    await pause.isConversationPaused(config.phoneNumberId, explicitPhone, {
+      now: () => explicitNow,
+      fetchState: async () => ({
+        ...idlePauseState,
+        globalPausedUntil: new Date(explicitNow + 60 * 60_000).toISOString(),
+      }),
+    }),
+    true
+  );
+  await pause.pauseConversationByEcho(config.phoneNumberId, explicitPhone, {
+    now: () => explicitNow,
+    persistPause: async () => new Date(explicitNow + 60 * 60_000).toISOString(),
+  });
+  pause.releaseLocalEchoPauseAfterAnaResume(
+    config.phoneNumberId,
+    explicitPhone
+  );
+  assert.equal(
+    await pause.isConversationPaused(config.phoneNumberId, explicitPhone, {
+      now: () => explicitNow + 2_000,
+      fetchState: async () => idlePauseState,
+    }),
+    true,
+    'pausa global continua soberana após limpar ECHO'
+  );
+  pause.__resetPauseCacheForTest();
+  assert.equal(
+    await pause.isConversationPaused(config.phoneNumberId, explicitPhone, {
+      now: () => explicitNow,
+      fetchState: async () => ({
+        ...idlePauseState,
+        schedulePausedUntil: new Date(explicitNow + 60 * 60_000).toISOString(),
+      }),
+    }),
+    true
+  );
+  await pause.pauseConversationByEcho(config.phoneNumberId, explicitPhone, {
+    now: () => explicitNow,
+    persistPause: async () => new Date(explicitNow + 60 * 60_000).toISOString(),
+  });
+  pause.releaseLocalEchoPauseAfterAnaResume(
+    config.phoneNumberId,
+    explicitPhone
+  );
+  assert.equal(
+    await pause.isConversationPaused(config.phoneNumberId, explicitPhone, {
+      now: () => explicitNow + 2_000,
+      fetchState: async () => idlePauseState,
+    }),
+    true,
+    'pausa de agenda continua soberana após limpar ECHO'
+  );
+  pause.__resetPauseCacheForTest();
+  technical.__resetTechnicalMaintenanceCacheForTest();
+  technical.observeTechnicalMaintenance({
+    phoneNumberId: config.phoneNumberId,
+    snapshot: { enabled: true, paused: true, exempt: false },
+    tenantSlug: config.tenantSlug,
+  });
+  await pause.pauseConversationByEcho(config.phoneNumberId, explicitPhone, {
+    now: () => explicitNow,
+    persistPause: async () => new Date(explicitNow + 60 * 60_000).toISOString(),
+  });
+  pause.releaseLocalEchoPauseAfterAnaResume(
+    config.phoneNumberId,
+    explicitPhone
+  );
+  assert.equal(
+    await pause.isConversationPaused(config.phoneNumberId, explicitPhone, {
+      now: () => explicitNow + 2_000,
+      fetchState: async () => null,
+    }),
+    true,
+    'modo técnico continua soberano após limpar ECHO'
+  );
+  pause.__resetPauseCacheForTest();
+  technical.__resetTechnicalMaintenanceCacheForTest();
+  escalation.__resetEscalationCacheForTest();
+  escalation.updateEscalationCache(
+    config.phoneNumberId,
+    explicitPhone,
+    { active: true, questionId: 'q-escalation', version: 3 },
+    explicitNow
+  );
+  await pause.pauseConversationByEcho(config.phoneNumberId, explicitPhone, {
+    now: () => explicitNow,
+    persistPause: async () => new Date(explicitNow + 60 * 60_000).toISOString(),
+  });
+  pause.releaseLocalEchoPauseAfterAnaResume(
+    config.phoneNumberId,
+    explicitPhone
+  );
+  assert.equal(
+    await pause.isConversationPaused(config.phoneNumberId, explicitPhone, {
+      now: () => explicitNow + 2_000,
+      fetchState: async () => idlePauseState,
+    }),
+    true,
+    'pausa de escalação continua soberana após limpar ECHO'
+  );
+  pause.__resetPauseCacheForTest();
+  technical.__resetTechnicalMaintenanceCacheForTest();
+  escalation.__resetEscalationCacheForTest();
 
   const salesCalls = { evaluate: 0, resumeGate: 0, begin: 0 };
   const salesCfg: TenantBotConfig = {

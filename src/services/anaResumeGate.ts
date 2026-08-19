@@ -5,10 +5,12 @@ import { Sentry } from '../observability/sentry';
 import { runtimeErrorKind, safeHttpStatus } from '../observability/safeRuntime';
 import {
   classifyAnaResume,
+  isExplicitAnaResumeRequest,
   type AnaResumeClassification,
 } from './anaResumeClassifier';
 import { isAnaConversationalV2Enabled } from './conversationalV2/featureFlag';
 import { getHistoryWithTimestamps } from './contextManager';
+import { releaseLocalEchoPauseAfterAnaResume } from './pauseService';
 import type {
   HumanControlDisposition,
   ReceptionistTurnControl,
@@ -18,13 +20,17 @@ import type {
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
 const REQUEST_TIMEOUT_MS = 10_000;
-const KEEP_SILENT_REASONS = ['PAUSE_ACTIVE', 'CLASSIFICATION_IN_FLIGHT'] as const;
+const KEEP_SILENT_REASONS = [
+  'PAUSE_ACTIVE',
+  'CLASSIFICATION_IN_FLIGHT',
+  'OUTBOUND_ECHO_PENDING',
+] as const;
 
 export type AnaResumeGateBeginResponse =
   | { action: 'PROCEED' }
   | {
       action: 'KEEP_SILENT';
-      reason: 'PAUSE_ACTIVE' | 'CLASSIFICATION_IN_FLIGHT';
+      reason: (typeof KEEP_SILENT_REASONS)[number];
     }
   | { action: 'EVALUATE'; expectedVersion: number; leaseUntil: string };
 
@@ -38,7 +44,8 @@ export interface AnaResumeGateFinalizeResponse {
 export interface AnaResumeGateDeps {
   begin: (
     phoneNumberId: string,
-    customerPhone: string
+    customerPhone: string,
+    explicitAnaResumeRequest: boolean
   ) => Promise<AnaResumeGateBeginResponse>;
   loadHistory: typeof getHistoryWithTimestamps;
   classify: typeof classifyAnaResume;
@@ -48,6 +55,7 @@ export interface AnaResumeGateDeps {
     expectedVersion: number;
     classification: AnaResumeClassification;
   }) => Promise<AnaResumeGateFinalizeResponse>;
+  onAnaResumeApplied?: (phoneNumberId: string, customerPhone: string) => void;
 }
 
 /**
@@ -68,7 +76,8 @@ export function parseAnaResumeGateBeginResponse(
   if (record.action === 'KEEP_SILENT') {
     if (
       record.reason !== 'PAUSE_ACTIVE' &&
-      record.reason !== 'CLASSIFICATION_IN_FLIGHT'
+      record.reason !== 'CLASSIFICATION_IN_FLIGHT' &&
+      record.reason !== 'OUTBOUND_ECHO_PENDING'
     ) {
       return null;
     }
@@ -135,11 +144,12 @@ async function callResumeGate<T>(body: unknown): Promise<T> {
 }
 
 const defaultDeps: AnaResumeGateDeps = {
-  begin: (phoneNumberId, customerPhone) =>
+  begin: (phoneNumberId, customerPhone, explicitAnaResumeRequest) =>
     callResumeGate<AnaResumeGateBeginResponse>({
       operation: 'begin',
       phoneNumberId,
       customerPhone,
+      explicitAnaResumeRequest,
     }),
   loadHistory: getHistoryWithTimestamps,
   classify: classifyAnaResume,
@@ -160,6 +170,7 @@ const defaultDeps: AnaResumeGateDeps = {
       latencyMs: classification.latencyMs,
       contextHash: classification.contextHash,
     }),
+  onAnaResumeApplied: releaseLocalEchoPauseAfterAnaResume,
 };
 
 function capture(
@@ -215,9 +226,11 @@ export async function evaluateAnaResumeForInbound(
     config: TenantBotConfig;
     customerPhone: string;
     customerName?: string | null;
+    inboundText?: string | null;
   },
-  deps: AnaResumeGateDeps = defaultDeps
+  deps: Partial<AnaResumeGateDeps> = {}
 ): Promise<AnaResumeGateEvaluation> {
+  const resolved: AnaResumeGateDeps = { ...defaultDeps, ...deps };
   if (!isAnaResumeGateEnabled(input.config)) {
     return {
       allowed: true,
@@ -226,9 +239,17 @@ export async function evaluateAnaResumeForInbound(
     };
   }
 
+  const explicitAnaResumeRequest = isExplicitAnaResumeRequest(
+    input.inboundText ?? ''
+  );
+
   let beginRaw: unknown;
   try {
-    beginRaw = await deps.begin(input.config.phoneNumberId, input.customerPhone);
+    beginRaw = await resolved.begin(
+      input.config.phoneNumberId,
+      input.customerPhone,
+      explicitAnaResumeRequest
+    );
   } catch (error) {
     capture(error, input.config, 'begin');
     return silentHuman('KEEP_SILENT');
@@ -251,7 +272,7 @@ export async function evaluateAnaResumeForInbound(
 
   let history: Awaited<ReturnType<typeof getHistoryWithTimestamps>>;
   try {
-    history = await deps.loadHistory(
+    history = await resolved.loadHistory(
       input.config.phoneNumberId,
       input.customerPhone
     );
@@ -262,7 +283,7 @@ export async function evaluateAnaResumeForInbound(
 
   let classification: AnaResumeClassification;
   try {
-    classification = await deps.classify({
+    classification = await resolved.classify({
       history,
       config: input.config,
       customerName: input.customerName,
@@ -277,7 +298,7 @@ export async function evaluateAnaResumeForInbound(
 
   try {
     const finalized = parseAnaResumeGateFinalizeResponse(
-      await deps.finalize({
+      await resolved.finalize({
         phoneNumberId: input.config.phoneNumberId,
         customerPhone: input.customerPhone,
         expectedVersion: begin.expectedVersion,
@@ -299,6 +320,10 @@ export async function evaluateAnaResumeForInbound(
           : classification.decision
       );
     }
+    resolved.onAnaResumeApplied?.(
+      input.config.phoneNumberId,
+      input.customerPhone
+    );
     return {
       allowed: true,
       disposition: 'RESUME_APPROVED',
@@ -320,8 +345,9 @@ export async function shouldAnaResumeForInbound(
     config: TenantBotConfig;
     customerPhone: string;
     customerName?: string | null;
+    inboundText?: string | null;
   },
-  deps: AnaResumeGateDeps = defaultDeps
+  deps: Partial<AnaResumeGateDeps> = {}
 ): Promise<boolean> {
   return (await evaluateAnaResumeForInbound(input, deps)).allowed;
 }

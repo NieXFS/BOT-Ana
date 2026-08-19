@@ -274,6 +274,9 @@ async function main(): Promise<void> {
         providerStatusAt: now,
         providerFailureCode: null,
         callbackPending: true,
+        humanHistoryPayload: null,
+        humanHistoryAcceptedAt: null,
+        humanHistoryRecordedAt: null,
       };
     },
   });
@@ -301,16 +304,25 @@ async function main(): Promise<void> {
         providerStatusAt: null,
         providerFailureCode: null,
         callbackPending: false,
+        humanHistoryPayload: null,
+        humanHistoryAcceptedAt: null,
+        humanHistoryRecordedAt: null,
       };
       return { inserted: true, row: replyRow };
     },
-    async update(_key, nextStatus, providerMessageId, failureCode) {
+    async update(_key, nextStatus, providerMessageId, failureCode, snapshot) {
       replyRow = {
         ...replyRow!,
         status: nextStatus,
         providerMessageId: providerMessageId ?? replyRow!.providerMessageId,
         failureCode,
         updatedAt: now,
+        humanHistoryPayload:
+          replyRow!.humanHistoryPayload ?? snapshot?.payload ?? null,
+        humanHistoryAcceptedAt:
+          providerMessageId && snapshot?.acceptedAt
+            ? snapshot.acceptedAt
+            : replyRow!.humanHistoryAcceptedAt ?? snapshot?.acceptedAt ?? null,
       };
       return replyRow;
     },
@@ -335,6 +347,20 @@ async function main(): Promise<void> {
       whatsappSends += 1;
       return { providerMessageId: 'wamid-whatsapp-once' };
     },
+    projectHumanHistory: async (input) => {
+      if (replyRow) {
+        replyRow = {
+          ...replyRow,
+          humanHistoryPayload: replyRow.humanHistoryPayload ?? input.payload,
+          humanHistoryAcceptedAt: input.providerMessageId
+            ? input.acceptedAt
+            : replyRow.humanHistoryAcceptedAt ?? input.acceptedAt,
+          humanHistoryRecordedAt: replyRow.humanHistoryRecordedAt ?? now,
+        };
+      }
+      return 'recorded';
+    },
+    withdrawHumanHistory: async () => undefined,
   });
   await reply.sendQuestionReply(
     replyInput,
@@ -347,6 +373,39 @@ async function main(): Promise<void> {
     replyDeps
   );
   check('status/callback/replay mantêm envio WhatsApp ≤1×', whatsappSends === 1);
+
+  seed('wamid-history-repair');
+  let statusRepair = 0;
+  await status.handleWhatsAppStatuses(
+    value('wamid-history-repair', 'delivered', 1_722_470_501),
+    {
+      ...successDeps,
+      repairHumanHistory: async (providerMessageId) => {
+        if (providerMessageId === 'wamid-history-repair') statusRepair += 1;
+      },
+    }
+  );
+  check(
+    'status sent/delivered/read reusa o sweeper para projetar histórico humano',
+    statusRepair === 1
+  );
+
+  let sweepRepair = 0;
+  const sweepResult = await status.sweepWhatsAppStatusCallbacks({
+    store: {
+      ...store,
+      listPendingCallbacks: async () => [],
+    },
+    postCallback: async () => undefined,
+    wait: async () => undefined,
+    repairHumanHistory: async () => {
+      sweepRepair += 1;
+    },
+  });
+  check(
+    'sweep existente repara histórico humano sem poller novo',
+    sweepRepair === 1 && sweepResult.attempted === 0
+  );
 
   status.__resetWhatsAppStatusCallbackSweepForTest();
   const schedulerFirst = status.startWhatsAppStatusCallbackSweep(successDeps, 60_000);

@@ -149,6 +149,29 @@ export function peekLocalEchoLatch(
     : null;
 }
 
+/**
+ * Após finalize(RESUME_ANA/PROCEED): apaga só o latch ECHO local e invalida o
+ * cache ordinário da conversa (força o próximo GET). Não toca manutenção
+ * técnica, escalação, pausa global nem agenda — esses motivos continuam
+ * soberanos na checagem seguinte.
+ */
+export function releaseLocalEchoPauseAfterAnaResume(
+  phoneNumberId: string,
+  customerPhone: string
+): void {
+  const canonicalPhone = canonicalCustomerPhone(customerPhone);
+  const key = cacheKey(phoneNumberId, canonicalPhone);
+  echoLatchByConversation.delete(key);
+  const existing = pauseCache.get(key);
+  if (!existing) return;
+  pauseCache.set(key, {
+    globalUntilMs: existing.globalUntilMs,
+    conversationUntilMs: null,
+    scheduleUntilMs: existing.scheduleUntilMs,
+    expiresAt: 0,
+  });
+}
+
 // NUNCA logar PII: só phoneNumberId (id do salão, allowlistado no scrub). O número
 // e o nome do cliente NÃO entram em tags/log.
 function capture(error: unknown, phoneNumberId: string, operation: string): void {
@@ -317,26 +340,66 @@ export async function isConversationPaused(
     );
   }
 
+  return isPausedFromState(
+    rememberFetchedPauseState(phoneNumberId, canonicalPhone, state, now),
+    now
+  );
+}
+
+function rememberFetchedPauseState(
+  phoneNumberId: string,
+  canonicalPhone: string,
+  state: PauseState,
+  nowMs: number
+): PauseState {
   observeTechnicalMaintenance({
     phoneNumberId,
     snapshot: parseTechnicalMaintenanceSnapshot(state.technicalMaintenance),
     tenantSlug: peekCachedTenantSlug(phoneNumberId),
   });
-
   const escalation = updateEscalationFromPauseState(
     phoneNumberId,
-    customerPhone,
+    canonicalPhone,
     state.escalation,
-    now
+    nowMs
   );
-
-  pauseCache.set(key, {
+  pauseCache.set(cacheKey(phoneNumberId, canonicalPhone), {
     globalUntilMs: toMs(state.globalPausedUntil),
     conversationUntilMs: toMs(state.conversationPausedUntil),
     scheduleUntilMs: toMs(state.schedulePausedUntil),
-    expiresAt: now + PAUSE_STATE_TTL_MS,
+    expiresAt: nowMs + PAUSE_STATE_TTL_MS,
   });
-  return isPausedFromState({ ...state, escalation }, now);
+  return { ...state, escalation };
+}
+
+/**
+ * Leitura da fronteira final (advisory lock, imediatamente antes do POST).
+ * Ignora o TTL ordinário de 25s e consulta `/pause-state` de novo: o overlay
+ * ERP de tentativa `SENDING`/`CONFIRMATION_PENDING` (e o ECHO real pós-SENT)
+ * pode nascer enquanto o brain trabalha. Falha do GET suprime o outbound
+ * (fail-closed). O latch local ECHO continua soberano. Checagens anteriores
+ * seguem em `isConversationPaused` (cache).
+ */
+export async function isConversationPausedFresh(
+  phoneNumberId: string,
+  customerPhone: string,
+  deps: ConversationPauseDeps = defaultConversationPauseDeps
+): Promise<boolean> {
+  const now = deps.now();
+  const canonicalPhone = canonicalCustomerPhone(customerPhone);
+  const latchActive = isActiveLocalEchoLatch(
+    echoLatchByConversation.get(cacheKey(phoneNumberId, canonicalPhone)),
+    now
+  );
+  const state = await deps.fetchState(phoneNumberId, canonicalPhone);
+  if (!state) return true;
+  const remembered = rememberFetchedPauseState(
+    phoneNumberId,
+    canonicalPhone,
+    state,
+    now
+  );
+  return latchActive || isPausedFromState(remembered, now);
 }
 
 /**

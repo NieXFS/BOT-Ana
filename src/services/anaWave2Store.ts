@@ -243,6 +243,27 @@ export async function ensureAnaWave2Tables(): Promise<void> {
     ON sent_question_replies (callback_next_attempt_at, updated_at)
     WHERE callback_pending = true
   `);
+  await pool.query(`
+    ALTER TABLE sent_question_replies
+    ADD COLUMN IF NOT EXISTS human_history_payload text
+  `);
+  await pool.query(`
+    ALTER TABLE sent_question_replies
+    ADD COLUMN IF NOT EXISTS human_history_accepted_at timestamptz
+  `);
+  await pool.query(`
+    ALTER TABLE sent_question_replies
+    ADD COLUMN IF NOT EXISTS human_history_recorded_at timestamptz
+  `);
+  await pool.query(`
+    DROP INDEX IF EXISTS sent_question_replies_human_history_repair_idx
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS sent_question_replies_human_history_repair_idx
+    ON sent_question_replies (updated_at)
+    WHERE human_history_recorded_at IS NULL
+      AND human_history_payload IS NOT NULL
+  `);
 }
 
 export interface AtomicInboundInput {
@@ -337,6 +358,258 @@ export async function persistHumanEchoAtomically(
   } finally {
     client.release();
   }
+}
+
+export const QUESTION_REPLY_PROVISIONAL_MESSAGE_PREFIX = 'qr-intent:';
+
+export function questionReplyProvisionalMessageId(idempotencyKey: string): string {
+  return `${QUESTION_REPLY_PROVISIONAL_MESSAGE_PREFIX}${idempotencyKey}`;
+}
+
+export interface QuestionReplyHumanHistoryProjection {
+  idempotencyKey: string;
+  conversationKey: string;
+  content: string;
+  createdAt: Date;
+  providerMessageId?: string | null;
+  payload: string;
+}
+
+function isPgUniqueViolation(error: unknown): boolean {
+  return (error as { code?: unknown }).code === '23505';
+}
+
+async function trimConversationHistory(
+  client: { query: PoolClient['query'] },
+  conversationKey: string
+): Promise<void> {
+  await client.query(
+    `DELETE FROM ana_conversation_history
+     WHERE "conversationKey" = $1
+       AND (
+         message_id IS NULL OR NOT EXISTS (
+           SELECT 1 FROM inbound_event_outbox pending
+           WHERE pending.message_id = ana_conversation_history.message_id
+             AND pending.delivered_at IS NULL
+         )
+       )
+       AND "id" NOT IN (
+         SELECT "id" FROM ana_conversation_history
+         WHERE "conversationKey" = $1
+         ORDER BY "createdAt" DESC, "id" DESC
+         LIMIT 30
+       )`,
+    [conversationKey]
+  );
+}
+
+/**
+ * Persiste snapshot + linha HUMAN na mesma transação. Sem wamid, usa
+ * `qr-intent:<idempotencyKey>` (intenção pré-Meta). Com wamid, promove essa
+ * linha para o id/horário factuais sem duplicar. O marcador NÃO exige
+ * `provider_message_id` já anexado — o reparo sobrevive ao crash pós-recibo.
+ * Nunca envia WhatsApp.
+ */
+export async function persistQuestionReplyHumanHistoryAtomically(
+  input: QuestionReplyHumanHistoryProjection
+): Promise<'recorded' | 'already_recorded'> {
+  const provisionalId = questionReplyProvisionalMessageId(input.idempotencyKey);
+  const wamid =
+    typeof input.providerMessageId === 'string' && input.providerMessageId.trim()
+      ? input.providerMessageId.trim()
+      : null;
+  const targetId = wamid ?? provisionalId;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const reservation = await client.query(
+      `UPDATE sent_question_replies
+       SET human_history_payload = COALESCE(human_history_payload, $2),
+           human_history_accepted_at = CASE
+             WHEN $3::text IS NOT NULL THEN $4
+             ELSE COALESCE(human_history_accepted_at, $4)
+           END,
+           updated_at = now()
+       WHERE idempotency_key = $1
+       RETURNING idempotency_key`,
+      [input.idempotencyKey, input.payload, wamid, input.createdAt]
+    );
+    if (!reservation.rows[0]) {
+      throw new Error('question reply human history reservation missing');
+    }
+
+    let wroteLine = false;
+    if (wamid) {
+      await client.query('SAVEPOINT promote_human');
+      try {
+        const promoted = await client.query(
+          `UPDATE ana_conversation_history
+           SET message_id = $1, "createdAt" = $2, "content" = $3
+           WHERE message_id = $4 AND "conversationKey" = $5
+           RETURNING "id"`,
+          [wamid, input.createdAt, input.content, provisionalId, input.conversationKey]
+        );
+        await client.query('RELEASE SAVEPOINT promote_human');
+        if (promoted.rows[0]) {
+          wroteLine = true;
+        } else {
+          const inserted = await client.query(
+            `INSERT INTO ana_conversation_history (
+               "conversationKey", "role", "content", "createdAt", message_id
+             ) VALUES ($1, 'assistant', $2, $3, $4)
+             ON CONFLICT (message_id) WHERE message_id IS NOT NULL DO NOTHING
+             RETURNING "id"`,
+            [input.conversationKey, input.content, input.createdAt, wamid]
+          );
+          wroteLine = inserted.rowCount === 1;
+        }
+      } catch (error) {
+        await client.query('ROLLBACK TO SAVEPOINT promote_human');
+        if (!isPgUniqueViolation(error)) throw error;
+        await client.query(
+          `DELETE FROM ana_conversation_history
+           WHERE message_id = $1 AND "conversationKey" = $2`,
+          [provisionalId, input.conversationKey]
+        );
+      }
+    } else {
+      const inserted = await client.query(
+        `INSERT INTO ana_conversation_history (
+           "conversationKey", "role", "content", "createdAt", message_id
+         ) VALUES ($1, 'assistant', $2, $3, $4)
+         ON CONFLICT (message_id) WHERE message_id IS NOT NULL DO NOTHING
+         RETURNING "id"`,
+        [input.conversationKey, input.content, input.createdAt, provisionalId]
+      );
+      wroteLine = inserted.rowCount === 1;
+    }
+
+    const existing = await client.query(
+      `SELECT "id" FROM ana_conversation_history
+       WHERE "conversationKey" = $1
+         AND message_id = ANY($2::text[])
+       LIMIT 1`,
+      [input.conversationKey, [targetId, provisionalId]]
+    );
+    if (!existing.rows[0]) {
+      throw new Error('question reply human history projection missing row');
+    }
+
+    await trimConversationHistory(client, input.conversationKey);
+
+    const marked = await client.query<{
+      human_history_recorded_at: Date | null;
+    }>(
+      `UPDATE sent_question_replies
+       SET human_history_recorded_at = COALESCE(human_history_recorded_at, now()),
+           updated_at = now()
+       WHERE idempotency_key = $1
+       RETURNING human_history_recorded_at`,
+      [input.idempotencyKey]
+    );
+    if (!marked.rows[0]?.human_history_recorded_at) {
+      throw new Error('question reply human history marker missing');
+    }
+    await client.query('COMMIT');
+    return wroteLine ? 'recorded' : 'already_recorded';
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Preserva a falha original; release da conexão encerra a transação.
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Remove a linha HUMAN provisória e o snapshot só quando o wamid ainda não
+ * foi anexado. Rejeição comprovadamente pre-send; nunca apaga fala promovida.
+ */
+export async function withdrawQuestionReplyHumanIntention(
+  idempotencyKey: string,
+  conversationKey: string
+): Promise<void> {
+  const provisionalId = questionReplyProvisionalMessageId(idempotencyKey);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM ana_conversation_history
+       WHERE message_id = $1 AND "conversationKey" = $2`,
+      [provisionalId, conversationKey]
+    );
+    await client.query(
+      `UPDATE sent_question_replies
+       SET human_history_payload = NULL,
+           human_history_accepted_at = NULL,
+           human_history_recorded_at = NULL,
+           updated_at = now()
+       WHERE idempotency_key = $1
+         AND provider_message_id IS NULL
+         AND status IN ('in_flight', 'failed_pre_send', 'stale_source')`,
+      [idempotencyKey]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Preserva a falha original; release da conexão encerra a transação.
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export interface UnrepairedQuestionReplyHumanHistory {
+  idempotencyKey: string;
+  conversationKey: string;
+  phoneNumberId: string;
+  providerMessageId: string | null;
+  payload: string;
+  acceptedAt: Date;
+}
+
+export async function listUnrepairedQuestionReplyHumanHistory(
+  limit = 100,
+  providerMessageId?: string
+): Promise<UnrepairedQuestionReplyHumanHistory[]> {
+  const result = await pool.query<{
+    idempotency_key: string;
+    conversation_key: string;
+    phone_number_id: string;
+    provider_message_id: string | null;
+    human_history_payload: string;
+    human_history_accepted_at: Date;
+  }>(
+    `SELECT idempotency_key, conversation_key, phone_number_id,
+            provider_message_id, human_history_payload,
+            human_history_accepted_at
+     FROM sent_question_replies
+     WHERE human_history_payload IS NOT NULL
+       AND human_history_accepted_at IS NOT NULL
+       AND status IN ('in_flight', 'sent', 'confirmation_pending')
+       AND (
+         ($2::text IS NOT NULL AND provider_message_id = $2)
+         OR
+         ($2::text IS NULL AND human_history_recorded_at IS NULL)
+       )
+     ORDER BY updated_at ASC
+     LIMIT $1`,
+    [limit, providerMessageId ?? null]
+  );
+  return result.rows.map((row) => ({
+    idempotencyKey: row.idempotency_key,
+    conversationKey: row.conversation_key,
+    phoneNumberId: row.phone_number_id,
+    providerMessageId: row.provider_message_id,
+    payload: row.human_history_payload,
+    acceptedAt: row.human_history_accepted_at,
+  }));
 }
 
 async function runAtomicInboundTransaction(

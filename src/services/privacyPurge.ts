@@ -49,6 +49,7 @@ export async function purgeConversationData(
            WHERE conversation_key = ANY($1)`,
           [[...keys]]
         );
+        // Snapshot human_history_* vive nesta linha; o DELETE cobre o reparo.
         const outbox = await client.query(
           `DELETE FROM inbound_event_outbox
            WHERE conversation_key = ANY($1)`,

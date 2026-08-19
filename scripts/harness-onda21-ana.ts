@@ -344,7 +344,13 @@ async function replyPhase(harnessDir: string): Promise<void> {
   let failSentPersistenceOnce = true;
   const replyStore: import('../src/services/questionReplyService').QuestionReplyStore = {
     ...replyService.pgQuestionReplyStore,
-    async update(idempotencyKey, status, persistedProviderMessageId, failureCode) {
+    async update(
+      idempotencyKey,
+      status,
+      persistedProviderMessageId,
+      failureCode,
+      snapshot
+    ) {
       if (status === 'sent' && failSentPersistenceOnce) {
         failSentPersistenceOnce = false;
         throw new Error('injected sent persistence failure');
@@ -353,7 +359,8 @@ async function replyPhase(harnessDir: string): Promise<void> {
         idempotencyKey,
         status,
         persistedProviderMessageId,
-        failureCode
+        failureCode,
+        snapshot
       );
     },
   };
