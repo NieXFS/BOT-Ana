@@ -6,6 +6,20 @@ import {
 } from './escalationCache';
 import { customerPhoneAsE164 } from './conversationOrder';
 import { buildHumanReviewCancelFallbackCopyV2 } from './conversationalV2/cancellationFlowV2';
+import type { UnderstandingFailureDivergenceV2 } from './conversationalV2/divergence';
+import {
+  classifySilentEscalationPostFailure,
+  persistSilentEscalationHold,
+  releaseSilentEscalationHold,
+  setSilentEscalationHoldOverlay,
+  SilentEscalationHoldPersistenceError,
+  SILENT_ESCALATION_FAST_RETRY_DELAYS_MS,
+  pgSilentEscalationHoldStore,
+  sweepRetryDelayMs,
+  type SilentEscalationHoldStore,
+} from './silentEscalationHold';
+import { Sentry } from '../observability/sentry';
+import { runtimeErrorKind, technicalHash } from '../observability/safeRuntime';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -21,6 +35,11 @@ export const ESCALATION_REASON_CODES = [
 
 export type EscalationReasonCode = (typeof ESCALATION_REASON_CODES)[number];
 export type EscalationTopicCode = 'PROCEDURE_INFO';
+export const ESCALATION_ACTIONS = [
+  'ANSWER_IN_RECEPS',
+  'TAKE_OVER_WHATSAPP',
+] as const;
+export type EscalationAction = (typeof ESCALATION_ACTIONS)[number];
 
 export function isAnaEscalationEnabled(
   value: string | undefined = process.env.ANA_ESCALATION_ENABLED
@@ -81,11 +100,14 @@ export interface EscalationInput {
   reasonCode: EscalationReasonCode;
   messageId: string;
   topicCode?: EscalationTopicCode;
+  requiredAction?: EscalationAction;
+  divergence?: UnderstandingFailureDivergenceV2;
 }
 
 export type EscalationOutcome =
   | { kind: 'created'; questionId: string }
   | { kind: 'active_question_different_source' }
+  | { kind: 'echo_human_active' }
   | { kind: 'failed' };
 
 export interface EscalationDeps {
@@ -209,13 +231,21 @@ export async function escalateQuestion(
     if (
       axios.isAxiosError(error) &&
       error.response?.data &&
-      typeof error.response.data === 'object' &&
-      ((error.response.data as { code?: unknown; error?: unknown }).code ===
-        'ACTIVE_QUESTION_DIFFERENT_SOURCE' ||
-        (error.response.data as { code?: unknown; error?: unknown }).error ===
-          'ACTIVE_QUESTION_DIFFERENT_SOURCE')
+      typeof error.response.data === 'object'
     ) {
-      return { kind: 'active_question_different_source' };
+      const code = (error.response.data as { code?: unknown; error?: unknown })
+        .code;
+      const errorCode = (error.response.data as { code?: unknown; error?: unknown })
+        .error;
+      if (
+        code === 'ACTIVE_QUESTION_DIFFERENT_SOURCE' ||
+        errorCode === 'ACTIVE_QUESTION_DIFFERENT_SOURCE'
+      ) {
+        return { kind: 'active_question_different_source' };
+      }
+      if (code === 'ECHO_HUMAN_ACTIVE' || errorCode === 'ECHO_HUMAN_ACTIVE') {
+        return { kind: 'echo_human_active' };
+      }
     }
     return { kind: 'failed' };
   }
@@ -406,4 +436,220 @@ export async function maybeEscalateReceptionistQuestion(
     deps
   );
   return buildEscalationReply(outcome, input.responsibleName);
+}
+
+export type SilentUnderstandingFailureOutcome =
+  | { kind: 'created'; questionId: string }
+  | { kind: 'deduplicated'; questionId: string }
+  | { kind: 'active_elsewhere' }
+  | { kind: 'pending' }
+  | { kind: 'released' };
+
+export interface SilentUnderstandingFailureDeps {
+  post?: EscalationDeps['post'];
+  holdStore?: SilentEscalationHoldStore;
+  wait?: (ms: number) => Promise<void>;
+  now?: () => Date;
+}
+
+async function postSilentUnderstandingFailureOnce(
+  input: {
+    phoneNumberId: string;
+    customerPhone: string;
+    messageId: string;
+    divergence: UnderstandingFailureDivergenceV2;
+  },
+  post: EscalationDeps['post']
+): Promise<EscalationOutcome> {
+  return escalateQuestion(
+    {
+      phoneNumberId: input.phoneNumberId,
+      customerPhone: input.customerPhone,
+      messageId: input.messageId,
+      reasonCode: 'REPEATED_FAILURE',
+      requiredAction: 'TAKE_OVER_WHATSAPP',
+      divergence: input.divergence,
+    },
+    { post }
+  );
+}
+
+/**
+ * Escala incompreensão terminal: hold durável ANTES de qualquer HTTP, silêncio
+ * sempre, POST idempotente por messageId, retry no padrão do inbound outbox.
+ */
+export async function escalateSilentUnderstandingFailure(
+  input: {
+    phoneNumberId: string;
+    customerPhone: string;
+    messageId: string;
+    divergence: UnderstandingFailureDivergenceV2;
+  },
+  deps: SilentUnderstandingFailureDeps = {}
+): Promise<SilentUnderstandingFailureOutcome> {
+  const holdStore = deps.holdStore ?? pgSilentEscalationHoldStore;
+  const post = deps.post ?? defaultDeps.post;
+  const wait = deps.wait ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const nowFn = deps.now ?? (() => new Date());
+
+  let persisted: Awaited<ReturnType<typeof persistSilentEscalationHold>>;
+  try {
+    persisted = await persistSilentEscalationHold({
+      ...input,
+      sourceMessageId: input.messageId,
+      store: holdStore,
+      now: nowFn(),
+    });
+  } catch (error) {
+    Sentry.captureException(new Error('silent escalation hold persist failed'), {
+      tags: {
+        service: 'silent_escalation',
+        operation: 'persist_hold',
+        phoneNumberHash: technicalHash(input.phoneNumberId),
+        messageIdHash: technicalHash(input.messageId),
+        error_kind: runtimeErrorKind(error),
+      },
+    });
+    if (error instanceof SilentEscalationHoldPersistenceError) throw error;
+    throw new SilentEscalationHoldPersistenceError(
+      error instanceof Error ? error.message : 'silent escalation hold persist failed'
+    );
+  }
+
+  if (persisted.kind === 'active_elsewhere') {
+    return { kind: 'active_elsewhere' };
+  }
+  if (persisted.hold.status === 'released') {
+    return { kind: 'released' };
+  }
+  if (persisted.hold.status === 'confirmed' && persisted.hold.questionId) {
+    return { kind: 'deduplicated', questionId: persisted.hold.questionId };
+  }
+  if (persisted.hold.status === 'active_elsewhere') {
+    return { kind: 'active_elsewhere' };
+  }
+
+  const attemptOnce = async (): Promise<SilentUnderstandingFailureOutcome> => {
+    const current = await holdStore.loadByMessageId(input.messageId);
+    if (!current || current.status === 'released') return { kind: 'released' };
+    if (current.status === 'confirmed' && current.questionId) {
+      return { kind: 'deduplicated', questionId: current.questionId };
+    }
+    if (current.status === 'active_elsewhere') return { kind: 'active_elsewhere' };
+
+    const nextAttempts = current.attempts + 1;
+    try {
+      const outcome = await postSilentUnderstandingFailureOnce(input, post);
+      if (outcome.kind === 'created') {
+        await holdStore.markConfirmed(input.messageId, outcome.questionId);
+        setSilentEscalationHoldOverlay(
+          input.phoneNumberId,
+          input.customerPhone,
+          false
+        );
+        return { kind: 'created', questionId: outcome.questionId };
+      }
+      if (outcome.kind === 'active_question_different_source') {
+        await holdStore.markActiveElsewhere(input.messageId);
+        return { kind: 'active_elsewhere' };
+      }
+      if (outcome.kind === 'echo_human_active') {
+        await releaseSilentEscalationHold(
+          input.phoneNumberId,
+          input.customerPhone,
+          holdStore
+        );
+        return { kind: 'released' };
+      }
+      await holdStore.markFailure(
+        input.messageId,
+        nextAttempts,
+        new Date(nowFn().getTime() + sweepRetryDelayMs(nextAttempts)),
+        'ESCALATE_FAILED'
+      );
+      return { kind: 'pending' };
+    } catch (error) {
+      const classified = classifySilentEscalationPostFailure(error);
+      if (classified.activeElsewhere) {
+        await holdStore.markActiveElsewhere(input.messageId);
+        return { kind: 'active_elsewhere' };
+      }
+      if (classified.released) {
+        await releaseSilentEscalationHold(
+          input.phoneNumberId,
+          input.customerPhone,
+          holdStore
+        );
+        return { kind: 'released' };
+      }
+      await holdStore.markFailure(
+        input.messageId,
+        nextAttempts,
+        new Date(nowFn().getTime() + sweepRetryDelayMs(nextAttempts)),
+        classified.failureCode
+      );
+      Sentry.captureException(new Error('silent escalation post failed'), {
+        level: 'warning',
+        tags: {
+          service: 'silent_escalation',
+          operation: 'post',
+          phoneNumberHash: technicalHash(input.phoneNumberId),
+          messageIdHash: technicalHash(input.messageId),
+          failure_code: classified.failureCode,
+          error_kind: runtimeErrorKind(error),
+        },
+      });
+      return { kind: 'pending' };
+    }
+  };
+
+  try {
+    let result = await attemptOnce();
+    for (const delay of SILENT_ESCALATION_FAST_RETRY_DELAYS_MS) {
+      if (result.kind !== 'pending') break;
+      await wait(delay);
+      result = await attemptOnce();
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof SilentEscalationHoldPersistenceError) throw error;
+    Sentry.captureException(new Error('silent escalation after hold persist failed'), {
+      level: 'warning',
+      tags: {
+        service: 'silent_escalation',
+        operation: 'post_persist',
+        phoneNumberHash: technicalHash(input.phoneNumberId),
+        messageIdHash: technicalHash(input.messageId),
+        error_kind: runtimeErrorKind(error),
+      },
+    });
+    return { kind: 'pending' };
+  }
+}
+
+export async function sweepSilentEscalationHolds(
+  deps: SilentUnderstandingFailureDeps = {},
+  limit = 100
+): Promise<{ attempted: number; confirmed: number }> {
+  const holdStore = deps.holdStore ?? pgSilentEscalationHoldStore;
+  const now = deps.now?.() ?? new Date();
+  const messageIds = await holdStore.listReady(limit, now);
+  let confirmed = 0;
+  for (const messageId of messageIds) {
+    const row = await holdStore.loadByMessageId(messageId);
+    if (!row || row.status !== 'pending') continue;
+    const result = await escalateSilentUnderstandingFailure(
+      {
+        phoneNumberId: row.phoneNumberId,
+        customerPhone: row.customerPhone,
+        messageId: row.sourceMessageId,
+        divergence: row.divergence,
+      },
+      { ...deps, holdStore }
+    );
+    if (result.kind === 'created' || result.kind === 'deduplicated') {
+      confirmed += 1;
+    }
+  }
+  return { attempted: messageIds.length, confirmed };
 }

@@ -13,7 +13,14 @@ import {
   __strictOrdinalForSmokeV2,
   resolveInitialServiceQuestionFastPathV2,
   resolveSelectionFastPathV2,
+  resolveWitnessedServiceFamilyFastPathV2,
 } from '../src/services/conversationalV2/fastPaths';
+import { resolveBookingReentryFastPathV2 } from '../src/services/conversationalV2/bookingReentryFastPath';
+import {
+  materializeServiceClarificationV2,
+  SERVICE_LIST_TRANSPORT_CEILING_V2,
+} from '../src/services/conversationalV2/serviceList';
+import { buildServiceQuestion } from '../src/services/service-gate';
 import {
   __enforceCanonicalTimeSummaryTransitionForSmokeV2,
   getReceptionistReplyV2,
@@ -271,6 +278,7 @@ const baseDeps = (store: MemoryConversationalV2StateStore) => ({
   isPaused: async () => false,
   executeProactiveDuplicateRead: async () =>
     JSON.stringify({ success: true, appointments: [] }),
+  escalateSilent: async () => ({ kind: 'pending' as const }),
 });
 
 async function main(): Promise<void> {
@@ -510,6 +518,349 @@ async function main(): Promise<void> {
       label
     );
   }
+
+  const familyCatalog: ServicesResult = {
+    success: true,
+    services: [
+      {
+        id: 'svc-virilha',
+        name: 'Depilação virilha completa',
+        durationMinutes: 30,
+        price: 80,
+        priceFormatted: 'R$ 80,00',
+        professionalIds: ['prof-julia'],
+      },
+      {
+        id: 'svc-coxa',
+        name: 'Depilação coxa',
+        durationMinutes: 30,
+        price: 80,
+        priceFormatted: 'R$ 80,00',
+        professionalIds: ['prof-julia'],
+      },
+      {
+        id: 'svc-axila',
+        name: 'Depilação axila',
+        durationMinutes: 20,
+        price: 60,
+        priceFormatted: 'R$ 60,00',
+        professionalIds: ['prof-julia'],
+      },
+      {
+        id: 'svc-peeling-family',
+        name: 'Peeling Facial',
+        durationMinutes: 60,
+        price: 100,
+        priceFormatted: 'R$ 100,00',
+        professionalIds: ['prof-julia'],
+      },
+    ],
+    professionals: [{ id: 'prof-julia', name: 'Júlia' }],
+  };
+  const familyIds = ['svc-virilha', 'svc-coxa', 'svc-axila'];
+  const familyNames = [
+    'Depilação virilha completa',
+    'Depilação coxa',
+    'Depilação axila',
+  ];
+  const familyQuestion = resolveInitialServiceQuestionFastPathV2({
+    frame: promptFrame,
+    inboundText: 'Quero marcar depilação',
+    catalog: familyCatalog,
+    now,
+  });
+  assert.equal(familyQuestion.kind, 'resolved');
+  if (familyQuestion.kind === 'resolved') {
+    assert.equal(
+      familyQuestion.result.pendingTransitionCandidate.kind === 'open' &&
+        familyQuestion.result.pendingTransitionCandidate.pendingKind,
+      'SERVICE'
+    );
+    assert.deepEqual(
+      familyQuestion.result.pendingTransitionCandidate.kind === 'open'
+        ? familyQuestion.result.pendingTransitionCandidate.optionEntityIds
+        : [],
+      familyIds
+    );
+    for (const name of familyNames) {
+      assert.match(familyQuestion.result.reply, new RegExp(name));
+    }
+    assert.doesNotMatch(familyQuestion.result.reply, /Peeling Facial/u);
+  }
+  const familyAvailability = resolveWitnessedServiceFamilyFastPathV2({
+    frame: promptFrame,
+    inboundText: 'Tem horário para depilação hoje?',
+    catalog: familyCatalog,
+    now,
+  });
+  assert.equal(familyAvailability.kind, 'resolved');
+  if (familyAvailability.kind === 'resolved') {
+    assert.deepEqual(
+      familyAvailability.result.pendingTransitionCandidate.kind === 'open'
+        ? familyAvailability.result.pendingTransitionCandidate.optionEntityIds
+        : [],
+      familyIds
+    );
+  }
+  assert.equal(
+    resolveWitnessedServiceFamilyFastPathV2({
+      frame: promptFrame,
+      inboundText: 'Não quero depilação',
+      catalog: familyCatalog,
+      now,
+    }).kind,
+    'continue_model',
+    'negação não abre família positiva'
+  );
+  assert.equal(
+    resolveInitialServiceQuestionFastPathV2({
+      frame: promptFrame,
+      inboundText: 'quero agendar Depilação virilha completa',
+      catalog: familyCatalog,
+      now,
+    }).kind,
+    'continue_model',
+    'serviço exato já resolvido permanece continue_model'
+  );
+
+  const wallCatalog: ServicesResult = {
+    success: true,
+    services: Array.from({ length: 103 }, (_, index) => ({
+      id: `svc-wall-${index + 1}`,
+      name: `Serviço catalogado ${String(index + 1).padStart(3, '0')}`,
+      durationMinutes: 30,
+      price: 50,
+      priceFormatted: 'R$ 50,00',
+      professionalIds: ['prof-julia'],
+    })),
+    professionals: [{ id: 'prof-julia', name: 'Júlia' }],
+  };
+  const wallMaterialized = materializeServiceClarificationV2(wallCatalog.services ?? []);
+  assert.ok(wallMaterialized);
+  assert.ok(wallMaterialized!.visibleServiceIds.length <= 8);
+  assert.ok(wallMaterialized!.text.length <= SERVICE_LIST_TRANSPORT_CEILING_V2);
+  assert.equal(
+    wallMaterialized!.omittedCount,
+    103 - wallMaterialized!.visibleServiceIds.length
+  );
+  const wallOpened = resolveInitialServiceQuestionFastPathV2({
+    frame: promptFrame,
+    inboundText: 'Quero agendar',
+    catalog: wallCatalog,
+    now,
+  });
+  assert.equal(wallOpened.kind, 'resolved');
+  if (wallOpened.kind === 'resolved') {
+    const optionIds =
+      wallOpened.result.pendingTransitionCandidate.kind === 'open'
+        ? wallOpened.result.pendingTransitionCandidate.optionEntityIds
+        : [];
+    assert.deepEqual(optionIds, wallMaterialized!.visibleServiceIds);
+    for (const id of optionIds) {
+      const name = wallCatalog.services!.find((entry) => entry.id === id)?.name;
+      assert.ok(name && wallOpened.result.reply.includes(name));
+    }
+    assert.ok(!wallOpened.result.reply.includes('Serviço catalogado 103'));
+  }
+
+  const longName = 'A'.repeat(800);
+  const longCatalog: ServicesResult = {
+    success: true,
+    services: Array.from({ length: 8 }, (_, index) => ({
+      id: `svc-long-${index + 1}`,
+      name: `${longName} ${index + 1}`,
+      durationMinutes: 30,
+      price: 50,
+      priceFormatted: 'R$ 50,00',
+      professionalIds: ['prof-julia'],
+    })),
+    professionals: [{ id: 'prof-julia', name: 'Júlia' }],
+  };
+  const longMaterialized = materializeServiceClarificationV2(longCatalog.services ?? []);
+  assert.ok(longMaterialized);
+  assert.ok(longMaterialized!.visibleServiceIds.length < 8);
+  assert.ok(longMaterialized!.text.length <= SERVICE_LIST_TRANSPORT_CEILING_V2);
+  for (const id of longMaterialized!.visibleServiceIds) {
+    const name = longCatalog.services!.find((entry) => entry.id === id)?.name;
+    assert.ok(name && longMaterialized!.text.includes(name));
+    assert.ok(!longMaterialized!.text.includes(`${name.slice(0, 40)}…`));
+  }
+
+  const familyPending = pending({
+    kind: 'SERVICE',
+    options: familyIds.map((entityId, index) => ({
+      position: index + 1,
+      entityId,
+      displayName: familyNames[index]!,
+    })),
+  });
+  const familyOrdinal = resolveSelectionFastPathV2({
+    frame: {
+      ...promptFrame,
+      pending: familyPending,
+      flowState: { flowId: familyPending.flowId, fixedByProofVersion: {} },
+      currentInboundIds: ['inbound-family-ordinal'],
+    },
+    inboundId: 'inbound-family-ordinal',
+    inboundText: 'a segunda opção',
+    catalog: familyCatalog,
+    now,
+  });
+  assert.equal(familyOrdinal.kind, 'resolved');
+  if (familyOrdinal.kind === 'resolved') {
+    assert.equal(familyOrdinal.proof?.kind, 'pending_option');
+    assert.equal(familyOrdinal.proof?.entityId, 'svc-coxa');
+    assert.equal(familyOrdinal.nextFlowState.fixedServiceId, 'svc-coxa');
+  }
+  const omittedExact = resolveInitialServiceQuestionFastPathV2({
+    frame: promptFrame,
+    inboundText: 'quero agendar Serviço catalogado 103',
+    catalog: wallCatalog,
+    now,
+  });
+  assert.equal(
+    omittedExact.kind,
+    'continue_model',
+    'nome exato omitido pelo teto continua resolvível no matcher canônico'
+  );
+
+  const v1Family = buildServiceQuestion(
+    familyCatalog.services ?? [],
+    'Quero marcar depilação'
+  );
+  assert.match(v1Family, /Depilação virilha completa/);
+  assert.match(v1Family, /Depilação coxa/);
+  assert.match(v1Family, /Depilação axila/);
+  assert.doesNotMatch(v1Family, /Peeling Facial/u);
+
+  const reentryNewFrame = {
+    ...promptFrame,
+    pending: pending({
+      kind: 'CONFIRMATION' as const,
+      options: [
+        { position: 1, entityId: 'booking-reentry:continue', displayName: 'continuar' },
+        { position: 2, entityId: 'booking-reentry:new', displayName: 'novo' },
+      ],
+    }),
+    flowState: {
+      flowId: promptFrame.flowState.flowId,
+      fixedServiceId: 'svc-virilha',
+      resolvedDate: '2026-08-21',
+      bookingReentry: {
+        pendingKind: 'TIME' as const,
+        optionEntityIds: ['14:00', '15:00'],
+      },
+      fixedByProofVersion: {},
+    },
+  };
+  reentryNewFrame.pending = {
+    ...reentryNewFrame.pending!,
+    flowId: reentryNewFrame.flowState.flowId,
+  };
+  const reentryNew = resolveBookingReentryFastPathV2({
+    frame: reentryNewFrame,
+    inboundId: 'inbound-reentry-new',
+    inboundText: 'novo',
+    currentDateResolution: { kind: 'none', mentions: [] },
+    catalog: wallCatalog,
+    now,
+    newFlowId: () => 'flow-reentry-new',
+  });
+  assert.equal(reentryNew.kind, 'resolved');
+  if (reentryNew.kind === 'resolved') {
+    const optionIds =
+      reentryNew.result.pendingTransitionCandidate.kind === 'open'
+        ? reentryNew.result.pendingTransitionCandidate.optionEntityIds
+        : [];
+    assert.ok(optionIds.length <= 8);
+    assert.deepEqual(optionIds, wallMaterialized!.visibleServiceIds);
+    assert.ok(!reentryNew.result.reply.includes('Serviço catalogado 103'));
+  }
+
+  const familyStore = new MemoryConversationalV2StateStore();
+  const familyPhone = '5511000000191';
+  familyStore.setInputSequence(`${config.phoneNumberId}:${familyPhone}`, 1);
+  let familyModelCalls = 0;
+  let familyToolCalls = 0;
+  const familyTurn = await getReceptionistReplyV2({
+    phone: familyPhone,
+    userMessage: 'Quero marcar depilação',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Quero marcar depilação' }),
+    deps: {
+      ...baseDeps(familyStore),
+      loadServices: async () => familyCatalog,
+      interpreterEnabled: true,
+      runInterpreter: async () => {
+        throw new Error('família testemunhada não chama intérprete');
+      },
+      runModelLoop: async () => {
+        familyModelCalls += 1;
+        throw new Error('família testemunhada não chama modelo');
+      },
+      executeTool: async () => {
+        familyToolCalls += 1;
+        throw new Error('família testemunhada não chama tools');
+      },
+    },
+  });
+  assert.equal(familyTurn.planReceipt.route, 'fast_path');
+  assert.equal(familyTurn.planReceipt.recoveryKind, 'none');
+  assert.equal(familyTurn.payload && familyTurn.payload.length > 0, true);
+  assert.doesNotMatch(familyTurn.payload ?? '', /Peeling Facial/u);
+  assert.equal(familyTurn.transition.kind, 'open');
+  if (familyTurn.transition.kind === 'open') {
+    assert.equal(familyTurn.transition.frame.kind, 'SERVICE');
+    assert.deepEqual(
+      familyTurn.transition.frame.options.map((option) => option.entityId),
+      familyIds
+    );
+  }
+  assert.equal(familyModelCalls, 0);
+  assert.equal(familyToolCalls, 0);
+  assert.doesNotMatch(
+    JSON.stringify(familyTurn.planReceipt.toolEffects ?? []),
+    /bookAppointment|cancelAppointment|getAvailableSlots/u
+  );
+
+  const familyAvailStore = new MemoryConversationalV2StateStore();
+  const familyAvailPhone = '5511000000192';
+  familyAvailStore.setInputSequence(`${config.phoneNumberId}:${familyAvailPhone}`, 1);
+  const familyAvailTurn = await getReceptionistReplyV2({
+    phone: familyAvailPhone,
+    userMessage: 'Tem horário para depilação hoje?',
+    userName: 'Cliente',
+    config,
+    turnRuntime: turnRuntime({ text: 'Tem horário para depilação hoje?' }),
+    deps: {
+      ...baseDeps(familyAvailStore),
+      loadServices: async () => familyCatalog,
+      interpreterEnabled: true,
+      runInterpreter: async () => {
+        throw new Error('família de disponibilidade não chama intérprete');
+      },
+      runModelLoop: async () => {
+        throw new Error('família de disponibilidade não chama modelo');
+      },
+      executeTool: async () => {
+        throw new Error('família de disponibilidade não chama tools');
+      },
+    },
+  });
+  assert.equal(familyAvailTurn.planReceipt.route, 'fast_path');
+  assert.equal(familyAvailTurn.transition.kind, 'open');
+  if (familyAvailTurn.transition.kind === 'open') {
+    assert.equal(familyAvailTurn.transition.frame.kind, 'SERVICE');
+    assert.deepEqual(
+      familyAvailTurn.transition.frame.options.map((option) => option.entityId),
+      familyIds
+    );
+  }
+  assert.doesNotMatch(
+    JSON.stringify(familyAvailTurn.planReceipt.toolEffects ?? []),
+    /getAvailableSlots|bookAppointment|cancelAppointment/u
+  );
 
   const timePending = pending({
     kind: 'TIME',
@@ -2873,7 +3224,7 @@ async function main(): Promise<void> {
   });
   assert.equal(i3ModelCalls, 0);
   assert.equal(i3.planReceipt.route, 'fast_path');
-  assert.match(i3.payload ?? '', /qual serviço/i);
+  assert.match(i3.payload ?? '', /por aqui:|interess/i);
   assert.doesNotMatch(i3.payload ?? '', /não (?:temos|está disponível)/i);
   assert.equal(i3.transition.kind, 'open');
   assert.equal(i3.transition.kind === 'open' && i3.transition.frame.kind, 'SERVICE');
@@ -2966,8 +3317,8 @@ async function main(): Promise<void> {
   });
   assert.equal(truncatedRegenCalls, 1);
   assert.equal(truncatedPrepared.planReceipt.route, 'fallback');
-  assert.equal(truncatedPrepared.planReceipt.primaryProviderCalls, 1);
-  assert.ok(truncatedPrepared.payload.trim().length > 0);
+  assert.equal(truncatedPrepared.planReceipt.recoveryKind, 'silent_escalation');
+  assert.equal(truncatedPrepared.payload, null);
 
   // D4 pós-matriz 2: content vazio sem qualquer tool permite exatamente uma
   // reinvocação completa. As duas provider calls ficam reconciliadas no plano.

@@ -17,6 +17,11 @@ import {
   isConversationPausedForEscalationAcknowledgement,
 } from './services/pauseService';
 import {
+  lookupSilentEscalationHold,
+  SilentEscalationHoldPersistenceError,
+  type SilentEscalationHoldLookupV2,
+} from './services/silentEscalationHold';
+import {
   evaluateAnaResumeForInbound,
   shouldAnaResumeForInbound,
   turnControlFromResumeEvaluation,
@@ -89,6 +94,10 @@ import type { DurableSuccessorBatchV2 } from './services/conversationalV2/stateS
 type OutboundReply = string | ValidatedReceptionistOutbound;
 type BufferedReply = OutboundReply | PreparedReceptionistTurnV2;
 export type ConfiguredReplyDelivery = 'sent' | 'suppressed';
+type SilentHoldLookup = (
+  phoneNumberId: string,
+  customerPhone: string
+) => Promise<SilentEscalationHoldLookupV2>;
 
 interface MessageBuffer {
   texts: string[];
@@ -187,6 +196,13 @@ export interface FlushDeps {
     phoneNumberId: string,
     customerPhone: string
   ) => Promise<boolean>;
+  /** Fresh ERP pause read without the local silent-hold overlay. */
+  isPausedWithoutSilentHoldBeforeTransport?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
+  /** Local tri-state lookup; `unknown` is fail-closed for reception. */
+  lookupSilentHold?: SilentHoldLookup;
   isPausedForEscalationAck?: (
     phoneNumberId: string,
     customerPhone: string,
@@ -207,7 +223,7 @@ export interface FlushDeps {
     prepared: PreparedReceptionistTurnV2,
     checkpoint: () => Promise<ConversationalV2Checkpoint>
   ) => Promise<{
-    delivery: 'sent' | 'suppressed' | 'transport_unknown' | 'transport_failed';
+    delivery: 'sent' | 'suppressed' | 'transport_unknown' | 'transport_failed' | 'silent';
     successor?: DurableSuccessorBatchV2 | null;
   }>;
 }
@@ -245,6 +261,8 @@ export interface ConfiguredReplyDeps {
     phoneNumberId: string,
     customerPhone: string
   ) => Promise<boolean>;
+  /** Local tri-state lookup; `unknown` is fail-closed for reception. */
+  lookupSilentHold?: SilentHoldLookup;
 }
 
 const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
@@ -258,7 +276,20 @@ const defaultConfiguredReplyDeps: ConfiguredReplyDeps = {
     await sendFreeformMessageWithReceipt(from, text, config);
   },
   isPausedBeforeTransport: isConversationPausedFresh,
+  lookupSilentHold: lookupSilentEscalationHold,
 };
+
+async function isSilentHoldSuppressed(
+  botRole: TenantBotConfig['botRole'],
+  phoneNumberId: string,
+  customerPhone: string,
+  lookup?: SilentHoldLookup
+): Promise<boolean> {
+  if (botRole === 'sales' || !lookup) return false;
+  // Only a proven inactive result licenses receptionist output. A store
+  // exception is `unknown` and therefore remains suppressed.
+  return (await lookup(phoneNumberId, customerPhone)).kind !== 'inactive';
+}
 
 /** Seam do ponto de entrega: permite provar o caminho byte-idêntico da recepção. */
 export async function sendConfiguredReply(
@@ -292,7 +323,31 @@ export async function sendConfiguredReply(
       });
       return 'suppressed';
     }
+    // The local hold check precedes typing so `unknown` cannot simulate human
+    // activity before the fail-closed decision.
+    if (
+      await isSilentHoldSuppressed(
+        config.botRole,
+        config.phoneNumberId,
+        from,
+        deps.lookupSilentHold
+      )
+    ) {
+      return 'suppressed';
+    }
     if (typingSimEnabled(config)) await deps.waitTyping(validated.payload);
+    // Echo can arrive during the typing delay. Recheck the local overlay before
+    // the fresh ERP boundary and the transport.
+    if (
+      await isSilentHoldSuppressed(
+        config.botRole,
+        config.phoneNumberId,
+        from,
+        deps.lookupSilentHold
+      )
+    ) {
+      return 'suppressed';
+    }
     if (
       deps.isPausedBeforeTransport &&
       (await deps.isPausedBeforeTransport(config.phoneNumberId, from))
@@ -341,7 +396,15 @@ const defaultFlushDeps: FlushDeps = {
     return 'sent';
   },
   isPaused: isConversationPaused,
-  isPausedBeforeTransport: isConversationPausedFresh,
+  lookupSilentHold: lookupSilentEscalationHold,
+  isPausedBeforeTransport: (phoneNumberId, customerPhone) =>
+    isPausedIncludingSilentHold(
+      phoneNumberId,
+      customerPhone,
+      isConversationPausedFresh,
+      lookupSilentEscalationHold
+    ),
+  isPausedWithoutSilentHoldBeforeTransport: isConversationPausedFresh,
   isPausedForEscalationAck:
     isConversationPausedForEscalationAcknowledgement,
   recordPausedInbound: recordInboundWhilePaused,
@@ -349,6 +412,54 @@ const defaultFlushDeps: FlushDeps = {
   withConversationLock: (phoneNumberId, customerPhone, work) =>
     withConversationLock(phoneNumberId, customerPhone, async () => work()),
 };
+
+async function isPausedIncludingSilentHold(
+  phoneNumberId: string,
+  customerPhone: string,
+  fallback: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>,
+  lookup: SilentHoldLookup = lookupSilentEscalationHold
+): Promise<boolean> {
+  if (
+    await isSilentHoldSuppressed(
+      'receptionist',
+      phoneNumberId,
+      customerPhone,
+      lookup
+    )
+  ) {
+    return true;
+  }
+  return fallback(phoneNumberId, customerPhone);
+}
+
+async function isReceptionistPausedWithSilentHold(
+  botRole: TenantBotConfig['botRole'],
+  phoneNumberId: string,
+  customerPhone: string,
+  fallback: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>,
+  lookup?: SilentHoldLookup
+): Promise<boolean> {
+  if (botRole === 'sales') {
+    return fallback(phoneNumberId, customerPhone);
+  }
+  if (
+    await isSilentHoldSuppressed(
+      botRole,
+      phoneNumberId,
+      customerPhone,
+      lookup
+    )
+  ) {
+    return true;
+  }
+  return fallback(phoneNumberId, customerPhone);
+}
 
 function safeSalesContext(config: TenantBotConfig, from: string): string {
   return `phoneNumberId=${config.phoneNumberId} convHash=${conversationHash(
@@ -381,6 +492,31 @@ function resolvePauseBeforeTransport(deps: {
   );
 }
 
+function resolvePauseWithoutSilentHoldBeforeTransport(deps: {
+  isPausedWithoutSilentHoldBeforeTransport?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
+  isPausedBeforeTransport?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
+  isPaused?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<boolean>;
+}): (
+  phoneNumberId: string,
+  customerPhone: string
+) => Promise<boolean> {
+  return (
+    deps.isPausedWithoutSilentHoldBeforeTransport ??
+    deps.isPausedBeforeTransport ??
+    deps.isPaused ??
+    isConversationPausedFresh
+  );
+}
+
 /**
  * M24: após uma falha no flush, avisa o cliente UMA vez (dentro da janela de
  * recovery) que houve um problema e pede pra repetir — antes ele ficava em
@@ -390,7 +526,8 @@ async function emitFlushFallback(
   bufferKey: string,
   from: string,
   config: TenantBotConfig,
-  deps: FlushDeps
+  deps: FlushDeps,
+  options: { skipSilentHoldLookup?: boolean } = {}
 ): Promise<void> {
   const now = Date.now();
   const suppressedUntil = flushRecoveryUntil.get(bufferKey) ?? 0;
@@ -416,9 +553,18 @@ async function emitFlushFallback(
           _customerPhone: string,
           work: () => Promise<void>
         ) => work());
-      const isPaused = resolvePauseBeforeTransport(deps);
+      const authoritativePause = resolvePauseWithoutSilentHoldBeforeTransport(deps);
       await serialize(config.phoneNumberId, from, async () => {
-        if (await isPaused(config.phoneNumberId, from)) {
+        const paused = options.skipSilentHoldLookup
+          ? await authoritativePause(config.phoneNumberId, from)
+          : await isReceptionistPausedWithSilentHold(
+              config.botRole,
+              config.phoneNumberId,
+              from,
+              authoritativePause,
+              deps.lookupSilentHold
+            );
+        if (paused) {
           sent = false;
           return;
         }
@@ -497,7 +643,15 @@ async function suppressFlushIfPaused(params: {
 }): Promise<boolean> {
   const { bufferKey, buffer, alreadyProcessedTexts, deps } = params;
   const isPaused = deps.isPaused ?? isConversationPaused;
-  if (!(await isPaused(buffer.config.phoneNumberId, buffer.from))) {
+  if (
+    !(await isReceptionistPausedWithSilentHold(
+      buffer.config.botRole,
+      buffer.config.phoneNumberId,
+      buffer.from,
+      isPaused,
+      deps.lookupSilentHold
+    ))
+  ) {
     return false;
   }
   cancelOnboardingPolling(bufferKey);
@@ -834,6 +988,7 @@ export async function flushBuffer(
           work: () => Promise<void>
         ) => work());
       let delivery: ConfiguredReplyDelivery = 'sent';
+      let silentTurn = false;
 
       // A pausa (inclusive o pause-ack e o latch local ECHO) e o transporte
       // compartilham a MESMA advisory lock do echo. pauseConversation do echo
@@ -922,14 +1077,29 @@ export async function flushBuffer(
               buffer.pendingForceUpcomingReadV2 === true ||
               result.successor.requiresAuthoritativeRead;
           }
-          if (result.delivery !== 'sent') delivery = 'suppressed';
+          if (result.delivery === 'silent') {
+            silentTurn = true;
+            delivery = 'sent';
+          } else if (result.delivery !== 'sent') {
+            delivery = 'suppressed';
+          }
         } else {
           const result = await deps.sendReply(from, reply as OutboundReply, config);
           if (result === 'suppressed') delivery = 'suppressed';
         }
       });
 
-      if (delivery === 'sent') {
+      if (silentTurn) {
+        const current = messageBuffers.get(bufferKey);
+        if (current) {
+          current.pendingTexts = [];
+          current.pendingMessageIds = [];
+          current.pendingInputSequences = [];
+        }
+        console.log(
+          `🤫 Escalada silenciosa encerrada sem outbound | ${safeSalesContext(config, from)}`
+        );
+      } else if (delivery === 'sent') {
         console.log(
           `🤖 Resposta enviada | ${safeSalesContext(config, from)} | chars=${typeof reply === 'string' ? reply.length : reply.payload?.length ?? 0}`
         );
@@ -997,7 +1167,11 @@ export async function flushBuffer(
       // `emitFlushFallback` é o único dono de lock+pausa+transporte neste
       // caminho. Advisory locks PG não são reentrantes entre conexões: adquirir
       // aqui e novamente dentro do helper causaria deadlock real.
-      await emitFlushFallback(bufferKey, from, config, deps);
+      // Somente a falha tipada de persistência inicial pode ignorar o lookup
+      // local neste M24 técnico. Qualquer outro erro permanece fail-closed.
+      await emitFlushFallback(bufferKey, from, config, deps, {
+        skipSilentHoldLookup: err instanceof SilentEscalationHoldPersistenceError,
+      });
     }
   }
 
@@ -1212,6 +1386,8 @@ export interface IncomingMessageDeps {
    * fora de horário). Default: GET fresco. Ausente nos smokes → `isPaused`.
    */
   isPausedBeforeTransport?: typeof isConversationPausedFresh;
+  /** Local tri-state lookup; `unknown` suppresses receptionist output. */
+  lookupSilentHold?: SilentHoldLookup;
   resumeGate?: typeof shouldAnaResumeForInbound;
   evaluateResume?: typeof evaluateAnaResumeForInbound;
   sendReply?: typeof sendConfiguredReply;
@@ -1232,7 +1408,14 @@ const defaultIncomingMessageDeps: IncomingMessageDeps = {
   handleOptOut: tryHandleOptOut,
   shouldSuspend: shouldSuspendForPendingInbound,
   isPaused: isConversationPaused,
-  isPausedBeforeTransport: isConversationPausedFresh,
+  lookupSilentHold: lookupSilentEscalationHold,
+  isPausedBeforeTransport: (phoneNumberId, customerPhone) =>
+    isPausedIncludingSilentHold(
+      phoneNumberId,
+      customerPhone,
+      isConversationPausedFresh,
+      lookupSilentEscalationHold
+    ),
   resumeGate: shouldAnaResumeForInbound,
   evaluateResume: evaluateAnaResumeForInbound,
   sendReply: sendConfiguredReply,
@@ -1252,7 +1435,11 @@ export async function sendDirectReceptionistReplyIfUnpaused(
   config: TenantBotConfig,
   deps: Pick<
     IncomingMessageDeps,
-    'isPaused' | 'isPausedBeforeTransport' | 'sendReply' | 'withConversationLock'
+    | 'isPaused'
+    | 'isPausedBeforeTransport'
+    | 'lookupSilentHold'
+    | 'sendReply'
+    | 'withConversationLock'
   >
 ): Promise<ConfiguredReplyDelivery> {
   const serialize = deps.withConversationLock ??
@@ -1265,6 +1452,16 @@ export async function sendDirectReceptionistReplyIfUnpaused(
   let delivery: ConfiguredReplyDelivery = 'suppressed';
 
   await serialize(config.phoneNumberId, from, async () => {
+    if (
+      await isSilentHoldSuppressed(
+        config.botRole,
+        config.phoneNumberId,
+        from,
+        deps.lookupSilentHold
+      )
+    ) {
+      return;
+    }
     if (await resolvePauseBeforeTransport(deps)(config.phoneNumberId, from)) {
       return;
     }
@@ -1495,12 +1692,21 @@ export async function handleIncomingMessage(
     inboundTurnControl = turnControlFromResumeEvaluation(resumeEvaluation);
   }
 
-  // Pausa: se o salão (geral) OU esta conversa estão pausados, a Ana fica calada
-  // (sem OpenAI, sem buffer). FAIL-OPEN: erro/timeout/404 → responde normal.
+  // Pausa: se o salão (geral), esta conversa ou o hold local estão pausados, a
+  // Ana fica calada (sem OpenAI, sem buffer). Um lookup local desconhecido é
+  // fail-closed; a política legada de pause-state continua no serviço de pausa.
   // Opt-out roda ANTES (compliance vale mesmo pausado). §8.2/INV-10: enquanto
   // pausada, a Ana NÃO responde mas REGISTRA o inbound no histórico (o echo do
   // humano é gravado pelo echoHandler) — assim ela tem contexto ao retomar.
-  if (await deps.isPaused(config.phoneNumberId, from)) {
+  if (
+    await isReceptionistPausedWithSilentHold(
+      config.botRole,
+      config.phoneNumberId,
+      from,
+      deps.isPaused,
+      deps.lookupSilentHold
+    )
+  ) {
     if (config.botRole === 'sales') {
       cancelOnboardingPolling(conversationKey);
     }

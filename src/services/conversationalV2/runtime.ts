@@ -32,8 +32,12 @@ import type { EscalationDeps } from '../questionEscalation';
 import {
   escalateCancelHumanReviewV2,
   escalateProcedureInfoQuestionV2,
+  escalateSilentUnderstandingFailure,
   maybeEscalateReceptionistQuestionV2,
+  type SilentUnderstandingFailureDeps,
+  type SilentUnderstandingFailureOutcome,
 } from '../questionEscalation';
+import { SilentEscalationHoldPersistenceError } from '../silentEscalationHold';
 import {
   cancelAppointmentV2Authorized,
   type CancelAppointmentV2AuthorizedDeps,
@@ -63,6 +67,7 @@ import {
 } from './boundary';
 import {
   resolveInitialServiceQuestionFastPathV2,
+  resolveWitnessedServiceFamilyFastPathV2,
   resolveInterpreterPendingOptionFastPathV2,
   resolvePendingOptionProofV2,
   resolveSelectionFastPathV2,
@@ -131,8 +136,10 @@ import { resolveForcedToolChoiceV2 } from './forcedToolChoice';
 import {
   opaqueReceiptHashV2,
   redactPendingTransitionCandidateV2,
+  serializeTurnPlanReceiptV2,
 } from './receipts';
 import { coordinateRecoveryV2 } from './recoveryCoordinator';
+import { buildUnderstandingFailureDivergenceV2 } from './divergence';
 import { classifyRecoveryFallbackIntentV2 } from './recoveryFallbackIntent';
 import {
   composeProcedureInfoComponentV2,
@@ -253,10 +260,24 @@ export interface ReceptionistV2RuntimeDeps {
     candidate: string;
     reasonCodes: readonly BoundaryReasonCodeV2[];
   }) => void;
+  escalateSilent?: typeof escalateSilentUnderstandingFailure;
+  escalateSilentDeps?: SilentUnderstandingFailureDeps;
 }
 
 function stableHash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function isAuthoritativeSilentEscalationOutcome(
+  outcome: SilentUnderstandingFailureOutcome
+): boolean {
+  return (
+    outcome.kind === 'created' ||
+    outcome.kind === 'deduplicated' ||
+    outcome.kind === 'pending' ||
+    outcome.kind === 'active_elsewhere' ||
+    outcome.kind === 'released'
+  );
 }
 
 function modelVisibleServicesV2(services: ServicesResult): ServicesResult {
@@ -2068,7 +2089,7 @@ export async function getReceptionistReplyV2(input: {
           now: startedAt,
         })
       : null;
-  const selectionFastPath =
+  const serviceFamilyFastPath =
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
     duplicateResolutionFastPath.kind === 'continue_model' &&
@@ -2078,6 +2099,24 @@ export async function getReceptionistReplyV2(input: {
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved'
+      ? resolveWitnessedServiceFamilyFastPathV2({
+          frame,
+          inboundText: currentInboundBatchText,
+          catalog: services,
+          now: startedAt,
+        })
+      : null;
+  const selectionFastPath =
+    bookingReentryFastPath.kind === 'continue_model' &&
+    dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
+    bookingConfirmationFastPath.kind === 'continue_model' &&
+    cancellationFastPath.kind === 'continue_model' &&
+    readFastPath.kind === 'continue_model' &&
+    duplicatePreflight.kind === 'continue_model' &&
+    initialServiceQuestionFastPath?.kind !== 'resolved' &&
+    serviceFamilyFastPath?.kind !== 'resolved'
       ? resolveSelectionFastPathV2({
           frame,
           inboundId,
@@ -2099,6 +2138,7 @@ export async function getReceptionistReplyV2(input: {
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved' &&
+    serviceFamilyFastPath?.kind !== 'resolved' &&
     selectionFastPath?.kind !== 'resolved';
 
   if (cancellationFastPath.kind === 'preempted') {
@@ -2235,16 +2275,25 @@ export async function getReceptionistReplyV2(input: {
           catalog: services,
           now: startedAt,
         });
-        if (resolved.kind === 'resolved') {
+        const opened =
+          resolved.kind === 'resolved'
+            ? resolved
+            : resolveWitnessedServiceFamilyFastPathV2({
+                frame,
+                inboundText: currentInboundBatchText,
+                catalog: services,
+                now: startedAt,
+              });
+        if (opened.kind === 'resolved') {
           interpreterResolved = {
-            result: resolved.result,
+            result: opened.result,
             loop: interpreterResult.loop,
             proof: null,
-            nextFlowState: resolved.nextFlowState,
+            nextFlowState: opened.nextFlowState,
           };
           serverCopyProvenance = provenanceFromProducerPathV2({
             producer: 'interpreter_novo',
-            result: resolved.result,
+            result: opened.result,
           });
         }
       } else {
@@ -2579,6 +2628,20 @@ export async function getReceptionistReplyV2(input: {
       producer: 'initial_service',
       result: initialServiceQuestionFastPath.result,
     });
+  } else if (serviceFamilyFastPath?.kind === 'resolved') {
+    nominalRoute = 'fast_path';
+    proof = null;
+    selectionNextFlowState = serviceFamilyFastPath.nextFlowState;
+    primary = {
+      ok: true,
+      value: serviceFamilyFastPath.result,
+      resolutionProof: null,
+      resolutionProofRejections: [],
+    };
+    serverCopyProvenance = provenanceFromProducerPathV2({
+      producer: 'initial_service',
+      result: serviceFamilyFastPath.result,
+    });
   } else if (selectionFastPath?.kind === 'resolved') {
     nominalRoute = 'fast_path';
     if (duplicatePreflight.loop) loop = duplicatePreflight.loop;
@@ -2856,6 +2919,115 @@ export async function getReceptionistReplyV2(input: {
       v2Route: 'preempted',
     });
     return preparedPreemption(recovery.preemption, successorTurnId, loop);
+  }
+
+  if (recovery.status === 'silent_escalation') {
+    const candidate = recovery.pendingTransitionCandidate;
+    const boundaryAttempts = recovery.boundaryAttempts.map((entry) => ({
+      index: entry.index,
+      candidateHash: entry.candidateHash,
+      reasonCodes: entry.evaluation.reasonCodes,
+    }));
+    const planReceipt = makePlan({
+      route: 'fallback',
+      loop,
+      candidate,
+      recoveryKind: 'silent_escalation',
+      regenCalls: recovery.regenCount,
+      boundaryAttempts,
+    });
+    let turnReceiptHash: string;
+    try {
+      turnReceiptHash = opaqueReceiptHashV2(
+        serializeTurnPlanReceiptV2(planReceipt)
+      );
+    } catch {
+      turnReceiptHash = opaqueReceiptHashV2(planReceipt.planReceiptId);
+    }
+    const divergence = buildUnderstandingFailureDivergenceV2({
+      fallbackIntent: recovery.fallbackIntent,
+      primaryReasonCodes: recovery.primaryReasonCodes,
+      regenerationReasonCodes: recovery.regenerationReasonCodes,
+      turnReceiptHash,
+    });
+    const escalateSilent =
+      deps.escalateSilent ?? escalateSilentUnderstandingFailure;
+    const silentOutcome = await escalateSilent(
+      {
+        phoneNumberId: input.config.phoneNumberId,
+        customerPhone: input.phone,
+        messageId: inboundId,
+        divergence,
+      },
+      deps.escalateSilentDeps
+    );
+    if (!isAuthoritativeSilentEscalationOutcome(silentOutcome)) {
+      throw new SilentEscalationHoldPersistenceError(
+        'silent escalation missing durable hold or authoritative concurrent state'
+      );
+    }
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'fallback',
+    });
+    const recoveredFlowState = nextFlowState;
+    const recoveredCandidate = enforceCanonicalTimeSummaryTransitionV2({
+      frame,
+      flowState: recoveredFlowState,
+      services,
+      payload: '',
+      candidate: recovery.pendingTransitionCandidate,
+      writeCommitted,
+    });
+    let silentCandidate = adjustTransitionForFlowResetV2(
+      coerceEquivalentOpenTransitionV2(
+        recoveredCandidate,
+        frame,
+        recoveredFlowState
+      ),
+      frame.pending,
+      flowResetReason
+    );
+    silentCandidate = applyCancellationAbandonmentTransitionV2(
+      silentCandidate,
+      cancellationAbandonment
+    );
+    const skipOperationalStamp =
+      cancellationFastPath.kind === 'resolved' &&
+      cancellationFastPath.refreshOperationalAt === false;
+    const committedFlowState = skipOperationalStamp
+      ? recoveredFlowState
+      : stampFlowOperationalActivityV2(recoveredFlowState, startedAt);
+    const transition = materializeTransition(
+      silentCandidate,
+      frame,
+      committedFlowState,
+      services,
+      nowFn(),
+      id,
+      hasDuplicateResolutionReadEvidence(loop)
+    );
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame: { ...frame, flowState: committedFlowState },
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: null,
+      transition,
+      planReceipt,
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: writeCommitted,
+      canonicalPendingQuestion: canonicalPendingQuestion(
+        { ...frame, flowState: committedFlowState },
+        services,
+        shouldReanchorPendingQuestion
+      ),
+      elicitationVariant,
+      copyVariant,
+    };
   }
 
   if (copyVariant !== 'canonical' && recovery.payload !== variedPrimaryReply) {

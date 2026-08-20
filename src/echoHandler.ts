@@ -23,6 +23,7 @@ import { downloadMedia } from './whatsappCloudService';
 import { transcreverAudioBuffer } from './utils/transcriber';
 import { isAnaResumeGateEnabled } from './services/anaResumeGate';
 import { persistHumanEchoAtomically } from './services/anaWave2Store';
+import { releaseSilentEscalationHold } from './services/silentEscalationHold';
 
 export { HUMAN_ECHO_PREFIX };
 
@@ -81,6 +82,11 @@ export interface EchoDeps {
     phoneNumberId: string,
     customerPhone: string
   ) => Promise<void>;
+  /** Echo encerra hold local de escalada silenciosa (conversation-scoped). */
+  releaseSilentHold?: (
+    phoneNumberId: string,
+    customerPhone: string
+  ) => Promise<void>;
 }
 
 async function invalidatePendingByHumanWhenV2Enabled(
@@ -115,6 +121,7 @@ const defaultEchoDeps: EchoDeps = {
   transcribeAudio: transcreverAudioBuffer,
   shouldTranscribeHumanAudio: isAnaResumeGateEnabled,
   invalidatePendingByHuman: invalidatePendingByHumanWhenV2Enabled,
+  releaseSilentHold: releaseSilentEscalationHold,
 };
 
 /** A Meta envia o campo "smb_message_echoes" em change.field (Coexistence). */
@@ -365,6 +372,20 @@ export async function handleSmbMessageEchoes(
               error_kind: runtimeErrorKind(err),
             },
           });
+        }
+        const loadConfig = deps.loadConfig ?? defaultEchoDeps.loadConfig;
+        const echoConfig = loadConfig
+          ? await loadConfig(target.phoneNumberId)
+          : null;
+        // Só uma configuração explicitamente de recepcionista pode liberar o
+        // hold. Config desconhecida (inclusive lookup transitório nulo) não
+        // pode degradar a proteção nem acionar release para a Renata.
+        if (echoConfig?.botRole === 'receptionist') {
+          const releaseHold =
+            deps.releaseSilentHold ?? defaultEchoDeps.releaseSilentHold;
+          if (releaseHold) {
+            await releaseHold(target.phoneNumberId, target.customerPhone);
+          }
         }
       });
     } catch (err) {

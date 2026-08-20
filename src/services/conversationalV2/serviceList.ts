@@ -53,6 +53,12 @@ export function matchServiceListQuestionV2(value: string): {
   };
 }
 
+export type MaterializedServiceClarificationV2 = {
+  text: string;
+  visibleServiceIds: string[];
+  omittedCount: number;
+};
+
 function joinVerbatimNames(names: readonly string[]): string {
   if (names.length <= 1) return names[0] ?? '';
   return `${names.slice(0, -1).join(', ')} e ${names.at(-1)}`;
@@ -80,6 +86,101 @@ function formatServiceListCopyV2(
  * Copy canônica: nomes VERBATIM na ordem do catálogo testemunhado. Sem
  * preço/duração anexados. Teto de 8 nomes inteiros; o restante vira contagem.
  * Nunca trunca um nome: para quando o próximo nome inteiro estouraria o
+ * orçamento e recalcula a contagem omitida. IDs acompanham a seleção; não
+ * são inferidos do texto depois.
+ */
+export function materializeServiceClarificationV2(
+  services: ReadonlyArray<{ id: string; name: string }>,
+  options?: { maxChars?: number }
+): MaterializedServiceClarificationV2 | null {
+  const entries = services.filter((entry) => entry.name.trim().length > 0);
+  if (entries.length === 0) return null;
+  const maxChars = options?.maxChars ?? SERVICE_LIST_TRANSPORT_CEILING_V2;
+  const listed: Array<{ id: string; name: string }> = [];
+  for (const entry of entries) {
+    if (listed.length >= SERVICE_LIST_MAX_NAMES_V2) break;
+    const candidate = [...listed, entry];
+    if (
+      formatServiceListCopyV2(
+        candidate.map((item) => item.name),
+        entries.length
+      ).length > maxChars
+    ) {
+      break;
+    }
+    listed.push(entry);
+  }
+  if (listed.length === 0) {
+    const omittedOnly = formatServiceListCopyV2([], entries.length);
+    return omittedOnly.length <= maxChars
+      ? {
+          text: omittedOnly,
+          visibleServiceIds: [],
+          omittedCount: entries.length,
+        }
+      : null;
+  }
+  return {
+    text: formatServiceListCopyV2(
+      listed.map((item) => item.name),
+      entries.length
+    ),
+    visibleServiceIds: listed.map((item) => item.id),
+    omittedCount: entries.length - listed.length,
+  };
+}
+
+export function selectCatalogServicesByIdsV2(
+  catalog: ServicesResult,
+  entityIds: readonly string[]
+): Array<{ id: string; name: string }> {
+  const allow = new Set(entityIds);
+  return (catalog.services ?? []).filter((entry) => allow.has(entry.id));
+}
+
+function catalogNameTokensV2(name: string): string[] {
+  return (
+    name
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .match(/[a-z0-9]{3,}/g) ?? []
+  );
+}
+
+function escapeRegexTokenV2(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function catalogFamilyHasPositiveWitnessV2(
+  inboundText: string,
+  entityIds: readonly string[],
+  services: ReadonlyArray<{ id: string; name: string }>
+): boolean {
+  const allow = new Set(entityIds);
+  const tokens = new Set<string>();
+  const normalizedInbound = inboundText
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  for (const service of services) {
+    if (!allow.has(service.id)) continue;
+    for (const token of catalogNameTokensV2(service.name)) {
+      if (normalizedInbound.includes(token)) tokens.add(token);
+    }
+  }
+  return [...tokens].some((token) =>
+    hasPositiveClauseMatchV2(
+      inboundText,
+      new RegExp(`\\b${escapeRegexTokenV2(token)}\\b`, 'u')
+    )
+  );
+}
+
+/**
+ * Copy canônica: nomes VERBATIM na ordem do catálogo testemunhado. Sem
+ * preço/duração anexados. Teto de 8 nomes inteiros; o restante vira contagem.
+ * Nunca trunca um nome: para quando o próximo nome inteiro estouraria o
  * orçamento e recalcula a contagem omitida.
  */
 export function materializeServiceListCopyV2(
@@ -87,25 +188,7 @@ export function materializeServiceListCopyV2(
   options?: { maxChars?: number }
 ): string | null {
   if (!services.success) return null;
-  const names = (services.services ?? [])
-    .map((entry) => entry.name)
-    .filter((name) => name.trim().length > 0);
-  if (names.length === 0) return null;
-  const maxChars = options?.maxChars ?? SERVICE_LIST_TRANSPORT_CEILING_V2;
-  const listed: string[] = [];
-  for (const name of names) {
-    if (listed.length >= SERVICE_LIST_MAX_NAMES_V2) break;
-    const candidate = [...listed, name];
-    if (formatServiceListCopyV2(candidate, names.length).length > maxChars) {
-      break;
-    }
-    listed.push(name);
-  }
-  if (listed.length === 0) {
-    const omittedOnly = formatServiceListCopyV2([], names.length);
-    return omittedOnly.length <= maxChars ? omittedOnly : null;
-  }
-  return formatServiceListCopyV2(listed, names.length);
+  return materializeServiceClarificationV2(services.services ?? [], options)?.text ?? null;
 }
 
 export function composeServiceListNonListPartsV2(input: {

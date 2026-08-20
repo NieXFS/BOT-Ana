@@ -1,7 +1,6 @@
 import type { ServicesResult } from '../calendarService';
 import {
   ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
-  buildServiceQuestion,
   resolveUniqueCatalogEntityFromCurrentMessage,
 } from '../service-gate';
 import type {
@@ -21,6 +20,7 @@ import {
   buildBookingReentryQuestionV2,
 } from './pendingQuestion';
 import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
+import { materializeServiceClarificationV2 } from './serviceList';
 
 export type BookingReentryFastPathV2 =
   | { kind: 'continue_model'; reason: string }
@@ -168,21 +168,25 @@ export function resolveBookingReentryFastPathV2(input: {
     }
     if (proof.entityId === 'booking-reentry:new') {
       const nextFlowState = newFlowStateV2(input.newFlowId(), input.now);
+      const clarification = materializeServiceClarificationV2(
+        input.catalog.services ?? []
+      );
+      if (!clarification || clarification.visibleServiceIds.length === 0) {
+        return { kind: 'continue_model', reason: 'reentry_catalog_unavailable' };
+      }
       return {
         kind: 'resolved',
         proof,
         nextFlowState,
         result: {
           schemaVersion: 2,
-          reply: buildServiceQuestion(input.catalog.services ?? []),
+          reply: clarification.text,
           replyPurpose: 'SERVICE_QUESTION',
           pendingTransitionCandidate: {
             kind: 'open',
             pendingKind: 'SERVICE',
             flowId: nextFlowState.flowId,
-            optionEntityIds: (input.catalog.services ?? []).map(
-              (service) => service.id
-            ),
+            optionEntityIds: clarification.visibleServiceIds,
           },
           resolutionCandidate: null,
           unknownServiceEvidence: null,

@@ -6,9 +6,6 @@ import type {
 } from '../src/services/conversationalV2/contracts';
 import type { ModelTurnResultV2ParseResult } from '../src/services/conversationalV2/modelResultParser';
 import {
-  ANSWER_TO_PENDING_FALLBACK_V2,
-  INFORMATION_QUESTION_FALLBACK_V2,
-  TRANSACTION_REQUEST_FALLBACK_V2,
   coordinateRecoveryV2,
 } from '../src/services/conversationalV2/recoveryCoordinator';
 import {
@@ -210,16 +207,17 @@ async function recover(input: {
 const realTypoRecovery = await recover({
   inboundText: 'Como funciona a Drenagem(',
 });
-assert.equal(realTypoRecovery.status, 'accepted');
-if (realTypoRecovery.status === 'accepted') {
-  assert.equal(realTypoRecovery.recoveryKind, 'direct_fallback');
-  assert.equal(realTypoRecovery.payload, INFORMATION_QUESTION_FALLBACK_V2);
+assert.equal(realTypoRecovery.status, 'silent_escalation');
+if (realTypoRecovery.status === 'silent_escalation') {
+  assert.equal(realTypoRecovery.recoveryKind, 'silent_escalation');
+  assert.equal(realTypoRecovery.payload, null);
+  assert.equal(realTypoRecovery.fallbackIntent, 'INFORMATION_QUESTION');
   assert.equal(
     realTypoRecovery.boundaryAttempts.some((attempt) =>
       attempt.evaluation.reasonCodes.includes('FALSE_WRITE_CLAIM')
     ),
     true,
-    'a reprodução atravessa FALSE_WRITE_CLAIM antes do fallback dirigido'
+    'a reprodução atravessa FALSE_WRITE_CLAIM antes da escalada silenciosa'
   );
 }
 
@@ -227,19 +225,15 @@ const newQuestionWithOldPending = await recover({
   inboundText: 'Como funciona a Drenagem?',
   frame: servicePendingFrame,
 });
-assert.equal(newQuestionWithOldPending.status, 'accepted');
-if (newQuestionWithOldPending.status === 'accepted') {
-  assert.equal(
-    newQuestionWithOldPending.payload,
-    INFORMATION_QUESTION_FALLBACK_V2,
-    'pergunta nova não repete a pendência antiga'
-  );
+assert.equal(newQuestionWithOldPending.status, 'silent_escalation');
+if (newQuestionWithOldPending.status === 'silent_escalation') {
+  assert.equal(newQuestionWithOldPending.payload, null);
   assert.deepEqual(newQuestionWithOldPending.pendingTransitionCandidate, {
     kind: 'preserve',
   });
-  assert.notEqual(
-    newQuestionWithOldPending.payload,
-    'Qual serviço você prefere: Drenagem, Peeling Facial?'
+  assert.equal(
+    newQuestionWithOldPending.fallbackIntent,
+    'INFORMATION_QUESTION'
   );
 }
 
@@ -263,9 +257,10 @@ const transactionRecovery = await recover({
   inboundText: 'Quero remarcar meu atendimento',
   primaryResult: invalidEnvelope,
 });
-assert.equal(transactionRecovery.status, 'accepted');
-if (transactionRecovery.status === 'accepted') {
-  assert.equal(transactionRecovery.payload, TRANSACTION_REQUEST_FALLBACK_V2);
+assert.equal(transactionRecovery.status, 'silent_escalation');
+if (transactionRecovery.status === 'silent_escalation') {
+  assert.equal(transactionRecovery.payload, null);
+  assert.equal(transactionRecovery.fallbackIntent, 'TRANSACTION_REQUEST');
 }
 
 const repeatedPendingFallback = await coordinateRecoveryV2({
@@ -284,13 +279,14 @@ const repeatedPendingFallback = await coordinateRecoveryV2({
   toolTrace: [],
   regenerate: failedRegen,
 });
-assert.equal(repeatedPendingFallback.status, 'accepted');
-if (repeatedPendingFallback.status === 'accepted') {
+assert.equal(repeatedPendingFallback.status, 'silent_escalation');
+if (repeatedPendingFallback.status === 'silent_escalation') {
   assert.equal(
     repeatedPendingFallback.payload,
-    ANSWER_TO_PENDING_FALLBACK_V2,
-    'anti-repetição troca a pergunta recém-entregue pela copy de ANSWER_TO_PENDING'
+    null,
+    'anti-repetição da pergunta recém-entregue vira escalada silenciosa'
   );
+  assert.equal(repeatedPendingFallback.fallbackIntent, 'ANSWER_TO_PENDING');
 }
 
 const confirmationPendingFrame = frameWithPending('CONFIRMATION', [
@@ -326,10 +322,6 @@ if (answeredConfirmation.status === 'accepted') {
     answeredConfirmation.payload,
     'Você confirma essa opção?',
     'CONFIRMATION + sim? reancora a moldura, não a copy de pergunta'
-  );
-  assert.notEqual(
-    answeredConfirmation.payload,
-    INFORMATION_QUESTION_FALLBACK_V2
   );
 }
 

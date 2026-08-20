@@ -1282,6 +1282,17 @@ function toolChoiceForRoundV2(input: {
   return 'auto';
 }
 
+function lastUserMessageContent(
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
+): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'user') continue;
+    return typeof message.content === 'string' ? message.content : undefined;
+  }
+  return undefined;
+}
+
 /**
  * Loop compartilhado pela produção e pelo benchmark. Não grava histórico, não
  * acessa o ERP e não envia WhatsApp por conta própria: todo efeito passa pelo
@@ -1318,7 +1329,10 @@ export async function runReceptionistModelLoop(
   let emptyCompletionRetryUsed = false;
   let expectedToolRetryUsed = false;
   const canonicalServiceQuestion = input.serviceSelectionAntiLoop
-    ? buildServiceQuestion(input.serviceSelectionAntiLoop.services)
+    ? buildServiceQuestion(
+        input.serviceSelectionAntiLoop.services,
+        lastUserMessageContent(input.messages)
+      )
     : null;
   const finish = (
     result: ReceptionistModelLoopResult
@@ -2073,7 +2087,7 @@ async function getReceptionistReply(
     shouldAskServiceUpfront(servicesForGate.services, userMessages, history)
   ) {
     const question = validateComposedReceptionistReply({
-      baseReply: buildServiceQuestion(servicesForGate.services),
+      baseReply: buildServiceQuestion(servicesForGate.services, userMessage),
       isFirstContact,
       config,
       services: servicesForGate,

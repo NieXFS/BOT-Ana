@@ -65,6 +65,11 @@ export interface PreparedReceptionistTurnV2 {
   licensedCatalogSegments?: LicensedCatalogSegmentV2[];
 }
 
+/** Silêncio D4: só após hold durável ou estado autoritativo concorrente. */
+export type SilentEscalationDispositionV2 = PreparedReceptionistTurnV2 & {
+  payload: null;
+};
+
 export function isPreparedReceptionistTurnV2(
   value: unknown
 ): value is PreparedReceptionistTurnV2 {

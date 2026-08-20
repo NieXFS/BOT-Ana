@@ -424,9 +424,9 @@ const unsafeRegenProse = await coordinateRecoveryV2({
     rawReply: 'Tem vaga amanhã.',
   }),
 });
-assert.equal(unsafeRegenProse.status, 'accepted');
-assert.equal(unsafeRegenProse.recoveryKind, 'direct_fallback');
-assert.notEqual(unsafeRegenProse.payload, 'Tem vaga amanhã.');
+assert.equal(unsafeRegenProse.status, 'silent_escalation');
+assert.equal(unsafeRegenProse.recoveryKind, 'silent_escalation');
+assert.equal(unsafeRegenProse.payload, null);
 
 let writeExecutions = 0;
 const executeWriteOnce = () => {
@@ -555,10 +555,9 @@ const personalDriftRecovery = await coordinateRecoveryV2({
   },
 });
 assert.equal(personalRegenCalls, 1);
-assert.equal(personalDriftRecovery.status, 'accepted');
-assert.equal(personalDriftRecovery.recoveryKind, 'direct_fallback');
-assert.ok(personalDriftRecovery.payload.trim().length > 0);
-assert.ok(regenRecovery.payload.trim());
+assert.equal(personalDriftRecovery.status, 'silent_escalation');
+assert.equal(personalDriftRecovery.recoveryKind, 'silent_escalation');
+assert.equal(personalDriftRecovery.payload, null);
 
 const failedRegen: RegenerationResultV2 = {
   ok: false,
@@ -574,9 +573,9 @@ const directFallback = await coordinateRecoveryV2({
   toolTrace: [],
   regenerate: async () => failedRegen,
 });
-assert.equal(directFallback.status, 'accepted');
-assert.equal(directFallback.recoveryKind, 'direct_fallback');
-assert.ok(directFallback.payload.trim());
+assert.equal(directFallback.status, 'silent_escalation');
+assert.equal(directFallback.recoveryKind, 'silent_escalation');
+assert.equal(directFallback.payload, null);
 
 for (const rejectedReply of [
   'Não fazemos Botox.',
@@ -593,8 +592,8 @@ for (const rejectedReply of [
     toolTrace: [],
     regenerate: async () => failedRegen,
   });
-  assert.equal(recovered.status, 'accepted', rejectedReply);
-  assert.ok(recovered.payload.trim(), rejectedReply);
+    assert.equal(recovered.status, 'silent_escalation', rejectedReply);
+    assert.equal(recovered.payload, null, rejectedReply);
 }
 
 const preemptions: DeliveryPreemptionV2[] = [

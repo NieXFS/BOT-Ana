@@ -526,8 +526,52 @@ expect(
 
 // buildServiceQuestion lista os serviços de forma neutra
 const q = buildServiceQuestion(TWO);
-checks.push({ name: 'buildServiceQuestion lista os 2 serviços (neutro)', ok: q.includes('Corte de cabelo') && q.includes('Depilação a Laser') && /qual|prefere/i.test(q) });
+checks.push({
+  name: 'buildServiceQuestion lista os 2 serviços (neutro)',
+  ok:
+    q.includes('Corte de cabelo') &&
+    q.includes('Depilação a Laser') &&
+    /interess/i.test(q),
+});
 console.log(`${checks[checks.length - 1].ok ? '[PASS]' : '[FAIL]'} buildServiceQuestion lista os 2 serviços (neutro) — ${q}`);
+
+const FAMILY_CATALOG = [
+  { id: 'svc-virilha', name: 'Depilação virilha completa' },
+  { id: 'svc-coxa', name: 'Depilação coxa' },
+  { id: 'svc-axila', name: 'Depilação axila' },
+  { id: 'svc-corte', name: 'Corte de cabelo' },
+];
+const familyCopy = buildServiceQuestion(FAMILY_CATALOG, 'Quero marcar depilação');
+checks.push({
+  name: 'v1 família testemunhada lista só o subset',
+  ok:
+    familyCopy.includes('Depilação virilha completa') &&
+    familyCopy.includes('Depilação coxa') &&
+    familyCopy.includes('Depilação axila') &&
+    !familyCopy.includes('Corte de cabelo') &&
+    /interess/i.test(familyCopy),
+});
+console.log(`${checks[checks.length - 1].ok ? '[PASS]' : '[FAIL]'} v1 família testemunhada lista só o subset — ${familyCopy}`);
+const familyNegated = buildServiceQuestion(FAMILY_CATALOG, 'Não quero depilação');
+checks.push({
+  name: 'v1 negação não abre família positiva',
+  ok: familyNegated.includes('Corte de cabelo'),
+});
+console.log(`${checks[checks.length - 1].ok ? '[PASS]' : '[FAIL]'} v1 negação não abre família positiva — ${familyNegated}`);
+const hugeCatalog = Array.from({ length: 103 }, (_, index) => ({
+  id: `svc-huge-${index + 1}`,
+  name: `Serviço catalogado ${String(index + 1).padStart(3, '0')}`,
+}));
+const cappedCopy = buildServiceQuestion(hugeCatalog, 'Quero agendar');
+const listedHuge = hugeCatalog.filter((service) => cappedCopy.includes(service.name));
+checks.push({
+  name: 'v1 no-match cap ≤8 nomes e ≤4096 chars',
+  ok:
+    listedHuge.length <= 8 &&
+    cappedCopy.length <= 4096 &&
+    listedHuge.every((service) => cappedCopy.includes(service.name)),
+});
+console.log(`${checks[checks.length - 1].ok ? '[PASS]' : '[FAIL]'} v1 no-match cap ≤8 nomes e ≤4096 chars — listed=${listedHuge.length} chars=${cappedCopy.length}`);
 
 const failed = checks.filter((c) => !c.ok);
 console.log(`\n${failed.length === 0 ? '✅ TODOS OS CHECKS PASSARAM' : `❌ ${failed.length} CHECK(S) FALHARAM`} (${checks.length} no total)`);

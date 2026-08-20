@@ -1,7 +1,6 @@
 import type { ServicesResult } from '../calendarService';
 import {
   ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
-  buildServiceQuestion,
   resolveUniqueCatalogEntityFromCurrentMessage,
 } from '../service-gate';
 import type {
@@ -20,9 +19,14 @@ import { hasPositiveExplicitBookingVerbV2 } from './flowSession';
 import type { CurrentDateResolutionV2 } from './currentDateResolution';
 import { isNaturalAffirmativeReplyV2 } from './naturalAffirmative';
 import { DATE_PENDING_QUESTION_V2 } from './pendingQuestion';
+import { clauseMatchHasPositivePolarityV2 } from './polarity';
 import {
-  clauseMatchHasPositivePolarityV2,
-} from './polarity';
+  materializeServiceClarificationV2,
+  selectCatalogServicesByIdsV2,
+  catalogFamilyHasPositiveWitnessV2,
+} from './serviceList';
+import { hasExplicitAvailabilityReadRequestV2 } from './readFastPaths';
+import { hasPositiveProceduralInterrogativeV2 } from './procedureInfo';
 
 export type FastPathResultV2 =
   | { kind: 'continue_model'; reason: string }
@@ -114,6 +118,33 @@ function pendingFresh(frame: TurnFrameV2, now: Date): boolean {
     Number.isFinite(askedAt) &&
     now.getTime() - askedAt <= PENDING_FAST_PATH_MAX_AGE_MS
   );
+}
+
+function openServiceClarificationV2(input: {
+  frame: TurnFrameV2;
+  services: ReadonlyArray<{ id: string; name: string }>;
+}): Extract<InitialServiceQuestionFastPathV2, { kind: 'resolved' }> | null {
+  const materialized = materializeServiceClarificationV2(input.services);
+  if (!materialized || materialized.visibleServiceIds.length === 0) {
+    return null;
+  }
+  return {
+    kind: 'resolved',
+    nextFlowState: input.frame.flowState,
+    result: {
+      schemaVersion: 2,
+      reply: materialized.text,
+      replyPurpose: 'SERVICE_QUESTION',
+      pendingTransitionCandidate: {
+        kind: 'open',
+        pendingKind: 'SERVICE',
+        flowId: input.frame.flowState.flowId,
+        optionEntityIds: materialized.visibleServiceIds,
+      },
+      resolutionCandidate: null,
+      unknownServiceEvidence: null,
+    },
+  };
 }
 
 function courtesyStrippedOptionText(
@@ -622,23 +653,86 @@ export function resolveInitialServiceQuestionFastPathV2(input: {
   if (resolution.kind === 'resolved') {
     return { kind: 'continue_model', reason: 'service_already_resolved' };
   }
-  return {
-    kind: 'resolved',
-    nextFlowState: input.frame.flowState,
-    result: {
-      schemaVersion: 2,
-      reply: buildServiceQuestion(services),
-      replyPurpose: 'SERVICE_QUESTION',
-      pendingTransitionCandidate: {
-        kind: 'open',
-        pendingKind: 'SERVICE',
-        flowId: input.frame.flowState.flowId,
-        optionEntityIds: services.map((service) => service.id),
-      },
-      resolutionCandidate: null,
-      unknownServiceEvidence: null,
-    },
-  };
+  if (resolution.kind === 'ambiguous') {
+    if (
+      !catalogFamilyHasPositiveWitnessV2(
+        input.inboundText,
+        resolution.entityIds,
+        services
+      )
+    ) {
+      return { kind: 'continue_model', reason: 'family_witness_negated' };
+    }
+    const subset = selectCatalogServicesByIdsV2(
+      input.catalog,
+      resolution.entityIds
+    );
+    return (
+      openServiceClarificationV2({ frame: input.frame, services: subset }) ?? {
+        kind: 'continue_model',
+        reason: 'family_clarification_unavailable',
+      }
+    );
+  }
+  const opened = openServiceClarificationV2({
+    frame: input.frame,
+    services,
+  });
+  return opened ?? { kind: 'continue_model', reason: 'catalog_clarification_unavailable' };
+}
+
+/**
+ * Disponibilidade ou informação com família testemunhada: abre SERVICE no
+ * subset visível, sem slots, sem modelo e sem silent_escalation.
+ */
+export function resolveWitnessedServiceFamilyFastPathV2(input: {
+  frame: TurnFrameV2;
+  inboundText: string;
+  catalog: ServicesResult;
+  now: Date;
+}): InitialServiceQuestionFastPathV2 {
+  const services = input.catalog.services ?? [];
+  if (!input.catalog.success || services.length < 2) {
+    return { kind: 'continue_model', reason: 'catalog_without_multiple_services' };
+  }
+  if (input.frame.pending && pendingFresh(input.frame, input.now)) {
+    return { kind: 'continue_model', reason: 'fresh_pending_is_authoritative' };
+  }
+  if (hasPositiveExplicitBookingVerbV2(input.inboundText)) {
+    return { kind: 'continue_model', reason: 'booking_verb_owned_by_initial_service' };
+  }
+  const availability = hasExplicitAvailabilityReadRequestV2(input.inboundText);
+  const information = hasPositiveProceduralInterrogativeV2(input.inboundText);
+  if (!availability && !information) {
+    return { kind: 'continue_model', reason: 'no_availability_or_information_question' };
+  }
+  const resolution = resolveUniqueCatalogEntityFromCurrentMessage(
+    input.inboundText,
+    services,
+    {
+      allowRestrictedDistanceTwo:
+        ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+    }
+  );
+  if (resolution.kind !== 'ambiguous') {
+    return { kind: 'continue_model', reason: 'family_not_ambiguous' };
+  }
+  if (
+    !catalogFamilyHasPositiveWitnessV2(
+      input.inboundText,
+      resolution.entityIds,
+      services
+    )
+  ) {
+    return { kind: 'continue_model', reason: 'family_witness_negated' };
+  }
+  const subset = selectCatalogServicesByIdsV2(input.catalog, resolution.entityIds);
+  return (
+    openServiceClarificationV2({ frame: input.frame, services: subset }) ?? {
+      kind: 'continue_model',
+      reason: 'family_clarification_unavailable',
+    }
+  );
 }
 
 function exactCatalogMatch(

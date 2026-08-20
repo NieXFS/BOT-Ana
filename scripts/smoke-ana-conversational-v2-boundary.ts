@@ -11,6 +11,7 @@ import {
   shouldProhibitServiceRelistV2,
 } from '../src/services/conversationalV2/boundary';
 import {
+  materializeServiceClarificationV2,
   materializeServiceListCopyV2,
   SERVICE_LIST_TRANSPORT_CEILING_V2,
 } from '../src/services/conversationalV2/serviceList';
@@ -1084,6 +1085,32 @@ assert.equal(
   true,
   `lista canônica testemunhada deve passar: ${licensedCanonicalList.reasonCodes.join(',')}`
 );
+const familyClarification = materializeServiceClarificationV2(
+  (servicesResult.services ?? []).slice(0, 2)
+);
+assert.ok(familyClarification);
+const familyBoundary = boundary(familyClarification!.text, {
+  source: 'CANONICAL',
+  exactCanonicalServiceListText: familyClarification!.text,
+});
+assert.equal(
+  familyBoundary.safe,
+  true,
+  `subset SERVICE/FAMILY canônico deve passar: ${familyBoundary.reasonCodes.join(',')}`
+);
+const familyOutOfCatalog = boundary(
+  `${familyClarification!.text}\n\nAs opções são Botox e Massagem`,
+  {
+    source: 'GENERATED',
+    exactCanonicalServiceListText: familyClarification!.text,
+  }
+);
+assert.equal(
+  familyOutOfCatalog.reasonCodes.includes('UNLICENSED_SERVICE_LIST'),
+  true,
+  `subset FAMILY + enumeração fora do catálogo deve bloquear: ${familyOutOfCatalog.reasonCodes.join(',')}`
+);
+assert.equal(familyOutOfCatalog.safe, false);
 const solProbe = boundary(
   `As opções são Botox e Drenagem Linfática\n\n${canonicalServiceList}`,
   {

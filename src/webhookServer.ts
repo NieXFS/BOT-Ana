@@ -54,6 +54,10 @@ import {
   startInboundOutboxSweep,
 } from './services/inboundOutbox';
 import {
+  ensureSilentEscalationHoldTable,
+  startSilentEscalationHoldSweep,
+} from './services/silentEscalationHold';
+import {
   getQuestionReplyStatus,
   sendQuestionReply,
 } from './services/questionReplyService';
@@ -773,6 +777,13 @@ async function boot(): Promise<void> {
   // Garante a tabela de idempotência e o schema da Onda 2 antes do tráfego.
   await ensureProcessedMessagesTable();
   await ensureAnaWave2Tables();
+  await ensureSilentEscalationHoldTable();
+  startSilentEscalationHoldSweep(async () => {
+    const { sweepSilentEscalationHolds } = await import(
+      './services/questionEscalation'
+    );
+    return sweepSilentEscalationHolds();
+  });
   // O schema/worker v2 só é carregado quando existe allowlist configurada.
   // Flag vazia mantém o boot e a rota v1 sem importar o runtime v2 pesado.
   const v2Allowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS

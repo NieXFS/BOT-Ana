@@ -24,6 +24,7 @@ import type { RegenerationResultV2 } from './regenerator';
 import { opaqueReceiptHashV2 } from './receipts';
 import { buildPendingQuestionV2 } from './pendingQuestion';
 import type { RecoveryFallbackIntentV2 } from './recoveryFallbackIntent';
+import { closedReasonCodesV2 } from './divergence';
 
 export const CATALOG_UNAVAILABLE_FALLBACK_V2 =
   'Não consegui consultar os serviços agora. Pode tentar novamente em instantes?';
@@ -99,17 +100,33 @@ export type RecoveryCoordinatorResultV2 =
       /** Só uma prova já validada pelo parser pode alcançar o flowState. */
       resolutionProof: ResolutionProof | null;
       boundaryAttempts: RecoveryBoundaryAttemptV2[];
+    }
+  | {
+      status: 'silent_escalation';
+      payload: null;
+      recoveryKind: 'silent_escalation';
+      regenCount: 0 | 1;
+      fallbackIntent: RecoveryFallbackIntentV2;
+      primaryReasonCodes: BoundaryReasonCodeV2[];
+      regenerationReasonCodes: BoundaryReasonCodeV2[];
+      pendingTransitionCandidate: PendingTransitionCandidate;
+      resolutionProof: null;
+      boundaryAttempts: RecoveryBoundaryAttemptV2[];
     };
+
+type FallbackDecisionV2 =
+  | { kind: 'copy'; text: string }
+  | { kind: 'silent_escalation' };
 
 function fallbackCandidate(
   input: RecoveryCoordinatorInputV2,
   safeWriteConfirmation: string | null
-): { text: string; pendingQuestion: boolean } {
+): FallbackDecisionV2 {
   if (toolTraceHasCustomerIdentityAmbiguity(input.toolTrace)) {
-    return { text: CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE, pendingQuestion: false };
+    return { kind: 'copy', text: CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE };
   }
   if (safeWriteConfirmation) {
-    return { text: safeWriteConfirmation, pendingQuestion: false };
+    return { kind: 'copy', text: safeWriteConfirmation };
   }
   const pending =
     input.canonicalPendingQuestion?.trim() ||
@@ -141,7 +158,8 @@ function fallbackCandidate(
     );
   // OTHER é a fala sem testemunha suficiente: com PendingFrame OPEN ela é o
   // caso genuinamente ambíguo. Pergunta/transação nova preserva o estado sem
-  // repetir a moldura antiga na mensagem.
+  // repetir a moldura antiga na mensagem. A moldura pendente NÃO é
+  // reformulação — só vira silêncio quando a pergunta acabou de ser entregue.
   const relatesToPending =
     input.fallbackIntent === 'ANSWER_TO_PENDING' ||
     input.fallbackIntent === 'OTHER';
@@ -150,28 +168,15 @@ function fallbackCandidate(
     relatesToPending &&
     (input.frame.pending?.kind === 'CONFIRMATION' || !wasJustDelivered(pending))
   ) {
-    return { text: pending, pendingQuestion: true };
+    return { kind: 'copy', text: pending };
   }
   const catalogUnavailableIsMaterial =
     input.frame.catalogState === 'unavailable' &&
     (input.fallbackIntent !== 'OTHER' || input.frame.pending !== null);
   if (catalogUnavailableIsMaterial) {
-    return { text: CATALOG_UNAVAILABLE_FALLBACK_V2, pendingQuestion: false };
+    return { kind: 'copy', text: CATALOG_UNAVAILABLE_FALLBACK_V2 };
   }
-  const preferred = {
-    ANSWER_TO_PENDING: ANSWER_TO_PENDING_FALLBACK_V2,
-    INFORMATION_QUESTION: INFORMATION_QUESTION_FALLBACK_V2,
-    TRANSACTION_REQUEST: TRANSACTION_REQUEST_FALLBACK_V2,
-    OTHER: OTHER_FALLBACK_V2,
-  } satisfies Record<RecoveryFallbackIntentV2, string>;
-  const primary = preferred[input.fallbackIntent];
-  // O fallback OTHER é a única troca semântica segura para evitar repetição;
-  // se ele próprio acabou de ser entregue, nunca-silêncio vence e ele repete.
-  const text =
-    wasJustDelivered(primary) && input.fallbackIntent !== 'OTHER'
-      ? OTHER_FALLBACK_V2
-      : primary;
-  return { text, pendingQuestion: false };
+  return { kind: 'silent_escalation' };
 }
 
 function boundaryAccepted(evaluation: BoundaryEvaluation): boolean {
@@ -354,6 +359,7 @@ export async function coordinateRecoveryV2(
       boundaryAttempts,
     };
   }
+  let regenerationReasonCodes: BoundaryReasonCodeV2[] = [];
   if (regenerated.ok) {
     const regeneratedEvaluation = evaluate(regenerated.result, 'GENERATED');
     if (boundaryAccepted(regeneratedEvaluation)) {
@@ -368,12 +374,14 @@ export async function coordinateRecoveryV2(
         boundaryAttempts,
       };
     }
+    regenerationReasonCodes = [...regeneratedEvaluation.reasonCodes];
     input.onRejectedBoundaryCandidate?.({
       stage: 'regen',
       candidate: regenerated.result.reply,
       reasonCodes: regeneratedEvaluation.reasonCodes,
     });
   } else if (regenerated.reasonCode === 'REGEN_MODEL_RESULT_INVALID') {
+    regenerationReasonCodes = ['REGEN_MODEL_RESULT_INVALID'];
     const regeneratedProse = asPlainProseCandidate(regenerated.rawReply);
     const regeneratedProseEvaluation = regeneratedProse
       ? evaluate(regeneratedProse, 'GENERATED')
@@ -393,18 +401,37 @@ export async function coordinateRecoveryV2(
       };
     }
     if (regeneratedProse && regeneratedProseEvaluation) {
+      regenerationReasonCodes = [...regeneratedProseEvaluation.reasonCodes];
       input.onRejectedBoundaryCandidate?.({
         stage: 'regen',
         candidate: regeneratedProse.reply,
         reasonCodes: regeneratedProseEvaluation.reasonCodes,
       });
     }
+  } else {
+    regenerationReasonCodes = [regenerated.reasonCode];
   }
 
-  const directedFallback = fallbackCandidate(input, null);
   const fallbackTransition = input.frame.pending
     ? ({ kind: 'preserve' } as const)
     : primaryModelResult?.pendingTransitionCandidate ?? ({ kind: 'preserve' } as const);
+  const silentEscalation = (): RecoveryCoordinatorResultV2 => ({
+    status: 'silent_escalation',
+    payload: null,
+    recoveryKind: 'silent_escalation',
+    regenCount: 1,
+    fallbackIntent: input.fallbackIntent,
+    primaryReasonCodes: closedReasonCodesV2(firstReasons),
+    regenerationReasonCodes: closedReasonCodesV2(regenerationReasonCodes),
+    pendingTransitionCandidate: fallbackTransition,
+    resolutionProof: null,
+    boundaryAttempts,
+  });
+
+  const directedFallback = fallbackCandidate(input, null);
+  if (directedFallback.kind === 'silent_escalation') {
+    return silentEscalation();
+  }
   const fallbackResult: ModelTurnResultV2 = {
     schemaVersion: 2,
     reply: directedFallback.text,
@@ -413,26 +440,9 @@ export async function coordinateRecoveryV2(
     resolutionCandidate: null,
     unknownServiceEvidence: null,
   };
-  let fallbackEvaluation = evaluate(fallbackResult, 'CANONICAL');
+  const fallbackEvaluation = evaluate(fallbackResult, 'CANONICAL');
   if (!boundaryAccepted(fallbackEvaluation)) {
-    const rejectedFallback = fallbackResult.reply;
-    fallbackResult.reply = [
-      OTHER_FALLBACK_V2,
-      INFORMATION_QUESTION_FALLBACK_V2,
-      TRANSACTION_REQUEST_FALLBACK_V2,
-      ANSWER_TO_PENDING_FALLBACK_V2,
-    ].find(
-      (candidate) =>
-        candidate !== rejectedFallback &&
-        !(input.boundaryContext.recentAssistantReplies ?? []).some(
-          (reply) => reply.trim() === candidate.trim()
-        )
-    ) ?? OTHER_FALLBACK_V2;
-    fallbackResult.pendingTransitionCandidate = { kind: 'preserve' };
-    fallbackEvaluation = evaluate(fallbackResult, 'CANONICAL');
-  }
-  if (!boundaryAccepted(fallbackEvaluation)) {
-    throw new Error('Fallback canônico v2 rejeitado pela própria boundary.');
+    return silentEscalation();
   }
   return {
     status: 'accepted',

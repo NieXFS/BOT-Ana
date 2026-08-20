@@ -584,9 +584,16 @@ async function main(): Promise<void> {
   assert.equal(modelCalls, 0);
   assert.equal(runtimeVoiceCalls, 1);
   assert.equal(prepared.planReceipt.route, 'fast_path');
-  assert.equal(prepared.planReceipt.voice?.decision, 'accepted');
+  assert.equal(
+    prepared.planReceipt.voice?.decision,
+    'fidelity_rejected_template',
+    'copy server-owned Por aqui: não casa a gramática fechada da voz; o registry permanece e a copy canônica é entregue'
+  );
   assert.equal(prepared.planReceipt.primaryProviderCalls, 0);
   assert.match(prepared.payload ?? '', /Peeling facial/);
+  assert.match(prepared.payload ?? '', /Drenagem Linfática/);
+  assert.match(prepared.payload ?? '', /Limpeza de Pele Profunda/);
+  assert.doesNotMatch(prepared.payload ?? '', /Para qual serviço você gostaria de agendar/u);
   assert.notEqual(prepared.copyVariant, undefined);
 
   const confirmationStore = new MemoryConversationalV2StateStore();

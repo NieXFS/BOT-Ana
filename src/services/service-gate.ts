@@ -21,6 +21,11 @@
  * token distintivo > plural regular/typo seguro > anti-ambiguidade).
  */
 
+import {
+  catalogFamilyHasPositiveWitnessV2,
+  materializeServiceClarificationV2,
+} from './conversationalV2/serviceList';
+
 export interface ServiceLike {
   id: string;
   name: string;
@@ -60,7 +65,7 @@ const ROMAN_GRADE_VALUES: Record<string, string> = {
   v: '5',
 };
 const SERVICE_CHOICE_QUESTION_RE =
-  /\b(?:qual|prefere|escolh(?:e|a|er|eu)|opcao)\b/;
+  /\b(?:qual|prefere|escolh(?:e|a|er|eu)|opcao|interessa)\b/;
 const NAKED_WEEKDAY_RE =
   /^(?:segunda|terca|quarta|quinta|sexta|sabado|domingo)(?:\s+feira)?$/;
 
@@ -907,15 +912,33 @@ export const SERVICE_SELECTION_INTERNAL_HINT_SAMPLE =
   ]);
 
 /** Pergunta amigável (vai DIRETO ao cliente) listando os serviços de forma neutra. */
-export function buildServiceQuestion(services: ServiceLike[]): string {
-  const names = services.map((s) => s.name);
-  let list: string;
-  if (names.length <= 1) {
-    list = names[0] ?? '';
-  } else {
-    list = `${names.slice(0, -1).join(', ')} e ${names[names.length - 1]}`;
+export function buildServiceQuestion(
+  services: ServiceLike[],
+  inboundText?: string
+): string {
+  const selected = servicesForClarificationQuestion(services, inboundText);
+  const materialized = materializeServiceClarificationV2(selected);
+  if (materialized?.text) return materialized.text;
+  return 'Por aqui: Algum desses te interessa?';
+}
+
+function servicesForClarificationQuestion(
+  services: ServiceLike[],
+  inboundText?: string
+): ServiceLike[] {
+  const trimmed = inboundText?.trim();
+  if (!trimmed) return services;
+  const resolution = resolveUniqueCatalogEntityFromCurrentMessage(trimmed, services, {
+    allowRestrictedDistanceTwo: ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+  });
+  if (
+    resolution.kind === 'ambiguous' &&
+    catalogFamilyHasPositiveWitnessV2(trimmed, resolution.entityIds, services)
+  ) {
+    const allow = new Set(resolution.entityIds);
+    return services.filter((service) => allow.has(service.id));
   }
-  return `Claro! Para qual serviço você gostaria de agendar? Temos ${list}. Qual você prefere?`;
+  return services;
 }
 
 /**

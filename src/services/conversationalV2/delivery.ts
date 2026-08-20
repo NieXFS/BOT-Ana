@@ -35,7 +35,7 @@ export interface DeliverPreparedReceptionistTurnV2Deps {
 }
 
 export interface DeliverPreparedReceptionistTurnV2Result {
-  delivery: 'sent' | 'suppressed' | 'transport_unknown' | 'transport_failed';
+  delivery: 'sent' | 'suppressed' | 'transport_unknown' | 'transport_failed' | 'silent';
   receipt: TurnDeliveryReceiptV2;
   successor: DurableSuccessorBatchV2 | null;
 }
@@ -172,6 +172,25 @@ export async function deliverPreparedReceptionistTurnV2(
     initialNow,
     id
   );
+
+  if (prepared.planReceipt.recoveryKind === 'silent_escalation') {
+    const pendingCommitOutcome = prepared.frame.pending
+      ? 'preserved'
+      : 'not_applicable';
+    const receipt = buildTerminalReceipt({
+      prepared,
+      id,
+      now: initialNow,
+      transportStartedAt: null,
+      transportOutcome: 'silent_escalation',
+      outboxState: 'prepared',
+      conversationCommitOutcome: 'not_applicable',
+      pendingCommitOutcome,
+    });
+    await store.saveTerminalDeliveryReceipt(receipt);
+    emitDelivery(receipt);
+    return { delivery: 'silent', receipt, successor };
+  }
 
   let preemption = prepared.preemption;
   if (initialCheckpoint.paused) preemption = 'PAUSE_RECHECK';

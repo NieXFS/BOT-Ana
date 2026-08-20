@@ -74,6 +74,13 @@ const NEGATED_PROCEDURAL_RE = new RegExp(
   `\\bnao\\b(?:\\s+\\w+){0,4}\\s+${PROCEDURAL_CUE_SRC}\\b`,
   'u'
 );
+
+export function hasPositiveProceduralInterrogativeV2(value: string): boolean {
+  const text = normalize(value);
+  return (
+    PROCEDURAL_INTERROGATIVE_RE.test(text) && !NEGATED_PROCEDURAL_RE.test(text)
+  );
+}
 const OPERATIONAL_OBJECT_RE = new RegExp(
   `\\b${PROCEDURAL_CUE_SRC}\\s+(?:(?:o|a|os|as|um|uma|de|dos|das)\\s+)?(?:agendamentos?|pagamentos?|pacotes?|cancelamentos?|remarcac(?:ao|oes)|horarios?|agendas?)\\b`,
   'u'
