@@ -219,6 +219,35 @@ async function main(): Promise<void> {
   assert.equal(divergence.stage, 'AFTER_INTERNAL_REGENERATION');
   assert.match(divergence.turnReceiptHash, /^[a-f0-9]{64}$/);
 
+  async function seedHold(
+    store: InstanceType<typeof holdMod.MemorySilentEscalationHoldStore>,
+    input: {
+      phoneNumberId: string;
+      customerPhone: string;
+      sourceMessageId: string;
+      status: 'pending' | 'confirmed' | 'active_elsewhere';
+      questionId?: string;
+      at?: Date;
+    }
+  ): Promise<void> {
+    await store.ensure({
+      conversationKey: context.buildConversationKey(
+        input.phoneNumberId,
+        input.customerPhone
+      ),
+      phoneNumberId: input.phoneNumberId,
+      customerPhone: input.customerPhone,
+      sourceMessageId: input.sourceMessageId,
+      divergence,
+      now: input.at ?? now,
+    });
+    if (input.status === 'confirmed') {
+      await store.markConfirmed(input.sourceMessageId, input.questionId ?? 'q-old');
+    } else if (input.status === 'active_elsewhere') {
+      await store.markActiveElsewhere(input.sourceMessageId);
+    }
+  }
+
   const first = await escalation.escalateSilentUnderstandingFailure(
     {
       phoneNumberId: config.phoneNumberId,
@@ -269,8 +298,956 @@ async function main(): Promise<void> {
     },
     { holdStore, post, now: () => now, wait: async () => undefined }
   );
-  assert.equal(secondInbound.kind, 'active_elsewhere');
-  assert.equal(posts.length, 1, 'inbound seguinte não cria novo evento');
+  assert.equal(secondInbound.kind, 'created');
+  assert.equal(posts.length, 2, 'confirmed stale exige reconciliação autoritativa');
+  assert.equal(
+    (await holdStore.loadByMessageId('wamid-silent-1'))?.status,
+    'released',
+    'a pergunta histórica é liberada após a criação de B'
+  );
+  assert.equal(
+    (await holdStore.loadByMessageId('wamid-silent-2'))?.status,
+    'confirmed',
+    'o hold atual ancora a nova divergência'
+  );
+  assert.equal(
+    (posts[1]?.messageId as string | undefined),
+    'wamid-silent-2',
+    'a divergência aponta para o WAMID atual'
+  );
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      config.phoneNumberId,
+      '+5511999000101',
+      holdStore
+    ),
+    false,
+    'created sem pending residual limpa o overlay'
+  );
+
+  // Housekeeping pós-created é best-effort: a falha técnica não rebaixa o
+  // resultado para pending nem perde a pergunta/recibos autoritativos.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const housekeepingFailureStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(housekeepingFailureStore, {
+    phoneNumberId: 'PN-HOUSEKEEPING',
+    customerPhone: '+5511999000109',
+    sourceMessageId: 'wamid-housekeeping-old',
+    status: 'confirmed',
+    questionId: 'q-housekeeping-old',
+  });
+  housekeepingFailureStore.releaseSupersededConfirmedByConversation = async () => {
+    throw new Error('housekeeping unavailable');
+  };
+  const housekeepingOutcome = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-HOUSEKEEPING',
+      customerPhone: '+5511999000109',
+      messageId: 'wamid-housekeeping-new',
+      divergence,
+    },
+    {
+      holdStore: housekeepingFailureStore,
+      post: async () => ({ questionId: 'q-housekeeping-new' }),
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(housekeepingOutcome.kind, 'created');
+  assert.equal(
+    (await housekeepingFailureStore.loadByMessageId('wamid-housekeeping-new'))?.status,
+    'confirmed'
+  );
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      'PN-HOUSEKEEPING',
+      '+5511999000109',
+      housekeepingFailureStore
+    ),
+    false
+  );
+
+  // IA-19D F2a/F2b: um ERP que prova pergunta OPEN alheia continua
+  // autoritativo, tanto no envelope normal quanto no erro HTTP classificado.
+  for (const mode of ['return', 'throw'] as const) {
+    holdMod.__resetSilentEscalationHoldForTest();
+    const activeStore = new holdMod.MemorySilentEscalationHoldStore();
+    const activePhone = mode === 'return' ? '+5511999000110' : '+5511999000111';
+    await seedHold(activeStore, {
+      phoneNumberId: 'PN-STALE-ACTIVE',
+      customerPhone: activePhone,
+      sourceMessageId: 'wamid-active-old',
+      status: 'confirmed',
+      questionId: 'q-open-old',
+    });
+    let activePosts = 0;
+    const activeOutcome = await escalation.escalateSilentUnderstandingFailure(
+      {
+        phoneNumberId: 'PN-STALE-ACTIVE',
+        customerPhone: activePhone,
+        messageId: `wamid-active-${mode}`,
+        divergence,
+      },
+      {
+        holdStore: activeStore,
+        post: async () => {
+          activePosts += 1;
+          if (mode === 'throw') {
+            throw Object.assign(new Error('active question'), {
+              isAxiosError: true,
+              response: {
+                status: 409,
+                data: { code: 'ACTIVE_QUESTION_DIFFERENT_SOURCE' },
+              },
+            });
+          }
+          return { code: 'ACTIVE_QUESTION_DIFFERENT_SOURCE' };
+        },
+        now: () => now,
+        wait: async () => undefined,
+      }
+    );
+    assert.equal(activePosts, 1, `${mode}: ERP OPEN é consultado uma vez`);
+    assert.equal(activeOutcome.kind, 'active_elsewhere');
+    assert.equal(
+      (await activeStore.loadByMessageId(`wamid-active-${mode}`))?.status,
+      'active_elsewhere'
+    );
+    assert.equal(
+      (await activeStore.loadByMessageId('wamid-active-old'))?.status,
+      'confirmed',
+      `${mode}: hold antigo confirmed não é liberado`
+    );
+    assert.equal(
+      await holdMod.isSilentEscalationHoldActive(
+        'PN-STALE-ACTIVE',
+        activePhone,
+        activeStore
+      ),
+      false,
+      `${mode}: ACTIVE_QUESTION limpa o overlay local`
+    );
+  }
+
+  // IA-19D F3: pending alheio ainda é um bloqueio local, sem criar B nem
+  // consumir o endpoint do ERP; A permanece elegível ao sweeper.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const pendingElsewhereStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(pendingElsewhereStore, {
+    phoneNumberId: 'PN-PENDING-OTHER',
+    customerPhone: '+5511999000120',
+    sourceMessageId: 'wamid-pending-old',
+    status: 'pending',
+  });
+  let pendingElsewherePosts = 0;
+  const pendingElsewhere = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-PENDING-OTHER',
+      customerPhone: '+5511999000120',
+      messageId: 'wamid-pending-new',
+      divergence,
+    },
+    {
+      holdStore: pendingElsewhereStore,
+      post: async () => {
+        pendingElsewherePosts += 1;
+        return { questionId: 'q-must-not-exist' };
+      },
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(pendingElsewhere.kind, 'active_elsewhere');
+  assert.equal(pendingElsewherePosts, 0);
+  assert.equal(await pendingElsewhereStore.loadByMessageId('wamid-pending-new'), null);
+  assert.deepEqual(
+    await pendingElsewhereStore.listReady(10, now),
+    ['wamid-pending-old'],
+    'pending alheio continua elegível ao sweeper'
+  );
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      'PN-PENDING-OTHER',
+      '+5511999000120',
+      pendingElsewhereStore
+    ),
+    true
+  );
+
+  // IA-19D revisão: A pending é dono mesmo quando B já está confirmed. A
+  // precedência do owner precisa impedir que B escreva cache inactive.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const ownerConfirmedStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(ownerConfirmedStore, {
+    phoneNumberId: 'PN-OWNER-CONFIRMED',
+    customerPhone: '+5511999000121',
+    sourceMessageId: 'wamid-owner-a',
+    status: 'pending',
+    at: new Date(now.getTime() - 1_000),
+  });
+  await seedHold(ownerConfirmedStore, {
+    phoneNumberId: 'PN-OWNER-CONFIRMED',
+    customerPhone: '+5511999000121',
+    sourceMessageId: 'wamid-owner-b',
+    status: 'confirmed',
+    questionId: 'q-owner-b',
+    at: now,
+  });
+  const ownerConfirmedPersist = await holdMod.persistSilentEscalationHold({
+    phoneNumberId: 'PN-OWNER-CONFIRMED',
+    customerPhone: '+5511999000121',
+    sourceMessageId: 'wamid-owner-b',
+    divergence,
+    store: ownerConfirmedStore,
+    now,
+  });
+  assert.equal(ownerConfirmedPersist.kind, 'active_elsewhere');
+  let ownerConfirmedPosts = 0;
+  const ownerConfirmedRetry = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-OWNER-CONFIRMED',
+      customerPhone: '+5511999000121',
+      messageId: 'wamid-owner-b',
+      divergence,
+    },
+    {
+      holdStore: ownerConfirmedStore,
+      post: async () => {
+        ownerConfirmedPosts += 1;
+        return { questionId: 'q-must-not-exist' };
+      },
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(ownerConfirmedRetry.kind, 'active_elsewhere');
+  assert.equal(ownerConfirmedPosts, 0);
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      'PN-OWNER-CONFIRMED',
+      '+5511999000121',
+      ownerConfirmedStore
+    ),
+    true,
+    'B confirmed não pode limpar o overlay do owner A pending'
+  );
+  assert.equal((await ownerConfirmedStore.loadByMessageId('wamid-owner-a'))?.status, 'pending');
+  assert.equal((await ownerConfirmedStore.loadByMessageId('wamid-owner-b'))?.status, 'confirmed');
+
+  // IA-19D revisão: com A pending antigo e B pending novo, retry de B fica
+  // bloqueado; retry do owner A pode POSTAR e o housekeeping não toca B.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const twoPendingStore = new holdMod.MemorySilentEscalationHoldStore();
+  const twoPendingPhone = '+5511999000122';
+  await seedHold(twoPendingStore, {
+    phoneNumberId: 'PN-TWO-PENDING',
+    customerPhone: twoPendingPhone,
+    sourceMessageId: 'wamid-two-a',
+    status: 'pending',
+    at: new Date(now.getTime() - 2_000),
+  });
+  await seedHold(twoPendingStore, {
+    phoneNumberId: 'PN-TWO-PENDING',
+    customerPhone: twoPendingPhone,
+    sourceMessageId: 'wamid-two-b',
+    status: 'pending',
+    at: new Date(now.getTime() - 1_000),
+  });
+  let twoPendingPosts = 0;
+  const twoPendingPost = async (candidate: { messageId: string }) => {
+    twoPendingPosts += 1;
+    assert.equal(candidate.messageId, 'wamid-two-a');
+    return { questionId: 'q-two-a' };
+  };
+  const retryBBlocked = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-TWO-PENDING',
+      customerPhone: twoPendingPhone,
+      messageId: 'wamid-two-b',
+      divergence,
+    },
+    {
+      holdStore: twoPendingStore,
+      post: twoPendingPost,
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(retryBBlocked.kind, 'active_elsewhere');
+  assert.equal(twoPendingPosts, 0);
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      'PN-TWO-PENDING',
+      twoPendingPhone,
+      twoPendingStore
+    ),
+    true
+  );
+  const retryAAllowed = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-TWO-PENDING',
+      customerPhone: twoPendingPhone,
+      messageId: 'wamid-two-a',
+      divergence,
+    },
+    {
+      holdStore: twoPendingStore,
+      post: twoPendingPost,
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(retryAAllowed.kind, 'created');
+  assert.equal(twoPendingPosts, 1);
+  assert.equal((await twoPendingStore.loadByMessageId('wamid-two-a'))?.status, 'confirmed');
+  assert.equal(
+    (await twoPendingStore.loadByMessageId('wamid-two-b'))?.status,
+    'pending',
+    'housekeeping pós-created nunca libera pending B'
+  );
+
+  // IA-19D revisão: empate de created_at usa source_message_id ASC tanto no
+  // owner em memória quanto no ORDER BY SQL do store PG.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const tieStore = new holdMod.MemorySilentEscalationHoldStore();
+  const tieAt = new Date(now.getTime() - 5_000);
+  await seedHold(tieStore, {
+    phoneNumberId: 'PN-TIE-OWNER',
+    customerPhone: '+5511999000123',
+    sourceMessageId: 'wamid-tie-z',
+    status: 'pending',
+    at: tieAt,
+  });
+  await seedHold(tieStore, {
+    phoneNumberId: 'PN-TIE-OWNER',
+    customerPhone: '+5511999000123',
+    sourceMessageId: 'wamid-tie-a',
+    status: 'pending',
+    at: tieAt,
+  });
+  const tieOwner = await tieStore.loadPendingOwnerByConversation(
+    context.buildConversationKey('PN-TIE-OWNER', '+5511999000123')
+  );
+  assert.equal(tieOwner?.sourceMessageId, 'wamid-tie-a');
+  assert.equal(tieOwner?.createdAt.getTime(), tieAt.getTime());
+
+  // IA-19D overlay residual: A created does not open the conversation while
+  // B pending remains; B's authoritative ACTIVE result then clears it.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const residualCreatedStore = new holdMod.MemorySilentEscalationHoldStore();
+  const residualCreatedPhone = '+5511999000124';
+  await seedHold(residualCreatedStore, {
+    phoneNumberId: 'PN-RESIDUAL-CREATED',
+    customerPhone: residualCreatedPhone,
+    sourceMessageId: 'wamid-residual-a',
+    status: 'pending',
+    at: new Date(now.getTime() - 2_000),
+  });
+  await seedHold(residualCreatedStore, {
+    phoneNumberId: 'PN-RESIDUAL-CREATED',
+    customerPhone: residualCreatedPhone,
+    sourceMessageId: 'wamid-residual-b',
+    status: 'pending',
+    at: new Date(now.getTime() - 1_000),
+  });
+  let residualCreatedPosts = 0;
+  const residualCreatedA = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-RESIDUAL-CREATED',
+      customerPhone: residualCreatedPhone,
+      messageId: 'wamid-residual-a',
+      divergence,
+    },
+    {
+      holdStore: residualCreatedStore,
+      post: async (candidate) => {
+        residualCreatedPosts += 1;
+        assert.equal(candidate.messageId, 'wamid-residual-a');
+        return { questionId: 'q-residual-a' };
+      },
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(residualCreatedA.kind, 'created');
+  assert.equal(residualCreatedPosts, 1);
+  assert.equal(
+    (await residualCreatedStore.loadByMessageId('wamid-residual-a'))?.status,
+    'confirmed'
+  );
+  assert.equal(
+    (await residualCreatedStore.loadByMessageId('wamid-residual-b'))?.status,
+    'pending'
+  );
+  const residualAfterA = await holdMod.lookupSilentEscalationHold(
+    'PN-RESIDUAL-CREATED',
+    residualCreatedPhone,
+    residualCreatedStore
+  );
+  assert.equal(residualAfterA.kind, 'active');
+  assert.equal(residualAfterA.sourceMessageId, 'wamid-residual-b');
+
+  const residualCreatedB = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-RESIDUAL-CREATED',
+      customerPhone: residualCreatedPhone,
+      messageId: 'wamid-residual-b',
+      divergence,
+    },
+    {
+      holdStore: residualCreatedStore,
+      post: async (candidate) => {
+        residualCreatedPosts += 1;
+        assert.equal(candidate.messageId, 'wamid-residual-b');
+        return { code: 'ACTIVE_QUESTION_DIFFERENT_SOURCE' };
+      },
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(residualCreatedB.kind, 'active_elsewhere');
+  assert.equal(residualCreatedPosts, 2);
+  assert.equal(
+    (await residualCreatedStore.loadByMessageId('wamid-residual-b'))?.status,
+    'active_elsewhere'
+  );
+  assert.equal(
+    (
+      await holdMod.lookupSilentEscalationHold(
+        'PN-RESIDUAL-CREATED',
+        residualCreatedPhone,
+        residualCreatedStore
+      )
+    ).kind,
+    'inactive'
+  );
+
+  // A ACTIVE preserva o silêncio de B pending; o owner residual continua no
+  // cache mesmo quando o source atual vira active_elsewhere.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const residualActiveStore = new holdMod.MemorySilentEscalationHoldStore();
+  const residualActivePhone = '+5511999000125';
+  await seedHold(residualActiveStore, {
+    phoneNumberId: 'PN-RESIDUAL-ACTIVE',
+    customerPhone: residualActivePhone,
+    sourceMessageId: 'wamid-residual-active-a',
+    status: 'pending',
+    at: new Date(now.getTime() - 2_000),
+  });
+  await seedHold(residualActiveStore, {
+    phoneNumberId: 'PN-RESIDUAL-ACTIVE',
+    customerPhone: residualActivePhone,
+    sourceMessageId: 'wamid-residual-active-b',
+    status: 'pending',
+    at: new Date(now.getTime() - 1_000),
+  });
+  const residualActive = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-RESIDUAL-ACTIVE',
+      customerPhone: residualActivePhone,
+      messageId: 'wamid-residual-active-a',
+      divergence,
+    },
+    {
+      holdStore: residualActiveStore,
+      post: async () => ({ code: 'ACTIVE_QUESTION_DIFFERENT_SOURCE' }),
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(residualActive.kind, 'active_elsewhere');
+  assert.equal((await residualActiveStore.loadByMessageId('wamid-residual-active-a'))?.status, 'active_elsewhere');
+  const residualAfterActive = await holdMod.lookupSilentEscalationHold(
+    'PN-RESIDUAL-ACTIVE',
+    residualActivePhone,
+    residualActiveStore
+  );
+  assert.equal(residualAfterActive.kind, 'active');
+  assert.equal(residualAfterActive.sourceMessageId, 'wamid-residual-active-b');
+
+  // Recompute failure invalidates the cache: the current turn remains silent
+  // by its ERP outcome, but the next lookup must be unknown while the store
+  // is down, then recover to inactive when the store returns.
+  for (const resultKind of ['created', 'active_elsewhere'] as const) {
+    holdMod.__resetSilentEscalationHoldForTest();
+    const recomputeFailureStore = new holdMod.MemorySilentEscalationHoldStore();
+    let ownerReads = 0;
+    const originalOwnerLookup =
+      recomputeFailureStore.loadPendingOwnerByConversation.bind(
+        recomputeFailureStore
+      );
+    recomputeFailureStore.loadPendingOwnerByConversation = async (key) => {
+      ownerReads += 1;
+      if (ownerReads > 1) throw new Error('residual owner lookup unavailable');
+      return originalOwnerLookup(key);
+    };
+    let recomputeFailurePosts = 0;
+    const recomputeFailureOutcome =
+      await escalation.escalateSilentUnderstandingFailure(
+        {
+          phoneNumberId: 'PN-RECOMPUTE-FAIL',
+          customerPhone:
+            resultKind === 'created' ? '+5511999000126' : '+5511999000127',
+          messageId: `wamid-recompute-${resultKind}`,
+          divergence,
+        },
+        {
+          holdStore: recomputeFailureStore,
+          post: async () => {
+            recomputeFailurePosts += 1;
+            return resultKind === 'created'
+              ? { questionId: 'q-recompute-created' }
+              : { code: 'ACTIVE_QUESTION_DIFFERENT_SOURCE' };
+          },
+          now: () => now,
+          wait: async () => undefined,
+        }
+      );
+    assert.equal(recomputeFailureOutcome.kind, resultKind);
+    assert.equal(recomputeFailurePosts, 1);
+    assert.equal(
+      (
+        await holdMod.lookupSilentEscalationHold(
+          'PN-RECOMPUTE-FAIL',
+          resultKind === 'created' ? '+5511999000126' : '+5511999000127',
+          recomputeFailureStore
+        )
+      ).kind,
+      'unknown',
+      `${resultKind}: recompute fail-closed não cria latch positivo`
+    );
+    recomputeFailureStore.loadPendingOwnerByConversation = originalOwnerLookup;
+    assert.equal(
+      (
+        await holdMod.lookupSilentEscalationHold(
+          'PN-RECOMPUTE-FAIL',
+          resultKind === 'created' ? '+5511999000126' : '+5511999000127',
+          recomputeFailureStore
+        )
+      ).kind,
+      'inactive',
+      `${resultKind}: store recuperado recompõe ausência de owner`
+    );
+  }
+
+  // A residual pending permanece visível depois da recuperação do lookup que
+  // falhou no pós-created.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const recomputeResidualStore = new holdMod.MemorySilentEscalationHoldStore();
+  const recomputeResidualPhone = '+5511999000128';
+  await seedHold(recomputeResidualStore, {
+    phoneNumberId: 'PN-RECOMPUTE-RESIDUAL',
+    customerPhone: recomputeResidualPhone,
+    sourceMessageId: 'wamid-recompute-residual-a',
+    status: 'pending',
+    at: new Date(now.getTime() - 2_000),
+  });
+  await seedHold(recomputeResidualStore, {
+    phoneNumberId: 'PN-RECOMPUTE-RESIDUAL',
+    customerPhone: recomputeResidualPhone,
+    sourceMessageId: 'wamid-recompute-residual-b',
+    status: 'pending',
+    at: new Date(now.getTime() - 1_000),
+  });
+  let residualOwnerReads = 0;
+  const originalResidualOwnerLookup =
+    recomputeResidualStore.loadPendingOwnerByConversation.bind(
+      recomputeResidualStore
+    );
+  recomputeResidualStore.loadPendingOwnerByConversation = async (key) => {
+    residualOwnerReads += 1;
+    if (residualOwnerReads > 1) {
+      throw new Error('residual owner lookup unavailable');
+    }
+    return originalResidualOwnerLookup(key);
+  };
+  const recomputeResidualOutcome =
+    await escalation.escalateSilentUnderstandingFailure(
+      {
+        phoneNumberId: 'PN-RECOMPUTE-RESIDUAL',
+        customerPhone: recomputeResidualPhone,
+        messageId: 'wamid-recompute-residual-a',
+        divergence,
+      },
+      {
+        holdStore: recomputeResidualStore,
+        post: async () => ({ questionId: 'q-recompute-residual-a' }),
+        now: () => now,
+        wait: async () => undefined,
+      }
+    );
+  assert.equal(recomputeResidualOutcome.kind, 'created');
+  assert.equal(
+    (
+      await holdMod.lookupSilentEscalationHold(
+        'PN-RECOMPUTE-RESIDUAL',
+        recomputeResidualPhone,
+        recomputeResidualStore
+      )
+    ).kind,
+    'unknown'
+  );
+  recomputeResidualStore.loadPendingOwnerByConversation =
+    originalResidualOwnerLookup;
+  const recoveredResidualLookup = await holdMod.lookupSilentEscalationHold(
+    'PN-RECOMPUTE-RESIDUAL',
+    recomputeResidualPhone,
+    recomputeResidualStore
+  );
+  assert.equal(recoveredResidualLookup.kind, 'active');
+  assert.equal(recoveredResidualLookup.sourceMessageId, 'wamid-recompute-residual-b');
+
+  // IA-19D F4: confirmação é deduplica por WAMID; pending retenta o mesmo
+  // POST e jamais abre uma segunda linha para a mesma mensagem.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const sameWamidStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(sameWamidStore, {
+    phoneNumberId: 'PN-SAME-WAMID',
+    customerPhone: '+5511999000130',
+    sourceMessageId: 'wamid-same-confirmed',
+    status: 'confirmed',
+    questionId: 'q-same-confirmed',
+  });
+  let sameConfirmedPosts = 0;
+  const sameConfirmed = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-SAME-WAMID',
+      customerPhone: '+5511999000130',
+      messageId: 'wamid-same-confirmed',
+      divergence,
+    },
+    {
+      holdStore: sameWamidStore,
+      post: async () => {
+        sameConfirmedPosts += 1;
+        return { questionId: 'q-duplicate' };
+      },
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(sameConfirmed.kind, 'deduplicated');
+  assert.equal(sameConfirmedPosts, 0);
+
+  holdMod.__resetSilentEscalationHoldForTest();
+  const samePendingStore = new holdMod.MemorySilentEscalationHoldStore();
+  let samePendingPosts = 0;
+  let samePendingFailures = 3;
+  const samePendingPost = async () => {
+    samePendingPosts += 1;
+    if (samePendingFailures > 0) {
+      samePendingFailures -= 1;
+      throw new Error('transient');
+    }
+    return { questionId: 'q-same-pending' };
+  };
+  const samePendingFirst = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-SAME-WAMID',
+      customerPhone: '+5511999000131',
+      messageId: 'wamid-same-pending',
+      divergence,
+    },
+    {
+      holdStore: samePendingStore,
+      post: samePendingPost,
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(samePendingFirst.kind, 'pending');
+  assert.equal(samePendingPosts, 3, 'retry pending usa o mesmo sourceMessageId');
+  assert.equal(
+    (await samePendingStore.loadByMessageId('wamid-same-pending'))?.status,
+    'pending'
+  );
+  const samePendingRetry = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-SAME-WAMID',
+      customerPhone: '+5511999000131',
+      messageId: 'wamid-same-pending',
+      divergence,
+    },
+    {
+      holdStore: samePendingStore,
+      post: samePendingPost,
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(samePendingRetry.kind, 'created');
+  assert.equal(samePendingPosts, 4, 'retry posterior faz um POST idempotente');
+  assert.equal(
+    await samePendingStore.loadByMessageId('wamid-same-pending-other'),
+    null,
+    'uma linha por source'
+  );
+
+  // IA-19D F5: a resolução pelo painel (sem echo) é modelada somente pelo
+  // oracle autoritativo do POST. Não há enum local nem write/WhatsApp novo.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const panelStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(panelStore, {
+    phoneNumberId: 'PN-PANEL-RESOLVE',
+    customerPhone: '+5511999000140',
+    sourceMessageId: 'wamid-panel-old',
+    status: 'confirmed',
+    questionId: 'q-panel-expired',
+  });
+  let panelCards = 0;
+  const panelOutcome = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-PANEL-RESOLVE',
+      customerPhone: '+5511999000140',
+      messageId: 'wamid-panel-new',
+      divergence,
+    },
+    {
+      holdStore: panelStore,
+      post: async (candidate) => {
+        panelCards += 1;
+        assert.equal(candidate.messageId, 'wamid-panel-new');
+        return {
+          questionId: 'q-panel-new',
+          escalation: { active: true, questionId: 'q-panel-new', version: 2 },
+        };
+      },
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(panelOutcome.kind, 'created');
+  assert.equal(panelCards, 1, 'oracle ERP cria exatamente um card/push para B');
+  assert.equal((await panelStore.loadByMessageId('wamid-panel-old'))?.status, 'released');
+  assert.equal((await panelStore.loadByMessageId('wamid-panel-new'))?.status, 'confirmed');
+  assert.equal(
+    (await panelStore.loadByMessageId('wamid-panel-new'))?.divergence.turnReceiptHash,
+    divergence.turnReceiptHash,
+    'hash da divergência acompanha o plan de B'
+  );
+
+  // IA-19D F6: ERP OPEN alheia mantém uma única autoridade; cada WAMID novo
+  // pode ser submetido uma vez, mas retry do mesmo WAMID é deduplicado localmente.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const manyActiveStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(manyActiveStore, {
+    phoneNumberId: 'PN-MANY-ACTIVE',
+    customerPhone: '+5511999000150',
+    sourceMessageId: 'wamid-many-old',
+    status: 'confirmed',
+    questionId: 'q-many-open',
+  });
+  let manyActivePosts = 0;
+  const manyActivePost = async () => {
+    manyActivePosts += 1;
+    return { code: 'ACTIVE_QUESTION_DIFFERENT_SOURCE' };
+  };
+  for (const messageId of ['wamid-many-b', 'wamid-many-c']) {
+    const result = await escalation.escalateSilentUnderstandingFailure(
+      {
+        phoneNumberId: 'PN-MANY-ACTIVE',
+        customerPhone: '+5511999000150',
+        messageId,
+        divergence,
+      },
+      {
+        holdStore: manyActiveStore,
+        post: manyActivePost,
+        now: () => now,
+        wait: async () => undefined,
+      }
+    );
+    assert.equal(result.kind, 'active_elsewhere');
+  }
+  const manyActiveRetry = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-MANY-ACTIVE',
+      customerPhone: '+5511999000150',
+      messageId: 'wamid-many-b',
+      divergence,
+    },
+    {
+      holdStore: manyActiveStore,
+      post: manyActivePost,
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(manyActiveRetry.kind, 'active_elsewhere');
+  assert.equal(manyActivePosts, 2);
+  assert.equal((await manyActiveStore.loadByMessageId('wamid-many-old'))?.status, 'confirmed');
+  assert.equal((await manyActiveStore.loadByMessageId('wamid-many-b'))?.status, 'active_elsewhere');
+  assert.equal((await manyActiveStore.loadByMessageId('wamid-many-c'))?.status, 'active_elsewhere');
+
+  // IA-19D F7: falha de transporte mantém B pending e o overlay ativo; uma
+  // tentativa posterior criada reconcilia A sem duplicar a pergunta.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const retryStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(retryStore, {
+    phoneNumberId: 'PN-RETRY-STALE',
+    customerPhone: '+5511999000160',
+    sourceMessageId: 'wamid-retry-old',
+    status: 'confirmed',
+    questionId: 'q-retry-old',
+  });
+  let retryPosts = 0;
+  let retryFailures = 3;
+  const retryPost = async () => {
+    retryPosts += 1;
+    if (retryFailures > 0) {
+      retryFailures -= 1;
+      throw new Error('transient transport');
+    }
+    return { questionId: 'q-retry-new' };
+  };
+  const retryFirst = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-RETRY-STALE',
+      customerPhone: '+5511999000160',
+      messageId: 'wamid-retry-new',
+      divergence,
+    },
+    {
+      holdStore: retryStore,
+      post: retryPost,
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(retryFirst.kind, 'pending');
+  assert.equal((await retryStore.loadByMessageId('wamid-retry-old'))?.status, 'confirmed');
+  assert.equal((await retryStore.loadByMessageId('wamid-retry-new'))?.status, 'pending');
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      'PN-RETRY-STALE',
+      '+5511999000160',
+      retryStore
+    ),
+    true
+  );
+  const retrySecond = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-RETRY-STALE',
+      customerPhone: '+5511999000160',
+      messageId: 'wamid-retry-new',
+      divergence,
+    },
+    {
+      holdStore: retryStore,
+      post: retryPost,
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(retrySecond.kind, 'created');
+  assert.equal(retryPosts, 4);
+  assert.equal((await retryStore.loadByMessageId('wamid-retry-old'))?.status, 'released');
+  assert.equal((await retryStore.loadByMessageId('wamid-retry-new'))?.status, 'confirmed');
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      'PN-RETRY-STALE',
+      '+5511999000160',
+      retryStore
+    ),
+    false
+  );
+
+  // IA-19D F8: echo humano vence a reconciliação, libera todos os holds e não
+  // cria nova Pergunta.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const echoReconcileStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(echoReconcileStore, {
+    phoneNumberId: 'PN-ECHO-RECONCILE',
+    customerPhone: '+5511999000170',
+    sourceMessageId: 'wamid-echo-old',
+    status: 'confirmed',
+    questionId: 'q-echo-old',
+  });
+  await seedHold(echoReconcileStore, {
+    phoneNumberId: 'PN-ECHO-RECONCILE',
+    customerPhone: '+5511999000170',
+    sourceMessageId: 'wamid-echo-current',
+    status: 'pending',
+  });
+  let echoReconcilePosts = 0;
+  const echoReconcile = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-ECHO-RECONCILE',
+      customerPhone: '+5511999000170',
+      messageId: 'wamid-echo-current',
+      divergence,
+    },
+    {
+      holdStore: echoReconcileStore,
+      post: async () => {
+        echoReconcilePosts += 1;
+        return { code: 'ECHO_HUMAN_ACTIVE' };
+      },
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(echoReconcile.kind, 'released');
+  assert.equal(echoReconcilePosts, 1, 'a resposta ECHO não cria Pergunta');
+  assert.equal((await echoReconcileStore.loadByMessageId('wamid-echo-old'))?.status, 'released');
+  assert.equal((await echoReconcileStore.loadByMessageId('wamid-echo-current'))?.status, 'released');
+  assert.equal(
+    await holdMod.isSilentEscalationHoldActive(
+      'PN-ECHO-RECONCILE',
+      '+5511999000170',
+      echoReconcileStore
+    ),
+    false
+  );
+
+  // IA-19D F9: o UPDATE de housekeeping é estritamente conversation-scoped.
+  holdMod.__resetSilentEscalationHoldForTest();
+  const isolationStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(isolationStore, {
+    phoneNumberId: 'PN-ISOLATION',
+    customerPhone: '+5511999000180',
+    sourceMessageId: 'wamid-isolation-a',
+    status: 'confirmed',
+    questionId: 'q-isolation-a',
+  });
+  await seedHold(isolationStore, {
+    phoneNumberId: 'PN-ISOLATION',
+    customerPhone: '+5511999000181',
+    sourceMessageId: 'wamid-isolation-other-conversation',
+    status: 'confirmed',
+    questionId: 'q-isolation-other',
+  });
+  await seedHold(isolationStore, {
+    phoneNumberId: 'PN-ISOLATION-OTHER-TENANT',
+    customerPhone: '+5511999000180',
+    sourceMessageId: 'wamid-isolation-other-tenant',
+    status: 'confirmed',
+    questionId: 'q-isolation-tenant',
+  });
+  const isolationResult = await escalation.escalateSilentUnderstandingFailure(
+    {
+      phoneNumberId: 'PN-ISOLATION',
+      customerPhone: '+5511999000180',
+      messageId: 'wamid-isolation-b',
+      divergence,
+    },
+    {
+      holdStore: isolationStore,
+      post: async () => ({ questionId: 'q-isolation-b' }),
+      now: () => now,
+      wait: async () => undefined,
+    }
+  );
+  assert.equal(isolationResult.kind, 'created');
+  assert.equal((await isolationStore.loadByMessageId('wamid-isolation-a'))?.status, 'released');
+  assert.equal(
+    (await isolationStore.loadByMessageId('wamid-isolation-other-conversation'))?.status,
+    'confirmed'
+  );
+  assert.equal(
+    (await isolationStore.loadByMessageId('wamid-isolation-other-tenant'))?.status,
+    'confirmed'
+  );
 
   const otherTenantHold = new holdMod.MemorySilentEscalationHoldStore();
   const other = await escalation.escalateSilentUnderstandingFailure(
@@ -288,7 +1265,7 @@ async function main(): Promise<void> {
     }
   );
   assert.equal(other.kind, 'created');
-  assert.equal(posts.length, 2, 'mesmo telefone em outro phoneNumberId isola');
+  assert.equal(posts.length, 3, 'mesmo telefone em outro phoneNumberId isola');
 
   const failStore = new holdMod.MemorySilentEscalationHoldStore();
   let failAttempts = 0;
@@ -436,6 +1413,12 @@ async function main(): Promise<void> {
   assert.equal(prepared.planReceipt.recoveryKind, 'silent_escalation');
   assert.equal(prepared.payload, null);
   assert.equal(runtimePosts.length, 1);
+  assert.equal(
+    (runtimePosts[0] as { divergence?: { turnReceiptHash?: string } }).divergence
+      ?.turnReceiptHash,
+    hashTurnPlanReceiptV2(prepared.planReceipt),
+    'created: divergence ancora o plan persistido'
+  );
 
   const delivered = await delivery.deliverPreparedReceptionistTurnV2(prepared, {
     store,
@@ -454,6 +1437,163 @@ async function main(): Promise<void> {
   assert.equal(delivered.delivery, 'silent');
   assert.equal(delivered.receipt.transportOutcome, 'silent_escalation');
   assert.equal(delivered.receipt.conversationCommitOutcome, 'not_applicable');
+
+  // IA-19D F10: os três resultados de reconciliação preservam os recibos
+  // IA-19C. Nenhum deles gera providerMessageIdHash, WhatsApp ou write.
+  async function prepareReceiptOutcome(
+    label: string,
+    phone: string,
+    holdStore: InstanceType<typeof holdMod.MemorySilentEscalationHoldStore>,
+    post: (input: Record<string, unknown>) => Promise<unknown>
+  ): Promise<{
+    prepared: any;
+    store: InstanceType<typeof stateStore.MemoryConversationalV2StateStore>;
+    posts: Array<Record<string, unknown>>;
+    transportCalls: number;
+  }> {
+    const receiptStore = new stateStore.MemoryConversationalV2StateStore();
+    receiptStore.setInputSequence(context.buildConversationKey(config.phoneNumberId, phone), 1);
+    const posts: Array<Record<string, unknown>> = [];
+    const prepared = await runtime.getReceptionistReplyV2({
+      phone,
+      userMessage: `conteúdo inválido ${label}`,
+      userName: 'Cliente Fixture',
+      config,
+      turnRuntime: {
+        turnId: `turn-receipt-${label}`,
+        inputSequence: 1,
+        currentInboundIds: [`wamid-receipt-${label}`],
+        currentInboundTextsById: {
+          [`wamid-receipt-${label}`]: `conteúdo inválido ${label}`,
+        },
+        checkpoint: async () => ({
+          paused: false,
+          latestInputSequence: 1,
+          successorInputSequence: null,
+          successorInboundMessageIds: [],
+        }),
+      },
+      deps: {
+        store: receiptStore,
+        now: () => now,
+        id: () => `receipt-id-${label}`,
+        loadServices: async () => services,
+        loadHistory: async () => [],
+        isPaused: async () => false,
+        interpreterEnabled: false,
+        runModelLoop: async () => ({
+          rawReply: '{',
+          exhausted: false,
+          provider: 'openai',
+          model: 'gpt-4o-mini',
+          providerReportedModels: ['gpt-4o-mini'],
+          rounds: 1,
+          messages: [],
+          toolTrace: [],
+          usage: [],
+        }),
+        regenerate: async () => ({
+          ok: false,
+          reasonCode: 'REGEN_MODEL_RESULT_INVALID',
+          providerCalls: 1,
+        }),
+        executeTool: async () => {
+          throw new Error('F10 não executa tools');
+        },
+        escalateSilent: (input: any, deps: any) =>
+          escalation.escalateSilentUnderstandingFailure(input, {
+            ...deps,
+            holdStore,
+            post: async (candidate: Record<string, unknown>) => {
+              posts.push(candidate);
+              return post(candidate);
+            },
+            now: () => now,
+            wait: async () => undefined,
+          }),
+      },
+    });
+    let transportCalls = 0;
+    const result = await delivery.deliverPreparedReceptionistTurnV2(prepared, {
+      store: receiptStore,
+      now: () => now,
+      id: () => `delivery-id-${label}`,
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: 1,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => {
+        transportCalls += 1;
+        throw new Error('F10 não envia WhatsApp');
+      },
+    });
+    assert.equal(prepared.planReceipt.recoveryKind, 'silent_escalation');
+    assert.equal(prepared.payload, null);
+    assert.equal(result.delivery, 'silent');
+    assert.equal(result.receipt.transportOutcome, 'silent_escalation');
+    assert.equal('providerMessageIdHash' in result.receipt, false);
+    assert.equal(transportCalls, 0);
+    assert.equal(
+      (posts[0]?.divergence as { turnReceiptHash?: string } | undefined)
+        ?.turnReceiptHash,
+      hashTurnPlanReceiptV2(prepared.planReceipt),
+      `${label}: hash do plan persistido`
+    );
+    return { prepared, store: receiptStore, posts, transportCalls };
+  }
+
+  holdMod.__resetSilentEscalationHoldForTest();
+  const f10CreatedStore = new holdMod.MemorySilentEscalationHoldStore();
+  const f10Created = await prepareReceiptOutcome(
+    'created',
+    '+5511999000210',
+    f10CreatedStore,
+    async () => ({ questionId: 'q-f10-created' })
+  );
+  assert.equal(f10Created.posts.length, 1);
+  assert.equal(
+    (await f10CreatedStore.loadByMessageId('wamid-receipt-created'))?.status,
+    'confirmed'
+  );
+
+  holdMod.__resetSilentEscalationHoldForTest();
+  const f10ActiveStore = new holdMod.MemorySilentEscalationHoldStore();
+  await seedHold(f10ActiveStore, {
+    phoneNumberId: config.phoneNumberId,
+    customerPhone: '+5511999000211',
+    sourceMessageId: 'wamid-f10-active-old',
+    status: 'confirmed',
+    questionId: 'q-f10-open',
+  });
+  const f10Active = await prepareReceiptOutcome(
+    'active',
+    '+5511999000211',
+    f10ActiveStore,
+    async () => ({ code: 'ACTIVE_QUESTION_DIFFERENT_SOURCE' })
+  );
+  assert.equal(f10Active.posts.length, 1);
+  assert.equal(
+    (await f10ActiveStore.loadByMessageId('wamid-receipt-active'))?.status,
+    'active_elsewhere'
+  );
+
+  holdMod.__resetSilentEscalationHoldForTest();
+  const f10PendingStore = new holdMod.MemorySilentEscalationHoldStore();
+  const f10Pending = await prepareReceiptOutcome(
+    'pending',
+    '+5511999000212',
+    f10PendingStore,
+    async () => {
+      throw new Error('F10 transitório');
+    }
+  );
+  assert.equal(f10Pending.posts.length, 3, 'pending: fast retries continuam no mesmo WAMID');
+  assert.equal(
+    (await f10PendingStore.loadByMessageId('wamid-receipt-pending'))?.status,
+    'pending'
+  );
 
   const humanPosts: unknown[] = [];
   const human = await runtime.getReceptionistReplyV2({
@@ -546,8 +1686,8 @@ async function main(): Promise<void> {
   persistFailStore.ensure = async () => {
     throw new Error('hold store ensure failed');
   };
-  persistFailStore.loadActiveByConversation = async () => {
-    throw new Error('hold store loadActive failed');
+  persistFailStore.loadPendingOwnerByConversation = async () => {
+    throw new Error('hold store pending-owner lookup failed');
   };
   const persistFailPosts: unknown[] = [];
   await assert.rejects(
@@ -586,8 +1726,8 @@ async function main(): Promise<void> {
   persistFailRuntimeStore.ensure = async () => {
     throw new Error('hold store ensure failed');
   };
-  persistFailRuntimeStore.loadActiveByConversation = async () => {
-    throw new Error('hold store loadActive failed');
+  persistFailRuntimeStore.loadPendingOwnerByConversation = async () => {
+    throw new Error('hold store pending-owner lookup failed');
   };
   const persistFailRuntimePosts: unknown[] = [];
   await assert.rejects(
@@ -681,7 +1821,7 @@ async function main(): Promise<void> {
     now,
   });
   holdMod.__resetSilentEscalationHoldForTest();
-  unknownStore.loadActiveByConversation = async () => {
+  unknownStore.loadPendingOwnerByConversation = async () => {
     throw new Error('lookup transitório indisponível');
   };
   let unknownInboundLookups = 0;
@@ -741,7 +1881,7 @@ async function main(): Promise<void> {
   );
   // A subsequent readable lookup must still reach the store: the exception
   // above did not poison the cache with a negative result.
-  unknownStore.loadActiveByConversation = async () =>
+  unknownStore.loadPendingOwnerByConversation = async () =>
     (await unknownStore.loadByMessageId('wamid-hold-unknown'))!;
   const recoveredUnknownLookup = await holdMod.lookupSilentEscalationHold(
     unknownConfig.phoneNumberId,

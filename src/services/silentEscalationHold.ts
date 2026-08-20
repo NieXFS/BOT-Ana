@@ -33,6 +33,7 @@ export interface SilentEscalationHoldRow {
   phoneNumberId: string;
   customerPhone: string;
   sourceMessageId: string;
+  createdAt: Date;
   status: SilentEscalationHoldStatus;
   questionId: string | null;
   attempts: number;
@@ -54,6 +55,10 @@ export interface SilentEscalationHoldStore {
   loadActiveByConversation: (
     conversationKey: string
   ) => Promise<SilentEscalationHoldRow | null>;
+  /** Pending owner: oldest created_at, then source_message_id ASC. */
+  loadPendingOwnerByConversation: (
+    conversationKey: string
+  ) => Promise<SilentEscalationHoldRow | null>;
   markConfirmed: (
     sourceMessageId: string,
     questionId: string
@@ -64,6 +69,14 @@ export interface SilentEscalationHoldStore {
     attempts: number,
     nextRetryAt: Date,
     failureCode: string
+  ) => Promise<void>;
+  /**
+   * Reconciliação autoritativa após uma nova Pergunta ser criada no ERP.
+   * Nunca inclui `pending`: o sweeper continua dono desses holds.
+   */
+  releaseSupersededConfirmedByConversation: (
+    conversationKey: string,
+    exceptSourceMessageId: string
   ) => Promise<void>;
   releaseByConversation: (conversationKey: string) => Promise<void>;
   listReady: (limit: number, now: Date) => Promise<string[]>;
@@ -87,6 +100,7 @@ interface RawHoldRow {
   phone_number_id: string;
   customer_phone: string;
   source_message_id: string;
+  created_at: Date;
   status: SilentEscalationHoldStatus;
   question_id: string | null;
   attempts: number | string;
@@ -101,6 +115,7 @@ function mapHold(row: RawHoldRow): SilentEscalationHoldRow {
     phoneNumberId: row.phone_number_id,
     customerPhone: row.customer_phone,
     sourceMessageId: row.source_message_id,
+    createdAt: row.created_at,
     status: row.status,
     questionId: row.question_id,
     attempts: Number(row.attempts),
@@ -111,7 +126,7 @@ function mapHold(row: RawHoldRow): SilentEscalationHoldRow {
 }
 
 const SELECT_HOLD = `SELECT conversation_key, phone_number_id, customer_phone,
-        source_message_id, status, question_id, attempts, next_retry_at,
+        source_message_id, created_at, status, question_id, attempts, next_retry_at,
         failure_code, divergence_json
  FROM ana_v2_silent_escalation_holds`;
 
@@ -153,7 +168,19 @@ export const pgSilentEscalationHoldStore: SilentEscalationHoldStore = {
       `${SELECT_HOLD}
        WHERE conversation_key = $1
          AND status IN ('pending', 'confirmed')
-       ORDER BY updated_at DESC
+       ORDER BY (status = 'pending') DESC, updated_at DESC
+       LIMIT 1`,
+      [conversationKey]
+    );
+    const row = result.rows[0];
+    return row ? mapHold(row) : null;
+  },
+  async loadPendingOwnerByConversation(conversationKey) {
+    const result = await pool.query<RawHoldRow>(
+      `${SELECT_HOLD}
+       WHERE conversation_key = $1
+         AND status = 'pending'
+       ORDER BY created_at ASC, source_message_id ASC
        LIMIT 1`,
       [conversationKey]
     );
@@ -194,6 +221,20 @@ export const pgSilentEscalationHoldStore: SilentEscalationHoldStore = {
       [sourceMessageId, attempts, nextRetryAt, failureCode]
     );
   },
+  async releaseSupersededConfirmedByConversation(
+    conversationKey,
+    exceptSourceMessageId
+  ) {
+    await pool.query(
+      `UPDATE ana_v2_silent_escalation_holds
+       SET status = 'released',
+           updated_at = now()
+       WHERE conversation_key = $1
+         AND source_message_id <> $2
+         AND status IN ('confirmed', 'active_elsewhere')`,
+      [conversationKey, exceptSourceMessageId]
+    );
+  },
   async releaseByConversation(conversationKey) {
     await pool.query(
       `UPDATE ana_v2_silent_escalation_holds
@@ -229,6 +270,7 @@ export class MemorySilentEscalationHoldStore implements SilentEscalationHoldStor
       phoneNumberId: input.phoneNumberId,
       customerPhone: input.customerPhone,
       sourceMessageId: input.sourceMessageId,
+      createdAt: input.now,
       status: 'pending',
       questionId: null,
       attempts: 0,
@@ -250,7 +292,28 @@ export class MemorySilentEscalationHoldStore implements SilentEscalationHoldStor
         row.conversationKey === conversationKey &&
         (row.status === 'pending' || row.status === 'confirmed')
     );
-    return matches.at(-1) ?? null;
+    return (
+      matches.sort((a, b) => {
+        return Number(b.status === 'pending') - Number(a.status === 'pending');
+      })[0] ?? null
+    );
+  }
+
+  async loadPendingOwnerByConversation(conversationKey: string) {
+    return (
+      [...this.byMessageId.values()]
+        .filter(
+          (row) =>
+            row.conversationKey === conversationKey && row.status === 'pending'
+        )
+        .sort((a, b) => {
+          const createdDelta = a.createdAt.getTime() - b.createdAt.getTime();
+          if (createdDelta !== 0) return createdDelta;
+          if (a.sourceMessageId < b.sourceMessageId) return -1;
+          if (a.sourceMessageId > b.sourceMessageId) return 1;
+          return 0;
+        })[0] ?? null
+    );
   }
 
   async markConfirmed(sourceMessageId: string, questionId: string) {
@@ -278,6 +341,21 @@ export class MemorySilentEscalationHoldStore implements SilentEscalationHoldStor
     row.attempts = Math.max(row.attempts, attempts);
     row.nextRetryAt = nextRetryAt;
     row.failureCode = failureCode;
+  }
+
+  async releaseSupersededConfirmedByConversation(
+    conversationKey: string,
+    exceptSourceMessageId: string
+  ) {
+    for (const row of this.byMessageId.values()) {
+      if (
+        row.conversationKey === conversationKey &&
+        row.sourceMessageId !== exceptSourceMessageId &&
+        (row.status === 'confirmed' || row.status === 'active_elsewhere')
+      ) {
+        row.status = 'released';
+      }
+    }
   }
 
   async releaseByConversation(conversationKey: string) {
@@ -378,10 +456,10 @@ export async function lookupSilentEscalationHold(
       : { kind: 'inactive' };
   }
   try {
-    const row = await store.loadActiveByConversation(
+    const row = await store.loadPendingOwnerByConversation(
       canonicalConversationKey(phoneNumberId, customerPhone)
     );
-    const active = row?.status === 'pending';
+    const active = row !== null;
     rememberActive(phoneNumberId, customerPhone, active, row?.sourceMessageId ?? null);
     return active
       ? { kind: 'active', sourceMessageId: row?.sourceMessageId ?? null }
@@ -446,7 +524,7 @@ export function classifySilentEscalationPostFailure(error: unknown): {
   failureCode: string;
 } {
   const status = safeHttpStatus(error);
-  const code =
+  const responseData =
     error &&
     typeof error === 'object' &&
     'response' in error &&
@@ -455,8 +533,9 @@ export function classifySilentEscalationPostFailure(error: unknown): {
     'data' in error.response &&
     error.response.data &&
     typeof error.response.data === 'object'
-      ? (error.response.data as { code?: unknown }).code
-      : undefined;
+      ? (error.response.data as { code?: unknown; error?: unknown })
+      : null;
+  const code = responseData?.code ?? responseData?.error;
   if (code === 'ACTIVE_QUESTION_DIFFERENT_SOURCE') {
     return {
       retryable: false,
@@ -526,22 +605,28 @@ export async function persistSilentEscalationHold(input: {
     input.customerPhone
   );
   try {
-    const active = await store.loadActiveByConversation(conversationKey);
+    const pendingOwner = await store.loadPendingOwnerByConversation(
+      conversationKey
+    );
     if (
-      active &&
-      active.sourceMessageId !== input.sourceMessageId &&
-      (active.status === 'pending' || active.status === 'confirmed')
+      pendingOwner &&
+      pendingOwner.sourceMessageId !== input.sourceMessageId
     ) {
-      // Overlay local só cobre pending: depois do POST, a pausa ESCALATION do
-      // ERP é autoritativa e o echo humano precisa conseguir encerrá-la.
+      // O dono pending é a única autoridade local viva. Ele vence qualquer
+      // estado do source atual (pending, confirmed, released ou
+      // active_elsewhere), evitando tanto fala quanto dois sweepers em ciclo.
       rememberActive(
         input.phoneNumberId,
         input.customerPhone,
-        active.status === 'pending',
-        active.sourceMessageId
+        true,
+        pendingOwner.sourceMessageId
       );
-      return { kind: 'active_elsewhere', hold: active };
+      return { kind: 'active_elsewhere', hold: pendingOwner };
     }
+
+    // Sem owner alheio, `ensure` é a leitura durable do source atual: ele
+    // preserva confirmed/released/active_elsewhere e permite retry do owner
+    // igual sem uma janela extra entre lookup e persistência.
     const hold = await store.ensure({
       conversationKey,
       phoneNumberId: input.phoneNumberId,
@@ -554,10 +639,17 @@ export async function persistSilentEscalationHold(input: {
       rememberActive(input.phoneNumberId, input.customerPhone, false, hold.sourceMessageId);
       return { kind: 'existing', hold };
     }
+    if (hold.status === 'active_elsewhere') {
+      rememberActive(input.phoneNumberId, input.customerPhone, false, hold.sourceMessageId);
+      return { kind: 'active_elsewhere', hold };
+    }
+    const pendingLike =
+      hold.status === 'pending' ||
+      (hold.status === 'confirmed' && !hold.questionId);
     rememberActive(
       input.phoneNumberId,
       input.customerPhone,
-      hold.status === 'pending',
+      pendingLike,
       hold.sourceMessageId
     );
     return {
@@ -626,4 +718,35 @@ export function setSilentEscalationHoldOverlay(
   active: boolean
 ): void {
   rememberActive(phoneNumberId, customerPhone, active, null);
+}
+
+/** Remove o memo local para que o próximo lookup consulte o store tipado. */
+export function invalidateSilentEscalationHoldOverlay(
+  phoneNumberId: string,
+  customerPhone: string
+): void {
+  activeHoldCache.delete(cacheKey(phoneNumberId, customerPhone));
+}
+
+/**
+ * Recalcula o overlay diretamente no store, sem confiar no cache anterior.
+ * Um source pode ter sido confirmado enquanto outro pending permanece na
+ * mesma conversa; nesse caso o pending residual continua dono do silêncio.
+ */
+export async function recomputeSilentEscalationHoldOverlay(
+  phoneNumberId: string,
+  customerPhone: string,
+  store: SilentEscalationHoldStore = pgSilentEscalationHoldStore
+): Promise<{ active: boolean; sourceMessageId: string | null }> {
+  const owner = await store.loadPendingOwnerByConversation(
+    canonicalConversationKey(phoneNumberId, customerPhone)
+  );
+  const active = owner !== null;
+  rememberActive(
+    phoneNumberId,
+    customerPhone,
+    active,
+    owner?.sourceMessageId ?? null
+  );
+  return { active, sourceMessageId: owner?.sourceMessageId ?? null };
 }

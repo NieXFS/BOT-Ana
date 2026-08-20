@@ -4,12 +4,16 @@ import {
   parseEscalationSnapshot,
   updateEscalationCache,
 } from './escalationCache';
-import { customerPhoneAsE164 } from './conversationOrder';
+import {
+  canonicalConversationKey,
+  customerPhoneAsE164,
+} from './conversationOrder';
 import { buildHumanReviewCancelFallbackCopyV2 } from './conversationalV2/cancellationFlowV2';
 import type { UnderstandingFailureDivergenceV2 } from './conversationalV2/divergence';
 import {
   classifySilentEscalationPostFailure,
   persistSilentEscalationHold,
+  recomputeSilentEscalationHoldOverlay,
   releaseSilentEscalationHold,
   setSilentEscalationHoldOverlay,
   SilentEscalationHoldPersistenceError,
@@ -17,6 +21,7 @@ import {
   pgSilentEscalationHoldStore,
   sweepRetryDelayMs,
   type SilentEscalationHoldStore,
+  invalidateSilentEscalationHoldOverlay,
 } from './silentEscalationHold';
 import { Sentry } from '../observability/sentry';
 import { runtimeErrorKind, technicalHash } from '../observability/safeRuntime';
@@ -182,6 +187,28 @@ function isTopicCodeValidationFailure(error: unknown): boolean {
   return errorText.includes('body invalido') || isEmptyObject(body.details);
 }
 
+function escalationOutcomeFromPayload(raw: unknown): EscalationOutcome | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const data = raw as {
+    code?: unknown;
+    error?: unknown;
+    questionId?: unknown;
+    escalation?: unknown;
+    version?: unknown;
+  };
+  const code = data.code ?? data.error;
+  if (code === 'ACTIVE_QUESTION_DIFFERENT_SOURCE') {
+    return { kind: 'active_question_different_source' };
+  }
+  if (code === 'ECHO_HUMAN_ACTIVE') {
+    return { kind: 'echo_human_active' };
+  }
+  const questionId =
+    typeof data.questionId === 'string' ? data.questionId.trim() : '';
+  if (!questionId) return null;
+  return { kind: 'created', questionId };
+}
+
 async function postEscalationWithTopicCompatibility(
   input: EscalationInput,
   deps: EscalationDeps
@@ -205,14 +232,14 @@ export async function escalateQuestion(
   if (!isEscalationReasonCode(input.reasonCode)) return { kind: 'failed' };
   try {
     const raw = await postEscalationWithTopicCompatibility(input, deps);
+    const outcome = escalationOutcomeFromPayload(raw);
+    if (!outcome) return { kind: 'failed' };
+    if (outcome.kind !== 'created') return outcome;
     const data = raw as {
-      questionId?: unknown;
       escalation?: unknown;
       version?: unknown;
     };
-    const questionId =
-      typeof data?.questionId === 'string' ? data.questionId.trim() : '';
-    if (!questionId) return { kind: 'failed' };
+    const questionId = outcome.questionId;
 
     const parsed = parseEscalationSnapshot(
       data.escalation ?? {
@@ -228,24 +255,13 @@ export async function escalateQuestion(
     });
     return { kind: 'created', questionId };
   } catch (error) {
+    const response = validationResponseShape(error);
+    const classified = escalationOutcomeFromPayload(response.data);
     if (
-      axios.isAxiosError(error) &&
-      error.response?.data &&
-      typeof error.response.data === 'object'
+      classified?.kind === 'active_question_different_source' ||
+      classified?.kind === 'echo_human_active'
     ) {
-      const code = (error.response.data as { code?: unknown; error?: unknown })
-        .code;
-      const errorCode = (error.response.data as { code?: unknown; error?: unknown })
-        .error;
-      if (
-        code === 'ACTIVE_QUESTION_DIFFERENT_SOURCE' ||
-        errorCode === 'ACTIVE_QUESTION_DIFFERENT_SOURCE'
-      ) {
-        return { kind: 'active_question_different_source' };
-      }
-      if (code === 'ECHO_HUMAN_ACTIVE' || errorCode === 'ECHO_HUMAN_ACTIVE') {
-        return { kind: 'echo_human_active' };
-      }
+      return classified;
     }
     return { kind: 'failed' };
   }
@@ -452,6 +468,60 @@ export interface SilentUnderstandingFailureDeps {
   now?: () => Date;
 }
 
+function captureSilentEscalationHousekeepingFailure(
+  input: {
+    phoneNumberId: string;
+    sourceMessageId: string;
+    operation: string;
+  },
+  error: unknown
+): void {
+  Sentry.captureException(new Error('silent escalation housekeeping failed'), {
+    level: 'warning',
+    tags: {
+      service: 'silent_escalation',
+      operation: input.operation,
+      phoneNumberHash: technicalHash(input.phoneNumberId),
+      messageIdHash: technicalHash(input.sourceMessageId),
+      error_kind: runtimeErrorKind(error),
+    },
+  });
+}
+
+async function reconcileSilentEscalationOverlayAfterAuthoritativeOutcome(
+  input: {
+    phoneNumberId: string;
+    customerPhone: string;
+    messageId: string;
+  },
+  holdStore: SilentEscalationHoldStore
+): Promise<void> {
+  try {
+    await recomputeSilentEscalationHoldOverlay(
+      input.phoneNumberId,
+      input.customerPhone,
+      holdStore
+    );
+  } catch (error) {
+    // The ERP outcome remains authoritative, but a failed residual-owner
+    // read must not create an eternal positive latch either. The current turn
+    // is already silent; the next lookup must re-read the store and return
+    // unknown while it remains unavailable.
+    invalidateSilentEscalationHoldOverlay(
+      input.phoneNumberId,
+      input.customerPhone
+    );
+    captureSilentEscalationHousekeepingFailure(
+      {
+        phoneNumberId: input.phoneNumberId,
+        sourceMessageId: input.messageId,
+        operation: 'recompute_overlay',
+      },
+      error
+    );
+  }
+}
+
 async function postSilentUnderstandingFailureOnce(
   input: {
     phoneNumberId: string;
@@ -542,15 +612,36 @@ export async function escalateSilentUnderstandingFailure(
       const outcome = await postSilentUnderstandingFailureOnce(input, post);
       if (outcome.kind === 'created') {
         await holdStore.markConfirmed(input.messageId, outcome.questionId);
-        setSilentEscalationHoldOverlay(
-          input.phoneNumberId,
-          input.customerPhone,
-          false
+        try {
+          await holdStore.releaseSupersededConfirmedByConversation(
+            canonicalConversationKey(input.phoneNumberId, input.customerPhone),
+            input.messageId
+          );
+        } catch (error) {
+          // ERP creation is authoritative. Historical housekeeping is
+          // best-effort and must never turn a created question into a retry,
+          // M24, duplicate POST or lost receipt.
+          captureSilentEscalationHousekeepingFailure(
+            {
+              phoneNumberId: input.phoneNumberId,
+              sourceMessageId: input.messageId,
+              operation: 'release_superseded_confirmed',
+            },
+            error
+          );
+        }
+        await reconcileSilentEscalationOverlayAfterAuthoritativeOutcome(
+          input,
+          holdStore
         );
         return { kind: 'created', questionId: outcome.questionId };
       }
       if (outcome.kind === 'active_question_different_source') {
         await holdStore.markActiveElsewhere(input.messageId);
+        await reconcileSilentEscalationOverlayAfterAuthoritativeOutcome(
+          input,
+          holdStore
+        );
         return { kind: 'active_elsewhere' };
       }
       if (outcome.kind === 'echo_human_active') {
@@ -567,11 +658,20 @@ export async function escalateSilentUnderstandingFailure(
         new Date(nowFn().getTime() + sweepRetryDelayMs(nextAttempts)),
         'ESCALATE_FAILED'
       );
+      setSilentEscalationHoldOverlay(
+        input.phoneNumberId,
+        input.customerPhone,
+        true
+      );
       return { kind: 'pending' };
     } catch (error) {
       const classified = classifySilentEscalationPostFailure(error);
       if (classified.activeElsewhere) {
         await holdStore.markActiveElsewhere(input.messageId);
+        await reconcileSilentEscalationOverlayAfterAuthoritativeOutcome(
+          input,
+          holdStore
+        );
         return { kind: 'active_elsewhere' };
       }
       if (classified.released) {
@@ -587,6 +687,11 @@ export async function escalateSilentUnderstandingFailure(
         nextAttempts,
         new Date(nowFn().getTime() + sweepRetryDelayMs(nextAttempts)),
         classified.failureCode
+      );
+      setSilentEscalationHoldOverlay(
+        input.phoneNumberId,
+        input.customerPhone,
+        true
       );
       Sentry.captureException(new Error('silent escalation post failed'), {
         level: 'warning',
