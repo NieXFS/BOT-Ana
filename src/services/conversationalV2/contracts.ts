@@ -452,6 +452,30 @@ export type TransportOutcomeV2 =
   | 'superseded'
   | 'silent_escalation';
 
+/** Status assíncrono da entrega, independente da aceitação do POST. */
+export const PROVIDER_DELIVERY_STATUSES_V2 = [
+  'sent',
+  'delivered',
+  'read',
+  'failed',
+] as const;
+
+export type ProviderDeliveryStatusV2 =
+  (typeof PROVIDER_DELIVERY_STATUSES_V2)[number];
+
+export interface ProviderDeliveryStatusReceiptV2 {
+  schemaVersion: 2;
+  statusReceiptId: string;
+  turnId: string;
+  deliveryReceiptId: string;
+  deliveryAttemptId: string;
+  providerMessageIdHash: string;
+  providerStatus: ProviderDeliveryStatusV2;
+  occurredAt: string;
+  failureCode: string | null;
+  observedAt: string;
+}
+
 export type OutboxStateV2 =
   | 'prepared'
   | 'transport_started'

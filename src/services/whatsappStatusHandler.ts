@@ -11,10 +11,21 @@ import {
   repairUnrecordedQuestionReplyHumanHistory,
   sanitizeFailureCode,
 } from './questionReplyService';
+import {
+  canApplyProviderDeliveryStatusV2,
+  pgProviderStatusStoreV2,
+  type ProviderStatusIngestResultV2,
+  type ProviderStatusStoreV2,
+} from './conversationalV2/providerStatus';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
 const REQUEST_TIMEOUT_MS = 10_000;
+const conversationalV2StatusEnabled =
+  process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
+    ?.split(',')
+    .map((entry) => entry.trim())
+    .some((entry) => Boolean(entry) && entry !== '*') ?? false;
 
 export const STATUS_CALLBACK_RETRY_DELAYS_MS = [50, 150, 450] as const;
 export const STATUS_CALLBACK_SWEEP_INTERVAL_MS = 60_000;
@@ -136,12 +147,7 @@ export function canApplyWhatsAppStatus(
   current: WhatsAppStatusEventName | null,
   next: WhatsAppStatusEventName
 ): boolean {
-  if (current === null) return true;
-  if (current === 'sent') {
-    return next === 'delivered' || next === 'read' || next === 'failed';
-  }
-  if (current === 'delivered') return next === 'read';
-  return false;
+  return canApplyProviderDeliveryStatusV2(current, next);
 }
 
 function transitionPredicate(status: WhatsAppStatusEventName): string {
@@ -318,6 +324,8 @@ export interface WhatsAppStatusDeps {
   wait: (ms: number) => Promise<void>;
   now?: () => number;
   repairHumanHistory?: (providerMessageId?: string) => Promise<void>;
+  /** Ausente nos smokes legados: nesse caso o caminho v2 fica injetado. */
+  providerStatusStore?: ProviderStatusStoreV2;
 }
 
 const defaultDeps: WhatsAppStatusDeps = {
@@ -325,6 +333,9 @@ const defaultDeps: WhatsAppStatusDeps = {
   postCallback: postStatusCallback,
   wait: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   now: Date.now,
+  providerStatusStore: conversationalV2StatusEnabled
+    ? pgProviderStatusStoreV2
+    : undefined,
   repairHumanHistory: async (providerMessageId) => {
     await repairUnrecordedQuestionReplyHumanHistory(
       providerMessageId ? { providerMessageId } : {}
@@ -420,20 +431,115 @@ async function postCallbackWithRetries(
 
 let unknownProviderCount = 0;
 let ignoredTransitionCount = 0;
+let v2ProviderStatusAppliedCount = 0;
+let v2ProviderStatusUnmatchedCount = 0;
+let v2ProviderFailureObserver:
+  | ((result: ProviderStatusIngestResultV2) => void)
+  | undefined;
+
+export interface HandleWhatsAppStatusesOptions {
+  /**
+   * Webhook: false. O status local já foi confirmado antes do HTTP 200; o
+   * callback ao ERP é uma obrigação durável e pode continuar fora do request.
+   * Chamadas legadas/smokes mantêm true por compatibilidade.
+   */
+  awaitCallbacks?: boolean;
+  /** Faz a rota devolver 500 se a persistência local de algum evento falhar. */
+  throwOnPersistenceFailure?: boolean;
+  /** Rota produtiva calcula isto por tenant; diretos/smokes defaultam true. */
+  allowV2Fallback?: boolean;
+  /**
+   * Resolver lazy da elegibilidade por tenant. Só é chamado depois que o
+   * caminho legacy retornou `unknown`, nunca para uma linha legacy conhecida.
+   */
+  resolveAllowV2Fallback?: () => Promise<boolean>;
+}
+
+function reportV2ProviderFailure(
+  result: ProviderStatusIngestResultV2
+): void {
+  if (!result.transitionApplied || result.event.statusEvent !== 'failed') return;
+  try {
+    v2ProviderFailureObserver?.(result);
+  } catch {
+    // Observability is best-effort; the committed status remains authoritative.
+  }
+  const deliveryAttemptIdHash = result.event.deliveryAttemptId
+    ? technicalHash(result.event.deliveryAttemptId)
+    : 'unmatched';
+  try {
+    Sentry.captureMessage('whatsapp provider delivery failed', {
+      level: 'warning',
+      tags: {
+        service: 'whatsapp_status_handler',
+        operation: 'v2_provider_failed',
+        providerMessageHash: result.event.providerMessageIdHash.slice(0, 16),
+        deliveryAttemptIdHash,
+        failure_code: result.event.failureCode ?? 'META_FAILED',
+      },
+    });
+  } catch {
+    // A Sentry transport/configuration failure must not affect delivery state.
+  }
+}
 
 /** Status real: fato+obrigação primeiro; callback durável e retomável depois. */
 export async function handleWhatsAppStatuses(
   value: unknown,
-  deps: WhatsAppStatusDeps = defaultDeps
+  deps: WhatsAppStatusDeps = defaultDeps,
+  options: HandleWhatsAppStatusesOptions = {}
 ): Promise<number> {
   const events = parseWhatsAppStatuses(value);
   let applied = 0;
+  let persistenceError = false;
+  const awaitCallbacks = options.awaitCallbacks ?? true;
+  const throwOnPersistenceFailure = options.throwOnPersistenceFailure ?? false;
+  let resolvedAllowV2Fallback: boolean | undefined;
+  let allowV2FallbackResolved = false;
+  const resolveAllowV2Fallback = async (): Promise<boolean> => {
+    if (options.allowV2Fallback !== undefined) return options.allowV2Fallback;
+    if (allowV2FallbackResolved) return resolvedAllowV2Fallback === true;
+    allowV2FallbackResolved = true;
+    if (options.resolveAllowV2Fallback) {
+      resolvedAllowV2Fallback = await options.resolveAllowV2Fallback();
+    } else {
+      // Chamadas diretas/smokes sem contexto de rota preservam compatibilidade.
+      resolvedAllowV2Fallback = true;
+    }
+    return resolvedAllowV2Fallback === true;
+  };
 
   for (const event of events) {
+    let localPersisted = false;
     try {
       const local = await deps.store.apply(event);
       if (local.kind === 'unknown') {
+        const allowV2Fallback = await resolveAllowV2Fallback();
+        const providerStatusStore = deps.providerStatusStore;
+        if (providerStatusStore && allowV2Fallback) {
+          const v2 = await providerStatusStore.ingest({
+            providerMessageId: event.providerMessageId,
+            providerStatus: event.statusEvent,
+            occurredAt: event.occurredAt,
+            failureCode: event.failureCode,
+            observedAt: new Date(deps.now?.() ?? Date.now()),
+          });
+          if (v2.state === 'applied') {
+            v2ProviderStatusAppliedCount += 1;
+            applied += v2.transitionApplied ? 1 : 0;
+          } else if (v2.state === 'unmatched') {
+            v2ProviderStatusUnmatchedCount += 1;
+          }
+          localPersisted = true;
+          // Observability is deliberately after durable success and is
+          // best-effort; it can never turn a committed status into webhook 500.
+          if (v2.state === 'applied') reportV2ProviderFailure(v2);
+          // pending/noop/unmatched v2 são fatos locais observáveis; não são
+          // tratados como WAMID legado desconhecido nem recebem callback ERP.
+          continue;
+        }
         unknownProviderCount += 1;
+        localPersisted = true;
         console.warn(
           `[whatsapp-status] provider desconhecido ignorado | providerMessageHash=${technicalHash(
             event.providerMessageId
@@ -441,6 +547,10 @@ export async function handleWhatsAppStatuses(
         );
         continue;
       }
+      // A known legacy row has already been durably projected by apply(). Any
+      // history repair/callback failure after this point must not turn the
+      // webhook into a false local-ingestion failure.
+      localPersisted = true;
       if (
         event.statusEvent === 'sent' ||
         event.statusEvent === 'delivered' ||
@@ -458,8 +568,15 @@ export async function handleWhatsAppStatuses(
         applied += 1;
       }
 
-      await postCallbackWithRetries(local.obligation, deps);
+      if (awaitCallbacks) {
+        await postCallbackWithRetries(local.obligation, deps);
+      } else {
+        // Fast attempt opcional: iniciado somente depois de apply() ter
+        // confirmado a persistência local. O sweeper é a garantia durável.
+        void postCallbackWithRetries(local.obligation, deps).catch(() => undefined);
+      }
     } catch (error) {
+      if (!localPersisted) persistenceError = true;
       Sentry.captureException(new Error('whatsapp status processing failed'), {
         level: 'warning',
         tags: {
@@ -473,13 +590,22 @@ export async function handleWhatsAppStatuses(
     }
   }
 
+  if (persistenceError && throwOnPersistenceFailure) {
+    // Mensagem constante: não vaza corpo da Meta, WAMID ou erro do driver.
+    throw new Error('whatsapp status durable ingestion failed');
+  }
+
   return applied;
 }
 
 export async function sweepWhatsAppStatusCallbacks(
   deps: WhatsAppStatusDeps = defaultDeps,
   limit = 100
-): Promise<{ attempted: number; acknowledged: number }> {
+): Promise<{
+  attempted: number;
+  acknowledged: number;
+  providerStatus?: { attempted: number; applied: number; unmatched: number };
+}> {
   const obligations = await deps.store.listPendingCallbacks(limit);
   let acknowledged = 0;
   for (const obligation of obligations) {
@@ -502,7 +628,15 @@ export async function sweepWhatsAppStatusCallbacks(
       },
     });
   }
-  return { attempted: obligations.length, acknowledged };
+  const providerStatus = deps.providerStatusStore
+    ? await deps.providerStatusStore.sweep(new Date(deps.now?.() ?? Date.now()))
+    : undefined;
+  for (const appliedEvent of providerStatus?.appliedEvents ?? []) {
+    v2ProviderStatusAppliedCount += 1;
+    reportV2ProviderFailure(appliedEvent);
+  }
+  v2ProviderStatusUnmatchedCount += providerStatus?.unmatched ?? 0;
+  return { attempted: obligations.length, acknowledged, providerStatus };
 }
 
 interface CallbackSweepRuntime {
@@ -556,13 +690,28 @@ export function startWhatsAppStatusCallbackSweep(
 export function getWhatsAppStatusCountersForTest(): {
   unknownProviderCount: number;
   ignoredTransitionCount: number;
+  v2ProviderStatusAppliedCount: number;
+  v2ProviderStatusUnmatchedCount: number;
 } {
-  return { unknownProviderCount, ignoredTransitionCount };
+  return {
+    unknownProviderCount,
+    ignoredTransitionCount,
+    v2ProviderStatusAppliedCount,
+    v2ProviderStatusUnmatchedCount,
+  };
 }
 
 export function resetWhatsAppStatusCountersForTest(): void {
   unknownProviderCount = 0;
   ignoredTransitionCount = 0;
+  v2ProviderStatusAppliedCount = 0;
+  v2ProviderStatusUnmatchedCount = 0;
+}
+
+export function __setV2ProviderFailureObserverForTest(
+  observer?: (result: ProviderStatusIngestResultV2) => void
+): void {
+  v2ProviderFailureObserver = observer;
 }
 
 export function __resetWhatsAppStatusCallbackSweepForTest(): void {

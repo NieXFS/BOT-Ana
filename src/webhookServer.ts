@@ -3,7 +3,7 @@ import 'dotenv/config';
 // dos services) pra instrumentar erros e auto-instrumentar http/express.
 import { Sentry } from './observability/sentry';
 import express, { Request, Response } from 'express';
-import { getTenantConfig } from './configProvider';
+import { getTenantConfig, type TenantBotConfig } from './configProvider';
 import {
   deliverDurableSuccessorFallbackV2,
   handleIncomingMessage,
@@ -66,6 +66,7 @@ import {
   handleWhatsAppStatuses,
   startWhatsAppStatusCallbackSweep,
 } from './services/whatsappStatusHandler';
+import { isAnaConversationalV2Enabled } from './services/conversationalV2/featureFlag';
 import { questionReplyResultToHttp } from './services/questionReplyHttp';
 import {
   conversationHash,
@@ -112,12 +113,43 @@ const PORT = parseInt(process.env.PORT ?? '3000', 10);
 
 type WebhookEchoHandler = typeof handleSmbMessageEchoes;
 let webhookEchoHandler: WebhookEchoHandler = handleSmbMessageEchoes;
+type WebhookStatusHandler = typeof handleWhatsAppStatuses;
+let webhookStatusHandler: WebhookStatusHandler = handleWhatsAppStatuses;
+type WebhookStatusConfigLoader = (
+  phoneNumberId: string
+) => Promise<TenantBotConfig | null>;
+let webhookStatusConfigLoader: WebhookStatusConfigLoader = getTenantConfig;
 
 /** Seam exclusivo de smoke HTTP; `undefined` restaura o handler produtivo. */
 export function __setWebhookEchoHandlerForTest(
   handler?: WebhookEchoHandler
 ): void {
   webhookEchoHandler = handler ?? handleSmbMessageEchoes;
+}
+
+/** Seam exclusivo de smoke HTTP; `undefined` restaura o handler produtivo. */
+export function __setWebhookStatusHandlerForTest(
+  handler?: WebhookStatusHandler
+): void {
+  webhookStatusHandler = handler ?? handleWhatsAppStatuses;
+}
+
+/** Seam exclusivo de smoke HTTP; `undefined` restaura o loader produtivo. */
+export function __setWebhookStatusConfigLoaderForTest(
+  loader?: WebhookStatusConfigLoader
+): void {
+  webhookStatusConfigLoader = loader ?? getTenantConfig;
+}
+
+export function isAnaV2ProviderStatusEligible(
+  config: Pick<TenantBotConfig, 'botRole' | 'tenantSlug'> | null,
+  rawAllowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
+): boolean {
+  return Boolean(
+    config &&
+      config.botRole === 'receptionist' &&
+      isAnaConversationalV2Enabled(config.tenantSlug, rawAllowlist)
+  );
 }
 
 async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
@@ -213,6 +245,7 @@ app.get('/webhook', (req: Request, res: Response) => {
 app.post('/webhook', botSignatureMiddleware, async (req: Request, res: Response) => {
   try {
     const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+    const allowV2ByPhoneNumberId = new Map<string, Promise<boolean>>();
 
     for (const entry of entries) {
       const changes = Array.isArray(entry?.changes) ? entry.changes : [];
@@ -232,16 +265,34 @@ app.post('/webhook', botSignatureMiddleware, async (req: Request, res: Response)
         }
 
         // Status Meta (sent/delivered/read/failed) é um fato separado de inbound:
-        // não passa pelo dedup por message.id e não é mais descartado.
+        // não passa pelo dedup por message.id e não é mais descartado. O
+        // durable ingest termina antes do 200; callbacks ERP continuam fora
+        // da resposta HTTP como obrigações retomáveis.
         if (value.statuses?.length) {
-          handleWhatsAppStatuses(value).catch((err) => {
-            Sentry.captureException(new Error('whatsapp status handler failed'), {
-              tags: {
-                service: 'webhook_server',
-                operation: 'whatsapp_statuses',
-                error_kind: err instanceof Error ? err.name : typeof err,
-              },
-            });
+          const statusPhoneNumberId =
+            value.metadata?.phone_number_id?.trim() || LEGACY_PHONE_NUMBER_ID;
+          await webhookStatusHandler(value, undefined, {
+            awaitCallbacks: false,
+            throwOnPersistenceFailure: true,
+            resolveAllowV2Fallback: async () => {
+              if (!statusPhoneNumberId) return false;
+              let pending = allowV2ByPhoneNumberId.get(statusPhoneNumberId);
+              if (!pending) {
+                pending = webhookStatusConfigLoader(statusPhoneNumberId).then(
+                  (statusConfig) => {
+                    if (!statusConfig) {
+                      // Unknown legacy status + absent config is inconclusive,
+                      // never evidence of v1/sales. Force Meta replay without
+                      // exposing phone/config details.
+                      throw new Error('status tenant config unavailable');
+                    }
+                    return isAnaV2ProviderStatusEligible(statusConfig);
+                  }
+                );
+                allowV2ByPhoneNumberId.set(statusPhoneNumberId, pending);
+              }
+              return pending;
+            },
           });
         }
 
@@ -266,15 +317,15 @@ app.post('/webhook', botSignatureMiddleware, async (req: Request, res: Response)
 
     res.sendStatus(200);
   } catch (err) {
-    Sentry.captureException(new Error('webhook echo processing failed'), {
+    Sentry.captureException(new Error('webhook durable processing failed'), {
       tags: {
         service: 'webhook_server',
-        operation: 'smb_message_echoes',
+        operation: 'durable_ingest',
         error_kind: runtimeErrorKind(err),
       },
     });
     console.error(
-      `❌ Erro ao persistir smb_message_echoes | error=${runtimeErrorKind(err)}`
+      `❌ Erro no durable ingest do webhook | error=${runtimeErrorKind(err)}`
     );
     res.sendStatus(500);
   }

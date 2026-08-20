@@ -14,6 +14,11 @@ import { Pool } from 'pg';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { scrubText } from '../src/observability/scrub';
+import {
+  buildProviderStatusDigestV2,
+  projectProviderStatusForDigestDayV2,
+  type ProviderDeliveryStatusV2,
+} from '../src/services/conversationalV2/providerStatus';
 
 // Autorização registrada: Jackeline (tia do Victor) em 2026-08-17, verbal ao Victor;
 // studio-viti é tenant de teste do próprio Victor. Rose: SEM autorização — fora.
@@ -59,6 +64,46 @@ async function main() {
      WHERE receipt_kind = 'plan'
        AND created_at >= $1::date AND created_at < ($1::date + interval '1 day')`,
     [targetDay]
+  );
+
+  // Aceitação do POST e status assíncrono são autoridades distintas. O
+  // snapshot do outbox conta aceites mesmo quando ainda não houve callback;
+  // a projeção de status nunca transforma accepted+failed em delivered.
+  const { rows: deliveryRows } = await pool.query(
+    `SELECT state, provider_status, provider_status_at, provider_failure_code,
+            NULLIF(commit_payload_json->'deliveryReceipt'->>'terminalAt', '')::timestamptz
+              AS accepted_at
+       FROM ana_v2_outbound_outbox
+      WHERE state IN ('accepted_by_provider', 'accepted_uncommitted')
+        AND (
+          (
+            NULLIF(commit_payload_json->'deliveryReceipt'->>'terminalAt', '')::timestamptz
+              >= $1::date
+            AND NULLIF(commit_payload_json->'deliveryReceipt'->>'terminalAt', '')::timestamptz
+              < ($1::date + interval '1 day')
+          )
+          OR (
+            provider_status_at >= $1::date
+            AND provider_status_at < ($1::date + interval '1 day')
+          )
+        )`,
+    [targetDay]
+  );
+  const deliveryDigest = buildProviderStatusDigestV2(
+    deliveryRows.map((row) =>
+      projectProviderStatusForDigestDayV2(
+        {
+          acceptedAt: row.accepted_at ?? null,
+          providerStatus: (row.provider_status ?? null) as ProviderDeliveryStatusV2 | null,
+          providerStatusAt: row.provider_status_at ?? null,
+          providerFailureCode:
+            typeof row.provider_failure_code === 'string'
+              ? row.provider_failure_code
+              : null,
+        },
+        targetDay
+      )
+    )
   );
 
   const stats = {
@@ -107,6 +152,15 @@ async function main() {
     `- bloqueios de fronteira: ${JSON.stringify(stats.boundaryBlocks)}`
   );
   lines.push(`- gate declines: ${JSON.stringify(stats.gateDeclines)}`);
+  lines.push('');
+  lines.push('## Entrega WhatsApp (aceite e status assíncrono)');
+  lines.push('');
+  lines.push(
+    `- accepted_by_provider: ${deliveryDigest.acceptedByProvider} · sent: ${deliveryDigest.sent} · delivered: ${deliveryDigest.delivered} · read: ${deliveryDigest.read} · failed: ${deliveryDigest.failed} · awaiting_status: ${deliveryDigest.awaitingStatus}`
+  );
+  lines.push(
+    `- failures por código: ${JSON.stringify(deliveryDigest.failuresByCode)}`
+  );
   lines.push('');
   lines.push(`## Conversas (${byConv.size})`);
   for (const [ck, msgs] of byConv) {

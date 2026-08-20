@@ -297,3 +297,32 @@ R6 [futuro, IA-19A]: `ESTABLISHMENT_AUTOMATION` ainda é tratado conservadoramen
 ## Estampa de convergência
 
 Rodada 3 (Grok 4.6 xhigh, adversário): "NÃO resta risco ALTO sem mitigação aceita. Convergência: a v2 é contrato de implementação." Rodada 2 (GPT 5.6 Sol xhigh, estrutura): "SIM com correções pontuais" — todas incorporadas nesta versão. Protocolo reuniao.md: fechado no critério, dentro do teto de 3 rodadas.
+
+## EMENDA IA-20 (2026-08-20) — status assíncrono de entrega da Ana
+
+O aceite do POST pelo provider e os callbacks posteriores da Meta são
+autoridades distintas. `TurnDeliveryReceiptV2.transportOutcome=
+"accepted_by_provider"` significa somente que o POST foi aceito e devolveu um
+identificador do provider; esse receipt terminal é imutável. `sent`,
+`delivered`, `read` e `failed` passam a uma autoridade assíncrona separada,
+representada por `ProviderDeliveryStatusReceiptV2` e projetada no outbox.
+
+O status assíncrono é monotônico e append-only na inbox: `null → sent →
+delivered → read`, ou `sent → failed`; `read` e `failed` são terminais.
+Duplicatas, regressões e callbacks com timestamp mais antigo são `noop` e não
+reescrevem o estado vigente. A aplicação do status e o vínculo ao outbox,
+turno e delivery receipt acontecem na mesma transação local. Um callback que
+chegue antes do commit do outbox fica `pending`, é reprocessado pelo sweeper e
+só vira `unmatched` depois do horizonte de reconciliação.
+
+O durable ingest local precede o HTTP 200 do webhook. Falha de persistência
+local deixa o webhook em 500 para permitir retransmissão idempotente da Meta;
+callback ao ERP e reconciliação posterior são obrigações duráveis que não
+seguram a resposta da Meta. `failed`, inclusive `META_131047`, é observabilidade
+durável e nunca autoriza resend, template, rollback, write, tool, mutação ou
+compensação.
+
+O WAMID cru existe apenas na memória do parser e no caminho legado autorizado
+de `sent_question_replies`. A correlação v2 persiste somente
+`opaqueReceiptHashV2(wamid)`/`providerMessageIdHash`; nenhuma coluna ou log novo
+guarda WAMID, `recipient_id`, telefone ou mensagem de erro da Meta.

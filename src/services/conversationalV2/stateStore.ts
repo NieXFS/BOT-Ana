@@ -3,10 +3,12 @@ import { pool } from '../contextManager';
 import type {
   FlowStateV2,
   PendingFrameSnapshotV2,
+  ProviderDeliveryStatusV2,
   TurnDeliveryReceiptV2,
   TurnPlanReceiptV2,
 } from './contracts';
 import type { CopyVariantIdV2 } from './copyVariants';
+import { ensureProviderStatusV2Tables } from './providerStatus';
 
 export const PENDING_FRAME_TTL_MS_V2 = 24 * 60 * 60 * 1_000;
 export const OUTBOX_TRANSPORT_STALE_MS_V2 = 2 * 60 * 1_000;
@@ -97,6 +99,11 @@ export interface OutboundOutboxRecordV2 {
   payload: string;
   transition: MaterializedPendingTransitionV2;
   providerMessageIdHash: string | null;
+  /** Projeção assíncrona; não altera commitPayload.deliveryReceipt. */
+  providerStatus: ProviderDeliveryStatusV2 | null;
+  providerStatusAt: string | null;
+  providerFailureCode: string | null;
+  providerStatusVersion: number;
   transportStartedAt: string | null;
   commitPayload: AcceptedCommitPayloadV2 | null;
   createdAt: string;
@@ -424,6 +431,10 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
       payload: input.payload,
       transition: clone(input.transition),
       providerMessageIdHash: null,
+      providerStatus: null,
+      providerStatusAt: null,
+      providerFailureCode: null,
+      providerStatusVersion: 0,
       transportStartedAt: null,
       commitPayload: null,
       createdAt: iso(input.now),
@@ -846,6 +857,20 @@ export async function ensureConversationalV2Tables(): Promise<void> {
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `);
+  // IA-20 é aditivo: instalações que já têm a tabela recebem apenas a
+  // projeção de status; o receipt terminal existente permanece inalterado.
+  await pool.query(`
+    ALTER TABLE ana_v2_outbound_outbox
+      ADD COLUMN IF NOT EXISTS provider_status text,
+      ADD COLUMN IF NOT EXISTS provider_status_at timestamptz,
+      ADD COLUMN IF NOT EXISTS provider_failure_code text,
+      ADD COLUMN IF NOT EXISTS provider_status_version bigint NOT NULL DEFAULT 0
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS ana_v2_outbound_outbox_provider_hash_idx
+      ON ana_v2_outbound_outbox (provider_message_id_hash)
+     WHERE provider_message_id_hash IS NOT NULL
+  `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS ana_v2_outbound_outbox_guard_idx
     ON ana_v2_outbound_outbox (conversation_key, updated_at DESC)
@@ -897,6 +922,7 @@ export async function ensureConversationalV2Tables(): Promise<void> {
     ON ana_v2_successor_batches (next_attempt_at, created_at)
     WHERE status = 'queued'
   `);
+  await ensureProviderStatusV2Tables();
 }
 
 interface RawPendingRowV2 {
@@ -921,6 +947,10 @@ interface RawOutboxRowV2 {
   payload: string;
   transition_json: MaterializedPendingTransitionV2;
   provider_message_id_hash: string | null;
+  provider_status: ProviderDeliveryStatusV2 | null;
+  provider_status_at: Date | string | null;
+  provider_failure_code: string | null;
+  provider_status_version: string | number;
   transport_started_at: Date | string | null;
   commit_payload_json: AcceptedCommitPayloadV2 | null;
   created_at: Date | string;
@@ -974,6 +1004,10 @@ function outboxFromRow(row: RawOutboxRowV2): OutboundOutboxRecordV2 {
     payload: row.payload,
     transition: row.transition_json,
     providerMessageIdHash: row.provider_message_id_hash,
+    providerStatus: row.provider_status ?? null,
+    providerStatusAt: row.provider_status_at ? dateIso(row.provider_status_at) : null,
+    providerFailureCode: row.provider_failure_code ?? null,
+    providerStatusVersion: Number(row.provider_status_version ?? 0),
     transportStartedAt: row.transport_started_at ? dateIso(row.transport_started_at) : null,
     commitPayload: row.commit_payload_json,
     createdAt: dateIso(row.created_at),

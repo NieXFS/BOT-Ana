@@ -79,6 +79,7 @@
     "smoke:ana-conversation-order-boot": "ts-node -T scripts/smoke-ana-conversation-order-boot.ts",
     "smoke:ana-reply-dedup": "ts-node -T scripts/smoke-ana-reply-dedup.ts",
     "smoke:ana-statuses": "ts-node -T scripts/smoke-ana-statuses.ts",
+    "smoke:ana-v2-provider-status": "ts-node -T scripts/smoke-ana-v2-provider-status.ts",
     "smoke:ana-status-callback-durable": "ts-node -T scripts/smoke-ana-status-callback-durable.ts",
     "smoke:ana-pii-runtime": "ts-node -T scripts/smoke-ana-pii-runtime.ts",
     "smoke:ana-escalation-cache": "ts-node -T scripts/smoke-ana-escalation-cache.ts",
