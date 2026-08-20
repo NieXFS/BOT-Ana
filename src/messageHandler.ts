@@ -971,6 +971,11 @@ export async function flushBuffer(
       }
     }
   } else {
+    // Depois que o runtime devolve um plano silencioso, a pausa/hold que ele
+    // próprio acabou de criar não pode suprimir o bookkeeping do delivery.
+    // Mantemos o marcador fora da lock e do try para que uma falha de receipt
+    // nunca caia no M24 e tente falar com a cliente.
+    let silentPreparedTurn = false;
     try {
       const reply = await getBufferedReply(
         buffer,
@@ -1001,6 +1006,9 @@ export async function flushBuffer(
           (reply as { kind?: unknown }).kind === 'ana_conversational_v2_prepared'
             ? (reply as PreparedReceptionistTurnV2)
             : null;
+        const silentPrepared =
+          preparedV2?.planReceipt?.recoveryKind === 'silent_escalation';
+        silentPreparedTurn = silentPrepared;
         const pauseCheck = preparedV2?.authoritativeEscalationQuestionId
           ? () =>
               deps.isPausedForEscalationAck
@@ -1018,16 +1026,18 @@ export async function flushBuffer(
                     )
           : () =>
               resolvePauseBeforeTransport(deps)(config.phoneNumberId, from);
-        if (
-          await suppressFlushIfPaused({
-            bufferKey,
-            buffer,
-            alreadyProcessedTexts: [],
-            deps: { ...deps, isPaused: (_phoneNumberId, _customerPhone) => pauseCheck() },
-          })
-        ) {
-          delivery = 'suppressed';
-          return;
+        if (!silentPrepared) {
+          if (
+            await suppressFlushIfPaused({
+              bufferKey,
+              buffer,
+              alreadyProcessedTexts: [],
+              deps: { ...deps, isPaused: (_phoneNumberId, _customerPhone) => pauseCheck() },
+            })
+          ) {
+            delivery = 'suppressed';
+            return;
+          }
         }
         if (
           typeof reply === 'object' &&
@@ -1063,6 +1073,11 @@ export async function flushBuffer(
               successorInboundMessageIds: [...buffer.pendingMessageIds],
             };
           });
+          if (silentPrepared && result.delivery !== 'silent') {
+            throw new Error(
+              `Prepared silent_escalation retornou delivery=${result.delivery}`
+            );
+          }
           if (result.successor) {
             if (
               !buffer.pendingDurableSuccessorTurnIds.includes(
@@ -1161,6 +1176,24 @@ export async function flushBuffer(
           current.pendingInputSequences = [];
         }
         messageBuffers.delete(bufferKey);
+        return;
+      }
+
+      // Falhas de bookkeeping de um plano silencioso são observáveis e
+      // reconciláveis, mas jamais autorizam fallback/M24 ou qualquer POST de
+      // transporte. O hold/pausa continua sendo a autoridade de silêncio.
+      if (silentPreparedTurn) {
+        const current = messageBuffers.get(bufferKey);
+        if (current) {
+          await completeActiveDurableSuccessorsV2(current);
+          current.pendingTexts = [];
+          current.pendingMessageIds = [];
+          current.pendingInputSequences = [];
+        }
+        messageBuffers.delete(bufferKey);
+        console.warn(
+          `🛑 Bookkeeping da escalada silenciosa falhou; nenhum outbound | ${safeSalesContext(config, from)}`
+        );
         return;
       }
 
@@ -2009,6 +2042,42 @@ export function __seedFlushBufferForTest(
 
 export function __hasBufferForTest(bufferKey: string): boolean {
   return messageBuffers.has(bufferKey);
+}
+
+/**
+ * Test seam for a concurrent inbound that arrived while a flush was in
+ * flight. It only mutates the pending side of an already-seeded in-memory
+ * buffer; production intake and debounce semantics remain untouched.
+ */
+export function __seedPendingFlushStateForTest(
+  bufferKey: string,
+  pendingTexts: string[],
+  pendingMessageIds: string[] = [],
+  pendingInputSequences: number[] = []
+): void {
+  const buffer = messageBuffers.get(bufferKey);
+  if (!buffer) throw new Error(`buffer de teste ausente: ${bufferKey}`);
+  buffer.pendingTexts = [...pendingTexts];
+  buffer.pendingMessageIds = [...pendingMessageIds];
+  buffer.pendingInputSequences = [...pendingInputSequences];
+}
+
+export function __inspectFlushBufferForTest(bufferKey: string): {
+  pendingTexts: number;
+  pendingMessageIds: number;
+  pendingInputSequences: number;
+  pendingDurableSuccessorTurnIds: number;
+  activeDurableSuccessorTurnIds: number;
+} | null {
+  const buffer = messageBuffers.get(bufferKey);
+  if (!buffer) return null;
+  return {
+    pendingTexts: buffer.pendingTexts.length,
+    pendingMessageIds: buffer.pendingMessageIds.length,
+    pendingInputSequences: buffer.pendingInputSequences.length,
+    pendingDurableSuccessorTurnIds: buffer.pendingDurableSuccessorTurnIds.length,
+    activeDurableSuccessorTurnIds: buffer.activeDurableSuccessorTurnIds.length,
+  };
 }
 
 export function __resetFlushStateForTest(): void {

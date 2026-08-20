@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import type { TenantBotConfig } from '../src/configProvider';
 import type { ServicesResult } from '../src/services/calendarService';
+import type { TurnPlanReceiptV2 } from '../src/services/conversationalV2/contracts';
 import { buildUnderstandingFailureDivergenceV2 } from '../src/services/conversationalV2/divergence';
-import { opaqueReceiptHashV2 } from '../src/services/conversationalV2/receipts';
+import { hashTurnPlanReceiptV2 } from '../src/services/conversationalV2/receipts';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL =
@@ -191,7 +192,27 @@ async function main(): Promise<void> {
     fallbackIntent: recovered.fallbackIntent,
     primaryReasonCodes: recovered.primaryReasonCodes,
     regenerationReasonCodes: recovered.regenerationReasonCodes,
-    turnReceiptHash: opaqueReceiptHashV2('plan-silent-fixture'),
+    turnReceiptHash: hashTurnPlanReceiptV2({
+      schemaVersion: 2,
+      planReceiptId: 'plan-silent-fixture',
+      turnId: 'turn-silent',
+      frameHash: 'a'.repeat(64),
+      inputSequence: 1,
+      route: 'fallback',
+      provider: 'openai',
+      requestedModel: 'gpt-4o-mini',
+      response: { model: 'gpt-4o-mini', systemFingerprint: null },
+      thinkingMode: 'disabled',
+      strictTools: false,
+      primaryModelRounds: 1,
+      primaryProviderCalls: 1,
+      regenProviderCalls: 1,
+      pendingTransitionCandidate: { kind: 'preserve' },
+      toolEffects: [],
+      boundaryAttempts: [],
+      recoveryKind: 'silent_escalation',
+      result: 'accepted_for_delivery',
+    } satisfies TurnPlanReceiptV2),
   });
   assert.equal(divergence.schemaVersion, 1);
   assert.equal(divergence.kind, 'UNDERSTANDING_FAILURE');

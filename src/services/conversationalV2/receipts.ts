@@ -17,6 +17,15 @@ export function opaqueReceiptHashV2(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/**
+ * Hash canônico do plano persistível. O hash é deliberadamente calculado
+ * sobre a serialização redigida, e nunca é armazenado dentro do próprio
+ * `TurnPlanReceiptV2` (o que criaria uma referência autorreferente).
+ */
+export function hashTurnPlanReceiptV2(receipt: TurnPlanReceiptV2): string {
+  return opaqueReceiptHashV2(serializeTurnPlanReceiptV2(receipt));
+}
+
 export function redactPendingTransitionCandidateV2(
   candidate: PendingTransitionCandidate
 ): RedactedPendingTransitionCandidateV2 {

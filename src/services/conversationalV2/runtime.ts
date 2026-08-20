@@ -134,9 +134,9 @@ import {
 } from './elicitation';
 import { resolveForcedToolChoiceV2 } from './forcedToolChoice';
 import {
+  hashTurnPlanReceiptV2,
   opaqueReceiptHashV2,
   redactPendingTransitionCandidateV2,
-  serializeTurnPlanReceiptV2,
 } from './receipts';
 import { coordinateRecoveryV2 } from './recoveryCoordinator';
 import { buildUnderstandingFailureDivergenceV2 } from './divergence';
@@ -2936,14 +2936,7 @@ export async function getReceptionistReplyV2(input: {
       regenCalls: recovery.regenCount,
       boundaryAttempts,
     });
-    let turnReceiptHash: string;
-    try {
-      turnReceiptHash = opaqueReceiptHashV2(
-        serializeTurnPlanReceiptV2(planReceipt)
-      );
-    } catch {
-      turnReceiptHash = opaqueReceiptHashV2(planReceipt.planReceiptId);
-    }
+    const turnReceiptHash = hashTurnPlanReceiptV2(planReceipt);
     const divergence = buildUnderstandingFailureDivergenceV2({
       fallbackIntent: recovery.fallbackIntent,
       primaryReasonCodes: recovery.primaryReasonCodes,
