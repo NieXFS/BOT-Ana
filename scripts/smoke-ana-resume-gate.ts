@@ -1434,8 +1434,8 @@ async function main() {
       now: () => explicitNow + 2_000,
       fetchState: async () => idlePauseState,
     }),
-    true,
-    'pausa global continua soberana após limpar ECHO'
+    false,
+    'GET fresco pode encerrar pausa global após limpar ECHO'
   );
   pause.__resetPauseCacheForTest();
   assert.equal(
@@ -1461,8 +1461,8 @@ async function main() {
       now: () => explicitNow + 2_000,
       fetchState: async () => idlePauseState,
     }),
-    true,
-    'pausa de agenda continua soberana após limpar ECHO'
+    false,
+    'GET fresco pode encerrar pausa de agenda após limpar ECHO'
   );
   pause.__resetPauseCacheForTest();
   technical.__resetTechnicalMaintenanceCacheForTest();
@@ -1509,8 +1509,8 @@ async function main() {
       now: () => explicitNow + 2_000,
       fetchState: async () => idlePauseState,
     }),
-    true,
-    'pausa de escalação continua soberana após limpar ECHO'
+    false,
+    'GET fresco pode encerrar escalation após limpar ECHO'
   );
   pause.__resetPauseCacheForTest();
   technical.__resetTechnicalMaintenanceCacheForTest();

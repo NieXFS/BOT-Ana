@@ -216,7 +216,8 @@ async function fetchPauseState(
         undefined,
     };
   } catch (error) {
-    // FAIL-OPEN: erro/timeout/404 → null → tratado como NÃO pausado pelo caller.
+    // FAIL-OPEN legado quando não há evidência positiva anterior: erro/timeout/
+    // 404 vira null; o caller preserva pausas positivas já observadas.
     capture(error, phoneNumberId, 'fetch-pause-state');
     return null;
   }
@@ -284,9 +285,10 @@ export async function pauseConversationByEcho(
  * "Esta conversa está pausada AGORA?" — combina pausa GERAL (salão) + pausa da
  * conversa. Usa cache curto por conversa + write-through do echo.
  *
- * FAIL-OPEN legado: erro/timeout/404 continua `false`, EXCETO se o cache já
- * conhecia escalation.active=true ou o modo técnico global já tinha sido
- * observado como ON para um tenant não isento. Esses motivos permanecem fechados.
+ * FAIL-OPEN legado: erro/timeout/404 continua `false` quando não há evidência
+ * positiva anterior. Uma pausa ordinária ainda futura no cache vencido, uma
+ * escalation.active conhecida ou o modo técnico global já observado como ON
+ * permanecem fechados até uma resposta autoritativa válida.
  */
 export async function isConversationPaused(
   phoneNumberId: string,
@@ -310,28 +312,34 @@ export async function isConversationPaused(
     now
   );
 
-  // Escalada ativa é motivo independente de pausa. Enquanto o snapshot ainda
-  // está fresco, não há motivo para rede. Quando vence, reconsulta; se o Receps
-  // cair, o snapshot ativo anterior continua fail-closed.
-  if (escalationWasActive && !escalationNeedsRefresh) {
-    return true;
-  }
-
-  // 1) Cache fresco (inclui o write-through imediato do echo) → decide sem rede.
+  // 1) Cache fresco (inclui o write-through imediato do echo) e escalada fresca
+  //    → decide sem rede. A escalada ativa é uma autoridade independente da
+  //    pausa ordinária, mas um cache ordinário vencido ainda obriga releitura.
   if (cached && cached.expiresAt > now && !escalationNeedsRefresh) {
-    return entryIsPaused(cached, now);
+    return escalationWasActive || entryIsPaused(cached, now);
   }
 
-  // 2) Cache vencido mas ainda indicando pausa no futuro → respeita (não deixa o
-  //    TTL do GET "despausar" antes da hora).
-  if (cached && entryIsPaused(cached, now)) {
-    return true;
+  // 2) Cache ordinário OU de escalada vencido → busca o estado fresco no
+  //    Receps. Um `pausedUntil` futuro é apenas a última evidência conhecida;
+  //    depois do TTL o ERP pode tê-lo encerrado antecipadamente (por exemplo,
+  //    pelo painel). Nunca deixe o relógio local transformar essa evidência em
+  //    autoridade até o fim do carimbo.
+  let state: PauseState | null;
+  try {
+    state = await deps.fetchState(phoneNumberId, canonicalPhone);
+  } catch (error) {
+    // A dependency seam may throw even though the production adapter converts
+    // transport failures to null. Keep the ordinary lookup fail-closed when
+    // there is prior positive evidence, without writing an inactive snapshot.
+    capture(error, phoneNumberId, 'fetch-pause-state');
+    state = null;
   }
-
-  // 3) Busca o estado fresco no Receps.
-  const state = await deps.fetchState(phoneNumberId, canonicalPhone);
   if (!state) {
+    // Falha/nulo não é uma despausa. Preserve qualquer pausa ordinária ainda
+    // positiva, além das autoridades sticky já conhecidas. Não escreva um
+    // snapshot inativo: a próxima chamada deve tentar o GET novamente.
     return (
+      Boolean(cached && entryIsPaused(cached, now)) ||
       escalationWasActive ||
       shouldFailClosedForTechnicalMaintenance({
         phoneNumberId,
