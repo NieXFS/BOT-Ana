@@ -472,7 +472,8 @@ export interface TurnPlanReceiptV2 {
     | 'regen'
     | 'canonical_write_confirmation'
     | 'direct_fallback'
-    | 'silent_escalation';
+    | 'silent_escalation'
+    | 'visible_escalation';
   /** Proveniência técnica da copy; nunca contém texto da conversa. */
   copyVariant?: CopyVariantIdV2;
   /** Subrecibo da camada de voz; hashes/enums apenas, sem copy. */
@@ -489,6 +490,24 @@ export type TransportOutcomeV2 =
   | 'suppressed_pause'
   | 'superseded'
   | 'silent_escalation';
+
+/**
+ * Resultado do commit do agregado FlowStateV2.  É deliberadamente separado
+ * do lifecycle da PendingFrame e do commit da conversa/histórico: uma
+ * mensagem pode ter sido aceita pelo provider sem que o processo tenha
+ * conseguido confirmar o próximo estado local.
+ */
+export const FLOW_STATE_COMMIT_OUTCOMES_V2 = [
+  'committed',
+  'not_applicable',
+  'accepted_uncommitted',
+  'cas_conflict',
+  'skipped_human_cutoff',
+  'failed',
+] as const;
+
+export type FlowStateCommitOutcomeV2 =
+  (typeof FLOW_STATE_COMMIT_OUTCOMES_V2)[number];
 
 /** Status assíncrono da entrega, independente da aceitação do POST. */
 export const PROVIDER_DELIVERY_STATUSES_V2 = [
@@ -532,6 +551,8 @@ export interface TurnDeliveryReceiptV2 {
   transportOutcome: TransportOutcomeV2;
   providerMessageIdHash?: string;
   outboxState: OutboxStateV2;
+  /** Compatível com receipts anteriores à IA-23; novos receipts sempre o gravam. */
+  flowStateCommitOutcome?: FlowStateCommitOutcomeV2;
   conversationCommitOutcome:
     | 'committed'
     | 'accepted_uncommitted'

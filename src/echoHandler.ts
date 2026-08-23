@@ -18,6 +18,7 @@ import {
   canonicalConversationKey,
   withConversationLock,
 } from './services/conversationOrder';
+import type { ConversationalV2LockClient } from './services/conversationalV2/stateStore';
 import { getTenantConfig, type TenantBotConfig } from './configProvider';
 import { downloadMedia } from './whatsappCloudService';
 import { transcreverAudioBuffer } from './utils/transcriber';
@@ -75,12 +76,13 @@ export interface EchoDeps {
   withConversationLock?: (
     phoneNumberId: string,
     customerPhone: string,
-    work: () => Promise<void>
+    work: (client?: ConversationalV2LockClient) => Promise<void>
   ) => Promise<void>;
   /** Fala humana invalida PendingFrame v2 dentro da mesma advisory lock. */
   invalidatePendingByHuman?: (
     phoneNumberId: string,
-    customerPhone: string
+    customerPhone: string,
+    client?: ConversationalV2LockClient
   ) => Promise<void>;
   /** Echo encerra hold local de escalada silenciosa (conversation-scoped). */
   releaseSilentHold?: (
@@ -91,21 +93,24 @@ export interface EchoDeps {
 
 async function invalidatePendingByHumanWhenV2Enabled(
   phoneNumberId: string,
-  customerPhone: string
+  customerPhone: string,
+  client?: ConversationalV2LockClient
 ): Promise<void> {
   const raw = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS?.trim();
   if (!raw) return;
   const config = await getTenantConfig(phoneNumberId);
   if (!config) return;
-  const [{ isAnaConversationalV2Enabled }, { pgConversationalV2StateStore }] =
-    await Promise.all([
-      import('./services/conversationalV2/featureFlag'),
-      import('./services/conversationalV2/stateStore'),
-    ]);
+  const [{ isAnaConversationalV2Enabled }, stateStore] = await Promise.all([
+    import('./services/conversationalV2/featureFlag'),
+    import('./services/conversationalV2/stateStore'),
+  ]);
   if (!isAnaConversationalV2Enabled(config.tenantSlug, raw)) return;
-  await pgConversationalV2StateStore.invalidateOpenPendingByHuman(
-    canonicalConversationKey(phoneNumberId, customerPhone)
-  );
+  const conversationKey = canonicalConversationKey(phoneNumberId, customerPhone);
+  if (client) {
+    await stateStore.invalidateOpenPendingByHumanWithClient(client, conversationKey);
+    return;
+  }
+  await stateStore.pgConversationalV2StateStore.invalidateOpenPendingByHuman(conversationKey);
 }
 
 const defaultEchoDeps: EchoDeps = {
@@ -115,7 +120,7 @@ const defaultEchoDeps: EchoDeps = {
   persistEchoAtomically: persistHumanEchoAtomically,
   recordMessage: addMessage,
   withConversationLock: (phoneNumberId, customerPhone, work) =>
-    withConversationLock(phoneNumberId, customerPhone, async () => work()),
+    withConversationLock(phoneNumberId, customerPhone, async (client) => work(client)),
   loadConfig: getTenantConfig,
   downloadAudio: downloadMedia,
   transcribeAudio: transcreverAudioBuffer,
@@ -346,7 +351,11 @@ export async function handleSmbMessageEchoes(
   const messages = parseEchoMessages(value, fallbackPhoneNumberId);
   const serialize =
     deps.withConversationLock ??
-    (async (_phoneNumberId: string, _customerPhone: string, work: () => Promise<void>) =>
+    (async (
+      _phoneNumberId: string,
+      _customerPhone: string,
+      work: (client?: ConversationalV2LockClient) => Promise<void>
+    ) =>
       work());
   let processingFailure: unknown = null;
 
@@ -356,7 +365,7 @@ export async function handleSmbMessageEchoes(
   // persistência final reentram na lock de ordenação da conversa.
   for (const target of targets) {
     try {
-      await serialize(target.phoneNumberId, target.customerPhone, async () => {
+      await serialize(target.phoneNumberId, target.customerPhone, async (lockClient) => {
         try {
           await deps.pauseConversation(target.phoneNumberId, target.customerPhone);
         } catch (err) {
@@ -418,7 +427,7 @@ export async function handleSmbMessageEchoes(
         });
       }
 
-      await serialize(target.phoneNumberId, target.customerPhone, async () => {
+      await serialize(target.phoneNumberId, target.customerPhone, async (lockClient) => {
         for (const { message, content } of resolvedMessages) {
           const conversationKey = canonicalConversationKey(
             message.phoneNumberId,
@@ -500,7 +509,8 @@ export async function handleSmbMessageEchoes(
         await (deps.invalidatePendingByHuman ??
           defaultEchoDeps.invalidatePendingByHuman)?.(
           target.phoneNumberId,
-          target.customerPhone
+          target.customerPhone,
+          lockClient
         );
       });
     } catch (err) {

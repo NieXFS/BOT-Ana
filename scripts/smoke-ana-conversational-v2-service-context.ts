@@ -22,9 +22,24 @@ import {
   inboundHasVaguePeriodV2,
   resolveServiceCorrectionDecisionV2,
   SERVICE_CONTEXT_REJECTED_COPY_V2,
+  buildDeferredOpenServiceQuestionCopyV2,
   buildPolarityAmbiguityCopyV2,
 } from '../src/services/conversationalV2/serviceContext';
+import {
+  evaluateBoundaryV2,
+  UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2,
+} from '../src/services/conversationalV2/boundary';
+import {
+  EMPTY_OPEN_SERVICE_CLARIFICATION_V2,
+  VISIBLE_HANDOFF_CANONICAL_V2,
+} from '../src/services/conversationalV2/recoveryCoordinator';
 import { getReceptionistReplyV2 } from '../src/services/conversationalV2/runtime';
+import {
+  flushBuffer,
+  __seedFlushBufferForTest,
+  __resetFlushStateForTest,
+} from '../src/messageHandler';
+import { SilentEscalationHoldPersistenceError } from '../src/services/silentEscalationHold';
 import type { ReceptionistTurnControl } from '../src/services/receptionistTurnDecision';
 import {
   MemoryConversationalV2StateStore,
@@ -155,6 +170,16 @@ const config = {
 
 const FAMILY_INBOUND =
   'Tem horário hoje após as 17:30? unha/pé e mão';
+const OPEN_SERVICE_INBOUND =
+  'Boa tarde! Tem horário hoje após as 17:30?';
+const DEFERRED_OPEN_SERVICE_QUESTION_COPY =
+  'Para eu consultar a agenda de hoje, depois das 17h30, qual serviço você quer fazer?';
+const DEFERRED_OPEN_SERVICE_QUESTION_DATE_ONLY_COPY =
+  'Para eu consultar a agenda de hoje, qual serviço você quer fazer?';
+const DEFERRED_OPEN_SERVICE_QUESTION_WINDOW_ONLY_COPY =
+  'Para eu consultar a agenda depois das 17h30, qual serviço você quer fazer?';
+const DEFERRED_OPEN_SERVICE_QUESTION_FALLBACK_COPY =
+  'Para eu consultar a agenda no período que você pediu, qual serviço você quer fazer?';
 const FULL_SLOTS = ['16:00', '17:00', '17:30', '18:00', '18:30', '19:00'];
 const DAY_SLOTS = [
   '08:00',
@@ -190,12 +215,15 @@ function capture(text: string, at = now) {
   });
 }
 
-function turnRuntime(text: string, sequence = 1, paused = false) {
-  const inboundId = nextId();
+function turnRuntime(text: string | readonly string[], sequence = 1, paused = false) {
+  const texts = typeof text === 'string' ? [text] : [...text];
+  const inboundIds = texts.map(() => nextId());
   return {
     inputSequence: sequence,
-    currentInboundIds: [inboundId],
-    currentInboundTextsById: { [inboundId]: text },
+    currentInboundIds: inboundIds,
+    currentInboundTextsById: Object.fromEntries(
+      inboundIds.map((inboundId, index) => [inboundId, texts[index] ?? ''])
+    ),
     checkpoint: async () => ({
       paused,
       latestInputSequence: sequence,
@@ -250,6 +278,8 @@ async function runTurn(input: {
   regenerateServiceQuestion?: boolean;
   modelRawReply?: string;
   modelReply?: string;
+  modelUnknownServiceText?: string | null;
+  failRegenerate?: boolean;
   modelNextPending?: 'SERVICE' | 'PRESERVE';
   sequence?: number;
   slots?: readonly string[];
@@ -258,20 +288,31 @@ async function runTurn(input: {
   now?: Date;
   paused?: boolean;
   allowModel?: boolean;
+  catalogOverride?: ServicesResult;
   turnControl?: ReceptionistTurnControl;
+  /** Literal multi-bubble batch used by the Laura fixture. */
+  messages?: readonly string[];
+  escalateSilent?: (input: {
+    phoneNumberId: string;
+    customerPhone: string;
+    messageId: string;
+  }) => Promise<
+    | { kind: 'created'; questionId: string }
+    | { kind: 'pending' }
+  >;
 }) {
   const toolNames: string[] = [];
   const slotPayload = input.slots ?? FULL_SLOTS;
   const prepared = await getReceptionistReplyV2({
     phone: input.phone,
-    userMessage: input.text,
+    userMessage: input.messages?.join(' ') ?? input.text,
     userName: 'Cliente',
     config,
     interpreterEnabled: input.interpreterEnabled ?? false,
     serviceContextEnabled: input.enabled,
     ...(input.turnControl ? { turnControl: input.turnControl } : {}),
     turnRuntime: turnRuntime(
-      input.text,
+      input.messages ?? input.text,
       input.sequence ?? 1,
       input.paused ?? false
     ),
@@ -279,14 +320,16 @@ async function runTurn(input: {
       store: input.store,
       now: () => input.now ?? tick(),
       id: nextId,
-      loadServices: async () => catalog,
+      loadServices: async () => input.catalogOverride ?? catalog,
       loadHistory: async () => [],
       isPaused: async () => false,
       interpreterEnabled: input.interpreterEnabled ?? false,
       serviceContextEnabled: input.enabled,
       executeProactiveDuplicateRead: async () =>
         JSON.stringify({ success: true, appointments: [] }),
-      escalateSilent: async () => ({ kind: 'pending' as const }),
+      escalateSilent:
+        input.escalateSilent ??
+        (async () => ({ kind: 'pending' as const })),
       runInterpreter: async () => {
         if (input.interpreterNenhuma) {
           return {
@@ -297,21 +340,30 @@ async function runTurn(input: {
         }
         throw new Error('planner/service-context não deve chamar o intérprete');
       },
-      ...(input.regenerateServiceQuestion
+      ...(input.regenerateServiceQuestion || input.failRegenerate
         ? {
-            regenerate: async () => ({
-              ok: true as const,
-              result: {
-                schemaVersion: 2 as const,
-                reply: SERVICE_QUESTION_COPY,
-                replyPurpose: 'SERVICE_QUESTION' as const,
-                pendingTransitionCandidate: { kind: 'preserve' as const },
-                resolutionCandidate: null,
-                unknownServiceEvidence: null,
-              },
-              resolutionProof: null,
-              providerCalls: 1 as const,
-            }),
+            regenerate: async () => {
+              if (input.failRegenerate) {
+                return {
+                  ok: false as const,
+                  reasonCode: 'REGEN_MODEL_RESULT_INVALID' as const,
+                  providerCalls: 1 as const,
+                };
+              }
+              return {
+                ok: true as const,
+                result: {
+                  schemaVersion: 2 as const,
+                  reply: SERVICE_QUESTION_COPY,
+                  replyPurpose: 'SERVICE_QUESTION' as const,
+                  pendingTransitionCandidate: { kind: 'preserve' as const },
+                  resolutionCandidate: null,
+                  unknownServiceEvidence: null,
+                },
+                resolutionProof: null,
+                providerCalls: 1 as const,
+              };
+            },
           }
         : {}),
       runModelLoop: async () => {
@@ -334,7 +386,7 @@ async function runTurn(input: {
               reply: input.modelReply ?? SERVICE_QUESTION_COPY,
               nextPending: input.modelNextPending ?? 'SERVICE',
               chosenOptionText: null,
-              unknownServiceText: null,
+              unknownServiceText: input.modelUnknownServiceText ?? null,
             }),
             exhausted: false,
             provider: 'openai',
@@ -370,15 +422,16 @@ async function runTurn(input: {
 async function deliver(
   prepared: Awaited<ReturnType<typeof getReceptionistReplyV2>>,
   store: MemoryConversationalV2StateStore,
-  sequence = 1
+  sequence = 1,
+  nowFactory: () => Date = tick
 ) {
   if (!prepared.payload) {
     throw new Error('entrega exige payload');
   }
-  await deliverPreparedReceptionistTurnV2(prepared, {
+  return deliverPreparedReceptionistTurnV2(prepared, {
     store,
     id: nextId,
-    now: () => tick(),
+    now: nowFactory,
     checkpoint: async () => ({
       paused: false,
       latestInputSequence: sequence,
@@ -411,6 +464,72 @@ function assertWindowOnlySlots(slots: readonly string[]): void {
   for (const forbidden of ['08:00', '08:30', '09:00', '16:00', '17:00', '17:30']) {
     assert.equal(slots.includes(forbidden), false);
   }
+}
+
+function fixtureClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Simula reload do processo: nenhuma referência da instância anterior é reutilizada. */
+function reloadMemoryStore(
+  source: MemoryConversationalV2StateStore
+): MemoryConversationalV2StateStore {
+  const reloaded = new MemoryConversationalV2StateStore();
+  for (const [key, rows] of source.pending) reloaded.pending.set(key, fixtureClone(rows));
+  for (const [key, row] of source.outbox) reloaded.outbox.set(key, fixtureClone(row));
+  for (const [key, row] of source.plans) reloaded.plans.set(key, fixtureClone(row));
+  for (const [key, row] of source.deliveries) reloaded.deliveries.set(key, fixtureClone(row));
+  for (const [key, row] of source.successors) reloaded.successors.set(key, fixtureClone(row));
+  for (const [key, value] of source.inputSequences) reloaded.inputSequences.set(key, value);
+  for (const [key, value] of source.flowStateInvalidations) {
+    reloaded.flowStateInvalidations.set(key, fixtureClone(value));
+  }
+  for (const [key, value] of source.assistantHistory) {
+    reloaded.assistantHistory.set(key, fixtureClone(value));
+  }
+  reloaded.transportPostCount = source.transportPostCount;
+  return reloaded;
+}
+
+function assertDeferredOpenServiceQuestionCopy(copy: string): void {
+  assert.doesNotMatch(copy, /tem horário/iu);
+  assert.doesNotMatch(copy, /tem vaga/iu);
+  assert.doesNotMatch(copy, /horários disponíveis/iu);
+  assert.doesNotMatch(copy, /encontrei/iu);
+  assert.doesNotMatch(copy, /verificar os horários/iu);
+}
+
+function evaluateDeferredOpenCopy(rawCandidate: string) {
+  return evaluateBoundaryV2({
+    rawCandidate,
+    servicesResult: catalog,
+    flowState: {
+      flowId: 'flow-open-service',
+      lastOperationalAt: now.toISOString(),
+      deferredAvailability: FAMILY_SERVICE_CONSTRAINT,
+      fixedByProofVersion: {},
+    },
+    pendingTransitionCandidate: {
+      kind: 'open',
+      pendingKind: 'SERVICE',
+      flowId: 'flow-open-service',
+      optionEntityIds: [],
+    },
+    replyPurpose: 'SERVICE_QUESTION',
+    source: 'CANONICAL',
+    toolTrace: [],
+    sourceInboundText: OPEN_SERVICE_INBOUND,
+    currentInboundIds: ['in-open-service'],
+    inboundTextsById: { 'in-open-service': OPEN_SERVICE_INBOUND },
+    pendingSnapshot: {
+      questionId: 'q-open-service',
+      askedAt: now.toISOString(),
+      kind: 'SERVICE',
+      flowId: 'flow-open-service',
+      version: 1,
+      options: [],
+    },
+  });
 }
 
 function servicePendingFrame(
@@ -530,6 +649,230 @@ async function main(): Promise<void> {
     'env do planner exige também a allowlist v2 no processo'
   );
 
+  // --- LAURA_LITERAL_FLOW_2026_08_21 ---
+  // Fixture independente do replay IA-22c: preserva as três bolhas reais do
+  // primeiro lote, força reload entre cada turno e prova uma única leitura de
+  // agenda sem qualquer write. O catálogo é deliberadamente inteiro, não o
+  // subset histórico Reposição/Unha infantil.
+  const LAURA_NOW = new Date('2026-08-21T15:00:00.000Z');
+  const LAURA_FIRST_BUBBLES = [
+    'Tem horário hoje após as 17:30?',
+    'Ou amanhã de manhã pra fazer a unha?',
+    'Pé e mão',
+  ] as const;
+  const LAURA_SLOTS = [
+    '08:00',
+    '10:00',
+    '14:00',
+    '17:00',
+    '17:30',
+    '18:00',
+    '18:30',
+    '19:00',
+  ] as const;
+  const LAURA_ALLOWED_SLOTS = ['18:00', '18:30', '19:00'] as const;
+  const LAURA_CATALOG: ServicesResult = {
+    ...catalog,
+    services: catalog.services!.filter((service) =>
+      [
+        'svc-repo',
+        'svc-unha-inf',
+        'svc-mani',
+        'svc-pedi',
+        'svc-mani-pedi',
+        'svc-mani-trad',
+      ].includes(service.id)
+    ),
+  };
+  const lauraCatalogNames = new Set(catalog.services!.map((service) => service.name));
+  for (const requiredName of [
+    'Manicure',
+    'Pedicure',
+    'Manicure e pedicure',
+    'Reposição de unha',
+    'Unha infantil',
+    'Manicure tradicional',
+  ]) {
+    assert.equal(lauraCatalogNames.has(requiredName), true, `Laura catalog: ${requiredName}`);
+  }
+  const lauraPhone = '5511000000501';
+  const lauraKey = `${config.phoneNumberId}:${lauraPhone}`;
+  let lauraStore = new MemoryConversationalV2StateStore();
+  lauraStore.setInputSequence(lauraKey, 1);
+  const lauraTurn1 = await runTurn({
+    phone: lauraPhone,
+    text: LAURA_FIRST_BUBBLES[0],
+    messages: LAURA_FIRST_BUBBLES,
+    store: lauraStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    allowModel: true,
+    modelReply: 'Qual serviço ou categoria você quer consultar primeiro?',
+    modelNextPending: 'SERVICE',
+    catalogOverride: LAURA_CATALOG,
+    sequence: 1,
+    now: LAURA_NOW,
+  });
+  assert.deepEqual(
+    LAURA_FIRST_BUBBLES,
+    ['Tem horário hoje após as 17:30?', 'Ou amanhã de manhã pra fazer a unha?', 'Pé e mão'],
+    'Laura mantém as três bolhas e a ordem literal'
+  );
+  assert.equal(lauraTurn1.prepared.frame.currentInboundIds.length, 3);
+  assert.ok(lauraTurn1.prepared.payload, 'Laura T1 has visible payload');
+  assert.equal(lauraTurn1.toolNames.length, 0, 'Laura T1 has zero tools');
+  assert.equal(lauraTurn1.prepared.hasCommittedWrite, false);
+  assert.equal(
+    lauraTurn1.prepared.planReceipt.toolEffects.some((effect) => effect.writeCommitted),
+    false,
+    'Laura T1 has zero writes'
+  );
+  assert.equal(
+    (lauraTurn1.prepared.payload ?? '').includes('Preenchimento Estético'),
+    false,
+    'Laura T1 has no catalog mural'
+  );
+  assert.ok((lauraTurn1.prepared.payload ?? '').length < 500, 'Laura T1 remains compact');
+  if (lauraTurn1.prepared.transition.kind === 'open') {
+    const firstOptions = lauraTurn1.prepared.transition.frame.options.map((option) => option.entityId);
+    assert.notDeepEqual(firstOptions, ['svc-repo', 'svc-unha-inf']);
+    assert.ok(firstOptions.length >= 3, 'Laura T1 asks a real category/service choice');
+  }
+  await deliver(lauraTurn1.prepared, lauraStore, 1, () => LAURA_NOW);
+
+  // Reload 1: a new Memory instance is the process-restart fixture boundary.
+  lauraStore = reloadMemoryStore(lauraStore);
+  lauraStore.setInputSequence(lauraKey, 2);
+  const lauraTurn2 = await runTurn({
+    phone: lauraPhone,
+    text: 'Manicure e pedicure',
+    store: lauraStore,
+    enabled: true,
+    interpreterEnabled: true,
+    sequence: 2,
+    now: LAURA_NOW,
+    catalogOverride: LAURA_CATALOG,
+  });
+  assert.equal(lauraTurn2.toolNames.length, 0, 'Laura service choice asks the window first');
+  assert.ok(lauraTurn2.prepared.payload);
+  assert.match(
+    lauraTurn2.prepared.payload ?? '',
+    /qual (?:dia|per[ií]odo|janela)|qual .*consultar primeiro/iu,
+    'Laura T2 fixes the two-window clarification before a read'
+  );
+  assert.equal(lauraTurn2.prepared.hasCommittedWrite, false);
+  assert.equal(
+    lauraTurn2.prepared.planReceipt.toolEffects.some((effect) => effect.writeCommitted),
+    false
+  );
+  await deliver(lauraTurn2.prepared, lauraStore, 2, () => LAURA_NOW);
+
+  // Reload 2: only the explicit temporal window can now authorize the read.
+  lauraStore = reloadMemoryStore(lauraStore);
+  lauraStore.setInputSequence(lauraKey, 3);
+  const lauraTurn3 = await runTurn({
+    phone: lauraPhone,
+    text: 'Hoje depois das 17:30',
+    store: lauraStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    sequence: 3,
+    now: LAURA_NOW,
+    slots: LAURA_SLOTS,
+    catalogOverride: LAURA_CATALOG,
+  });
+  assert.deepEqual(
+    lauraTurn3.toolNames,
+    ['getAvailableSlots'],
+    'Laura T3 performs exactly one read and no write'
+  );
+  assert.equal(lauraTurn3.prepared.hasCommittedWrite, false);
+  assert.equal(
+    lauraTurn3.prepared.planReceipt.toolEffects.some((effect) => effect.writeCommitted),
+    false
+  );
+  assert.equal(
+    lauraTurn3.prepared.planReceipt.toolEffects.some((effect) => effect.tool === 'bookAppointment'),
+    false
+  );
+  assert.equal(lauraTurn3.prepared.transition.kind, 'open');
+  if (lauraTurn3.prepared.transition.kind === 'open') {
+    assert.equal(lauraTurn3.prepared.transition.frame.kind, 'TIME');
+    assert.deepEqual(
+      lauraTurn3.prepared.transition.frame.options.map((option) => option.entityId),
+      LAURA_ALLOWED_SLOTS
+    );
+  }
+  assert.deepEqual(nextFlowState(lauraTurn3.prepared).slotEvidence?.slots, LAURA_ALLOWED_SLOTS);
+  assert.deepEqual(
+    lauraTurn3.prepared.planReceipt.toolEffects
+      .filter((effect) => effect.tool === 'getAvailableSlots')
+      .map((effect) => effect.class),
+    ['read']
+  );
+  await deliver(lauraTurn3.prepared, lauraStore, 3, () => LAURA_NOW);
+  lauraStore = reloadMemoryStore(lauraStore);
+  const lauraAfterReload = await lauraStore.loadLatestState(lauraKey, LAURA_NOW);
+  assert.equal(lauraAfterReload.pending?.snapshot.kind, 'TIME');
+  assert.deepEqual(lauraAfterReload.pending?.snapshot.options.map((option) => option.entityId), LAURA_ALLOWED_SLOTS);
+
+  async function runLauraNegativeBranch(
+    phone: string,
+    text: 'Não é só manicure mesmo' | 'Não é manicure normal'
+  ): Promise<void> {
+    const store = new MemoryConversationalV2StateStore();
+    const key = `${config.phoneNumberId}:${phone}`;
+    seedPending(
+      store,
+      key,
+      {
+        questionId: `q-${phone}`,
+        askedAt: LAURA_NOW.toISOString(),
+        kind: 'SERVICE',
+        flowId: `flow-${phone}`,
+        version: 1,
+        options: [
+          { position: 1, entityId: 'svc-mani', displayName: 'Manicure' },
+          { position: 2, entityId: 'svc-pedi', displayName: 'Pedicure' },
+          { position: 3, entityId: 'svc-mani-pedi', displayName: 'Manicure e pedicure' },
+          { position: 4, entityId: 'svc-mani-trad', displayName: 'Manicure tradicional' },
+        ],
+      },
+      { flowId: `flow-${phone}`, lastOperationalAt: LAURA_NOW.toISOString(), fixedByProofVersion: {} }
+    );
+    store.setInputSequence(key, 1);
+    const turn = await runTurn({
+      phone,
+      text,
+      store,
+      enabled: true,
+      interpreterEnabled: true,
+      sequence: 1,
+      now: LAURA_NOW,
+      catalogOverride: LAURA_CATALOG,
+    });
+    assert.equal(turn.toolNames.length, 0, `${text}: no tool before service is unequivocal`);
+    assert.ok(turn.prepared.payload, `${text}: visible clarification`);
+    assert.equal(nextFlowState(turn.prepared).fixedServiceId, undefined, `${text}: negation never selects service`);
+    assert.equal(turn.prepared.hasCommittedWrite, false);
+    assert.equal(
+      turn.prepared.planReceipt.toolEffects.some((effect) => effect.writeCommitted),
+      false,
+      `${text}: zero writes`
+    );
+    if (turn.prepared.transition.kind === 'open') {
+      assert.notDeepEqual(
+        turn.prepared.transition.frame.options.map((option) => option.entityId),
+        ['svc-repo', 'svc-unha-inf'],
+        `${text}: no historical two-item subset`
+      );
+    }
+  }
+  await runLauraNegativeBranch('5511000000502', 'Não é só manicure mesmo');
+  await runLauraNegativeBranch('5511000000503', 'Não é manicure normal');
+
   const after = capture('Tem horário hoje após as 17:30?');
   assert.equal(after.kind, 'captured');
   if (after.kind === 'captured') {
@@ -634,6 +977,47 @@ async function main(): Promise<void> {
   );
   assert.equal(capture('Boa noite, quero agendar unha').kind, 'none');
   assert.equal(capture('Tem horário sexta à tarde?').kind, 'vague_period');
+
+  const dateAndWindowConstraint: DeferredAvailabilityConstraintV2 = {
+    schemaVersion: 1,
+    capturedAt: now.toISOString(),
+    capturedTurnId: 'turn-open-copy',
+    capturedInputSequence: 1,
+    date: '2026-08-13',
+    timeWindow: { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 },
+  };
+  assert.equal(
+    buildDeferredOpenServiceQuestionCopyV2(dateAndWindowConstraint, now, timezone),
+    DEFERRED_OPEN_SERVICE_QUESTION_COPY
+  );
+  assert.equal(
+    buildDeferredOpenServiceQuestionCopyV2(
+      { ...dateAndWindowConstraint, timeWindow: undefined },
+      now,
+      timezone
+    ),
+    DEFERRED_OPEN_SERVICE_QUESTION_DATE_ONLY_COPY
+  );
+  assert.equal(
+    buildDeferredOpenServiceQuestionCopyV2(
+      { ...dateAndWindowConstraint, date: undefined },
+      now,
+      timezone
+    ),
+    DEFERRED_OPEN_SERVICE_QUESTION_WINDOW_ONLY_COPY
+  );
+  assert.equal(
+    buildDeferredOpenServiceQuestionCopyV2(
+      { ...dateAndWindowConstraint, date: undefined, timeWindow: undefined },
+      now,
+      timezone
+    ),
+    DEFERRED_OPEN_SERVICE_QUESTION_FALLBACK_COPY
+  );
+  assertDeferredOpenServiceQuestionCopy(DEFERRED_OPEN_SERVICE_QUESTION_COPY);
+  assertDeferredOpenServiceQuestionCopy(DEFERRED_OPEN_SERVICE_QUESTION_DATE_ONLY_COPY);
+  assertDeferredOpenServiceQuestionCopy(DEFERRED_OPEN_SERVICE_QUESTION_WINDOW_ONLY_COPY);
+  assertDeferredOpenServiceQuestionCopy(DEFERRED_OPEN_SERVICE_QUESTION_FALLBACK_COPY);
 
   const pendingFrame = servicePendingFrame();
   assert.equal(
@@ -1548,6 +1932,542 @@ async function main(): Promise<void> {
     false
   );
 
+  // --- IA-22e fixture C: restrição temporal sem serviço resolvido ---
+  const openServiceStore = new MemoryConversationalV2StateStore();
+  const openServicePhone = '5511000000401';
+  const openServiceKey = `${config.phoneNumberId}:${openServicePhone}`;
+  openServiceStore.setInputSequence(openServiceKey, 1);
+  const openServiceTurn1 = await runTurn({
+    phone: openServicePhone,
+    text: OPEN_SERVICE_INBOUND,
+    store: openServiceStore,
+    enabled: true,
+    interpreterEnabled: true,
+    sequence: 1,
+  });
+  assert.equal(
+    openServiceTurn1.prepared.planReceipt.serviceContextDecision,
+    'temporal_deferred'
+  );
+  assert.equal(openServiceTurn1.prepared.planReceipt.route, 'fast_path');
+  assert.equal(openServiceTurn1.prepared.planReceipt.recoveryKind, 'none');
+  assert.notEqual(
+    openServiceTurn1.prepared.planReceipt.recoveryKind,
+    'silent_escalation'
+  );
+  assert.equal(openServiceTurn1.prepared.payload, DEFERRED_OPEN_SERVICE_QUESTION_COPY);
+  assertDeferredOpenServiceQuestionCopy(openServiceTurn1.prepared.payload ?? '');
+  const openServiceBoundary = evaluateDeferredOpenCopy(
+    openServiceTurn1.prepared.payload ?? ''
+  );
+  assert.equal(openServiceBoundary.safe, true);
+  assert.equal(openServiceBoundary.originalAccepted, true);
+  assert.deepEqual(openServiceBoundary.reasonCodes, []);
+  assert.equal(
+    openServiceBoundary.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+    false
+  );
+  assert.equal(
+    openServiceTurn1.prepared.planReceipt.boundaryAttempts.some((attempt) =>
+      attempt.reasonCodes.includes('UNVERIFIED_AVAILABILITY')
+    ),
+    false
+  );
+  assert.equal(openServiceTurn1.prepared.planReceipt.primaryProviderCalls, 0);
+  assert.equal(openServiceTurn1.prepared.planReceipt.regenProviderCalls, 0);
+  assert.equal(openServiceTurn1.prepared.planReceipt.route.startsWith('interpreter'), false);
+  assert.equal(openServiceTurn1.toolNames.length, 0);
+  assert.equal(openServiceTurn1.prepared.hasCommittedWrite, false);
+  assert.equal(
+    openServiceTurn1.prepared.planReceipt.toolEffects.some((entry) => entry.writeCommitted),
+    false
+  );
+  assert.equal(openServiceTurn1.prepared.preemption, null);
+  assert.equal(openServiceTurn1.prepared.transition.kind, 'open');
+  if (openServiceTurn1.prepared.transition.kind === 'open') {
+    assert.equal(openServiceTurn1.prepared.transition.frame.kind, 'SERVICE');
+    assert.equal(openServiceTurn1.prepared.transition.frame.options.length, 0);
+  }
+  const openServiceConstraint = nextFlowState(openServiceTurn1.prepared).deferredAvailability;
+  assert.ok(openServiceConstraint);
+  assert.equal(openServiceConstraint?.date, '2026-08-13');
+  assert.deepEqual(openServiceConstraint?.timeWindow, {
+    kind: 'AFTER_EXCLUSIVE',
+    minuteOfDay: 17 * 60 + 30,
+  });
+  await deliver(openServiceTurn1.prepared, openServiceStore, 1);
+  const openServiceAfter1 = await openServiceStore.loadLatestState(
+    openServiceKey,
+    new Date(clockMs)
+  );
+  assert.equal(openServiceAfter1.pending?.state, 'OPEN');
+  assert.equal(openServiceAfter1.pending?.snapshot.kind, 'SERVICE');
+  assert.equal(openServiceAfter1.pending?.snapshot.options.length, 0);
+  assert.ok(
+    openServiceAfter1.pending?.flowState.deferredAvailability ??
+      openServiceAfter1.flowState?.deferredAvailability
+  );
+  assert.equal(
+    (
+      openServiceAfter1.pending?.flowState.deferredAvailability ??
+      openServiceAfter1.flowState?.deferredAvailability
+    )?.date,
+    '2026-08-13'
+  );
+  assert.deepEqual(
+    (
+      openServiceAfter1.pending?.flowState.deferredAvailability ??
+      openServiceAfter1.flowState?.deferredAvailability
+    )?.timeWindow,
+    { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 }
+  );
+
+  openServiceStore.setInputSequence(openServiceKey, 2);
+  const openServiceTurn2 = await runTurn({
+    phone: openServicePhone,
+    text: 'Drenagem linfática',
+    store: openServiceStore,
+    enabled: true,
+    interpreterEnabled: true,
+    sequence: 2,
+    slots: DAY_SLOTS,
+  });
+  assert.equal(
+    openServiceTurn2.toolNames.filter((name) => name === 'getAvailableSlots').length,
+    1
+  );
+  assert.doesNotMatch(
+    openServiceTurn2.prepared.payload ?? '',
+    new RegExp(DATE_QUESTION_COPY, 'u')
+  );
+  assert.equal(openServiceTurn2.prepared.transition.kind, 'open');
+  if (openServiceTurn2.prepared.transition.kind === 'open') {
+    assert.equal(openServiceTurn2.prepared.transition.frame.kind, 'TIME');
+  }
+  assertWindowOnlySlots(openedTimeSlots(openServiceTurn2.prepared));
+  assertWindowOnlySlots(nextFlowState(openServiceTurn2.prepared).slotEvidence?.slots ?? []);
+
+  // --- IA-22f: serviço fora do catálogo com SERVICE OPEN options=[] ---
+  const HAIR_INBOUND = 'quero fazer o cabelo';
+  const GENERIC_SERVICE_QUESTION = 'Qual serviço você prefere?';
+  const NON_CANONICAL_HAIR_DENIAL =
+    'A gente não faz cabelo aqui, infelizmente.';
+
+  async function openRestrictedEmptyService(phone: string) {
+    const store = new MemoryConversationalV2StateStore();
+    const key = `${config.phoneNumberId}:${phone}`;
+    store.setInputSequence(key, 1);
+    const turn1 = await runTurn({
+      phone,
+      text: OPEN_SERVICE_INBOUND,
+      store,
+      enabled: true,
+      interpreterEnabled: true,
+      sequence: 1,
+    });
+    assert.equal(turn1.prepared.payload, DEFERRED_OPEN_SERVICE_QUESTION_COPY);
+    assert.equal(turn1.prepared.transition.kind, 'open');
+    if (turn1.prepared.transition.kind === 'open') {
+      assert.equal(turn1.prepared.transition.frame.kind, 'SERVICE');
+      assert.equal(turn1.prepared.transition.frame.options.length, 0);
+    }
+    await deliver(turn1.prepared, store, 1);
+    const after1 = await store.loadLatestState(key, new Date(clockMs));
+    assert.equal(after1.pending?.state, 'OPEN');
+    assert.equal(after1.pending?.snapshot.kind, 'SERVICE');
+    assert.equal(after1.pending?.snapshot.options.length, 0);
+    assert.ok(
+      after1.pending?.flowState.deferredAvailability ??
+        after1.flowState?.deferredAvailability
+    );
+    return { store, key };
+  }
+
+  function assertPendingEmptyServicePreserved(
+    prepared: Awaited<ReturnType<typeof getReceptionistReplyV2>>
+  ): void {
+    const flow = nextFlowState(prepared);
+    assert.ok(flow.deferredAvailability);
+    assert.equal(flow.deferredAvailability?.date, '2026-08-13');
+    assert.deepEqual(flow.deferredAvailability?.timeWindow, {
+      kind: 'AFTER_EXCLUSIVE',
+      minuteOfDay: 17 * 60 + 30,
+    });
+    if (prepared.transition.kind === 'open') {
+      assert.equal(prepared.transition.frame.kind, 'SERVICE');
+      assert.equal(prepared.transition.frame.options.length, 0);
+    } else {
+      assert.equal(prepared.transition.kind, 'preserve');
+    }
+  }
+
+  const hairEvidenceStore = await openRestrictedEmptyService('5511000000402');
+  hairEvidenceStore.store.setInputSequence(hairEvidenceStore.key, 2);
+  const hairEvidenceTurn2 = await runTurn({
+    phone: '5511000000402',
+    text: HAIR_INBOUND,
+    store: hairEvidenceStore.store,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    allowModel: true,
+    failRegenerate: true,
+    modelReply: NON_CANONICAL_HAIR_DENIAL,
+    modelUnknownServiceText: 'cabelo',
+    modelNextPending: 'PRESERVE',
+    sequence: 2,
+  });
+  assert.equal(
+    hairEvidenceTurn2.prepared.payload,
+    UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2
+  );
+  assert.notEqual(hairEvidenceTurn2.prepared.payload, GENERIC_SERVICE_QUESTION);
+  assert.notEqual(
+    hairEvidenceTurn2.prepared.planReceipt.recoveryKind,
+    'silent_escalation'
+  );
+  assert.equal(hairEvidenceTurn2.toolNames.length, 0);
+  assert.equal(hairEvidenceTurn2.prepared.hasCommittedWrite, false);
+  assert.equal(
+    hairEvidenceTurn2.prepared.planReceipt.toolEffects.some(
+      (entry) => entry.writeCommitted
+    ),
+    false
+  );
+  assert.equal(hairEvidenceTurn2.prepared.planReceipt.regenProviderCalls, 0);
+  assertPendingEmptyServicePreserved(hairEvidenceTurn2.prepared);
+  await deliver(hairEvidenceTurn2.prepared, hairEvidenceStore.store, 2);
+  const hairAfter2 = await hairEvidenceStore.store.loadLatestState(
+    hairEvidenceStore.key,
+    new Date(clockMs)
+  );
+  assert.equal(hairAfter2.pending?.state, 'OPEN');
+  assert.equal(hairAfter2.pending?.snapshot.kind, 'SERVICE');
+  assert.equal(hairAfter2.pending?.snapshot.options.length, 0);
+  assert.ok(
+    hairAfter2.pending?.flowState.deferredAvailability ??
+      hairAfter2.flowState?.deferredAvailability
+  );
+
+  async function hairClarificationVariant(input: {
+    phone: string;
+    modelRawReply?: string;
+    modelReply?: string;
+    modelUnknownServiceText?: string | null;
+  }) {
+    const opened = await openRestrictedEmptyService(input.phone);
+    opened.store.setInputSequence(opened.key, 2);
+    const turn2 = await runTurn({
+      phone: input.phone,
+      text: HAIR_INBOUND,
+      store: opened.store,
+      enabled: true,
+      interpreterEnabled: true,
+      interpreterNenhuma: true,
+      allowModel: true,
+      failRegenerate: true,
+      modelRawReply: input.modelRawReply,
+      modelReply: input.modelReply ?? NON_CANONICAL_HAIR_DENIAL,
+      modelUnknownServiceText: input.modelUnknownServiceText,
+      modelNextPending: 'PRESERVE',
+      sequence: 2,
+    });
+    assert.equal(turn2.prepared.payload, EMPTY_OPEN_SERVICE_CLARIFICATION_V2);
+    assert.notEqual(turn2.prepared.payload, GENERIC_SERVICE_QUESTION);
+    assert.notEqual(
+      turn2.prepared.planReceipt.recoveryKind,
+      'silent_escalation'
+    );
+    assert.equal(turn2.prepared.payload, EMPTY_OPEN_SERVICE_CLARIFICATION_V2);
+    assert.ok(turn2.prepared.payload);
+    assert.equal(turn2.toolNames.length, 0);
+    assert.equal(turn2.prepared.hasCommittedWrite, false);
+    assertPendingEmptyServicePreserved(turn2.prepared);
+    return { ...opened, turn2 };
+  }
+
+  await hairClarificationVariant({
+    phone: '5511000000403',
+    modelReply: NON_CANONICAL_HAIR_DENIAL,
+    modelUnknownServiceText: null,
+  });
+  await hairClarificationVariant({
+    phone: '5511000000404',
+    modelReply: 'Pode me repetir o serviço?',
+    modelUnknownServiceText: null,
+  });
+  await hairClarificationVariant({
+    phone: '5511000000405',
+    modelRawReply: 'isto nao e json {{{',
+  });
+
+  const hairRepeat = await hairClarificationVariant({
+    phone: '5511000000406',
+    modelReply: NON_CANONICAL_HAIR_DENIAL,
+    modelUnknownServiceText: null,
+  });
+  await deliver(hairRepeat.turn2.prepared, hairRepeat.store, 2);
+  hairRepeat.store.setInputSequence(hairRepeat.key, 3);
+  const hairTurn3 = await runTurn({
+    phone: '5511000000406',
+    text: HAIR_INBOUND,
+    store: hairRepeat.store,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    allowModel: true,
+    failRegenerate: true,
+    modelReply: NON_CANONICAL_HAIR_DENIAL,
+    modelUnknownServiceText: null,
+    modelNextPending: 'PRESERVE',
+    sequence: 3,
+  });
+  assert.equal(hairTurn3.prepared.payload, VISIBLE_HANDOFF_CANONICAL_V2);
+  assert.notEqual(hairTurn3.prepared.payload, GENERIC_SERVICE_QUESTION);
+  assert.notEqual(hairTurn3.prepared.payload, EMPTY_OPEN_SERVICE_CLARIFICATION_V2);
+  assert.equal(
+    hairTurn3.prepared.planReceipt.recoveryKind,
+    'visible_escalation'
+  );
+  assert.notEqual(
+    hairTurn3.prepared.planReceipt.recoveryKind,
+    'silent_escalation'
+  );
+  assert.ok(hairTurn3.prepared.payload);
+  assert.equal(hairTurn3.toolNames.length, 0);
+  assert.equal(hairTurn3.prepared.hasCommittedWrite, false);
+
+  const visibleHandoffPhone = '5511000000410';
+  const visibleOpened = await openRestrictedEmptyService(visibleHandoffPhone);
+  visibleOpened.store.setInputSequence(visibleOpened.key, 2);
+  const visibleTurn2 = await runTurn({
+    phone: visibleHandoffPhone,
+    text: HAIR_INBOUND,
+    store: visibleOpened.store,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    allowModel: true,
+    failRegenerate: true,
+    modelReply: NON_CANONICAL_HAIR_DENIAL,
+    modelUnknownServiceText: null,
+    modelNextPending: 'PRESERVE',
+    sequence: 2,
+  });
+  assert.equal(
+    visibleTurn2.prepared.payload,
+    EMPTY_OPEN_SERVICE_CLARIFICATION_V2
+  );
+  await deliver(visibleTurn2.prepared, visibleOpened.store, 2);
+  visibleOpened.store.setInputSequence(visibleOpened.key, 3);
+  const oldVisibleState = await visibleOpened.store.loadLatestState(
+    visibleOpened.key,
+    new Date(clockMs)
+  );
+  const oldVisibleFlowId =
+    oldVisibleState.pending?.flowState.flowId ?? oldVisibleState.flowState?.flowId;
+  assert.ok(oldVisibleFlowId);
+
+  let visibleSilentPosts = 0;
+  let holdActive = false;
+  const visibleTurn3 = await runTurn({
+    phone: visibleHandoffPhone,
+    text: HAIR_INBOUND,
+    store: visibleOpened.store,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    allowModel: true,
+    failRegenerate: true,
+    modelReply: NON_CANONICAL_HAIR_DENIAL,
+    modelUnknownServiceText: null,
+    modelNextPending: 'PRESERVE',
+    sequence: 3,
+    escalateSilent: async (input) => {
+      visibleSilentPosts += 1;
+      holdActive = true;
+      return { kind: 'created' as const, questionId: `q-${input.messageId}` };
+    },
+  });
+  assert.equal(visibleTurn3.prepared.payload, VISIBLE_HANDOFF_CANONICAL_V2);
+  assert.equal(
+    visibleTurn3.prepared.planReceipt.recoveryKind,
+    'visible_escalation'
+  );
+  assert.equal(visibleSilentPosts, 1, 'card/POST nasce no T3');
+  assert.ok(visibleTurn3.prepared.authoritativeEscalationQuestionId);
+  assert.equal(
+    visibleOpened.store.flowStateInvalidations.get(visibleOpened.key)?.reason,
+    'SILENT_ESCALATION',
+    'handoff visível também grava cutoff durável'
+  );
+
+  __resetFlushStateForTest();
+  let visibleT3HoldAfterPrepare = false;
+  let visibleT3FlushDeliveries = 0;
+  let visibleT3TransportPosts = 0;
+  const visibleDeliveryNow = new Date(clockMs + 60_000);
+  let visibleT3EscalationAckChecks = 0;
+  const visibleT3FlushKey = __seedFlushBufferForTest(
+    config,
+    visibleHandoffPhone,
+    [HAIR_INBOUND]
+  );
+  await flushBuffer(visibleT3FlushKey, {
+    getReply: async () => {
+      visibleT3HoldAfterPrepare = true;
+      return visibleTurn3.prepared;
+    },
+    sendReply: async () => {
+      throw new Error('T3 visível não pode usar transporte v1');
+    },
+    sendReplyPlain: async () => {
+      throw new Error('T3 visível não pode usar transporte v1');
+    },
+    isPaused: async () => false,
+    isPausedBeforeTransport: async () => false,
+    isPausedWithoutSilentHoldBeforeTransport: async () => false,
+    isPausedForEscalationAck: async () => {
+      visibleT3EscalationAckChecks += 1;
+      return true;
+    },
+    lookupSilentHold: async () =>
+      visibleT3HoldAfterPrepare
+        ? { kind: 'active' as const, sourceMessageId: 'wamid-visible-t3' }
+        : { kind: 'inactive' as const },
+    withConversationLock: async (_phoneNumberId, _customerPhone, work) =>
+      work(),
+    deliverV2: async (prepared, checkpoint) => {
+      const state = await checkpoint();
+      if (state.paused) {
+        throw new Error('hold do mesmo turno suprimiu o handoff visível');
+      }
+      const result = await deliverPreparedReceptionistTurnV2(prepared, {
+        store: visibleOpened.store,
+        checkpoint,
+        id: nextId,
+        now: () => visibleDeliveryNow,
+        sendTransport: async () => {
+          visibleT3TransportPosts += 1;
+          return { providerMessageId: nextId() };
+        },
+      });
+      visibleT3FlushDeliveries += 1;
+      assert.equal(prepared.payload, VISIBLE_HANDOFF_CANONICAL_V2);
+      assert.equal(result.delivery, 'sent');
+      assert.equal(result.receipt.transportOutcome, 'accepted_by_provider');
+      assert.notEqual(result.receipt.transportStartedAt, null);
+      assert.notEqual(result.receipt.pendingCommitOutcome, 'cas_conflict');
+      assert.equal(result.receipt.flowStateCommitOutcome, 'committed');
+      return { delivery: 'sent' as const, successor: result.successor };
+    },
+  });
+  assert.equal(
+    visibleT3FlushDeliveries,
+    1,
+    'T3 entrega a copy visível apesar do hold recém-criado'
+  );
+  assert.equal(
+    visibleT3EscalationAckChecks,
+    0,
+    'T3 visível não usa pause-ack de escalada humana'
+  );
+  assert.equal(visibleSilentPosts, 1, 'flush do T3 não cria segundo POST');
+  assert.equal(visibleT3TransportPosts, 1, 'delivery v2 real faz exatamente um POST');
+  const visibleAfterDelivery = await visibleOpened.store.loadLatestState(
+    visibleOpened.key,
+    visibleDeliveryNow
+  );
+  assert.equal(visibleAfterDelivery.pending, null, 'handoff fecha PendingFrame antiga');
+  assert.notEqual(
+    visibleAfterDelivery.flowState?.flowId,
+    oldVisibleFlowId,
+    'handoff não projeta o flow antigo'
+  );
+  assert.equal(visibleAfterDelivery.flowState?.fixedServiceId, undefined);
+  assert.equal(visibleAfterDelivery.flowState?.fixedProfessionalId, undefined);
+  assert.equal(visibleAfterDelivery.flowState?.resolvedDate, undefined);
+  assert.equal(visibleAfterDelivery.flowState?.bookingDraft, undefined);
+  assert.equal(visibleAfterDelivery.flowState?.slotEvidence, undefined);
+  assert.equal(visibleAfterDelivery.flowState?.deferredAvailability, undefined);
+  assert.equal(visibleAfterDelivery.flowState?.cancellation, undefined);
+  __resetFlushStateForTest();
+
+  const visibleT4Key = __seedFlushBufferForTest(
+    config,
+    visibleHandoffPhone,
+    [HAIR_INBOUND]
+  );
+  let visibleT4BrainCalls = 0;
+  let visibleT4Outbound = 0;
+  await flushBuffer(visibleT4Key, {
+    getReply: async () => {
+      visibleT4BrainCalls += 1;
+      throw new Error('T4 em hold não pode chamar o brain');
+    },
+    sendReply: async () => {
+      visibleT4Outbound += 1;
+    },
+    sendReplyPlain: async () => {
+      visibleT4Outbound += 1;
+    },
+    isPaused: async () => false,
+    isPausedBeforeTransport: async () => false,
+    lookupSilentHold: async () =>
+      holdActive
+        ? { kind: 'active' as const, sourceMessageId: 'wamid-visible-t3' }
+        : { kind: 'inactive' as const },
+    withConversationLock: async (_phoneNumberId, _customerPhone, work) => work(),
+  });
+  assert.equal(visibleT4BrainCalls, 0, 'T4 é silêncio pré-brain');
+  assert.equal(visibleT4Outbound, 0, 'T4 não gera outbound');
+  assert.equal(visibleSilentPosts, 1, 'T4 não cria segundo POST/card');
+  __resetFlushStateForTest();
+
+  const persistFailPhone = '5511000000411';
+  const persistFailOpened = await openRestrictedEmptyService(persistFailPhone);
+  persistFailOpened.store.setInputSequence(persistFailOpened.key, 2);
+  const persistFailTurn2 = await runTurn({
+    phone: persistFailPhone,
+    text: HAIR_INBOUND,
+    store: persistFailOpened.store,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    allowModel: true,
+    failRegenerate: true,
+    modelReply: NON_CANONICAL_HAIR_DENIAL,
+    modelUnknownServiceText: null,
+    modelNextPending: 'PRESERVE',
+    sequence: 2,
+  });
+  await deliver(persistFailTurn2.prepared, persistFailOpened.store, 2);
+  persistFailOpened.store.setInputSequence(persistFailOpened.key, 3);
+  await assert.rejects(
+    () =>
+      runTurn({
+        phone: persistFailPhone,
+        text: HAIR_INBOUND,
+        store: persistFailOpened.store,
+        enabled: true,
+        interpreterEnabled: true,
+        interpreterNenhuma: true,
+        allowModel: true,
+        failRegenerate: true,
+        modelReply: NON_CANONICAL_HAIR_DENIAL,
+        modelUnknownServiceText: null,
+        modelNextPending: 'PRESERVE',
+        sequence: 3,
+        escalateSilent: async () => {
+          throw new SilentEscalationHoldPersistenceError(
+            'persistência do hold visível falhou'
+          );
+        },
+      }),
+    (error: unknown) =>
+      error instanceof SilentEscalationHoldPersistenceError
+  );
+
   // --- IA-22c fixture C: round-trip real pelo store, não o consumidor direto ---
   const replayStore = new MemoryConversationalV2StateStore();
   const replayPhone = '5511000000301';
@@ -1559,24 +2479,38 @@ async function main(): Promise<void> {
     store: replayStore,
     enabled: true,
     interpreterEnabled: true,
-    interpreterNenhuma: true,
-    regenerateServiceQuestion: true,
-    modelRawReply: '{not-json',
     sequence: 1,
   });
-  assert.equal(replayTurn1.prepared.planReceipt.route, 'interpreter_nenhuma');
-  assert.equal(replayTurn1.prepared.planReceipt.recoveryKind, 'regen');
-  assert.equal(replayTurn1.prepared.transition.kind, 'preserve');
-  assert.equal(replayTurn1.prepared.payload, SERVICE_QUESTION_COPY);
+  assert.equal(replayTurn1.prepared.planReceipt.route, 'fast_path');
+  assert.equal(replayTurn1.prepared.planReceipt.recoveryKind, 'none');
+  assert.equal(replayTurn1.prepared.transition.kind, 'open');
+  if (replayTurn1.prepared.transition.kind === 'open') {
+    assert.equal(replayTurn1.prepared.transition.frame.kind, 'SERVICE');
+    assert.equal(replayTurn1.prepared.transition.frame.options.length, 0);
+  }
+  assert.equal(replayTurn1.prepared.payload, DEFERRED_OPEN_SERVICE_QUESTION_COPY);
   await deliver(replayTurn1.prepared, replayStore, 1);
   const replayAfter1 = await replayStore.loadLatestState(replayKey, new Date(clockMs));
-  assert.equal(replayAfter1.pending, null);
-  assert.ok(replayAfter1.flowState?.deferredAvailability);
-  assert.equal(replayAfter1.flowState?.deferredAvailability?.date, '2026-08-13');
-  assert.deepEqual(replayAfter1.flowState?.deferredAvailability?.timeWindow, {
-    kind: 'AFTER_EXCLUSIVE',
-    minuteOfDay: 17 * 60 + 30,
-  });
+  assert.equal(replayAfter1.pending?.state, 'OPEN');
+  assert.equal(replayAfter1.pending?.snapshot.kind, 'SERVICE');
+  assert.ok(replayAfter1.flowState?.deferredAvailability ?? replayAfter1.pending?.flowState.deferredAvailability);
+  assert.equal(
+    (
+      replayAfter1.pending?.flowState.deferredAvailability ??
+      replayAfter1.flowState?.deferredAvailability
+    )?.date,
+    '2026-08-13'
+  );
+  assert.deepEqual(
+    (
+      replayAfter1.pending?.flowState.deferredAvailability ??
+      replayAfter1.flowState?.deferredAvailability
+    )?.timeWindow,
+    {
+      kind: 'AFTER_EXCLUSIVE',
+      minuteOfDay: 17 * 60 + 30,
+    }
+  );
 
   replayStore.setInputSequence(replayKey, 2);
   const replayTurn2 = await runTurn({
@@ -1649,24 +2583,42 @@ async function main(): Promise<void> {
     store: threeStepStore,
     enabled: true,
     interpreterEnabled: true,
-    interpreterNenhuma: true,
-    regenerateServiceQuestion: true,
-    modelRawReply: '{not-json',
     sequence: 1,
   });
-  assert.equal(threeStepTurn1.prepared.planReceipt.route, 'interpreter_nenhuma');
-  assert.equal(threeStepTurn1.prepared.transition.kind, 'preserve');
+  assert.equal(threeStepTurn1.prepared.planReceipt.route, 'fast_path');
+  assert.equal(threeStepTurn1.prepared.transition.kind, 'open');
+  if (threeStepTurn1.prepared.transition.kind === 'open') {
+    assert.equal(threeStepTurn1.prepared.transition.frame.kind, 'SERVICE');
+    assert.equal(threeStepTurn1.prepared.transition.frame.options.length, 0);
+  }
+  assert.equal(
+    threeStepTurn1.prepared.payload,
+    DEFERRED_OPEN_SERVICE_QUESTION_WINDOW_ONLY_COPY
+  );
   await deliver(threeStepTurn1.prepared, threeStepStore, 1);
   const threeStepAfter1 = await threeStepStore.loadLatestState(
     threeStepKey,
     new Date(clockMs)
   );
-  assert.equal(threeStepAfter1.pending, null);
-  assert.equal(threeStepAfter1.flowState?.deferredAvailability?.date, undefined);
-  assert.deepEqual(threeStepAfter1.flowState?.deferredAvailability?.timeWindow, {
-    kind: 'AFTER_EXCLUSIVE',
-    minuteOfDay: 17 * 60 + 30,
-  });
+  assert.equal(threeStepAfter1.pending?.state, 'OPEN');
+  assert.equal(threeStepAfter1.pending?.snapshot.kind, 'SERVICE');
+  assert.equal(
+    (
+      threeStepAfter1.pending?.flowState.deferredAvailability ??
+      threeStepAfter1.flowState?.deferredAvailability
+    )?.date,
+    undefined
+  );
+  assert.deepEqual(
+    (
+      threeStepAfter1.pending?.flowState.deferredAvailability ??
+      threeStepAfter1.flowState?.deferredAvailability
+    )?.timeWindow,
+    {
+      kind: 'AFTER_EXCLUSIVE',
+      minuteOfDay: 17 * 60 + 30,
+    }
+  );
 
   threeStepStore.setInputSequence(threeStepKey, 2);
   const threeStepTurn2 = await runTurn({
@@ -1848,9 +2800,6 @@ async function main(): Promise<void> {
     store: resumeCutStore,
     enabled: true,
     interpreterEnabled: true,
-    interpreterNenhuma: true,
-    regenerateServiceQuestion: true,
-    modelRawReply: '{not-json',
     sequence: 1,
     turnControl: {
       disposition: 'RESUME_APPROVED',

@@ -910,7 +910,9 @@ async function main(): Promise<void> {
     }),
     now,
   });
-  assert.equal(helperMalformed, null);
+  // IA-23 generaliza a projeção: o estado mínimo sem deferredAvailability é
+  // válido. O parser só rejeita subshapes efetivamente malformados.
+  assert.equal(helperMalformed?.flowId, 'flow-bad');
 
   const memoryFallback = new MemoryConversationalV2StateStore();
   const memoryKey = 'PN:ia22c-memory';

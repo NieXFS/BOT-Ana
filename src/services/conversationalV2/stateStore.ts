@@ -1,6 +1,8 @@
 import type { PoolClient } from 'pg';
 import { pool } from '../contextManager';
+import { conversationAdvisoryLockKey } from '../conversationOrder';
 import type {
+  FlowStateCommitOutcomeV2,
   FlowStateV2,
   PendingFrameSnapshotV2,
   ProviderDeliveryStatusV2,
@@ -9,6 +11,16 @@ import type {
 } from './contracts';
 import type { CopyVariantIdV2 } from './copyVariants';
 import { ensureProviderStatusV2Tables } from './providerStatus';
+import { parsePersistedFlowStateV2 } from './flowStateParser';
+
+export { parsePersistedFlowStateV2 } from './flowStateParser';
+
+/** Minimal lock-owned client surface; pure/test callers need not know PG. */
+export type ConversationalV2LockClient = Pick<PoolClient, 'query'>;
+
+export interface ConversationalV2TransactionLockDeps {
+  connect: () => Promise<PoolClient>;
+}
 
 export const PENDING_FRAME_TTL_MS_V2 = 24 * 60 * 60 * 1_000;
 export const OUTBOX_TRANSPORT_STALE_MS_V2 = 2 * 60 * 1_000;
@@ -120,6 +132,7 @@ export interface AcceptedDeliveryEvidenceV2 {
   readonly transition: MaterializedPendingTransitionV2;
   readonly conversationCommitOutcome: TurnDeliveryReceiptV2['conversationCommitOutcome'];
   readonly pendingCommitOutcome: TurnDeliveryReceiptV2['pendingCommitOutcome'];
+  readonly flowStateCommitOutcome?: FlowStateCommitOutcomeV2;
   readonly copyVariant: CopyVariantIdV2;
 }
 
@@ -162,6 +175,7 @@ export interface PendingCommitResultV2 {
     | 'not_applicable'
     | 'failed';
   observedVersion: number | null;
+  flowStateCommitOutcome: FlowStateCommitOutcomeV2;
 }
 
 export interface ReceiptReconciliationV2 {
@@ -226,12 +240,31 @@ export interface ConversationalV2StateStore {
     commitPayload: AcceptedCommitPayloadV2;
     now: Date;
   }): Promise<PendingCommitResultV2>;
+  /** Lock-owned variant for delivery invoked inside conversationOrder. */
+  commitAcceptedWithClient?: (
+    client: ConversationalV2LockClient,
+    input: {
+      deliveryAttemptId: string;
+      providerMessageIdHash: string;
+      commitPayload: AcceptedCommitPayloadV2;
+      now: Date;
+    }
+  ) => Promise<PendingCommitResultV2>;
   markAcceptedUncommitted(input: {
     deliveryAttemptId: string;
     providerMessageIdHash: string;
     commitPayload: AcceptedCommitPayloadV2;
     now: Date;
   }): Promise<void>;
+  markAcceptedUncommittedWithClient?: (
+    client: ConversationalV2LockClient,
+    input: {
+      deliveryAttemptId: string;
+      providerMessageIdHash: string;
+      commitPayload: AcceptedCommitPayloadV2;
+      now: Date;
+    }
+  ) => Promise<void>;
   reconcileAcceptedCommit(deliveryAttemptId: string, now?: Date): Promise<PendingCommitResultV2>;
   inspectInboundGuard(conversationKey: string, now?: Date): Promise<InboundDeliveryGuardV2>;
   invalidateOpenPendingByHuman(conversationKey: string, now?: Date): Promise<number>;
@@ -264,6 +297,53 @@ function iso(now: Date): string {
   return now.toISOString();
 }
 
+/**
+ * Reuse the exact advisory-lock domain of `conversationOrder.ts`.  Echo and
+ * the Questions panel hold a session lock from the dedicated direct pool;
+ * these state-store transactions therefore must use the same 64-bit key,
+ * rather than `hashtext`, or the supposed fence would be two independent
+ * locks.
+ */
+function conversationAdvisoryKeyV2(conversationKey: string): string {
+  const separator = conversationKey.indexOf(':');
+  if (separator <= 0 || separator === conversationKey.length - 1) {
+    // This is only a defensive fallback for malformed fixture keys.  Normal
+    // production keys are always phoneNumberId:canonicalCustomerPhone.
+    return conversationAdvisoryLockKey(conversationKey, '');
+  }
+  return conversationAdvisoryLockKey(
+    conversationKey.slice(0, separator),
+    conversationKey.slice(separator + 1)
+  );
+}
+
+/**
+ * Autonomous transaction owner for state-store operations. Lock-owned
+ * callers (echo/panel) must call the `WithClient` functions directly instead
+ * of entering this wrapper a second time.
+ */
+export async function withConversationalV2TransactionLock<T>(
+  conversationKey: string,
+  work: (client: PoolClient) => Promise<T>,
+  deps: ConversationalV2TransactionLockDeps = { connect: () => pool.connect() }
+): Promise<T> {
+  const client = await deps.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [
+      conversationAdvisoryKeyV2(conversationKey),
+    ]);
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* preserve original */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 function isExpired(snapshot: PendingFrameSnapshotV2, now: Date): boolean {
   const askedAt = Date.parse(snapshot.askedAt);
   return !Number.isFinite(askedAt) || now.getTime() - askedAt >= PENDING_FRAME_TTL_MS_V2;
@@ -276,25 +356,30 @@ function acceptedDeliveryEvidenceFromOutbox(
   if (
     record.state !== 'accepted_by_provider' ||
     !commit ||
-    commit.deliveryReceipt.transportOutcome !== 'accepted_by_provider'
+    commit.deliveryReceipt.transportOutcome !== 'accepted_by_provider' ||
+    commit.deliveryReceipt.conversationCommitOutcome !== 'committed'
   ) {
     return null;
   }
+  const flowStateCommitOutcome =
+    commit.deliveryReceipt.flowStateCommitOutcome ?? 'committed';
   return {
     payload: record.payload,
     terminalAt: commit.deliveryReceipt.terminalAt,
     transition: clone(record.transition),
     conversationCommitOutcome: commit.deliveryReceipt.conversationCommitOutcome,
     pendingCommitOutcome: commit.deliveryReceipt.pendingCommitOutcome,
+    flowStateCommitOutcome,
     copyVariant: commit.copyVariant ?? 'canonical',
   };
 }
 
 function isAcceptedProviderOutbox(record: OutboundOutboxRecordV2): boolean {
+  if (record.state !== 'accepted_by_provider') return false;
+  const evidence = acceptedDeliveryEvidenceFromOutbox(record);
   return (
-    record.state === 'accepted_by_provider' &&
-    record.commitPayload?.deliveryReceipt.transportOutcome ===
-      'accepted_by_provider'
+    evidence !== null &&
+    evidence.flowStateCommitOutcome === 'committed'
   );
 }
 
@@ -304,12 +389,23 @@ function compareAcceptedOutboxByTerminal(
   direction: 'asc' | 'desc'
 ): number {
   const sign = direction === 'desc' ? -1 : 1;
+  const compareDeliveryAttemptId = (leftId: string, rightId: string): number => {
+    const leftNumeric = /(?:^|-)\d+$/u.test(leftId) ? Number(leftId.match(/\d+$/u)?.[0]) : NaN;
+    const rightNumeric = /(?:^|-)\d+$/u.test(rightId) ? Number(rightId.match(/\d+$/u)?.[0]) : NaN;
+    if (Number.isFinite(leftNumeric) && Number.isFinite(rightNumeric) && leftNumeric !== rightNumeric) {
+      return leftNumeric - rightNumeric;
+    }
+    return leftId.localeCompare(rightId);
+  };
   const terminalDelta =
     Date.parse(left.commitPayload!.deliveryReceipt.terminalAt) -
     Date.parse(right.commitPayload!.deliveryReceipt.terminalAt);
   return (
     sign * terminalDelta ||
-    sign * (Date.parse(left.updatedAt) - Date.parse(right.updatedAt))
+    // `updatedAt` is reconciliation bookkeeping and is never an authority
+    // for event ordering.  Delivery attempt id is only a deterministic tie
+    // breaker for equal provider-acceptance instants.
+    sign * compareDeliveryAttemptId(left.deliveryAttemptId, right.deliveryAttemptId)
   );
 }
 
@@ -322,6 +418,7 @@ function isCommittedOpeningOutboxForPending(
   if (
     !evidence ||
     evidence.conversationCommitOutcome !== 'committed' ||
+    evidence.flowStateCommitOutcome !== 'committed' ||
     evidence.pendingCommitOutcome !== 'opened'
   ) {
     return false;
@@ -337,42 +434,8 @@ function isCommittedOpeningOutboxForPending(
 function transitionNextFlowStateV2(
   transition: MaterializedPendingTransitionV2
 ): FlowStateV2 | undefined {
-  return transition.nextFlowState;
-}
-
-function isPersistedDeferredFlowStateV2(
-  flowState: FlowStateV2 | null | undefined
-): flowState is FlowStateV2 {
-  const constraint = flowState?.deferredAvailability;
-  if (!constraint || constraint.schemaVersion !== 1) return false;
-  if (typeof constraint.capturedAt !== 'string') return false;
-  if (!Number.isFinite(Date.parse(constraint.capturedAt))) return false;
-  if (
-    typeof constraint.capturedTurnId !== 'string' ||
-    constraint.capturedTurnId.trim().length === 0
-  ) {
-    return false;
-  }
-  if (
-    typeof constraint.capturedInputSequence !== 'number' ||
-    !Number.isFinite(constraint.capturedInputSequence)
-  ) {
-    return false;
-  }
-  return true;
-}
-
-function committedDeferredFlowStateFromOutboxV2(
-  record: OutboundOutboxRecordV2 | null
-): FlowStateV2 | null {
-  if (!record) return null;
-  if (record.state !== 'accepted_by_provider') return null;
-  const receipt = record.commitPayload?.deliveryReceipt;
-  if (!receipt) return null;
-  if (receipt.transportOutcome !== 'accepted_by_provider') return null;
-  if (receipt.conversationCommitOutcome !== 'committed') return null;
-  const nextFlowState = transitionNextFlowStateV2(record.transition);
-  return isPersistedDeferredFlowStateV2(nextFlowState) ? nextFlowState : null;
+  const parsed = parsePersistedFlowStateV2(transition.nextFlowState);
+  return parsed ?? undefined;
 }
 
 function outboxTerminalIsAfterPendingV2(
@@ -400,6 +463,49 @@ function isStrictlyAfterCutoffV2(
 function withoutDeferredAvailabilityV2(flowState: FlowStateV2): FlowStateV2 {
   const { deferredAvailability: _deferred, ...rest } = clone(flowState);
   return rest;
+}
+
+function sanitizedFlowStateV2(
+  flowState: FlowStateV2,
+  featureEnabled: boolean
+): FlowStateV2 | null {
+  const parsed = parsePersistedFlowStateV2(flowState);
+  if (!parsed) return null;
+  if (featureEnabled || !parsed.deferredAvailability) return parsed;
+  return parsePersistedFlowStateV2(withoutDeferredAvailabilityV2(parsed));
+}
+
+function pendingCommitResultFromReceipt(
+  receipt: TurnDeliveryReceiptV2
+): PendingCommitResultV2 {
+  return {
+    outcome: receipt.pendingCommitOutcome,
+    observedVersion: receipt.observedPendingVersion,
+    flowStateCommitOutcome:
+      receipt.flowStateCommitOutcome ??
+      (receipt.conversationCommitOutcome === 'committed'
+        ? 'committed'
+        : receipt.conversationCommitOutcome === 'accepted_uncommitted'
+          ? 'accepted_uncommitted'
+          : 'not_applicable'),
+  };
+}
+
+function committedFlowStateFromOutboxV2(
+  record: OutboundOutboxRecordV2 | null,
+  featureEnabled: boolean,
+  cutoffAt: string | null | undefined
+): FlowStateV2 | null {
+  if (!record || !isAcceptedProviderOutbox(record)) return null;
+  const receipt = record.commitPayload?.deliveryReceipt;
+  const terminalAt = receipt?.terminalAt;
+  if (
+    !terminalAt ||
+    !Number.isFinite(Date.parse(terminalAt)) ||
+    !isStrictlyAfterCutoffV2(terminalAt, cutoffAt)
+  ) return null;
+  const nextFlowState = transitionNextFlowStateV2(record.transition);
+  return nextFlowState ? sanitizedFlowStateV2(nextFlowState, featureEnabled) : null;
 }
 
 function mergeFlowStateInvalidationV2(
@@ -436,11 +542,15 @@ function restorableOpenPendingV2(
 export function resolveLatestFlowStateV2(input: {
   latestPendingRecord: PendingFrameRecordV2 | null;
   lastAcceptedOutbox: OutboundOutboxRecordV2 | null;
+  /** Newest-first is derived from the receipt's original provider acceptance. */
+  acceptedOutboxes?: readonly OutboundOutboxRecordV2[];
   now: Date;
   flowStateInvalidation?: FlowStateInvalidationV2 | null;
+  featureEnabled?: boolean;
 }): FlowStateV2 | null {
   const pending = input.latestPendingRecord;
   const cutoffAt = input.flowStateInvalidation?.invalidatedAt ?? null;
+  const featureEnabled = input.featureEnabled ?? true;
   const openApplicable =
     pending &&
     pending.state === 'OPEN' &&
@@ -448,27 +558,42 @@ export function resolveLatestFlowStateV2(input: {
       ? pending
       : null;
   const openRestorable = restorableOpenPendingV2(openApplicable, input.flowStateInvalidation);
-  if (openRestorable) return clone(openRestorable.flowState);
   // OPEN anterior ao cutoff não vence: invalidação incompleta falha fechada.
   const pendingForFallback = openApplicable && !openRestorable ? null : pending;
 
-  const fromOutbox = committedDeferredFlowStateFromOutboxV2(input.lastAcceptedOutbox);
-  if (
-    fromOutbox &&
-    input.lastAcceptedOutbox &&
-    isStrictlyAfterCutoffV2(
-      input.lastAcceptedOutbox.commitPayload?.deliveryReceipt.terminalAt,
-      cutoffAt
-    ) &&
-    outboxTerminalIsAfterPendingV2(input.lastAcceptedOutbox, pendingForFallback)
-  ) {
-    return clone(fromOutbox);
+  const events = [
+    ...(input.acceptedOutboxes ?? []),
+    ...(input.lastAcceptedOutbox ? [input.lastAcceptedOutbox] : []),
+  ].filter((record, index, all) =>
+    all.findIndex((candidate) => candidate.deliveryAttemptId === record.deliveryAttemptId) === index
+  );
+  const accepted = events
+    .filter((record) => isAcceptedProviderOutbox(record))
+    .filter((record) => isStrictlyAfterCutoffV2(record.commitPayload?.deliveryReceipt.terminalAt, cutoffAt))
+    .sort((left, right) => compareAcceptedOutboxByTerminal(left, right, 'desc'));
+  // An accepted event that predates a newer PendingFrame is not applicable to
+  // that lifecycle.  The pending row remains the legacy fallback in this
+  // narrow case; it does not become a generic FlowState projection source.
+  const latestApplicableEvent = accepted.find((record) =>
+    !pendingForFallback || pendingForFallback.state === 'EXPIRED'
+      ? true
+      : outboxTerminalIsAfterPendingV2(record, pendingForFallback)
+  );
+  const fromOutbox = committedFlowStateFromOutboxV2(
+    latestApplicableEvent ?? null,
+    featureEnabled,
+    cutoffAt
+  );
+  if (fromOutbox) return clone(fromOutbox);
+  if (openRestorable) {
+    return sanitizedFlowStateV2(openRestorable.flowState, featureEnabled);
   }
   if (pendingForFallback && pendingForFallback.state !== 'EXPIRED') {
     if (!isStrictlyAfterCutoffV2(pendingForFallback.updatedAt, cutoffAt)) {
       return null;
     }
-    const restored = clone(pendingForFallback.flowState);
+    const restored = sanitizedFlowStateV2(pendingForFallback.flowState, featureEnabled);
+    if (!restored) return null;
     if (
       pendingForFallback.state === 'INVALIDATED' ||
       pendingForFallback.state === 'SUPERSEDED' ||
@@ -485,20 +610,30 @@ export function projectLatestFlowStateV2(input: {
   openPending: PendingFrameRecordV2 | null;
   latestPending: PendingFrameRecordV2 | null;
   lastAcceptedOutbox: OutboundOutboxRecordV2 | null;
+  acceptedOutboxes?: readonly OutboundOutboxRecordV2[];
   invalidation: FlowStateInvalidationV2 | null;
   now: Date;
+  featureEnabled?: boolean;
 }): Pick<ConversationalV2LatestState, 'pending' | 'flowState'> {
   const restorableOpen = restorableOpenPendingV2(
     input.openPending,
     input.invalidation
   );
+  const restorableOpenFlow = restorableOpen
+    ? sanitizedFlowStateV2(restorableOpen.flowState, input.featureEnabled ?? true)
+    : null;
   return {
-    pending: restorableOpen ? clone(restorableOpen) : null,
+    pending:
+      restorableOpen && restorableOpenFlow
+        ? { ...clone(restorableOpen), flowState: restorableOpenFlow }
+        : null,
     flowState: resolveLatestFlowStateV2({
       latestPendingRecord: input.openPending ?? input.latestPending,
       lastAcceptedOutbox: input.lastAcceptedOutbox,
+      acceptedOutboxes: input.acceptedOutboxes,
       now: input.now,
       flowStateInvalidation: input.invalidation,
+      featureEnabled: input.featureEnabled,
     }),
   };
 }
@@ -509,11 +644,13 @@ function reconstructedPending(
   now: Date
 ): PendingFrameRecordV2 | null {
   if (transition.kind !== 'open' || isExpired(transition.frame, now)) return null;
+  const flowState = parsePersistedFlowStateV2(transition.nextFlowState);
+  if (!flowState) return null;
   return {
     conversationKey,
     state: 'OPEN',
     snapshot: clone(transition.frame),
-    flowState: clone(transition.nextFlowState),
+    flowState,
     updatedAt: iso(now),
   };
 }
@@ -526,8 +663,32 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
   readonly successors = new Map<string, DurableSuccessorBatchV2>();
   readonly inputSequences = new Map<string, number>();
   readonly flowStateInvalidations = new Map<string, FlowStateInvalidationV2>();
+  /** Fixture observability for the same assistant-history commit fence. */
+  readonly assistantHistory = new Map<string, string[]>();
+  private readonly conversationLocks = new Map<string, Promise<void>>();
   failNextAcceptedCommit = false;
   transportPostCount = 0;
+
+  private async withConversationLock<T>(
+    conversationKey: string,
+    work: () => Promise<T>
+  ): Promise<T> {
+    const previous = this.conversationLocks.get(conversationKey) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.conversationLocks.set(conversationKey, current);
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+      if (this.conversationLocks.get(conversationKey) === current) {
+        this.conversationLocks.delete(conversationKey);
+      }
+    }
+  }
 
   setInputSequence(conversationKey: string, sequence: number): void {
     this.inputSequences.set(conversationKey, sequence);
@@ -561,12 +722,13 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
     }
     const latest = rows.at(-1) ?? null;
     const open = [...rows].reverse().find((row) => row.state === 'OPEN') ?? null;
-    const accepted = [...this.outbox.values()].filter(
+    const allAccepted = [...this.outbox.values()].filter(
       (record) =>
         record.conversationKey === conversationKey &&
-        isAcceptedProviderOutbox(record)
+        acceptedDeliveryEvidenceFromOutbox(record) !== null
     );
-    const lastAccepted = [...accepted].sort((left, right) =>
+    const accepted = allAccepted.filter(isAcceptedProviderOutbox);
+    const lastAccepted = [...allAccepted].sort((left, right) =>
       compareAcceptedOutboxByTerminal(left, right, 'desc')
     )[0];
     const openingAccepted = open
@@ -583,6 +745,7 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
       openPending: open,
       latestPending: latest,
       lastAcceptedOutbox: lastAccepted ?? null,
+      acceptedOutboxes: accepted,
       invalidation,
       now,
     });
@@ -671,21 +834,28 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
     const rows = this.rows(conversationKey);
     const open = [...rows].reverse().find((row) => row.state === 'OPEN') ?? null;
     if (transition.kind === 'preserve') {
+      const expectedQuestionId = transition.expectedQuestionId ?? null;
+      const expectedVersion = transition.expectedVersion ?? null;
       if (
         transition.nextFlowState &&
-        (transition.expectedQuestionId !== (open?.snapshot.questionId ?? null) ||
-          transition.expectedVersion !== (open?.snapshot.version ?? null))
+        (expectedQuestionId !== (open?.snapshot.questionId ?? null) ||
+          expectedVersion !== (open?.snapshot.version ?? null))
       ) {
         return {
           outcome: 'cas_conflict',
           observedVersion: open?.snapshot.version ?? null,
+          flowStateCommitOutcome: 'cas_conflict',
         };
       }
       if (open && transition.nextFlowState) {
         open.flowState = clone(transition.nextFlowState);
         open.updatedAt = iso(now);
       }
-      return { outcome: open ? 'preserved' : 'not_applicable', observedVersion: open?.snapshot.version ?? null };
+      return {
+        outcome: open ? 'preserved' : 'not_applicable',
+        observedVersion: open?.snapshot.version ?? null,
+        flowStateCommitOutcome: 'committed',
+      };
     }
     if (transition.kind === 'resolve' || transition.kind === 'invalidate') {
       if (
@@ -693,7 +863,11 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
         open.snapshot.questionId !== transition.questionId ||
         open.snapshot.version !== transition.expectedVersion
       ) {
-        return { outcome: 'cas_conflict', observedVersion: open?.snapshot.version ?? null };
+        return {
+          outcome: 'cas_conflict',
+          observedVersion: open?.snapshot.version ?? null,
+          flowStateCommitOutcome: 'cas_conflict',
+        };
       }
       open.state = transition.kind === 'resolve' ? 'RESOLVED' : 'INVALIDATED';
       open.snapshot = { ...open.snapshot, version: open.snapshot.version + 1 };
@@ -702,16 +876,21 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
       return {
         outcome: transition.kind === 'resolve' ? 'resolved' : 'invalidated',
         observedVersion: transition.expectedVersion,
+        flowStateCommitOutcome: 'committed',
       };
     }
     if (
-      (transition.expectedQuestionId === null && open) ||
-      (transition.expectedQuestionId !== null &&
+      ((transition.expectedQuestionId ?? null) === null && open) ||
+      ((transition.expectedQuestionId ?? null) !== null &&
         (!open ||
           open.snapshot.questionId !== transition.expectedQuestionId ||
           open.snapshot.version !== transition.expectedVersion))
     ) {
-      return { outcome: 'cas_conflict', observedVersion: open?.snapshot.version ?? null };
+      return {
+        outcome: 'cas_conflict',
+        observedVersion: open?.snapshot.version ?? null,
+        flowStateCommitOutcome: 'cas_conflict',
+      };
     }
     if (open) {
       open.state = 'SUPERSEDED';
@@ -725,7 +904,11 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
       flowState: clone(transition.nextFlowState),
       updatedAt: iso(now),
     });
-    return { outcome: 'opened', observedVersion: transition.expectedVersion };
+    return {
+      outcome: 'opened',
+      observedVersion: transition.expectedVersion,
+      flowStateCommitOutcome: 'committed',
+    };
   }
 
   async commitAccepted(input: {
@@ -734,40 +917,71 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
     commitPayload: AcceptedCommitPayloadV2;
     now: Date;
   }): Promise<PendingCommitResultV2> {
-    if (this.failNextAcceptedCommit) {
-      this.failNextAcceptedCommit = false;
-      throw new Error('accepted commit failure injected');
-    }
     const record = this.outbox.get(input.deliveryAttemptId);
     if (!record) throw new Error('outbox v2 ausente');
-    if (record.state === 'accepted_by_provider') {
-      return {
-        outcome: input.commitPayload.deliveryReceipt.pendingCommitOutcome,
-        observedVersion: input.commitPayload.deliveryReceipt.observedPendingVersion,
-      } as PendingCommitResultV2;
-    }
-    if (!['transport_started', 'accepted_uncommitted'].includes(record.state)) {
-      throw new Error('outbox v2 não aceita commit local neste estado');
-    }
-    const pending = this.applyTransition(
-      record.conversationKey,
-      input.commitPayload.transition,
-      input.now
-    );
-    record.state = 'accepted_by_provider';
-    record.providerMessageIdHash = input.providerMessageIdHash;
-    record.commitPayload = clone(input.commitPayload);
-    record.updatedAt = iso(input.now);
-    const receipt: TurnDeliveryReceiptV2 = {
-      ...input.commitPayload.deliveryReceipt,
-      outboxState: 'accepted_by_provider',
-      conversationCommitOutcome: 'committed',
-      pendingCommitOutcome: pending.outcome,
-      observedPendingVersion: pending.observedVersion,
-    };
-    record.commitPayload.deliveryReceipt = receipt;
-    this.deliveries.set(receipt.deliveryReceiptId, clone(receipt));
-    return pending;
+    return this.withConversationLock(record.conversationKey, async () => {
+      if (this.failNextAcceptedCommit) {
+        this.failNextAcceptedCommit = false;
+        throw new Error('accepted commit failure injected');
+      }
+      const current = this.outbox.get(input.deliveryAttemptId);
+      if (!current) throw new Error('outbox v2 ausente');
+      if (current.state === 'accepted_by_provider' && current.commitPayload) {
+        // Idempotência: o receipt persistido é soberano; nunca se usa o
+        // payload do chamador para recalcular outcome ou reabrir pending.
+        return pendingCommitResultFromReceipt(current.commitPayload.deliveryReceipt);
+      }
+      if (!['transport_started', 'accepted_uncommitted'].includes(current.state)) {
+        throw new Error('outbox v2 não aceita commit local neste estado');
+      }
+      const cutoffAt = this.flowStateInvalidations.get(current.conversationKey)?.invalidatedAt;
+      const acceptanceAfterCutoff = isStrictlyAfterCutoffV2(
+        input.commitPayload.deliveryReceipt.terminalAt,
+        cutoffAt
+      );
+      let pending: PendingCommitResultV2;
+      const parsedNext = parsePersistedFlowStateV2(current.transition.nextFlowState);
+      if (!acceptanceAfterCutoff) {
+        pending = {
+          outcome: 'not_applicable',
+          observedVersion: null,
+          flowStateCommitOutcome: 'skipped_human_cutoff',
+        };
+      } else if (!parsedNext) {
+        pending = {
+          outcome: 'not_applicable',
+          observedVersion: null,
+          flowStateCommitOutcome: 'failed',
+        };
+      } else {
+        pending = this.applyTransition(
+          current.conversationKey,
+          current.transition,
+          input.now
+        );
+      }
+      const receipt: TurnDeliveryReceiptV2 = {
+        ...input.commitPayload.deliveryReceipt,
+        outboxState: 'accepted_by_provider',
+        conversationCommitOutcome: 'committed',
+        flowStateCommitOutcome: pending.flowStateCommitOutcome,
+        pendingCommitOutcome: pending.outcome,
+        observedPendingVersion: pending.observedVersion,
+      };
+      current.state = 'accepted_by_provider';
+      current.providerMessageIdHash = input.providerMessageIdHash;
+      current.commitPayload = {
+        ...clone(input.commitPayload),
+        transition: clone(current.transition),
+        deliveryReceipt: receipt,
+      };
+      current.updatedAt = iso(input.now);
+      const history = this.assistantHistory.get(current.conversationKey) ?? [];
+      history.push(input.commitPayload.assistantText);
+      this.assistantHistory.set(current.conversationKey, history);
+      this.deliveries.set(receipt.deliveryReceiptId, clone(receipt));
+      return pending;
+    });
   }
 
   async markAcceptedUncommitted(input: {
@@ -778,20 +992,43 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
   }): Promise<void> {
     const record = this.outbox.get(input.deliveryAttemptId);
     if (!record) throw new Error('outbox v2 ausente');
-    record.state = 'accepted_uncommitted';
-    record.providerMessageIdHash = input.providerMessageIdHash;
-    record.commitPayload = clone(input.commitPayload);
-    record.updatedAt = iso(input.now);
-    this.deliveries.set(
-      input.commitPayload.deliveryReceipt.deliveryReceiptId,
-      clone(input.commitPayload.deliveryReceipt)
-    );
+    await this.withConversationLock(record.conversationKey, async () => {
+      const current = this.outbox.get(input.deliveryAttemptId);
+      if (!current) throw new Error('outbox v2 ausente');
+      if (current.state === 'accepted_by_provider' || current.state === 'accepted_uncommitted') return;
+      if (current.state !== 'transport_started') {
+        throw new Error('outbox v2 não aceita aceite não commitado neste estado');
+      }
+      const receipt: TurnDeliveryReceiptV2 = {
+        ...input.commitPayload.deliveryReceipt,
+        outboxState: 'accepted_uncommitted',
+        conversationCommitOutcome: 'accepted_uncommitted',
+        flowStateCommitOutcome: 'accepted_uncommitted',
+        pendingCommitOutcome: 'not_applicable',
+      };
+      current.state = 'accepted_uncommitted';
+      current.providerMessageIdHash = input.providerMessageIdHash;
+      current.commitPayload = {
+        ...clone(input.commitPayload),
+        transition: clone(current.transition),
+        deliveryReceipt: receipt,
+      };
+      current.updatedAt = iso(input.now);
+      this.deliveries.set(receipt.deliveryReceiptId, clone(receipt));
+    });
   }
 
   async reconcileAcceptedCommit(deliveryAttemptId: string, now = new Date()): Promise<PendingCommitResultV2> {
     const record = this.outbox.get(deliveryAttemptId);
+    if (record?.state === 'accepted_by_provider' && record.commitPayload) {
+      return pendingCommitResultFromReceipt(record.commitPayload.deliveryReceipt);
+    }
     if (!record?.commitPayload || record.state !== 'accepted_uncommitted') {
-      return { outcome: 'not_applicable', observedVersion: null };
+      return {
+        outcome: 'not_applicable',
+        observedVersion: null,
+        flowStateCommitOutcome: 'not_applicable',
+      };
     }
     return this.commitAccepted({
       deliveryAttemptId,
@@ -835,27 +1072,29 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
   }
 
   async invalidateOpenPendingByHuman(conversationKey: string, now = new Date()): Promise<number> {
-    let count = 0;
-    for (const row of this.rows(conversationKey)) {
-      if (row.state !== 'OPEN') continue;
-      row.state = 'INVALIDATED';
-      row.snapshot = { ...row.snapshot, version: row.snapshot.version + 1 };
-      row.updatedAt = iso(now);
-      count += 1;
-    }
-    await this.recordFlowStateInvalidation({
-      conversationKey,
-      reason: 'HUMAN_OWNERSHIP',
-      now,
+    return this.withConversationLock(conversationKey, async () => {
+      let count = 0;
+      for (const row of this.rows(conversationKey)) {
+        if (row.state !== 'OPEN') continue;
+        row.state = 'INVALIDATED';
+        row.snapshot = { ...row.snapshot, version: row.snapshot.version + 1 };
+        row.updatedAt = iso(now);
+        count += 1;
+      }
+      this.recordFlowStateInvalidationLocked({
+        conversationKey,
+        reason: 'HUMAN_OWNERSHIP',
+        now,
+      });
+      return count;
     });
-    return count;
   }
 
-  async recordFlowStateInvalidation(input: {
+  private recordFlowStateInvalidationLocked(input: {
     conversationKey: string;
     reason: FlowStateInvalidationReasonV2;
     now?: Date;
-  }): Promise<void> {
+  }): void {
     const now = input.now ?? new Date();
     const next: FlowStateInvalidationV2 = {
       conversationKey: input.conversationKey,
@@ -869,6 +1108,21 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
         next
       )
     );
+  }
+
+  async recordFlowStateInvalidation(input: {
+    conversationKey: string;
+    reason: FlowStateInvalidationReasonV2;
+    now?: Date;
+  }): Promise<void> {
+    const now = input.now ?? new Date();
+    await this.withConversationLock(input.conversationKey, async () => {
+      this.recordFlowStateInvalidationLocked({
+        conversationKey: input.conversationKey,
+        reason: input.reason,
+        now,
+      });
+    });
   }
 
   async enqueueSuccessor(input: Omit<
@@ -1240,6 +1494,74 @@ ON CONFLICT (conversation_key) DO UPDATE SET
   END
 `;
 
+const INVALIDATE_PENDING_AND_CUTOFF_SQL = `
+WITH invalidated AS (
+  UPDATE ana_v2_pending_frames
+  SET state = 'INVALIDATED',
+      version = version + 1,
+      updated_at = $2
+  WHERE conversation_key = $1
+    AND state = 'OPEN'
+  RETURNING 1
+),
+cutoff AS (
+  INSERT INTO ana_v2_flow_state_invalidations (
+    conversation_key, invalidated_at, reason
+  ) VALUES ($1, $2, 'HUMAN_OWNERSHIP')
+  ON CONFLICT (conversation_key) DO UPDATE SET
+    invalidated_at = GREATEST(
+      ana_v2_flow_state_invalidations.invalidated_at,
+      EXCLUDED.invalidated_at
+    ),
+    reason = CASE
+      WHEN EXCLUDED.invalidated_at > ana_v2_flow_state_invalidations.invalidated_at
+      THEN EXCLUDED.reason
+      ELSE ana_v2_flow_state_invalidations.reason
+    END
+  RETURNING 1
+)
+SELECT
+  (SELECT count(*) FROM invalidated)::int AS invalidated_count,
+  EXISTS (SELECT 1 FROM cutoff) AS cutoff_written
+`;
+
+/**
+ * Lock-owned human takeover operation. The caller already owns the
+ * conversation advisory/session lock; this function intentionally performs
+ * no BEGIN, connection acquisition, or second advisory lock.
+ */
+export async function invalidateOpenPendingByHumanWithClient(
+  client: ConversationalV2LockClient,
+  conversationKey: string,
+  now = new Date()
+): Promise<number> {
+  const result = await client.query<{
+    invalidated_count: number | string;
+    cutoff_written: boolean;
+  }>(INVALIDATE_PENDING_AND_CUTOFF_SQL, [conversationKey, now]);
+  const row = result.rows[0];
+  if (!row || row.cutoff_written !== true) {
+    throw new Error('human ownership cutoff was not written atomically');
+  }
+  return Number(row.invalidated_count);
+}
+
+/** Lock-owned cutoff-only operation; no nested advisory acquisition. */
+export async function recordFlowStateInvalidationWithClient(
+  client: ConversationalV2LockClient,
+  input: {
+    conversationKey: string;
+    reason: FlowStateInvalidationReasonV2;
+    now?: Date;
+  }
+): Promise<void> {
+  await client.query(UPSERT_FLOW_STATE_INVALIDATION_SQL, [
+    input.conversationKey,
+    input.now ?? new Date(),
+    input.reason,
+  ]);
+}
+
 function pendingFromRow(row: RawPendingRowV2): PendingFrameRecordV2 {
   return {
     conversationKey: row.conversation_key,
@@ -1321,14 +1643,17 @@ async function applyPgTransition(
 ): Promise<PendingCommitResultV2> {
   const open = await selectOpenPending(client, conversationKey, true);
   if (transition.kind === 'preserve') {
+    const expectedQuestionId = transition.expectedQuestionId ?? null;
+    const expectedVersion = transition.expectedVersion ?? null;
     if (
       transition.nextFlowState &&
-      (transition.expectedQuestionId !== (open?.snapshot.questionId ?? null) ||
-        transition.expectedVersion !== (open?.snapshot.version ?? null))
+      (expectedQuestionId !== (open?.snapshot.questionId ?? null) ||
+        expectedVersion !== (open?.snapshot.version ?? null))
     ) {
       return {
         outcome: 'cas_conflict',
         observedVersion: open?.snapshot.version ?? null,
+        flowStateCommitOutcome: 'cas_conflict',
       };
     }
     if (open && transition.nextFlowState) {
@@ -1350,6 +1675,7 @@ async function applyPgTransition(
     return {
       outcome: open ? 'preserved' : 'not_applicable',
       observedVersion: open?.snapshot.version ?? null,
+      flowStateCommitOutcome: 'committed',
     };
   }
   if (transition.kind === 'resolve' || transition.kind === 'invalidate') {
@@ -1358,7 +1684,11 @@ async function applyPgTransition(
       open.snapshot.questionId !== transition.questionId ||
       open.snapshot.version !== transition.expectedVersion
     ) {
-      return { outcome: 'cas_conflict', observedVersion: open?.snapshot.version ?? null };
+      return {
+        outcome: 'cas_conflict',
+        observedVersion: open?.snapshot.version ?? null,
+        flowStateCommitOutcome: 'cas_conflict',
+      };
     }
     await client.query(
       `UPDATE ana_v2_pending_frames
@@ -1379,16 +1709,21 @@ async function applyPgTransition(
     return {
       outcome: transition.kind === 'resolve' ? 'resolved' : 'invalidated',
       observedVersion: transition.expectedVersion,
+      flowStateCommitOutcome: 'committed',
     };
   }
   if (
-    (transition.expectedQuestionId === null && open) ||
-    (transition.expectedQuestionId !== null &&
+    ((transition.expectedQuestionId ?? null) === null && open) ||
+    ((transition.expectedQuestionId ?? null) !== null &&
       (!open ||
         open.snapshot.questionId !== transition.expectedQuestionId ||
         open.snapshot.version !== transition.expectedVersion))
   ) {
-    return { outcome: 'cas_conflict', observedVersion: open?.snapshot.version ?? null };
+    return {
+      outcome: 'cas_conflict',
+      observedVersion: open?.snapshot.version ?? null,
+      flowStateCommitOutcome: 'cas_conflict',
+    };
   }
   if (open) {
     await client.query(
@@ -1416,18 +1751,40 @@ async function applyPgTransition(
       now,
     ]
   );
-  return { outcome: 'opened', observedVersion: transition.expectedVersion };
+  return {
+    outcome: 'opened',
+    observedVersion: transition.expectedVersion,
+    flowStateCommitOutcome: 'committed',
+  };
 }
 
-async function commitAcceptedPg(input: {
+async function commitAcceptedPg(
+  input: {
   deliveryAttemptId: string;
   providerMessageIdHash: string;
   commitPayload: AcceptedCommitPayloadV2;
   now: Date;
-}): Promise<PendingCommitResultV2> {
-  const client = await pool.connect();
+  },
+  ownedClient?: PoolClient
+): Promise<PendingCommitResultV2> {
+  const client = ownedClient ?? await pool.connect();
+  const autonomous = !ownedClient;
   try {
     await client.query('BEGIN');
+    if (autonomous) {
+      // Same conversation-scoped fence as takeover/invalidation. The
+      // lock-owned delivery path deliberately skips this: its caller already
+      // holds the session lock on this exact client.
+      const lockRow = await client.query<{ conversation_key: string }>(
+        `SELECT conversation_key FROM ana_v2_outbound_outbox WHERE delivery_attempt_id = $1`,
+        [input.deliveryAttemptId]
+      );
+      const lockConversationKey =
+        lockRow.rows[0]?.conversation_key ?? input.deliveryAttemptId;
+      await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [
+        conversationAdvisoryKeyV2(lockConversationKey),
+      ]);
+    }
     const locked = await client.query<RawOutboxRowV2>(
       `SELECT * FROM ana_v2_outbound_outbox
        WHERE delivery_attempt_id = $1 FOR UPDATE`,
@@ -1436,25 +1793,62 @@ async function commitAcceptedPg(input: {
     const row = locked.rows[0];
     if (!row) throw new Error('outbox v2 ausente');
     if (row.state === 'accepted_by_provider') {
+      const persisted = row.commit_payload_json?.deliveryReceipt;
       await client.query('COMMIT');
-      return {
-        outcome: input.commitPayload.deliveryReceipt.pendingCommitOutcome,
-        observedVersion: input.commitPayload.deliveryReceipt.observedPendingVersion,
-      } as PendingCommitResultV2;
+      return persisted
+        ? pendingCommitResultFromReceipt(persisted)
+        : {
+            outcome: 'not_applicable',
+            observedVersion: null,
+            flowStateCommitOutcome: 'failed',
+          };
     }
     if (!['transport_started', 'accepted_uncommitted'].includes(row.state)) {
       throw new Error('outbox v2 não aceita commit local neste estado');
     }
-    const pending = await applyPgTransition(
-      client,
-      row.conversation_key,
-      input.commitPayload.transition,
-      input.now
+    const persistedPayload: AcceptedCommitPayloadV2 = row.commit_payload_json
+      ? row.commit_payload_json
+      : {
+          ...input.commitPayload,
+          // The prepared outbox transition is the planned event; callers of
+          // reconcile/commit cannot replace it with a different payload.
+          transition: row.transition_json,
+        };
+    const cutoff = await client.query<{ invalidated_at: Date | string }>(
+      `SELECT invalidated_at FROM ana_v2_flow_state_invalidations
+       WHERE conversation_key = $1`,
+      [row.conversation_key]
     );
+    const cutoffAt = cutoff.rows[0]?.invalidated_at
+      ? dateIso(cutoff.rows[0].invalidated_at)
+      : null;
+    const acceptanceAfterCutoff = isStrictlyAfterCutoffV2(
+      persistedPayload.deliveryReceipt.terminalAt,
+      cutoffAt
+    );
+    const parsedNext = parsePersistedFlowStateV2(row.transition_json.nextFlowState);
+    const pending = !acceptanceAfterCutoff
+      ? {
+          outcome: 'not_applicable' as const,
+          observedVersion: null,
+          flowStateCommitOutcome: 'skipped_human_cutoff' as const,
+        }
+      : !parsedNext
+        ? {
+            outcome: 'not_applicable' as const,
+            observedVersion: null,
+            flowStateCommitOutcome: 'failed' as const,
+          }
+        : await applyPgTransition(
+            client,
+            row.conversation_key,
+            row.transition_json,
+            input.now
+          );
     await client.query(
       `INSERT INTO ana_conversation_history ("conversationKey", "role", "content")
        VALUES ($1, 'assistant', $2)`,
-      [row.conversation_key, input.commitPayload.assistantText]
+      [row.conversation_key, persistedPayload.assistantText]
     );
     await client.query(
       `DELETE FROM ana_conversation_history
@@ -1475,14 +1869,15 @@ async function commitAcceptedPg(input: {
       [row.conversation_key]
     );
     const receipt: TurnDeliveryReceiptV2 = {
-      ...input.commitPayload.deliveryReceipt,
+      ...persistedPayload.deliveryReceipt,
       outboxState: 'accepted_by_provider',
       conversationCommitOutcome: 'committed',
+      flowStateCommitOutcome: pending.flowStateCommitOutcome,
       pendingCommitOutcome: pending.outcome,
       observedPendingVersion: pending.observedVersion,
     };
     const committedPayload: AcceptedCommitPayloadV2 = {
-      ...input.commitPayload,
+      ...persistedPayload,
       deliveryReceipt: receipt,
     };
     await client.query(
@@ -1492,9 +1887,9 @@ async function commitAcceptedPg(input: {
        WHERE delivery_attempt_id = $1`,
       [
         input.deliveryAttemptId,
-        input.providerMessageIdHash,
+        row.provider_message_id_hash ?? input.providerMessageIdHash,
         JSON.stringify(committedPayload),
-        new Date(input.now.getTime() + SUCCESSOR_REARM_DEBOUNCE_MS_V2),
+        input.now,
       ]
     );
     await client.query(
@@ -1514,7 +1909,85 @@ async function commitAcceptedPg(input: {
     }
     throw error;
   } finally {
-    client.release();
+    if (autonomous) client.release();
+  }
+}
+
+async function markAcceptedUncommittedPg(
+  input: {
+    deliveryAttemptId: string;
+    providerMessageIdHash: string;
+    commitPayload: AcceptedCommitPayloadV2;
+    now: Date;
+  },
+  ownedClient?: PoolClient
+): Promise<void> {
+  const client = ownedClient ?? await pool.connect();
+  const autonomous = !ownedClient;
+  try {
+    await client.query('BEGIN');
+    const found = await client.query<{ conversation_key: string }>(
+      `SELECT conversation_key FROM ana_v2_outbound_outbox
+       WHERE delivery_attempt_id = $1`,
+      [input.deliveryAttemptId]
+    );
+    const conversationKey = found.rows[0]?.conversation_key;
+    if (!conversationKey) throw new Error('outbox v2 ausente');
+    if (autonomous) {
+      await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [
+        conversationAdvisoryKeyV2(conversationKey),
+      ]);
+    }
+    const locked = await client.query<RawOutboxRowV2>(
+      `SELECT * FROM ana_v2_outbound_outbox
+       WHERE delivery_attempt_id = $1 FOR UPDATE`,
+      [input.deliveryAttemptId]
+    );
+    const row = locked.rows[0];
+    if (!row) throw new Error('outbox v2 ausente');
+    if (row.state === 'accepted_by_provider' || row.state === 'accepted_uncommitted') {
+      await client.query('COMMIT');
+      return;
+    }
+    if (row.state !== 'transport_started') {
+      throw new Error('outbox v2 não aceita aceite não commitado neste estado');
+    }
+    const receipt: TurnDeliveryReceiptV2 = {
+      ...input.commitPayload.deliveryReceipt,
+      outboxState: 'accepted_uncommitted',
+      conversationCommitOutcome: 'accepted_uncommitted',
+      flowStateCommitOutcome: 'accepted_uncommitted',
+      pendingCommitOutcome: 'not_applicable',
+    };
+    const persistedPayload: AcceptedCommitPayloadV2 = {
+      ...input.commitPayload,
+      transition: row.transition_json,
+      deliveryReceipt: receipt,
+    };
+    await client.query(
+      `UPDATE ana_v2_outbound_outbox
+       SET state = 'accepted_uncommitted', provider_message_id_hash = $2,
+           commit_payload_json = $3::jsonb, updated_at = $4
+       WHERE delivery_attempt_id = $1`,
+      [
+        input.deliveryAttemptId,
+        input.providerMessageIdHash,
+        JSON.stringify(persistedPayload),
+        input.now,
+      ]
+    );
+    await client.query(
+      `INSERT INTO ana_v2_turn_receipts (receipt_id, turn_id, receipt_kind, receipt_json)
+       VALUES ($1,$2,'delivery',$3::jsonb)
+       ON CONFLICT (receipt_id) DO UPDATE SET receipt_json = EXCLUDED.receipt_json`,
+      [receipt.deliveryReceiptId, receipt.turnId, JSON.stringify(receipt)]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* preserve */ }
+    throw error;
+  } finally {
+    if (autonomous) client.release();
   }
 }
 
@@ -1560,12 +2033,9 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
          AND state = 'accepted_by_provider'
          AND commit_payload_json->'deliveryReceipt'->>'transportOutcome' =
              'accepted_by_provider'
-       ORDER BY COALESCE(
-                  NULLIF(commit_payload_json->'deliveryReceipt'->>'terminalAt', '')::timestamptz,
-                  updated_at
-                ) DESC,
-                updated_at DESC
-       LIMIT 1`,
+         AND commit_payload_json->'deliveryReceipt'->>'conversationCommitOutcome' =
+             'committed'
+       ORDER BY delivery_attempt_id DESC`,
       [conversationKey]
     );
     const opening = open
@@ -1577,19 +2047,19 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
              AND commit_payload_json->'deliveryReceipt'->>'transportOutcome' =
                  'accepted_by_provider'
              AND commit_payload_json->'deliveryReceipt'->>'conversationCommitOutcome' =
-                 'committed'
-             AND commit_payload_json->'deliveryReceipt'->>'pendingCommitOutcome' =
+             'committed'
+            AND commit_payload_json->'deliveryReceipt'->>'pendingCommitOutcome' =
                  'opened'
+             AND (
+               commit_payload_json->'deliveryReceipt'->>'flowStateCommitOutcome' =
+                 'committed'
+               OR NOT (commit_payload_json->'deliveryReceipt' ? 'flowStateCommitOutcome')
+             )
              AND transition_json->>'kind' = 'open'
              AND transition_json->'frame'->>'questionId' = $2
              AND transition_json->'frame'->>'flowId' = $3
              AND transition_json->'frame'->>'version' = $4
-           ORDER BY COALESCE(
-                      NULLIF(commit_payload_json->'deliveryReceipt'->>'terminalAt', '')::timestamptz,
-                      updated_at
-                    ) ASC,
-                    updated_at ASC
-           LIMIT 1`,
+           ORDER BY delivery_attempt_id ASC`,
           [
             conversationKey,
             open.snapshot.questionId,
@@ -1606,12 +2076,17 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
     );
     const [latestResult, acceptedResult, openingResult, invalidationResult] =
       await Promise.all([latest, accepted, opening, invalidationQuery]);
-    const lastAccepted = acceptedResult.rows[0]
-      ? outboxFromRow(acceptedResult.rows[0])
-      : null;
-    const openingAccepted = openingResult.rows[0]
-      ? outboxFromRow(openingResult.rows[0])
-      : null;
+    const allAcceptedOutboxes = acceptedResult.rows
+      .map(outboxFromRow)
+      .filter((record) => acceptedDeliveryEvidenceFromOutbox(record) !== null)
+      .sort((left, right) => compareAcceptedOutboxByTerminal(left, right, 'desc'));
+    const acceptedOutboxes = allAcceptedOutboxes.filter(isAcceptedProviderOutbox);
+    const lastAccepted = allAcceptedOutboxes[0] ?? null;
+    const openingCandidates = openingResult.rows
+      .map(outboxFromRow)
+      .filter((record) => isAcceptedProviderOutbox(record))
+      .sort((left, right) => compareAcceptedOutboxByTerminal(left, right, 'asc'));
+    const openingAccepted = openingCandidates[0] ?? null;
     const latestPending = latestResult.rows[0]
       ? pendingFromRow(latestResult.rows[0])
       : null;
@@ -1622,6 +2097,7 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
       openPending: open,
       latestPending,
       lastAcceptedOutbox: lastAccepted,
+      acceptedOutboxes,
       invalidation,
       now,
     });
@@ -1697,47 +2173,27 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
     }
   },
   commitAccepted: commitAcceptedPg,
-  async markAcceptedUncommitted(input) {
-    const receipt = input.commitPayload.deliveryReceipt;
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        `UPDATE ana_v2_outbound_outbox
-         SET state = 'accepted_uncommitted', provider_message_id_hash = $2,
-             commit_payload_json = $3::jsonb, updated_at = $4
-         WHERE delivery_attempt_id = $1
-           AND state IN ('transport_started','accepted_uncommitted')`,
-        [
-          input.deliveryAttemptId,
-          input.providerMessageIdHash,
-          JSON.stringify(input.commitPayload),
-          input.now,
-        ]
-      );
-      await client.query(
-        `INSERT INTO ana_v2_turn_receipts (receipt_id, turn_id, receipt_kind, receipt_json)
-         VALUES ($1,$2,'delivery',$3::jsonb)
-         ON CONFLICT (receipt_id) DO UPDATE SET receipt_json = EXCLUDED.receipt_json`,
-        [receipt.deliveryReceiptId, receipt.turnId, JSON.stringify(receipt)]
-      );
-      await client.query('COMMIT');
-    } catch (error) {
-      try { await client.query('ROLLBACK'); } catch { /* preserve */ }
-      throw error;
-    } finally {
-      client.release();
-    }
-  },
+  commitAcceptedWithClient: (client, input) =>
+    commitAcceptedPg(input, client as PoolClient),
+  markAcceptedUncommitted: markAcceptedUncommittedPg,
+  markAcceptedUncommittedWithClient: (client, input) =>
+    markAcceptedUncommittedPg(input, client as PoolClient),
   async reconcileAcceptedCommit(deliveryAttemptId, now = new Date()) {
     const result = await pool.query<RawOutboxRowV2>(
       `SELECT * FROM ana_v2_outbound_outbox
-       WHERE delivery_attempt_id = $1 AND state = 'accepted_uncommitted'`,
+       WHERE delivery_attempt_id = $1`,
       [deliveryAttemptId]
     );
     const row = result.rows[0];
+    if (row?.state === 'accepted_by_provider' && row.commit_payload_json) {
+      return pendingCommitResultFromReceipt(row.commit_payload_json.deliveryReceipt);
+    }
     if (!row?.commit_payload_json || !row.provider_message_id_hash) {
-      return { outcome: 'not_applicable', observedVersion: null };
+      return {
+        outcome: 'not_applicable',
+        observedVersion: null,
+        flowStateCommitOutcome: 'not_applicable',
+      };
     }
     return commitAcceptedPg({
       deliveryAttemptId,
@@ -1780,35 +2236,16 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
     return { kind: 'clear', pending: state.pending };
   },
   async invalidateOpenPendingByHuman(conversationKey, now = new Date()) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await client.query(
-        `UPDATE ana_v2_pending_frames
-         SET state = 'INVALIDATED', version = version + 1, updated_at = $2
-         WHERE conversation_key = $1 AND state = 'OPEN'`,
-        [conversationKey, now]
-      );
-      await client.query(UPSERT_FLOW_STATE_INVALIDATION_SQL, [
-        conversationKey,
-        now,
-        'HUMAN_OWNERSHIP',
-      ]);
-      await client.query('COMMIT');
-      return result.rowCount ?? 0;
-    } catch (error) {
-      try { await client.query('ROLLBACK'); } catch { /* preserve */ }
-      throw error;
-    } finally {
-      client.release();
-    }
+    return withConversationalV2TransactionLock(
+      conversationKey,
+      (client) => invalidateOpenPendingByHumanWithClient(client, conversationKey, now)
+    );
   },
   async recordFlowStateInvalidation(input) {
-    await pool.query(UPSERT_FLOW_STATE_INVALIDATION_SQL, [
+    return withConversationalV2TransactionLock(
       input.conversationKey,
-      input.now ?? new Date(),
-      input.reason,
-    ]);
+      (client) => recordFlowStateInvalidationWithClient(client, input)
+    );
   },
   async enqueueSuccessor(input) {
     const result = await pool.query<RawSuccessorRowV2>(
@@ -1964,7 +2401,7 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
     );
     const accepted = await pool.query<{ delivery_attempt_id: string }>(
       `SELECT delivery_attempt_id FROM ana_v2_outbound_outbox
-       WHERE state = 'accepted_uncommitted' ORDER BY updated_at ASC LIMIT 50`,
+       WHERE state = 'accepted_uncommitted' ORDER BY created_at ASC LIMIT 50`,
       []
     );
     let reconciled = 0;

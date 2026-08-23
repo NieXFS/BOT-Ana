@@ -28,6 +28,7 @@ import {
   type AnaResumeGateEvaluation,
 } from './services/anaResumeGate';
 import type { ReceptionistTurnControl } from './services/receptionistTurnDecision';
+import type { ConversationalV2LockClient } from './services/conversationalV2/stateStore';
 import {
   markFollowupOptedOut,
   markFollowupPostLink,
@@ -217,11 +218,12 @@ export interface FlushDeps {
   withConversationLock?: (
     phoneNumberId: string,
     customerPhone: string,
-    work: () => Promise<void>
+    work: (client?: ConversationalV2LockClient) => Promise<void>
   ) => Promise<void>;
   deliverV2?: (
     prepared: PreparedReceptionistTurnV2,
-    checkpoint: () => Promise<ConversationalV2Checkpoint>
+    checkpoint: () => Promise<ConversationalV2Checkpoint>,
+    lockClient?: ConversationalV2LockClient
   ) => Promise<{
     delivery: 'sent' | 'suppressed' | 'transport_unknown' | 'transport_failed' | 'silent';
     successor?: DurableSuccessorBatchV2 | null;
@@ -410,7 +412,7 @@ const defaultFlushDeps: FlushDeps = {
   recordPausedInbound: recordInboundWhilePaused,
   markPostLink: markFollowupPostLink,
   withConversationLock: (phoneNumberId, customerPhone, work) =>
-    withConversationLock(phoneNumberId, customerPhone, async () => work()),
+    withConversationLock(phoneNumberId, customerPhone, async (client) => work(client)),
 };
 
 async function isPausedIncludingSilentHold(
@@ -551,10 +553,10 @@ async function emitFlushFallback(
         (async (
           _phoneNumberId: string,
           _customerPhone: string,
-          work: () => Promise<void>
+          work: (client?: ConversationalV2LockClient) => Promise<void>
         ) => work());
       const authoritativePause = resolvePauseWithoutSilentHoldBeforeTransport(deps);
-      await serialize(config.phoneNumberId, from, async () => {
+      await serialize(config.phoneNumberId, from, async (lockClient) => {
         const paused = options.skipSilentHoldLookup
           ? await authoritativePause(config.phoneNumberId, from)
           : await isReceptionistPausedWithSilentHold(
@@ -990,7 +992,7 @@ export async function flushBuffer(
         (async (
           _phoneNumberId: string,
           _customerPhone: string,
-          work: () => Promise<void>
+          work: (client?: ConversationalV2LockClient) => Promise<void>
         ) => work());
       let delivery: ConfiguredReplyDelivery = 'sent';
       let silentTurn = false;
@@ -999,7 +1001,7 @@ export async function flushBuffer(
       // compartilham a MESMA advisory lock do echo. pauseConversation do echo
       // corre sob essa lock antes de liberar o restante do processamento; o
       // pause-ack consulta o latch ECHO (preservado se o POST ao ERP falhar).
-      await serialize(config.phoneNumberId, from, async () => {
+      await serialize(config.phoneNumberId, from, async (lockClient) => {
         const preparedV2 =
           typeof reply === 'object' &&
           reply !== null &&
@@ -1008,31 +1010,52 @@ export async function flushBuffer(
             : null;
         const silentPrepared =
           preparedV2?.planReceipt?.recoveryKind === 'silent_escalation';
+        const visibleEscalationPrepared =
+          preparedV2?.planReceipt?.recoveryKind === 'visible_escalation';
         silentPreparedTurn = silentPrepared;
-        const pauseCheck = preparedV2?.authoritativeEscalationQuestionId
+        // Handoff visível: o hold que ESTE turno acabou de persistir não pode
+        // suprimir a única copy. Pause-ack de escalada humana também não se
+        // aplica — o questionId é do card silencioso, não do snapshot ESCALATION.
+        // Echo/ERP continuam vencendo via leitura sem overlay de silent-hold.
+        const pauseCheck = visibleEscalationPrepared
           ? () =>
-              deps.isPausedForEscalationAck
-                ? deps.isPausedForEscalationAck(
-                    config.phoneNumberId,
-                    from,
-                    preparedV2.authoritativeEscalationQuestionId!
-                  )
-                : deps.isPaused
-                  ? deps.isPaused(config.phoneNumberId, from)
-                  : isConversationPausedForEscalationAcknowledgement(
+              resolvePauseWithoutSilentHoldBeforeTransport(deps)(
+                config.phoneNumberId,
+                from
+              )
+          : preparedV2?.authoritativeEscalationQuestionId
+            ? () =>
+                deps.isPausedForEscalationAck
+                  ? deps.isPausedForEscalationAck(
                       config.phoneNumberId,
                       from,
                       preparedV2.authoritativeEscalationQuestionId!
                     )
-          : () =>
-              resolvePauseBeforeTransport(deps)(config.phoneNumberId, from);
+                  : deps.isPaused
+                    ? deps.isPaused(config.phoneNumberId, from)
+                    : isConversationPausedForEscalationAcknowledgement(
+                        config.phoneNumberId,
+                        from,
+                        preparedV2.authoritativeEscalationQuestionId!
+                      )
+            : () =>
+                resolvePauseBeforeTransport(deps)(config.phoneNumberId, from);
         if (!silentPrepared) {
           if (
             await suppressFlushIfPaused({
               bufferKey,
               buffer,
               alreadyProcessedTexts: [],
-              deps: { ...deps, isPaused: (_phoneNumberId, _customerPhone) => pauseCheck() },
+              deps: {
+                ...deps,
+                isPaused: (_phoneNumberId, _customerPhone) => pauseCheck(),
+                ...(visibleEscalationPrepared
+                  ? {
+                      lookupSilentHold: async () =>
+                        ({ kind: 'inactive' }) as const,
+                    }
+                  : {}),
+              },
             })
           ) {
             delivery = 'suppressed';
@@ -1048,13 +1071,15 @@ export async function flushBuffer(
           const deliverV2 = deps.deliverV2 ??
             (async (
               value: PreparedReceptionistTurnV2,
-              checkpoint: () => Promise<ConversationalV2Checkpoint>
+              checkpoint: () => Promise<ConversationalV2Checkpoint>,
+              lockClient?: ConversationalV2LockClient
             ) => {
               const { deliverPreparedReceptionistTurnV2 } = await import(
                 './services/conversationalV2/delivery'
               );
               return deliverPreparedReceptionistTurnV2(value, {
                 checkpoint,
+                ...(lockClient ? { lockClient } : {}),
                 sendTransport: (payload) =>
                   sendFreeformMessageWithReceipt(from, payload, config),
               });
@@ -1072,7 +1097,7 @@ export async function flushBuffer(
               successorInputSequence: pendingSequence,
               successorInboundMessageIds: [...buffer.pendingMessageIds],
             };
-          });
+          }, lockClient);
           if (silentPrepared && result.delivery !== 'silent') {
             throw new Error(
               `Prepared silent_escalation retornou delivery=${result.delivery}`

@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { FLOW_STATE_COMMIT_OUTCOMES_V2 } from './contracts';
 import type {
   PendingTransitionCandidate,
   RedactedPendingTransitionCandidateV2,
@@ -172,6 +173,14 @@ export function serializeTurnDeliveryReceiptV2(
 ): string {
   if (receipt.schemaVersion !== 2) {
     throw new Error('TurnDeliveryReceiptV2 inválido.');
+  }
+  if (
+    receipt.flowStateCommitOutcome !== undefined &&
+    !(FLOW_STATE_COMMIT_OUTCOMES_V2 as readonly string[]).includes(
+      receipt.flowStateCommitOutcome
+    )
+  ) {
+    throw new Error('TurnDeliveryReceiptV2 contém flowStateCommitOutcome inválido.');
   }
   if (receipt.transportOutcome === 'superseded' && !receipt.successorTurnId?.trim()) {
     throw new Error('Entrega superseded exige successorTurnId duravelmente persistido.');

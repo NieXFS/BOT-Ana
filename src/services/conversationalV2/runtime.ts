@@ -3149,6 +3149,7 @@ export async function getReceptionistReplyV2(input: {
     },
     toolTrace: loop.toolTrace as ToolTraceLike[],
     fallbackIntent: recoveryFallbackIntent,
+    now: startedAt,
     canonicalPendingQuestion:
       canonicalPendingQuestion(
         { ...frame, flowState: nextFlowState },
@@ -3222,7 +3223,11 @@ export async function getReceptionistReplyV2(input: {
       legacyRoute: legacyShadowRoute,
       v2Route: 'fallback',
     });
-    const recoveredFlowState = nextFlowState;
+    // The handoff is a terminal ownership boundary for the old flow. Use a
+    // clean successor FlowState and close the old PendingFrame in the same
+    // accepted delivery; otherwise a preserve transition after the cutoff
+    // could make the pre-handoff question look live again on reload.
+    const recoveredFlowState = newFlowStateV2(id(), startedAt);
     const recoveredCandidate = enforceCanonicalTimeSummaryTransitionV2({
       frame,
       flowState: recoveredFlowState,
@@ -3279,6 +3284,135 @@ export async function getReceptionistReplyV2(input: {
       ),
       elicitationVariant,
       copyVariant,
+    };
+  }
+
+  if (recovery.status === 'visible_escalation') {
+    const candidate = recovery.pendingTransitionCandidate;
+    const boundaryAttempts = recovery.boundaryAttempts.map((entry) => ({
+      index: entry.index,
+      candidateHash: entry.candidateHash,
+      reasonCodes: entry.evaluation.reasonCodes,
+    }));
+    const planReceipt = makePlan({
+      route: 'fallback',
+      loop,
+      candidate,
+      recoveryKind: 'visible_escalation',
+      regenCalls: recovery.regenCount,
+      boundaryAttempts,
+    });
+    const turnReceiptHash = hashTurnPlanReceiptV2(planReceipt);
+    const divergence = buildUnderstandingFailureDivergenceV2({
+      fallbackIntent: recovery.fallbackIntent,
+      primaryReasonCodes: recovery.primaryReasonCodes,
+      regenerationReasonCodes: recovery.regenerationReasonCodes,
+      turnReceiptHash,
+    });
+    const escalateSilent =
+      deps.escalateSilent ?? escalateSilentUnderstandingFailure;
+    const silentOutcome = await escalateSilent(
+      {
+        phoneNumberId: input.config.phoneNumberId,
+        customerPhone: input.phone,
+        messageId: inboundId,
+        divergence,
+      },
+      deps.escalateSilentDeps
+    );
+    if (!isAuthoritativeSilentEscalationOutcome(silentOutcome)) {
+      throw new SilentEscalationHoldPersistenceError(
+        'visible escalation missing durable hold or authoritative concurrent state'
+      );
+    }
+    // The visible handoff owns the conversation boundary just like a silent
+    // escalation. Persist the cutoff before licensing its one customer-facing
+    // copy; a previously accepted/pending flow must not be revived on reload.
+    await store.recordFlowStateInvalidation({
+      conversationKey,
+      reason: 'SILENT_ESCALATION',
+      now: nowFn(),
+    });
+    const visibleHandoffQuestionId =
+      silentOutcome.kind === 'created' || silentOutcome.kind === 'deduplicated'
+        ? silentOutcome.questionId
+        : undefined;
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'fallback',
+    });
+    // Visible handoff is a terminal ownership boundary for the old flow. A
+    // clean successor prevents accepted handoff delivery from reviving the
+    // pre-handoff service/date/draft/deferred state on reload.
+    const recoveredFlowState = newFlowStateV2(id(), startedAt);
+    const recoveredCandidate = enforceCanonicalTimeSummaryTransitionV2({
+      frame,
+      flowState: recoveredFlowState,
+      services,
+      payload: recovery.payload,
+      candidate: recovery.pendingTransitionCandidate,
+      writeCommitted,
+    });
+    let visibleCandidate = adjustTransitionForFlowResetV2(
+      frame.pending
+        ? {
+            kind: 'invalidate' as const,
+            questionId: frame.pending.questionId,
+            reason: 'visible_escalation_flow_cutoff',
+          }
+        : coerceEquivalentOpenTransitionV2(
+            recoveredCandidate,
+            frame,
+            recoveredFlowState
+          ),
+      frame.pending,
+      flowResetReason
+    );
+    visibleCandidate = applyCancellationAbandonmentTransitionV2(
+      visibleCandidate,
+      cancellationAbandonment
+    );
+    const skipOperationalStamp =
+      cancellationFastPath.kind === 'resolved' &&
+      cancellationFastPath.refreshOperationalAt === false;
+    const committedFlowState = skipOperationalStamp
+      ? recoveredFlowState
+      : stampFlowOperationalActivityV2(recoveredFlowState, startedAt);
+    const transition = materializeTransition(
+      visibleCandidate,
+      frame,
+      committedFlowState,
+      services,
+      nowFn(),
+      id,
+      hasDuplicateResolutionReadEvidence(loop)
+    );
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame: { ...frame, flowState: committedFlowState },
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: recovery.payload,
+      transition,
+      planReceipt,
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: writeCommitted,
+      canonicalPendingQuestion: canonicalPendingQuestion(
+        { ...frame, flowState: committedFlowState },
+        services,
+        shouldReanchorPendingQuestion
+      ),
+      elicitationVariant,
+      copyVariant,
+      ...(visibleHandoffQuestionId
+        ? { authoritativeEscalationQuestionId: visibleHandoffQuestionId }
+        : {}),
+      ...(frame.pending
+        ? { visibleEscalationSourceQuestionId: frame.pending.questionId }
+        : {}),
     };
   }
 

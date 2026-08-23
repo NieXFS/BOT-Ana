@@ -15,6 +15,8 @@ import {
 } from '../src/services/conversationalV2/modelResultParser';
 import {
   coordinateRecoveryV2,
+  EMPTY_OPEN_SERVICE_CLARIFICATION_V2,
+  VISIBLE_HANDOFF_CANONICAL_V2,
   type RecoveryCoordinatorInputV2,
 } from '../src/services/conversationalV2/recoveryCoordinator';
 import {
@@ -22,6 +24,10 @@ import {
   type RegenerationResultV2,
 } from '../src/services/conversationalV2/regenerator';
 import { MODEL_TURN_RESULT_V2_CONTRACT_BLOCK } from '../src/services/conversationalV2/modelResultContract';
+import {
+  evaluateBoundaryV2,
+  UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2,
+} from '../src/services/conversationalV2/boundary';
 
 const servicesResult: ServicesResult = {
   success: true,
@@ -642,6 +648,195 @@ const pendingFallback = await coordinateRecoveryV2({
 });
 assert.equal(pendingFallback.status, 'accepted');
 assert.equal(pendingFallback.payload, 'Qual dia você prefere?');
+
+const hairNow = new Date('2026-08-13T15:00:00.000Z');
+const hairInbound = 'quero fazer o cabelo';
+const emptyServiceFrame: TurnFrameV2 = {
+  ...frame,
+  currentInboundIds: ['in-current'],
+  pending: {
+    questionId: 'question-service-open',
+    askedAt: '2026-08-13T14:55:00.000Z',
+    kind: 'SERVICE',
+    flowId: 'flow-recovery',
+    version: 1,
+    options: [],
+  },
+  flowState: {
+    flowId: 'flow-recovery',
+    fixedByProofVersion: {},
+    deferredAvailability: {
+      schemaVersion: 1,
+      capturedAt: '2026-08-13T14:55:00.000Z',
+      capturedTurnId: 'turn-open',
+      capturedInputSequence: 1,
+      date: '2026-08-13',
+      timeWindow: { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 },
+    },
+  },
+};
+const hairBoundaryContext = {
+  servicesResult,
+  sourceInboundText: hairInbound,
+  currentInboundIds: ['in-current'],
+  inboundTextsById: { 'in-current': hairInbound },
+  recentAssistantReplies: [] as string[],
+};
+const hairEvidenceResult: ModelTurnResultV2 = {
+  schemaVersion: 2,
+  reply: 'A gente não faz cabelo aqui, infelizmente.',
+  replyPurpose: 'OPERATIONAL_ANSWER',
+  pendingTransitionCandidate: { kind: 'preserve' },
+  resolutionCandidate: null,
+  unknownServiceEvidence: {
+    inboundId: 'in-current',
+    span: { start: 14, end: 20 },
+  },
+};
+
+let hairEvidenceRegenCalls = 0;
+const hairEvidenceRecovery = await coordinateRecoveryV2({
+  ...baseInput,
+  frame: emptyServiceFrame,
+  fallbackIntent: 'OTHER',
+  boundaryContext: hairBoundaryContext,
+  primaryResult: parsed(hairEvidenceResult),
+  now: hairNow,
+  toolTrace: [],
+  regenerate: async () => {
+    hairEvidenceRegenCalls += 1;
+    throw new Error('evidência válida não deve regenerar');
+  },
+});
+assert.equal(hairEvidenceRecovery.status, 'accepted');
+assert.equal(
+  hairEvidenceRecovery.payload,
+  UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2
+);
+assert.notEqual(hairEvidenceRecovery.payload, 'Qual serviço você prefere?');
+assert.notEqual(hairEvidenceRecovery.recoveryKind, 'silent_escalation');
+assert.deepEqual(hairEvidenceRecovery.pendingTransitionCandidate, {
+  kind: 'preserve',
+});
+assert.equal(hairEvidenceRegenCalls, 0);
+
+let hairWriteRegenCalls = 0;
+const hairWriteRecovery = await coordinateRecoveryV2({
+  ...baseInput,
+  frame: emptyServiceFrame,
+  fallbackIntent: 'OTHER',
+  boundaryContext: hairBoundaryContext,
+  primaryResult: parsed(hairEvidenceResult),
+  now: hairNow,
+  toolTrace: [
+    {
+      name: 'bookAppointment',
+      result: JSON.stringify({ success: true }),
+    },
+  ],
+  regenerate: async () => {
+    hairWriteRegenCalls += 1;
+    throw new Error('write confirmado soberano não deve regenerar');
+  },
+});
+assert.equal(hairWriteRecovery.status, 'accepted');
+assert.equal(hairWriteRecovery.recoveryKind, 'canonical_write_confirmation');
+assert.equal(hairWriteRecovery.payload.includes('confirmado com sucesso'), true);
+assert.notEqual(
+  hairWriteRecovery.payload,
+  UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2
+);
+assert.equal(hairWriteRegenCalls, 0);
+
+const emptyOpenClarificationBoundary = evaluateBoundaryV2({
+  rawCandidate: EMPTY_OPEN_SERVICE_CLARIFICATION_V2,
+  servicesResult,
+  flowState: emptyServiceFrame.flowState,
+  pendingTransitionCandidate: { kind: 'preserve' },
+  replyPurpose: 'CLARIFICATION',
+  source: 'CANONICAL',
+  toolTrace: [],
+  sourceInboundText: hairInbound,
+  currentInboundIds: ['in-current'],
+  inboundTextsById: { 'in-current': hairInbound },
+  pendingSnapshot: emptyServiceFrame.pending,
+});
+assert.equal(emptyOpenClarificationBoundary.safe, true);
+assert.equal(emptyOpenClarificationBoundary.originalAccepted, true);
+assert.deepEqual(emptyOpenClarificationBoundary.reasonCodes, []);
+assert.equal(
+  emptyOpenClarificationBoundary.acceptedPayload,
+  EMPTY_OPEN_SERVICE_CLARIFICATION_V2
+);
+
+const hairClarificationRecovery = await coordinateRecoveryV2({
+  ...baseInput,
+  frame: emptyServiceFrame,
+  fallbackIntent: 'OTHER',
+  boundaryContext: hairBoundaryContext,
+  primaryResult: parsed({
+    ...hairEvidenceResult,
+    unknownServiceEvidence: null,
+  }),
+  now: hairNow,
+  toolTrace: [],
+  regenerate: async () => failedRegen,
+});
+assert.equal(hairClarificationRecovery.status, 'accepted');
+assert.equal(
+  hairClarificationRecovery.payload,
+  EMPTY_OPEN_SERVICE_CLARIFICATION_V2
+);
+assert.notEqual(
+  hairClarificationRecovery.payload,
+  'Qual serviço você prefere?'
+);
+assert.notEqual(hairClarificationRecovery.recoveryKind, 'silent_escalation');
+assert.deepEqual(hairClarificationRecovery.pendingTransitionCandidate, {
+  kind: 'preserve',
+});
+
+const hairInvalidEnvelopeRecovery = await coordinateRecoveryV2({
+  ...baseInput,
+  frame: emptyServiceFrame,
+  fallbackIntent: 'OTHER',
+  boundaryContext: hairBoundaryContext,
+  primaryResult: {
+    ok: false,
+    issues: [{ code: 'INVALID_JSON', path: '$' }],
+  },
+  now: hairNow,
+  toolTrace: [],
+  regenerate: async () => failedRegen,
+});
+assert.equal(hairInvalidEnvelopeRecovery.status, 'accepted');
+assert.equal(
+  hairInvalidEnvelopeRecovery.payload,
+  EMPTY_OPEN_SERVICE_CLARIFICATION_V2
+);
+
+const hairRepeatRecovery = await coordinateRecoveryV2({
+  ...baseInput,
+  frame: emptyServiceFrame,
+  fallbackIntent: 'OTHER',
+  boundaryContext: {
+    ...hairBoundaryContext,
+    recentAssistantReplies: [EMPTY_OPEN_SERVICE_CLARIFICATION_V2],
+  },
+  primaryResult: parsed({
+    ...hairEvidenceResult,
+    unknownServiceEvidence: null,
+  }),
+  now: hairNow,
+  toolTrace: [],
+  regenerate: async () => failedRegen,
+});
+assert.equal(hairRepeatRecovery.status, 'visible_escalation');
+assert.equal(hairRepeatRecovery.payload, VISIBLE_HANDOFF_CANONICAL_V2);
+assert.equal(hairRepeatRecovery.recoveryKind, 'visible_escalation');
+assert.notEqual(hairRepeatRecovery.recoveryKind, 'direct_fallback');
+assert.notEqual(hairRepeatRecovery.recoveryKind, 'silent_escalation');
+assert.ok(hairRepeatRecovery.payload);
 
 console.log('smoke ana conversational v2 recovery: OK');
 }

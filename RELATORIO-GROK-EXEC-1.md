@@ -2457,3 +2457,183 @@ Fontes: echo Meta (já chamava o método); aba Perguntas/`sendQuestionReply`; `R
 | `smoke:ana-v2-tau2` | 0 | hermético; `FAIL:0`; macro `pass1=1`, `pass4=1` |
 
 O `git diff --check` depois de remover o newline extra saiu 0. HEAD permaneceu `d013590` destacado. Sem commit.
+
+## Exec IA-22e — copy server-owned para restrição temporal sem serviço (segunda reprovação de campo)
+
+**Status:** corrigido localmente sobre `HEAD` destacado `af554e3`. Sem commit/push/deploy/PM2/`--real`/produção/ERP. IA-22c e IA-22d permanecem acima, sem apagar.
+
+A conferência do Sol e o E2E do canário `studio-viti` **aprovaram** o IA-22d no caminho com serviço já resolvido (`Boa tarde! Tem horário hoje após as 17:30?` devolveu 18h, 18h30 e 19h). O caminho **sem** serviço resolvido caiu em silêncio + card, reproduzido 2× com restart. Flag desligada no canário. Não foi o cutoff, a flag nem a persistência: `planServiceContextV2` produzia `deferred_open_service_question` + `vetoFamilyFastPath` + `result:null`. O turno ia ao modelo; a prosa “horário hoje depois das 17h30” virava `UNVERIFIED_AVAILABILITY`; RecoveryCoordinator terminava em `silent_escalation`.
+
+### O que mudou
+
+Ramo `deferred_open_service_question` agora devolve `ModelTurnResultV2` server-owned (`SERVICE_QUESTION`, PendingFrame `SERVICE` OPEN com `options=[]`, constraint no `nextFlowState`). Helper puro `buildDeferredOpenServiceQuestionCopyV2`. Family copy, cutoff, precedência Memory/PG, writes, boundary, Renata e ERP intocados.
+
+### Copy final e 4 materializações
+
+Fonte única: `buildDeferredOpenServiceQuestionCopyV2`. Usa “consultar a agenda”. Proibidos: `tem horário`, `tem vaga`, `horários disponíveis`, `encontrei`, `verificar os horários`.
+
+| Caso | string |
+|---|---|
+| data + janela (E2E, byte-exata) | `Para eu consultar a agenda de hoje, depois das 17h30, qual serviço você quer fazer?` |
+| somente data | `Para eu consultar a agenda de hoje, qual serviço você quer fazer?` |
+| somente janela | `Para eu consultar a agenda depois das 17h30, qual serviço você quer fazer?` |
+| constraint válida, frase não materializável | `Para eu consultar a agenda no período que você pediu, qual serviço você quer fazer?` |
+
+### Fixture C (entregável central)
+
+Smoke `ana-conversational-v2-service-context`, bloco `IA-22e fixture C`. Nome: `open-service-greeting-studio-viti-literal`. Catálogo válido, nenhuma entidade casando o inbound, flow state limpo, flag ligada. `runModelLoop` e `runInterpreter` lançam se forem chamados no T1.
+
+Inbound T1: `Boa tarde! Tem horário hoje após as 17:30?`
+
+| asserção T1 | valor |
+|---|---|
+| `serviceContextDecision` | `temporal_deferred` |
+| route | `fast_path` |
+| `recoveryKind` | `none` |
+| payload byte-exato | `Para eu consultar a agenda de hoje, depois das 17h30, qual serviço você quer fazer?` |
+| `BoundaryEvaluation.safe` | `true` |
+| `originalAccepted` | `true` |
+| `UNVERIFIED_AVAILABILITY` | zero |
+| primary provider / regen / interpreter / tool / write | zero |
+| transição | `SERVICE` OPEN, `options.length===0` |
+| `silent_escalation` / card / hold / pausa | ausentes |
+
+Depois: `deliverPreparedReceptionistTurnV2` → recarga do store → `PendingFrame SERVICE OPEN` + `deferredAvailability` preservada → inbound T2 `Drenagem linfática` → 1× `getAvailableSlots` → `TIME` só `18:00`/`18:30`/`19:00` → não pergunta a data.
+
+Regressão D em `smoke-ana-conversational-v2-boundary.ts`: a copy canônica passa; `Para eu verificar os horários de hoje depois das 17h30, qual serviço você quer fazer?` cai em `UNVERIFIED_AVAILABILITY`.
+
+### Validação (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` (após o append, com newline extra) | 2 | `RELATORIO-GROK-EXEC-1.md:2524: new blank line at EOF` |
+| `git diff --check` (depois de remover o newline extra) | 0 | exit verdadeiro desta execução |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `smoke:ana-conversational-v2-service-context` | 0 | Fixture C + 4 materializações + round-trip T2 |
+| `smoke:ana-conversational-v2-boundary` | 0 | copy aceita vs `verificar os horários` bloqueada |
+| `smoke:ana-conversational-v2-persistence` | 0 | cutoff IA-22d intacto |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-receipt-bookkeeping` | 0 | F1-F8 |
+| `smoke:ana-conversational-v2-silent-escalation` | 0 | |
+| `smoke:debounce-flush` | 0 | 56/56 |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5 |
+| `smoke:ana-v2-tau2` | 0 | hermético; `FAIL:0`; macro `pass1=1`, `pass4=1` |
+
+HEAD permaneceu `af554e3` destacado. Sem commit.
+## Exec IA-22f — serviço fora do catálogo sob pendência SERVICE vazia (reprovação do IA-22e)
+
+**Status:** corrigido localmente sobre o WIP do IA-22e / HEAD destacado `af554e3`. Sem commit/push/deploy/PM2/`--real`/produção/ERP. IA-22c, IA-22d e IA-22e permanecem acima, sem apagar. Flag desligada no canário.
+
+O IA-22e acertou a copy server-owned da pergunta aberta, mas criou um caminho novo: com `SERVICE` OPEN e `options=[]`, “quero fazer o cabelo” (intent `OTHER`, sem prova de opção) podia repetir `Qual serviço você prefere?` e, na segunda falha, cair em `silent_escalation`. O prompt pedia “uma negativa genérica”; a boundary só aceita a constante byte-exata; o modelo nunca recebe esses bytes.
+
+### O que mudou
+
+Com o mesmo `flowId` e `deferredAvailability` consumível, o coordenador de recovery:
+
+1. Se o parser produzir `unknownServiceEvidence` validada, o servidor materializa `UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2` (source `CANONICAL`), preserva a pendência vazia e a restrição, zero tool/write, sem regen. O modelo não adivinha os bytes.
+2. Sem evidência válida (resposta não canônica, evidência nula, envelope inválido), o fallback é `EMPTY_OPEN_SERVICE_CLARIFICATION_V2` — nunca a pergunta genérica e nunca silêncio no primeiro no-match. GENERATED que apenas `preserve` neste estado não é entregue.
+3. Se a clarificação já foi entregue, o turno registra a divergência (`direct_fallback`) e entrega `VISIBLE_HANDOFF_CANONICAL_V2`. Sem loop e sem `silent_escalation` neste caso operacional.
+4. GENERATED que abre TIME (controle “Drenagem linfática”) continua aceito e consome a restrição.
+
+Copy da pergunta aberta do IA-22e intocada. Regra E do prompt intocada. Fixture C T1 (lança modelo/intérprete) intocada.
+
+### Copies canônicas materializadas pelo servidor
+
+| constante | bytes |
+|---|---|
+| `UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2` | `Esse procedimento não está disponível no momento. Posso te ajudar com outro serviço?` |
+| `EMPTY_OPEN_SERVICE_CLARIFICATION_V2` | `Não consegui identificar qual serviço você quer. Pode me dizer o nome de outro jeito?` |
+| `VISIBLE_HANDOFF_CANONICAL_V2` | `Não consigo responder isso com segurança por aqui. Você pode falar diretamente com a equipe do estabelecimento.` |
+
+### Fixture de três turnos
+
+Smoke `ana-conversational-v2-service-context`, bloco `IA-22f: serviço fora do catálogo com SERVICE OPEN options=[]`. Helper `openRestrictedEmptyService`. T1 = inbound aberto da Fixture C (`Boa tarde! Tem horário hoje após as 17:30?`) → pergunta canônica IA-22e, `options=[]`, restrição `2026-08-13` / `AFTER_EXCLUSIVE` 17:30.
+
+| variante | inbound T2/T3 | evidência | payload |
+|---|---|---|---|
+| evidência válida (`hairEvidenceTurn2`) | `quero fazer o cabelo` | `unknownServiceText='cabelo'` | negativa canônica; `regenProviderCalls===0`; zero tool/write; pendência+restrição preservadas |
+| resposta não canônica | mesma | evidência nula + negativa não canônica | clarificação |
+| evidência nula (`Pode me repetir o serviço?`) | mesma | nula | clarificação |
+| envelope inválido | mesma | `modelRawReply` não-JSON | clarificação |
+| repetição (`hairTurn3`) | mesma após deliver da clarificação | nula | handoff visível; nunca `silent_escalation` |
+| controle Fixture C T2 | `Drenagem linfática` | n/a | consumo normal da restrição (TIME, slots da janela) |
+
+Coordenador: os mesmos ramos em `smoke-ana-conversational-v2-recovery.ts`.
+
+### Validação (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | exit verdadeiro |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `smoke:ana-conversational-v2-service-context` | 0 | Fixture C + bloco IA-22f |
+| `smoke:ana-conversational-v2-recovery` | 0 | overlay + clarificação + handoff |
+| `smoke:ana-conversational-v2-boundary` | 0 | |
+| `smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | cutoff IA-22d intacto |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-receipt-bookkeeping` | 0 | F1-F8 |
+| `smoke:ana-conversational-v2-silent-escalation` | 0 | |
+| `smoke:debounce-flush` | 0 | 56/56 |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5 |
+| `smoke:ana-v2-tau2` | 0 | hermético; `FAIL:0`; macro `pass1=1`, `pass4=1` |
+
+HEAD permaneceu `af554e3` destacado. Sem commit.
+
+## Exec IA-22g — write confirmado soberano; handoff visível persiste antes da copy (reprovação D1/D2 do IA-22f)
+
+**Status:** corrigido localmente sobre o WIP do IA-22f / HEAD destacado `af554e3`. Sem commit/push/deploy/PM2/`--real`/produção/ERP. IA-22c, IA-22d, IA-22e e IA-22f permanecem acima, sem apagar. Flag desligada no canário.
+
+O IA-22f foi aceito em a/b/c e reprovado em dois bloqueantes do item d: a negativa de serviço desconhecido passava na frente de um write confirmado, e o “handoff visível” saía como `direct_fallback` sem card/hold/divergência no próprio turno.
+
+### D1
+
+`buildSafeWriteConfirmation` executa **antes** de qualquer overlay de serviço desconhecido. `bookAppointment success:true` + `unknownServiceEvidence` no SERVICE vazio + deferredAvailability entrega a confirmação canônica do write, `recoveryKind=canonical_write_confirmation`, zero regen. Se o reducer já materializou a mesma copy no primary, o kind permanece `none` (rota feliz); o overlay não pode mais revogar o write.
+
+### D2
+
+Resultado tipado `visible_escalation` (não sobrecarrega `direct_fallback`). O runtime persiste divergência/card/hold **antes** de licenciar a copy visível. Falha de persistência lança `SilentEscalationHoldPersistenceError` e não finge que a equipe foi acionada. O hold recém-criado não suprime a copy daquele mesmo turno (`pauseCheck` ignora silent-hold; `suppressFlushIfPaused` recebe lookup `inactive` neste recoveryKind). O turno seguinte em hold é silêncio pré-brain. `silent_escalation` legítimo (disponibilidade não verificada sem evidência/tool) permanece intacto. `TurnPlanReceiptV2.recoveryKind` ganha `visible_escalation`.
+
+### Copy
+
+Clarificação byte-exata (medida na fronteira com `safe=true` / `originalAccepted=true` / `reasonCodes=[]`):
+
+`Não achei esse nome na nossa lista. Você sabe se o serviço tem outro nome?`
+
+Não afirma que o serviço está ausente (isso é a negativa canônica, reservada à evidência válida). Afirma que o **nome** não casou.
+
+### Correção documental
+
+Revisão 8: o sujeito que só restaura pending/outbox é `resolveLatestFlowStateV2`, não `invalidateOpenPendingByHuman`. Histórico preservado; correção registrada no contrato.
+
+### Fixtures novas
+
+- Recovery: write confirmado soberano (`hairWriteRecovery`) com zero regen.
+- Service-context T1→T4 (`5511000000410`): T3 nasce o card (1 POST) + 1 copy visível, inclusive via `flushBuffer` com hold já ativo; T4 silêncio pré-brain, zero outbound, POST continua 1.
+- Persist-fail (`5511000000411`): T3 lança; copy não sai.
+
+### Validação (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | exit verdadeiro |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | `tsc` concluiu |
+| `smoke:ana-conversational-v2-service-context` | 0 | Fixture C + IA-22f + T1→T4 |
+| `smoke:ana-conversational-v2-recovery` | 0 | write soberano + `visible_escalation` |
+| `smoke:ana-conversational-v2-boundary` | 0 | copy nova `safe=true` |
+| `smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `smoke:ana-conversational-v2-persistence` | 0 | cutoff IA-22d intacto |
+| `smoke:ana-conversational-v2-route` | 0 | reducer write continua `none` |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-receipt-bookkeeping` | 0 | F1-F8 |
+| `smoke:ana-conversational-v2-silent-escalation` | 0 | |
+| `smoke:debounce-flush` | 0 | |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5 |
+| `smoke:ana-v2-tau2` | 0 | hermético; `FAIL:0`; macro `pass1=1`, `pass4=1` |
+
+HEAD permaneceu `af554e3` destacado. Sem commit.

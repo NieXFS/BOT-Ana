@@ -12,6 +12,7 @@ import {
   canonicalConversationKey,
   withConversationLock,
 } from './conversationOrder';
+import type { ConversationalV2LockClient } from './conversationalV2/stateStore';
 import type { QuestionReplyStatus } from './anaWave2Store';
 import {
   listUnrepairedQuestionReplyHumanHistory,
@@ -353,7 +354,8 @@ export interface QuestionReplyDeps {
   invalidateConversationalFlowStateByHuman?: (
     phoneNumberId: string,
     customerPhone: string,
-    now?: Date
+    now?: Date,
+    client?: ConversationalV2LockClient
   ) => Promise<number>;
 }
 
@@ -383,21 +385,25 @@ async function withdrawHumanHistoryDefault(input: {
 async function invalidateConversationalFlowStateByHumanDefault(
   phoneNumberId: string,
   customerPhone: string,
-  now?: Date
+  now?: Date,
+  client?: ConversationalV2LockClient
 ): Promise<number> {
   const raw = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS?.trim();
   if (!raw) return 0;
   const { getTenantConfig } = await import('../configProvider');
   const config = await getTenantConfig(phoneNumberId);
   if (!config) return 0;
-  const [{ isAnaConversationalV2Enabled }, { pgConversationalV2StateStore }] =
-    await Promise.all([
-      import('./conversationalV2/featureFlag'),
-      import('./conversationalV2/stateStore'),
-    ]);
+  const [{ isAnaConversationalV2Enabled }, stateStore] = await Promise.all([
+    import('./conversationalV2/featureFlag'),
+    import('./conversationalV2/stateStore'),
+  ]);
   if (!isAnaConversationalV2Enabled(config.tenantSlug, raw)) return 0;
-  return pgConversationalV2StateStore.invalidateOpenPendingByHuman(
-    canonicalConversationKey(phoneNumberId, customerPhone),
+  const conversationKey = canonicalConversationKey(phoneNumberId, customerPhone);
+  if (client) {
+    return stateStore.invalidateOpenPendingByHumanWithClient(client, conversationKey, now);
+  }
+  return stateStore.pgConversationalV2StateStore.invalidateOpenPendingByHuman(
+    conversationKey,
     now
   );
 }
@@ -405,11 +411,12 @@ async function invalidateConversationalFlowStateByHumanDefault(
 async function recordHumanOwnershipCutoff(
   phoneNumberId: string,
   customerPhone: string,
-  deps: QuestionReplyDeps
+  deps: QuestionReplyDeps,
+  client?: ConversationalV2LockClient
 ): Promise<void> {
   const invalidate = deps.invalidateConversationalFlowStateByHuman;
   if (!invalidate) return;
-  await invalidate(phoneNumberId, customerPhone, new Date(deps.now()));
+  await invalidate(phoneNumberId, customerPhone, new Date(deps.now()), client);
 }
 
 function captureHumanHistoryProjectionFailure(
@@ -717,7 +724,8 @@ export async function sendQuestionReply(
           await recordHumanOwnershipCutoff(
             input.phoneNumberId,
             input.customerPhone,
-            deps
+            deps,
+            client
           );
         } catch {
           const row = await deps.store.update(

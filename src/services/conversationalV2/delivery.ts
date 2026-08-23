@@ -20,6 +20,7 @@ import { buildPendingQuestionV2 } from './pendingQuestion';
 import {
   pgConversationalV2StateStore,
   type ConversationalV2StateStore,
+  type ConversationalV2LockClient,
   type DurableSuccessorBatchV2,
 } from './stateStore';
 
@@ -32,6 +33,8 @@ export interface DeliverPreparedReceptionistTurnV2Deps {
   isAmbiguousTransportError?: (error: unknown) => boolean;
   now?: () => Date;
   id?: () => string;
+  /** Existing conversationOrder lock, when delivery is invoked inside it. */
+  lockClient?: ConversationalV2LockClient;
 }
 
 export interface DeliverPreparedReceptionistTurnV2Result {
@@ -66,6 +69,7 @@ function buildTerminalReceipt(input: {
   transportStartedAt: string | null;
   transportOutcome: TurnDeliveryReceiptV2['transportOutcome'];
   outboxState: TurnDeliveryReceiptV2['outboxState'];
+  flowStateCommitOutcome: NonNullable<TurnDeliveryReceiptV2['flowStateCommitOutcome']>;
   conversationCommitOutcome: TurnDeliveryReceiptV2['conversationCommitOutcome'];
   pendingCommitOutcome: TurnDeliveryReceiptV2['pendingCommitOutcome'];
   providerMessageIdHash?: string;
@@ -84,6 +88,7 @@ function buildTerminalReceipt(input: {
       ? { providerMessageIdHash: input.providerMessageIdHash }
       : {}),
     outboxState: input.outboxState,
+    flowStateCommitOutcome: input.flowStateCommitOutcome,
     conversationCommitOutcome: input.conversationCommitOutcome,
     pendingCommitOutcome: input.pendingCommitOutcome,
     ...(input.successorTurnId
@@ -184,6 +189,7 @@ export async function deliverPreparedReceptionistTurnV2(
       transportStartedAt: null,
       transportOutcome: 'silent_escalation',
       outboxState: 'prepared',
+      flowStateCommitOutcome: 'not_applicable',
       conversationCommitOutcome: 'not_applicable',
       pendingCommitOutcome,
     });
@@ -218,6 +224,7 @@ export async function deliverPreparedReceptionistTurnV2(
       transportStartedAt: null,
       transportOutcome: terminal.outcome,
       outboxState: terminal.outboxState,
+      flowStateCommitOutcome: 'not_applicable',
       conversationCommitOutcome: 'not_applicable',
       pendingCommitOutcome: 'not_applicable',
       ...(successorTurnId ? { successorTurnId } : {}),
@@ -250,6 +257,7 @@ export async function deliverPreparedReceptionistTurnV2(
       transportStartedAt: null,
       transportOutcome: 'suppressed_pause',
       outboxState: 'prepared',
+      flowStateCommitOutcome: 'not_applicable',
       conversationCommitOutcome: 'not_applicable',
       pendingCommitOutcome: 'not_applicable',
     });
@@ -262,6 +270,15 @@ export async function deliverPreparedReceptionistTurnV2(
   // âncora mudou, nunca enviamos uma copy de seleção baseada no snapshot velho;
   // repetimos somente a pergunta OPEN atual.
   const current = await store.loadLatestState(prepared.conversationKey, initialNow);
+  const visibleEscalationDeliveryAuthorized = Boolean(
+    prepared.planReceipt.recoveryKind === 'visible_escalation' &&
+      prepared.authoritativeEscalationQuestionId?.trim() &&
+      prepared.frame.pending &&
+      prepared.visibleEscalationSourceQuestionId ===
+        prepared.frame.pending.questionId &&
+      prepared.transition.kind === 'invalidate' &&
+      prepared.transition.questionId === prepared.frame.pending.questionId
+  );
   if (
     prepared.frame.pending &&
     (!current.pending ||
@@ -269,6 +286,30 @@ export async function deliverPreparedReceptionistTurnV2(
       current.pending.snapshot.version !== prepared.frame.pending.version)
   ) {
     if (!current.pending) {
+      if (visibleEscalationDeliveryAuthorized) {
+        // The cutoff intentionally hides the old PendingFrame from the read
+        // projection. The typed source question + invalidate transition is a
+        // narrow same-turn authorization; commitAccepted still performs the
+        // physical CAS against the old row and can fail closed if a fresh
+        // human action invalidated it first.
+      } else {
+        const receipt = buildTerminalReceipt({
+          prepared,
+          id,
+          now: initialNow,
+          transportStartedAt: null,
+          transportOutcome: 'transport_unknown',
+          outboxState: 'transport_unknown',
+          flowStateCommitOutcome: 'not_applicable',
+          conversationCommitOutcome: 'not_applicable',
+          pendingCommitOutcome: 'cas_conflict',
+          observedPendingVersion: null,
+        });
+        await store.saveTerminalDeliveryReceipt(receipt);
+        emitDelivery(receipt);
+        return { delivery: 'suppressed', receipt, successor };
+      }
+    } else if (visibleEscalationDeliveryAuthorized) {
       const receipt = buildTerminalReceipt({
         prepared,
         id,
@@ -276,23 +317,26 @@ export async function deliverPreparedReceptionistTurnV2(
         transportStartedAt: null,
         transportOutcome: 'transport_unknown',
         outboxState: 'transport_unknown',
+        flowStateCommitOutcome: 'not_applicable',
         conversationCommitOutcome: 'not_applicable',
         pendingCommitOutcome: 'cas_conflict',
-        observedPendingVersion: null,
+        observedPendingVersion: current.pending.snapshot.version,
       });
       await store.saveTerminalDeliveryReceipt(receipt);
       emitDelivery(receipt);
       return { delivery: 'suppressed', receipt, successor };
     }
-    payload = buildPendingQuestionV2({
-      pending: current.pending.snapshot,
-      flowState: current.pending.flowState,
-      catalog: prepared.config.authoritativeCatalog ?? {},
-    }) ?? 'Você confirma essa opção?';
-    prepared.planReceipt.route = 'fallback';
-    prepared.planReceipt.recoveryKind = 'direct_fallback';
-    prepared.transition = { kind: 'preserve' };
-    await store.savePlanReceipt(prepared.planReceipt);
+    if (current.pending) {
+      payload = buildPendingQuestionV2({
+        pending: current.pending.snapshot,
+        flowState: current.pending.flowState,
+        catalog: prepared.config.authoritativeCatalog ?? {},
+      }) ?? 'Você confirma essa opção?';
+      prepared.planReceipt.route = 'fallback';
+      prepared.planReceipt.recoveryKind = 'direct_fallback';
+      prepared.transition = { kind: 'preserve' };
+      await store.savePlanReceipt(prepared.planReceipt);
+    }
   }
 
   const deliveryAttemptId = id();
@@ -323,6 +367,7 @@ export async function deliverPreparedReceptionistTurnV2(
         transportStartedAt: transportStartedAt.toISOString(),
         transportOutcome: outcome,
         outboxState: outcome,
+        flowStateCommitOutcome: 'not_applicable',
         conversationCommitOutcome: 'failed',
         pendingCommitOutcome: 'not_applicable',
       }),
@@ -362,6 +407,7 @@ export async function deliverPreparedReceptionistTurnV2(
       transportStartedAt: transportStartedAt.toISOString(),
       transportOutcome: 'accepted_by_provider',
       outboxState: 'accepted_by_provider',
+      flowStateCommitOutcome: 'committed',
       conversationCommitOutcome: 'committed',
       pendingCommitOutcome: pendingOutcome,
       providerMessageIdHash,
@@ -379,14 +425,19 @@ export async function deliverPreparedReceptionistTurnV2(
   };
 
   try {
-    const pending = await store.commitAccepted({
+    const commitInput = {
       deliveryAttemptId,
       providerMessageIdHash,
       commitPayload,
       now: acceptedAt,
-    });
+    };
+    const pending =
+      deps.lockClient && store.commitAcceptedWithClient
+        ? await store.commitAcceptedWithClient(deps.lockClient, commitInput)
+        : await store.commitAccepted(commitInput);
     const receipt: TurnDeliveryReceiptV2 = {
       ...acceptedReceipt,
+      flowStateCommitOutcome: pending.flowStateCommitOutcome,
       pendingCommitOutcome: pending.outcome,
       observedPendingVersion: pending.observedVersion,
     };
@@ -397,17 +448,26 @@ export async function deliverPreparedReceptionistTurnV2(
       ...acceptedReceipt,
       outboxState: 'accepted_uncommitted',
       conversationCommitOutcome: 'accepted_uncommitted',
-      pendingCommitOutcome: 'failed',
+      flowStateCommitOutcome: 'accepted_uncommitted',
+      pendingCommitOutcome: 'not_applicable',
     };
     let acceptedStatePersisted = false;
     for (let attempt = 0; attempt < 3 && !acceptedStatePersisted; attempt += 1) {
       try {
-        await store.markAcceptedUncommitted({
+        const uncommittedInput = {
           deliveryAttemptId,
           providerMessageIdHash,
           commitPayload: { ...commitPayload, deliveryReceipt: receipt },
           now: acceptedAt,
-        });
+        };
+        if (deps.lockClient && store.markAcceptedUncommittedWithClient) {
+          await store.markAcceptedUncommittedWithClient(
+            deps.lockClient,
+            uncommittedInput
+          );
+        } else {
+          await store.markAcceptedUncommitted(uncommittedInput);
+        }
         acceptedStatePersisted = true;
       } catch {
         // Retry exclusivamente local. O POST já foi aceito e nunca se repete.

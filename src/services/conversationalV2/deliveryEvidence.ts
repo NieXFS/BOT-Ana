@@ -54,6 +54,7 @@ export function findCommittedOpeningDeliveryV2(input: {
     const transition = delivery.transition;
     if (
       delivery.conversationCommitOutcome === 'committed' &&
+      (delivery.flowStateCommitOutcome ?? 'committed') === 'committed' &&
       delivery.pendingCommitOutcome === 'opened' &&
       transition.kind === 'open' &&
       pendingFrameMatchesOpeningV2(input.pending, transition.frame)

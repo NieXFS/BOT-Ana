@@ -17,6 +17,7 @@ import type {
 } from './contracts';
 import {
   evaluateBoundaryV2,
+  UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2,
   type BoundaryEvaluationInputV2,
 } from './boundary';
 import type { ModelTurnResultV2ParseResult } from './modelResultParser';
@@ -25,6 +26,7 @@ import { opaqueReceiptHashV2 } from './receipts';
 import { buildPendingQuestionV2 } from './pendingQuestion';
 import type { RecoveryFallbackIntentV2 } from './recoveryFallbackIntent';
 import { closedReasonCodesV2 } from './divergence';
+import { isDeferredAvailabilityConsumableV2 } from './serviceContext';
 
 export const CATALOG_UNAVAILABLE_FALLBACK_V2 =
   'Não consegui consultar os serviços agora. Pode tentar novamente em instantes?';
@@ -36,6 +38,10 @@ export const TRANSACTION_REQUEST_FALLBACK_V2 =
   'Não consegui concluir isso com segurança. Pode me dizer de outro jeito o que você quer fazer?';
 export const OTHER_FALLBACK_V2 =
   'Não consegui entender com segurança. Pode explicar de outro jeito?';
+export const EMPTY_OPEN_SERVICE_CLARIFICATION_V2 =
+  'Não achei esse nome na nossa lista. Você sabe se o serviço tem outro nome?';
+export const VISIBLE_HANDOFF_CANONICAL_V2 =
+  'Não consigo responder isso com segurança por aqui. Você pode falar diretamente com a equipe do estabelecimento.';
 
 type BoundaryContextV2 = Omit<
   BoundaryEvaluationInputV2,
@@ -58,6 +64,8 @@ export interface RecoveryCoordinatorInputV2 {
   fallbackIntent: RecoveryFallbackIntentV2;
   preemption?: DeliveryPreemptionV2;
   canonicalPendingQuestion?: string;
+  /** Relógio do turno; default `new Date()` só para smokes isolados do coordenador. */
+  now?: Date;
   regenerate: (
     reasonCodes: readonly BoundaryReasonCodeV2[]
   ) => Promise<RegenerationResultV2>;
@@ -112,11 +120,58 @@ export type RecoveryCoordinatorResultV2 =
       pendingTransitionCandidate: PendingTransitionCandidate;
       resolutionProof: null;
       boundaryAttempts: RecoveryBoundaryAttemptV2[];
+    }
+  | {
+      status: 'visible_escalation';
+      payload: string;
+      recoveryKind: 'visible_escalation';
+      regenCount: 0 | 1;
+      fallbackIntent: RecoveryFallbackIntentV2;
+      primaryReasonCodes: BoundaryReasonCodeV2[];
+      regenerationReasonCodes: BoundaryReasonCodeV2[];
+      pendingTransitionCandidate: PendingTransitionCandidate;
+      resolutionProof: null;
+      boundaryAttempts: RecoveryBoundaryAttemptV2[];
     };
 
 type FallbackDecisionV2 =
   | { kind: 'copy'; text: string }
-  | { kind: 'silent_escalation' };
+  | { kind: 'silent_escalation' }
+  | { kind: 'visible_escalation'; text: string };
+
+export function isEmptyOpenServicePendingWithConsumableDeferredV2(
+  frame: TurnFrameV2,
+  now: Date
+): boolean {
+  const pending = frame.pending;
+  if (!pending || pending.kind !== 'SERVICE') return false;
+  if (pending.options.length !== 0) return false;
+  if (pending.flowId !== frame.flowState.flowId) return false;
+  return isDeferredAvailabilityConsumableV2(
+    frame.flowState.deferredAvailability,
+    frame.flowState.flowId,
+    now
+  );
+}
+
+function overlayCanonicalUnknownServiceDenialV2(
+  result: ModelTurnResultV2,
+  frame: TurnFrameV2,
+  now: Date
+): ModelTurnResultV2 | null {
+  if (!result.unknownServiceEvidence) return null;
+  if (!isEmptyOpenServicePendingWithConsumableDeferredV2(frame, now)) {
+    return null;
+  }
+  return {
+    schemaVersion: 2,
+    reply: UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2,
+    replyPurpose: 'OPERATIONAL_ANSWER',
+    pendingTransitionCandidate: { kind: 'preserve' },
+    resolutionCandidate: null,
+    unknownServiceEvidence: result.unknownServiceEvidence,
+  };
+}
 
 function fallbackCandidate(
   input: RecoveryCoordinatorInputV2,
@@ -156,6 +211,16 @@ function fallbackCandidate(
         .replace(/\s+/g, ' ')
         .trim()
     );
+  const now = input.now ?? new Date();
+  if (isEmptyOpenServicePendingWithConsumableDeferredV2(input.frame, now)) {
+    if (
+      wasJustDelivered(EMPTY_OPEN_SERVICE_CLARIFICATION_V2) ||
+      wasJustDelivered(VISIBLE_HANDOFF_CANONICAL_V2)
+    ) {
+      return { kind: 'visible_escalation', text: VISIBLE_HANDOFF_CANONICAL_V2 };
+    }
+    return { kind: 'copy', text: EMPTY_OPEN_SERVICE_CLARIFICATION_V2 };
+  }
   // OTHER é a fala sem testemunha suficiente: com PendingFrame OPEN ela é o
   // caso genuinamente ambíguo. Pergunta/transação nova preserva o estado sem
   // repetir a moldura antiga na mensagem. A moldura pendente NÃO é
@@ -252,35 +317,17 @@ export async function coordinateRecoveryV2(
   const primaryModelResult = input.primaryResult.ok
     ? input.primaryResult.value
     : null;
+  const now = input.now ?? new Date();
+  const emptyOpenServicePreserveGenerated = (
+    transition: PendingTransitionCandidate
+  ): boolean =>
+    isEmptyOpenServicePendingWithConsumableDeferredV2(input.frame, now) &&
+    transition.kind === 'preserve';
 
-  const primaryEvaluation = primaryModelResult
-    ? evaluate(primaryModelResult, 'GENERATED')
-    : null;
-  if (primaryEvaluation && !boundaryAccepted(primaryEvaluation)) {
-    input.onRejectedBoundaryCandidate?.({
-      stage: 'primary',
-      candidate: primaryModelResult!.reply,
-      reasonCodes: primaryEvaluation.reasonCodes,
-    });
-  }
-  if (primaryEvaluation && boundaryAccepted(primaryEvaluation)) {
-    return {
-      status: 'accepted',
-      payload: primaryEvaluation.acceptedPayload,
-      recoveryKind: 'none',
-      regenCount: 0,
-      pendingTransitionCandidate: primaryModelResult!.pendingTransitionCandidate,
-      resolutionProof: input.primaryResult.ok
-        ? input.primaryResult.resolutionProof
-        : null,
-      boundaryAttempts,
-    };
-  }
-
-  // Um reducer tipado pode já ter produzido a confirmação canônica como
-  // primaryResult e, nesse caso, mantém recoveryKind=none. Fora desse caso, o
-  // evento de write é soberano sobre qualquer copy do modelo — inclusive
-  // prosa segura sem envelope — e a confirmação nasce apenas do success:true.
+  // Write confirmado é soberano sobre qualquer overlay de serviço desconhecido.
+  // Sempre entrega a copy do success:true. recoveryKind=none só quando o
+  // reducer já tinha materializado essa mesma copy no primary — o overlay
+  // não pode mais trocá-la por negativa.
   if (safeWriteConfirmation) {
     const canonicalResult: ModelTurnResultV2 = {
       schemaVersion: 2,
@@ -295,13 +342,72 @@ export async function coordinateRecoveryV2(
     if (!boundaryAccepted(canonicalEvaluation)) {
       throw new Error('Confirmação canônica de write rejeitada pela boundary v2.');
     }
+    const primaryAlreadyCanonicalWrite =
+      primaryModelResult?.reply.trim() === safeWriteConfirmation.trim();
     return {
       status: 'accepted',
       payload: canonicalEvaluation.acceptedPayload,
-      recoveryKind: 'canonical_write_confirmation',
+      recoveryKind: primaryAlreadyCanonicalWrite
+        ? 'none'
+        : 'canonical_write_confirmation',
       regenCount: 0,
       pendingTransitionCandidate: canonicalResult.pendingTransitionCandidate,
-      resolutionProof: null,
+      resolutionProof:
+        primaryAlreadyCanonicalWrite && input.primaryResult.ok
+          ? input.primaryResult.resolutionProof
+          : null,
+      boundaryAttempts,
+    };
+  }
+
+  const overlaidPrimary = primaryModelResult
+    ? overlayCanonicalUnknownServiceDenialV2(primaryModelResult, input.frame, now)
+    : null;
+  if (overlaidPrimary) {
+    const overlaidEvaluation = evaluate(overlaidPrimary, 'CANONICAL');
+    if (boundaryAccepted(overlaidEvaluation)) {
+      return {
+        status: 'accepted',
+        payload: overlaidEvaluation.acceptedPayload,
+        recoveryKind:
+          primaryModelResult!.reply.trim() ===
+          UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2
+            ? 'none'
+            : 'direct_fallback',
+        regenCount: 0,
+        pendingTransitionCandidate: { kind: 'preserve' },
+        resolutionProof: null,
+        boundaryAttempts,
+      };
+    }
+  }
+
+  const primaryEvaluation = primaryModelResult
+    ? evaluate(primaryModelResult, 'GENERATED')
+    : null;
+  if (primaryEvaluation && !boundaryAccepted(primaryEvaluation)) {
+    input.onRejectedBoundaryCandidate?.({
+      stage: 'primary',
+      candidate: primaryModelResult!.reply,
+      reasonCodes: primaryEvaluation.reasonCodes,
+    });
+  }
+  if (
+    primaryEvaluation &&
+    boundaryAccepted(primaryEvaluation) &&
+    !emptyOpenServicePreserveGenerated(
+      primaryModelResult!.pendingTransitionCandidate
+    )
+  ) {
+    return {
+      status: 'accepted',
+      payload: primaryEvaluation.acceptedPayload,
+      recoveryKind: 'none',
+      regenCount: 0,
+      pendingTransitionCandidate: primaryModelResult!.pendingTransitionCandidate,
+      resolutionProof: input.primaryResult.ok
+        ? input.primaryResult.resolutionProof
+        : null,
       boundaryAttempts,
     };
   }
@@ -319,7 +425,11 @@ export async function coordinateRecoveryV2(
       reasonCodes: proseEvaluation.reasonCodes,
     });
   }
-  if (proseEvaluation && boundaryAccepted(proseEvaluation)) {
+  if (
+    proseEvaluation &&
+    boundaryAccepted(proseEvaluation) &&
+    !emptyOpenServicePreserveGenerated({ kind: 'preserve' })
+  ) {
     return {
       status: 'accepted',
       payload: proseEvaluation.acceptedPayload,
@@ -361,8 +471,32 @@ export async function coordinateRecoveryV2(
   }
   let regenerationReasonCodes: BoundaryReasonCodeV2[] = [];
   if (regenerated.ok) {
+    const overlaidRegen = overlayCanonicalUnknownServiceDenialV2(
+      regenerated.result,
+      input.frame,
+      now
+    );
+    if (overlaidRegen) {
+      const overlaidEvaluation = evaluate(overlaidRegen, 'CANONICAL');
+      if (boundaryAccepted(overlaidEvaluation)) {
+        return {
+          status: 'accepted',
+          payload: overlaidEvaluation.acceptedPayload,
+          recoveryKind: 'direct_fallback',
+          regenCount: 1,
+          pendingTransitionCandidate: { kind: 'preserve' },
+          resolutionProof: null,
+          boundaryAttempts,
+        };
+      }
+    }
     const regeneratedEvaluation = evaluate(regenerated.result, 'GENERATED');
-    if (boundaryAccepted(regeneratedEvaluation)) {
+    if (
+      boundaryAccepted(regeneratedEvaluation) &&
+      !emptyOpenServicePreserveGenerated(
+        regenerated.result.pendingTransitionCandidate
+      )
+    ) {
       return {
         status: 'accepted',
         payload: regeneratedEvaluation.acceptedPayload,
@@ -388,7 +522,8 @@ export async function coordinateRecoveryV2(
       : null;
     if (
       regeneratedProseEvaluation &&
-      boundaryAccepted(regeneratedProseEvaluation)
+      boundaryAccepted(regeneratedProseEvaluation) &&
+      !emptyOpenServicePreserveGenerated({ kind: 'preserve' })
     ) {
       return {
         status: 'accepted',
@@ -442,7 +577,26 @@ export async function coordinateRecoveryV2(
   };
   const fallbackEvaluation = evaluate(fallbackResult, 'CANONICAL');
   if (!boundaryAccepted(fallbackEvaluation)) {
+    if (directedFallback.kind === 'visible_escalation') {
+      throw new Error(
+        'Copy canônica de handoff visível rejeitada pela boundary v2.'
+      );
+    }
     return silentEscalation();
+  }
+  if (directedFallback.kind === 'visible_escalation') {
+    return {
+      status: 'visible_escalation',
+      payload: fallbackEvaluation.acceptedPayload,
+      recoveryKind: 'visible_escalation',
+      regenCount: 1,
+      fallbackIntent: input.fallbackIntent,
+      primaryReasonCodes: closedReasonCodesV2(firstReasons),
+      regenerationReasonCodes: closedReasonCodesV2(regenerationReasonCodes),
+      pendingTransitionCandidate: fallbackResult.pendingTransitionCandidate,
+      resolutionProof: null,
+      boundaryAttempts,
+    };
   }
   return {
     status: 'accepted',

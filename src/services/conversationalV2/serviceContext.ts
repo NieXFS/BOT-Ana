@@ -369,37 +369,46 @@ export function applyServiceChangeToFlowStateV2(
   };
 }
 
+function formatDeferredDatePhraseV2(
+  constraint: DeferredAvailabilityConstraintV2,
+  now: Date,
+  timezone: string
+): string | null {
+  const date = constraint.date?.trim();
+  if (!date) return null;
+  const today = civilTodayV2(now, timezone);
+  if (date === today) return 'hoje';
+  if (date === addCivilDays(today, 1)) return 'amanhã';
+  const displayed = displayDateV2(date).trim();
+  return displayed || null;
+}
+
+function formatDeferredWindowPhraseV2(
+  window: DeferredAvailabilityTimeWindowV2 | undefined
+): string | null {
+  if (!window) return null;
+  if (window.kind === 'BETWEEN_INCLUSIVE') {
+    return `entre ${displayClockFromMinutesV2(window.startMinute)} e ${displayClockFromMinutesV2(window.endMinute)}`;
+  }
+  const clock = displayClockFromMinutesV2(window.minuteOfDay);
+  if (window.kind === 'AFTER_EXCLUSIVE') return `depois das ${clock}`;
+  if (window.kind === 'AT_OR_AFTER') return `a partir das ${clock}`;
+  if (window.kind === 'BEFORE_EXCLUSIVE') return `antes das ${clock}`;
+  if (window.kind === 'AT_OR_BEFORE') return `até ${clock}`;
+  if (window.kind === 'EXACT') return `às ${clock}`;
+  return null;
+}
+
 export function formatDeferredConstraintPhraseV2(
   constraint: DeferredAvailabilityConstraintV2,
   now: Date,
   timezone: string
 ): string {
   const parts: string[] = [];
-  if (constraint.date) {
-    const today = civilTodayV2(now, timezone);
-    parts.push(
-      constraint.date === today
-        ? 'hoje'
-        : constraint.date === addCivilDays(today, 1)
-          ? 'amanhã'
-          : displayDateV2(constraint.date)
-    );
-  }
-  const window = constraint.timeWindow;
-  if (window) {
-    if (window.kind === 'BETWEEN_INCLUSIVE') {
-      parts.push(
-        `entre ${displayClockFromMinutesV2(window.startMinute)} e ${displayClockFromMinutesV2(window.endMinute)}`
-      );
-    } else {
-      const clock = displayClockFromMinutesV2(window.minuteOfDay);
-      if (window.kind === 'AFTER_EXCLUSIVE') parts.push(`depois das ${clock}`);
-      else if (window.kind === 'AT_OR_AFTER') parts.push(`a partir das ${clock}`);
-      else if (window.kind === 'BEFORE_EXCLUSIVE') parts.push(`antes das ${clock}`);
-      else if (window.kind === 'AT_OR_BEFORE') parts.push(`até ${clock}`);
-      else parts.push(`às ${clock}`);
-    }
-  }
+  const datePhrase = formatDeferredDatePhraseV2(constraint, now, timezone);
+  const windowPhrase = formatDeferredWindowPhraseV2(constraint.timeWindow);
+  if (datePhrase) parts.push(datePhrase);
+  if (windowPhrase) parts.push(windowPhrase);
   return parts.join(' ');
 }
 
@@ -423,6 +432,25 @@ export function buildDeferredFamilyClarificationCopyV2(
 ): string {
   const phrase = formatDeferredConstraintPhraseV2(constraint, now, timezone);
   return `Para eu verificar ${phrase}, qual destes serviços você quer: ${joinServiceNames(names)}?`;
+}
+
+export function buildDeferredOpenServiceQuestionCopyV2(
+  constraint: DeferredAvailabilityConstraintV2,
+  now: Date,
+  timezone: string
+): string {
+  const datePhrase = formatDeferredDatePhraseV2(constraint, now, timezone);
+  const windowPhrase = formatDeferredWindowPhraseV2(constraint.timeWindow);
+  if (datePhrase && windowPhrase) {
+    return `Para eu consultar a agenda de ${datePhrase}, ${windowPhrase}, qual serviço você quer fazer?`;
+  }
+  if (datePhrase) {
+    return `Para eu consultar a agenda de ${datePhrase}, qual serviço você quer fazer?`;
+  }
+  if (windowPhrase) {
+    return `Para eu consultar a agenda ${windowPhrase}, qual serviço você quer fazer?`;
+  }
+  return 'Para eu consultar a agenda no período que você pediu, qual serviço você quer fazer?';
 }
 
 export function buildEmptyDeferredAvailabilityCopyV2(
@@ -908,7 +936,20 @@ export function planServiceContextV2(input: {
     receipt: 'temporal_deferred',
     vetoFamilyFastPath: true,
     capturedConstraint: constraint,
-    result: null,
+    result: modelResult({
+      reply: buildDeferredOpenServiceQuestionCopyV2(
+        constraint,
+        input.now,
+        input.timezone
+      ),
+      purpose: 'SERVICE_QUESTION',
+      transition: {
+        kind: 'open',
+        pendingKind: 'SERVICE',
+        flowId: frame.flowState.flowId,
+        optionEntityIds: [],
+      },
+    }),
     nextFlowState: withDeferredAvailabilityV2(frame.flowState, constraint),
   };
 }

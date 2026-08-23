@@ -58,6 +58,8 @@ export interface PreparedReceptionistTurnV2 {
   copyVariant?: CopyVariantIdV2;
   /** Única entrega que pode atravessar a pausa recém-criada pela própria escalada. */
   authoritativeEscalationQuestionId?: string;
+  /** PendingFrame questionId fechado por este mesmo visible handoff. */
+  visibleEscalationSourceQuestionId?: string;
   /**
    * Segmentos de catálogo no payload visível. O commit persiste visibleText +
    * offsets; a projeção para LLM troca só esses intervalos por placeholder.

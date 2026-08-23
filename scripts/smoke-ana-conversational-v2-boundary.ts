@@ -15,6 +15,7 @@ import {
   materializeServiceListCopyV2,
   SERVICE_LIST_TRANSPORT_CEILING_V2,
 } from '../src/services/conversationalV2/serviceList';
+import { EMPTY_OPEN_SERVICE_CLARIFICATION_V2 } from '../src/services/conversationalV2/recoveryCoordinator';
 import { hasPositiveClauseMatchV2 } from '../src/services/conversationalV2/polarity';
 import { normalizeTemporalAssertionsV2 } from '../src/services/conversationalV2/temporalNormalizer';
 import { classifyReceptionistTurnPermission } from '../src/services/receptionistSocialSafety';
@@ -1307,6 +1308,105 @@ assert.equal(
   recordedNamedAvisar.reasonCodes.includes('UNRECORDED_HANDOFF'),
   false,
   'questionId confirmado licencia a copy com responsável nominal arbitrário'
+);
+
+const deferredOpenAcceptedCopy =
+  'Para eu consultar a agenda de hoje, depois das 17h30, qual serviço você quer fazer?';
+const deferredOpenBlockedCopy =
+  'Para eu verificar os horários de hoje depois das 17h30, qual serviço você quer fazer?';
+const deferredOpenFlowState = {
+  flowId: 'flow-deferred-open',
+  lastOperationalAt: '2026-08-13T15:00:00.000Z',
+  deferredAvailability: {
+    schemaVersion: 1 as const,
+    capturedAt: '2026-08-13T15:00:00.000Z',
+    capturedTurnId: 'turn-deferred-open',
+    capturedInputSequence: 1,
+    date: '2026-08-13',
+    timeWindow: { kind: 'AFTER_EXCLUSIVE' as const, minuteOfDay: 17 * 60 + 30 },
+  },
+  fixedByProofVersion: {},
+};
+const deferredOpenPending = {
+  questionId: 'q-deferred-open',
+  askedAt: '2026-08-13T15:00:00.000Z',
+  kind: 'SERVICE' as const,
+  flowId: 'flow-deferred-open',
+  version: 1,
+  options: [] as Array<{ position: number; entityId: string; displayName: string }>,
+};
+const deferredOpenInbound = 'Boa tarde! Tem horário hoje após as 17:30?';
+const deferredOpenAccepted = evaluateBoundaryV2({
+  rawCandidate: deferredOpenAcceptedCopy,
+  servicesResult,
+  flowState: deferredOpenFlowState,
+  pendingTransitionCandidate: {
+    kind: 'open',
+    pendingKind: 'SERVICE',
+    flowId: 'flow-deferred-open',
+    optionEntityIds: [],
+  },
+  replyPurpose: 'SERVICE_QUESTION',
+  source: 'CANONICAL',
+  toolTrace: [],
+  sourceInboundText: deferredOpenInbound,
+  currentInboundIds: ['in-deferred-open'],
+  inboundTextsById: { 'in-deferred-open': deferredOpenInbound },
+  pendingSnapshot: deferredOpenPending,
+});
+assert.equal(deferredOpenAccepted.safe, true);
+assert.equal(deferredOpenAccepted.originalAccepted, true);
+assert.deepEqual(deferredOpenAccepted.reasonCodes, []);
+assert.equal(
+  deferredOpenAccepted.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  false,
+  'consultar a agenda não afirma disponibilidade'
+);
+const deferredOpenBlocked = evaluateBoundaryV2({
+  rawCandidate: deferredOpenBlockedCopy,
+  servicesResult,
+  flowState: deferredOpenFlowState,
+  pendingTransitionCandidate: {
+    kind: 'open',
+    pendingKind: 'SERVICE',
+    flowId: 'flow-deferred-open',
+    optionEntityIds: [],
+  },
+  replyPurpose: 'SERVICE_QUESTION',
+  source: 'CANONICAL',
+  toolTrace: [],
+  sourceInboundText: deferredOpenInbound,
+  currentInboundIds: ['in-deferred-open'],
+  inboundTextsById: { 'in-deferred-open': deferredOpenInbound },
+  pendingSnapshot: deferredOpenPending,
+});
+assert.equal(
+  deferredOpenBlocked.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  true,
+  'verificar os horários reabre UNVERIFIED_AVAILABILITY'
+);
+
+const emptyOpenClarificationEval = evaluateBoundaryV2({
+  rawCandidate: EMPTY_OPEN_SERVICE_CLARIFICATION_V2,
+  servicesResult,
+  flowState: deferredOpenFlowState,
+  pendingTransitionCandidate: {
+    kind: 'preserve',
+  },
+  replyPurpose: 'CLARIFICATION',
+  source: 'CANONICAL',
+  toolTrace: [],
+  sourceInboundText: 'quero fazer o cabelo',
+  currentInboundIds: ['in-hair-clarification'],
+  inboundTextsById: { 'in-hair-clarification': 'quero fazer o cabelo' },
+  pendingSnapshot: deferredOpenPending,
+});
+assert.equal(emptyOpenClarificationEval.safe, true);
+assert.equal(emptyOpenClarificationEval.originalAccepted, true);
+assert.deepEqual(emptyOpenClarificationEval.reasonCodes, []);
+assert.equal(
+  emptyOpenClarificationEval.acceptedPayload,
+  EMPTY_OPEN_SERVICE_CLARIFICATION_V2
 );
 
 console.log('smoke ana conversational v2 boundary: OK');
