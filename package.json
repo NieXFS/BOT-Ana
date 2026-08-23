@@ -57,6 +57,7 @@
   "smoke:ana-conversational-v2-ia23": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-ia23.ts",
   "smoke:ana-conversational-v2-ia23b": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-ia23b.ts",
   "smoke:ana-conversational-v2-ia23c": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-ia23b.ts",
+  "smoke:ana-conversational-v2-ia23-pg": "ts-node -T scripts/smoke-ana-conversational-v2-ia23-pg.ts",
     "smoke:ana-conversational-v2-procedure-info": "ts-node -T scripts/smoke-ana-conversational-v2-procedure-info.ts",
     "smoke:ana-conversational-v2-business-address": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-business-address.ts",
     "smoke:ana-conversational-v2-route": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-route.ts",
