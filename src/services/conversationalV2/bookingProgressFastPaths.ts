@@ -49,6 +49,13 @@ import {
   validatedBookingDraftForPendingV2,
 } from './pendingQuestion';
 import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
+import {
+  buildEmptyDeferredAvailabilityCopyV2,
+  captureDeferredAvailabilityConstraintV2,
+  filterSlotsByDeferredWindowV2,
+  isDeferredAvailabilityConsumableV2,
+  withDeferredAvailabilityV2,
+} from './serviceContext';
 
 export type BookingProgressFastPathV2 =
   | {
@@ -461,6 +468,7 @@ export async function resolveDateSlotsFastPathV2(input: {
   now: Date;
   lastAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
+  serviceContextEnabled?: boolean;
 }): Promise<BookingProgressFastPathV2> {
   const entitlement = dateSlotsEntitlementV2({
     frame: input.frame,
@@ -471,7 +479,27 @@ export async function resolveDateSlotsFastPathV2(input: {
   if (entitlement.kind === 'continue') {
     return { kind: 'continue_model', reason: entitlement.reason };
   }
+  const capturedConstraint = input.serviceContextEnabled
+    ? captureDeferredAvailabilityConstraintV2({
+        inboundText: input.currentInboundText,
+        dateResolution: input.dateResolution,
+        now: input.now,
+        turnId: input.frame.turnId,
+        inputSequence: input.frame.inputSequence,
+      })
+    : { kind: 'none' as const };
+  if (
+    input.serviceContextEnabled &&
+    (capturedConstraint.kind === 'vague_period' ||
+      capturedConstraint.kind === 'conflict')
+  ) {
+    return {
+      kind: 'continue_model',
+      reason: 'deferred_availability_unresolved',
+    };
+  }
   if (input.dateResolution.kind === 'ambiguous') {
+    const clearedTemporal = clearTemporalState(input.frame.flowState);
     return {
       kind: 'resolved',
       result: dateQuestionResult(
@@ -481,7 +509,9 @@ export async function resolveDateSlotsFastPathV2(input: {
       loop: loopForReads([]),
       proof: null,
       nextFlowState: withFixedServiceState(
-        clearTemporalState(input.frame.flowState),
+        input.serviceContextEnabled === true
+          ? clearedTemporal
+          : withDeferredAvailabilityV2(clearedTemporal, null),
         entitlement.serviceId,
         entitlement.professionalId
       ),
@@ -498,11 +528,50 @@ export async function resolveDateSlotsFastPathV2(input: {
     return { kind: 'continue_model', reason: 'same_date_as_time_evidence' };
   }
   const serviceId = entitlement.serviceId;
-  const baseState = withFixedServiceState(
-    clearTemporalState(input.frame.flowState),
-    serviceId,
-    entitlement.professionalId
-  );
+  const existingConstraint =
+    input.serviceContextEnabled === true &&
+    isDeferredAvailabilityConsumableV2(
+      input.frame.flowState.deferredAvailability,
+      input.frame.flowState.flowId,
+      input.now
+    )
+      ? input.frame.flowState.deferredAvailability
+      : undefined;
+  const inboundConstraint =
+    capturedConstraint.kind === 'captured'
+      ? capturedConstraint.constraint
+      : undefined;
+  const constraint =
+    input.serviceContextEnabled === true
+      ? inboundConstraint
+        ? {
+            ...inboundConstraint,
+            ...(inboundConstraint.date
+              ? {}
+              : existingConstraint?.date
+                ? { date: existingConstraint.date }
+                : {}),
+            ...(inboundConstraint.timeWindow
+              ? {}
+              : existingConstraint?.timeWindow
+                ? { timeWindow: existingConstraint.timeWindow }
+                : {}),
+          }
+        : existingConstraint
+      : undefined;
+  const clearedTemporal = clearTemporalState(input.frame.flowState);
+  const rolledBackTemporal =
+    input.serviceContextEnabled === true
+      ? clearedTemporal
+      : withDeferredAvailabilityV2(clearedTemporal, null);
+  const baseState = {
+    ...withFixedServiceState(
+      rolledBackTemporal,
+      serviceId,
+      entitlement.professionalId
+    ),
+    ...(constraint ? { deferredAvailability: constraint } : {}),
+  };
   if (isRepeatedEmptyAvailabilityDayV2(input.lastAcceptedDelivery, date, input.now)) {
     const alreadyAskingDate = input.frame.pending?.kind === 'DATE';
     return {
@@ -516,7 +585,9 @@ export async function resolveDateSlotsFastPathV2(input: {
       proof: null,
       nextFlowState: alreadyAskingDate
         ? withFixedServiceState(
-            input.frame.flowState,
+            input.serviceContextEnabled === true
+              ? input.frame.flowState
+              : withDeferredAvailabilityV2(input.frame.flowState, null),
             serviceId,
             entitlement.professionalId
           )
@@ -564,8 +635,7 @@ export async function resolveDateSlotsFastPathV2(input: {
     argumentsValidJson: true,
     result: read.raw,
   };
-  const loop = loopForReads([trace]);
-  const slots =
+  const rawSlots =
     read.parsed?.success === true
       ? validSlots(
           read.parsed,
@@ -574,6 +644,10 @@ export async function resolveDateSlotsFastPathV2(input: {
           date
         )
       : null;
+  const constraintWindow = constraint?.timeWindow;
+  const slots = rawSlots
+    ? filterSlotsByDeferredWindowV2(rawSlots, constraintWindow)
+    : null;
   if (slots && slots.length > 0) {
     const filteredTrace: ReceptionistToolTraceEntry = {
       ...trace,
@@ -587,9 +661,14 @@ export async function resolveDateSlotsFastPathV2(input: {
       toolTrace: [filteredTrace],
       services: input.servicesResult,
       sourceInboundText: input.currentInboundText,
+      preserveDeferredAvailability:
+        input.serviceContextEnabled === true && Boolean(constraint),
     });
     if (reducer?.kind === 'canonical_slots') {
-      if (reducer.result.replyPurpose === 'WRITE_CONFIRMATION') {
+      if (
+        reducer.result.replyPurpose === 'WRITE_CONFIRMATION' &&
+        (!constraintWindow || constraintWindow.kind === 'EXACT')
+      ) {
         return {
           kind: 'resolved',
           result: reducer.result,
@@ -599,10 +678,18 @@ export async function resolveDateSlotsFastPathV2(input: {
         };
       }
       const inboundTimes = inboundTimesV2(input.currentInboundText);
-      const matchingTime =
-        inboundTimes.length === 1 && slots.includes(inboundTimes[0]!)
-          ? inboundTimes[0]!
+      const exactClock =
+        constraintWindow?.kind === 'EXACT'
+          ? `${String(Math.floor(constraintWindow.minuteOfDay / 60)).padStart(2, '0')}:${String(constraintWindow.minuteOfDay % 60).padStart(2, '0')}`
           : null;
+      const matchingTime =
+        constraintWindow && constraintWindow.kind !== 'EXACT'
+          ? null
+          : inboundTimes.length === 1 && slots.includes(inboundTimes[0]!)
+            ? inboundTimes[0]!
+            : exactClock && slots.includes(exactClock)
+              ? exactClock
+              : null;
       if (matchingTime) {
         const timeFrame: TurnFrameV2 = {
           ...input.frame,
@@ -644,16 +731,33 @@ export async function resolveDateSlotsFastPathV2(input: {
       };
     }
   }
-  const reply = slots && slots.length === 0
-    ? emptyAvailabilityDayCopyV2(date)
-    : canonicalReadFailureCopyV2(
-        'availability',
-        read.parsed?.success === true ? 'invalid_payload' : readReason(read.parsed)
-      );
+  const reply =
+    slots && slots.length === 0
+      ? constraintWindow && rawSlots && rawSlots.length > 0
+        ? buildEmptyDeferredAvailabilityCopyV2(
+            constraint!,
+            input.now,
+            input.config.timezone
+          )
+        : emptyAvailabilityDayCopyV2(date)
+      : canonicalReadFailureCopyV2(
+          'availability',
+          read.parsed?.success === true ? 'invalid_payload' : readReason(read.parsed)
+        );
+  const emptyFilterTrace: ReceptionistToolTraceEntry =
+    constraintWindow && rawSlots && rawSlots.length > 0 && slots?.length === 0
+      ? {
+          ...trace,
+          result: JSON.stringify({
+            ...(read.parsed ?? {}),
+            slots: [],
+          }),
+        }
+      : trace;
   return {
     kind: 'resolved',
     result: dateQuestionResult(input.frame, reply),
-    loop,
+    loop: loopForReads([emptyFilterTrace]),
     proof: null,
     nextFlowState: baseState,
   };

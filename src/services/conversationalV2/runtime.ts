@@ -73,6 +73,14 @@ import {
   resolveSelectionFastPathV2,
 } from './fastPaths';
 import {
+  applyServiceChangeToFlowStateV2,
+  consumeDeferredAvailabilityV2,
+  planServiceContextV2,
+  serviceSelectionFollowUpWithConstraintV2,
+  type ServiceContextPlanV2,
+} from './serviceContext';
+import { isAnaV2ServiceContextEnabled } from './featureFlag';
+import {
   hasExplicitAvailabilityReadRequestV2,
   hasExplicitUpcomingReadRequestV2,
   resolveReadFastPathV2,
@@ -254,6 +262,8 @@ export interface ReceptionistV2RuntimeDeps {
   /** Opt-in do braço de voz; produção omite e permanece OFF. */
   voiceEnabled?: boolean;
   rephraseCompletion?: VoiceRephraseCompletionFactoryV2;
+  /** Rollout temporário do planner de contexto de serviço (IA-22). */
+  serviceContextEnabled?: boolean;
   /** Somente observabilidade injetada; não é recibo nem log de produção. */
   onRejectedBoundaryCandidate?: (input: {
     stage: 'primary' | 'regen';
@@ -518,7 +528,8 @@ function optionsForTransition(
 function flowStateWithProof(
   frame: TurnFrameV2,
   proof: ResolutionProof | null,
-  services: ServicesResult
+  services: ServicesResult,
+  serviceContextEnabled = false
 ): FlowStateV2 {
   if (!proof) return frame.flowState;
   const pendingKind = frame.pending?.kind;
@@ -531,6 +542,16 @@ function flowStateWithProof(
           ? 'service'
           : null;
   if (entityKind === 'service') {
+    if (serviceContextEnabled) {
+      if (frame.flowState.fixedServiceId === proof.entityId) {
+        return frame.flowState;
+      }
+      return applyServiceChangeToFlowStateV2(
+        frame.flowState,
+        proof.entityId,
+        services
+      );
+    }
     const nextVersion =
       (frame.flowState.fixedByProofVersion.fixedServiceId ?? 0) + 1;
     const service = services.services?.find((entry) => entry.id === proof.entityId);
@@ -924,6 +945,8 @@ export async function getReceptionistReplyV2(input: {
   interpreterEnabled?: boolean;
   /** Braço ortogonal da camada de voz; default OFF, injetado na matriz. */
   voiceEnabled?: boolean;
+  /** Rollout temporário do planner de contexto de serviço; default OFF. */
+  serviceContextEnabled?: boolean;
   deps?: ReceptionistV2RuntimeDeps;
 }): Promise<PreparedReceptionistTurnV2> {
   const deps = input.deps ?? {};
@@ -939,6 +962,10 @@ export async function getReceptionistReplyV2(input: {
     input.interpreterEnabled ?? deps.interpreterEnabled
   );
   const voiceEnabled = input.voiceEnabled ?? deps.voiceEnabled;
+  const serviceContextEnabled = isAnaV2ServiceContextEnabled(
+    input.config.tenantSlug,
+    input.serviceContextEnabled ?? deps.serviceContextEnabled
+  );
   const elicitationVariant = resolveElicitationVariantV2(
     input.elicitationVariant
   );
@@ -1100,6 +1127,8 @@ export async function getReceptionistReplyV2(input: {
   let serverCopyProvenance: ServerCopyProvenanceV2 | null = null;
   let provenancedPayload: string | null = null;
   let voiceReceipt: TurnPlanReceiptV2['voice'];
+  let serviceContextDecisionReceipt: TurnPlanReceiptV2['serviceContextDecision'];
+  let serviceContextOwnedTurn = false;
 
   const makePlan = (args: {
     route: TurnPlanReceiptV2['route'];
@@ -1142,6 +1171,9 @@ export async function getReceptionistReplyV2(input: {
     copyVariant,
     ...(selectedGateDecline ? { gateDecline: selectedGateDecline } : {}),
     ...(args.voice ? { voice: args.voice } : {}),
+    ...(serviceContextDecisionReceipt
+      ? { serviceContextDecision: serviceContextDecisionReceipt }
+      : {}),
     result: 'accepted_for_delivery',
   });
   };
@@ -1876,6 +1908,97 @@ export async function getReceptionistReplyV2(input: {
       : []),
   ];
 
+  const serviceContextPlan: ServiceContextPlanV2 = planServiceContextV2({
+    enabled: serviceContextEnabled,
+    frame,
+    inboundText: currentInboundBatchText,
+    catalog: services,
+    now: startedAt,
+    dateResolution,
+    timezone: input.config.timezone,
+    turnId,
+    inputSequence,
+  });
+  if (serviceContextEnabled) {
+    serviceContextDecisionReceipt = serviceContextPlan.receipt;
+  }
+  const serviceContextPlanningFrame: TurnFrameV2 = {
+    ...frame,
+    flowState: serviceContextPlan.nextFlowState ?? frame.flowState,
+  };
+
+  const applyDeferredAvailabilityConsumption = async (resolved: {
+    result: ModelTurnResultV2;
+    nextFlowState: FlowStateV2;
+    proof: ResolutionProof | null;
+    loop?: ReceptionistModelLoopResult;
+  }): Promise<{
+    kind: 'resolved';
+    result: ModelTurnResultV2;
+    nextFlowState: FlowStateV2;
+    proof: ResolutionProof | null;
+    loop: ReceptionistModelLoopResult;
+  }> => {
+    if (!serviceContextEnabled) {
+      return {
+        kind: 'resolved',
+        result: resolved.result,
+        nextFlowState: resolved.nextFlowState,
+        proof: resolved.proof,
+        loop: resolved.loop ?? emptyLoopResult(),
+      };
+    }
+    const alreadyOfferedAvailability =
+      resolved.result.replyPurpose === 'WRITE_CONFIRMATION' ||
+      (resolved.result.pendingTransitionCandidate.kind === 'open' &&
+        (resolved.result.pendingTransitionCandidate.pendingKind === 'TIME' ||
+          resolved.result.pendingTransitionCandidate.pendingKind ===
+            'CONFIRMATION'));
+    if (alreadyOfferedAvailability) {
+      return {
+        kind: 'resolved',
+        result: resolved.result,
+        nextFlowState: resolved.nextFlowState,
+        proof: resolved.proof,
+        loop: resolved.loop ?? emptyLoopResult(),
+      };
+    }
+    const consumed = await consumeDeferredAvailabilityV2({
+      frame: { ...frame, flowState: resolved.nextFlowState },
+      flowState: resolved.nextFlowState,
+      inboundText: currentInboundBatchText,
+      catalog: services,
+      config: input.config,
+      now: startedAt,
+      executeTool,
+    });
+    if (consumed.kind !== 'resolved') {
+      return {
+        kind: 'resolved',
+        result: resolved.result,
+        nextFlowState: resolved.nextFlowState,
+        proof: resolved.proof,
+        loop: resolved.loop ?? emptyLoopResult(),
+      };
+    }
+    serviceContextOwnedTurn = true;
+    if (
+      !serviceContextDecisionReceipt ||
+      serviceContextDecisionReceipt === 'not_applicable'
+    ) {
+      serviceContextDecisionReceipt = 'temporal_deferred';
+    }
+    return {
+      kind: 'resolved',
+      result: consumed.result,
+      nextFlowState: consumed.nextFlowState,
+      proof: resolved.proof,
+      loop: resolved.loop
+        ? mergeFastPathLoopsV2(resolved.loop, consumed.loop)
+        : consumed.loop,
+    };
+  };
+
   const bookingReentryFastPath = resolveBookingReentryFastPathV2({
     frame,
     inboundId,
@@ -1888,7 +2011,7 @@ export async function getReceptionistReplyV2(input: {
   });
   const dateSlotsFastPath = bookingReentryFastPath.kind === 'continue_model'
     ? await resolveDateSlotsFastPathV2({
-        frame,
+        frame: serviceContextPlanningFrame,
         dateResolution,
         currentInboundText: currentInboundBatchText,
         servicesResult: services,
@@ -1896,6 +2019,7 @@ export async function getReceptionistReplyV2(input: {
         now: startedAt,
         lastAcceptedDelivery: stored.lastAcceptedDelivery,
         executeTool,
+        serviceContextEnabled,
       })
     : { kind: 'continue_model' as const, reason: 'booking_reentry_resolved' };
   const pendingReadProof = resolvePendingOptionProofV2({
@@ -2081,12 +2205,16 @@ export async function getReceptionistReplyV2(input: {
     bookingConfirmationFastPath.kind === 'continue_model' &&
     cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
-    duplicatePreflight.kind === 'continue_model'
+    duplicatePreflight.kind === 'continue_model' &&
+    !serviceContextPlan.result &&
+    !serviceContextPlan.selectedServiceId &&
+    !serviceContextPlan.vetoFamilyFastPath
       ? resolveInitialServiceQuestionFastPathV2({
           frame,
           inboundText: currentInboundBatchText,
           catalog: services,
           now: startedAt,
+          serviceContextEnabled,
         })
       : null;
   const serviceFamilyFastPath =
@@ -2098,12 +2226,16 @@ export async function getReceptionistReplyV2(input: {
     cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
+    !serviceContextPlan.result &&
+    !serviceContextPlan.selectedServiceId &&
+    !serviceContextPlan.vetoFamilyFastPath &&
     initialServiceQuestionFastPath?.kind !== 'resolved'
       ? resolveWitnessedServiceFamilyFastPathV2({
           frame,
           inboundText: currentInboundBatchText,
           catalog: services,
           now: startedAt,
+          serviceContextEnabled,
         })
       : null;
   const selectionFastPath =
@@ -2115,6 +2247,8 @@ export async function getReceptionistReplyV2(input: {
     cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
+    !serviceContextPlan.result &&
+    !serviceContextPlan.selectedServiceId &&
     initialServiceQuestionFastPath?.kind !== 'resolved' &&
     serviceFamilyFastPath?.kind !== 'resolved'
       ? resolveSelectionFastPathV2({
@@ -2125,6 +2259,27 @@ export async function getReceptionistReplyV2(input: {
           now: startedAt,
           currentDateResolution: dateResolution,
           lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
+          serviceContextEnabled,
+        })
+      : null;
+
+  const serviceContextFollowUp =
+    bookingReentryFastPath.kind === 'continue_model' &&
+    dateSlotsFastPath.kind === 'continue_model' &&
+    duplicateResolutionFastPath.kind === 'continue_model' &&
+    confirmationDuplicatePreflight.kind === 'continue_model' &&
+    bookingConfirmationFastPath.kind === 'continue_model' &&
+    cancellationFastPath.kind === 'continue_model' &&
+    readFastPath.kind === 'continue_model' &&
+    duplicatePreflight.kind === 'continue_model' &&
+    serviceContextPlan.selectedServiceId &&
+    !serviceContextPlan.result
+      ? serviceSelectionFollowUpWithConstraintV2({
+          serviceId: serviceContextPlan.selectedServiceId,
+          frame: serviceContextPlanningFrame,
+          catalog: services,
+          now: startedAt,
+          timezone: input.config.timezone,
         })
       : null;
 
@@ -2139,7 +2294,9 @@ export async function getReceptionistReplyV2(input: {
     duplicatePreflight.kind === 'continue_model' &&
     initialServiceQuestionFastPath?.kind !== 'resolved' &&
     serviceFamilyFastPath?.kind !== 'resolved' &&
-    selectionFastPath?.kind !== 'resolved';
+    selectionFastPath?.kind !== 'resolved' &&
+    !serviceContextPlan.result &&
+    !serviceContextFollowUp;
 
   if (cancellationFastPath.kind === 'preempted') {
     emitRouteComparisonShadow({
@@ -2191,13 +2348,20 @@ export async function getReceptionistReplyV2(input: {
           frame,
           proof: interpreted.proof,
           catalog: services,
+          serviceContextEnabled,
         });
         if (resolved.kind === 'resolved') {
-          interpreterResolved = {
+          const consumed = await applyDeferredAvailabilityConsumption({
             result: resolved.result,
-            loop: interpreterResult.loop,
+            nextFlowState: resolved.nextFlowState ?? frame.flowState,
             proof: resolved.proof,
-            nextFlowState: resolved.nextFlowState,
+            loop: interpreterResult.loop,
+          });
+          interpreterResolved = {
+            result: consumed.result,
+            loop: consumed.loop,
+            proof: consumed.proof,
+            nextFlowState: consumed.nextFlowState,
           };
         }
       } else if (interpreted.route === 'CANCELAR') {
@@ -2269,32 +2433,36 @@ export async function getReceptionistReplyV2(input: {
           };
         }
       } else if (interpreted.route === 'NOVO_AGENDAMENTO') {
-        const resolved = resolveInitialServiceQuestionFastPathV2({
-          frame,
-          inboundText: currentInboundBatchText,
-          catalog: services,
-          now: startedAt,
-        });
-        const opened =
-          resolved.kind === 'resolved'
-            ? resolved
-            : resolveWitnessedServiceFamilyFastPathV2({
-                frame,
-                inboundText: currentInboundBatchText,
-                catalog: services,
-                now: startedAt,
-              });
-        if (opened.kind === 'resolved') {
-          interpreterResolved = {
-            result: opened.result,
-            loop: interpreterResult.loop,
-            proof: null,
-            nextFlowState: opened.nextFlowState,
-          };
-          serverCopyProvenance = provenanceFromProducerPathV2({
-            producer: 'interpreter_novo',
-            result: opened.result,
+        if (!serviceContextPlan.vetoFamilyFastPath) {
+          const resolved = resolveInitialServiceQuestionFastPathV2({
+            frame,
+            inboundText: currentInboundBatchText,
+            catalog: services,
+            now: startedAt,
+            serviceContextEnabled,
           });
+          const opened =
+            resolved.kind === 'resolved'
+              ? resolved
+              : resolveWitnessedServiceFamilyFastPathV2({
+                  frame,
+                  inboundText: currentInboundBatchText,
+                  catalog: services,
+                  now: startedAt,
+                  serviceContextEnabled,
+                });
+          if (opened.kind === 'resolved') {
+            interpreterResolved = {
+              result: opened.result,
+              loop: interpreterResult.loop,
+              proof: null,
+              nextFlowState: opened.nextFlowState,
+            };
+            serverCopyProvenance = provenanceFromProducerPathV2({
+              producer: 'interpreter_novo',
+              result: opened.result,
+            });
+          }
         }
       } else {
         const witnessedEscalation = await escalate({
@@ -2533,6 +2701,12 @@ export async function getReceptionistReplyV2(input: {
       producer: 'date_slots',
       result: dateSlotsFastPath.result,
     });
+    if (
+      serviceContextEnabled &&
+      dateSlotsFastPath.nextFlowState.deferredAvailability
+    ) {
+      serviceContextOwnedTurn = true;
+    }
   } else if (duplicateResolutionFastPath.kind === 'resolved') {
     nominalRoute = 'fast_path';
     loop = duplicateResolutionFastPath.loop;
@@ -2614,6 +2788,39 @@ export async function getReceptionistReplyV2(input: {
       resolutionProof: duplicatePreflight.proof,
       resolutionProofRejections: [],
     };
+  } else if (serviceContextPlan.result) {
+    nominalRoute = 'fast_path';
+    serviceContextOwnedTurn = true;
+    proof = null;
+    selectionNextFlowState = serviceContextPlan.nextFlowState ?? frame.flowState;
+    primary = {
+      ok: true,
+      value: serviceContextPlan.result,
+      resolutionProof: null,
+      resolutionProofRejections: [],
+    };
+  } else if (serviceContextFollowUp) {
+    const consumed = await applyDeferredAvailabilityConsumption({
+      result: serviceContextFollowUp.result,
+      nextFlowState: serviceContextFollowUp.nextFlowState,
+      proof: null,
+    });
+    nominalRoute = 'fast_path';
+    loop = consumed.loop;
+    proof = null;
+    selectionNextFlowState = consumed.nextFlowState;
+    primary = {
+      ok: true,
+      value: consumed.result,
+      resolutionProof: null,
+      resolutionProofRejections: [],
+    };
+    if (!serviceContextOwnedTurn) {
+      serverCopyProvenance = provenanceFromProducerPathV2({
+        producer: 'selection',
+        result: consumed.result,
+      });
+    }
   } else if (initialServiceQuestionFastPath?.kind === 'resolved') {
     nominalRoute = 'fast_path';
     proof = null;
@@ -2643,21 +2850,31 @@ export async function getReceptionistReplyV2(input: {
       result: serviceFamilyFastPath.result,
     });
   } else if (selectionFastPath?.kind === 'resolved') {
+    const consumed = await applyDeferredAvailabilityConsumption({
+      result: selectionFastPath.result,
+      nextFlowState:
+        duplicatePreflight.nextFlowState ??
+        selectionFastPath.nextFlowState ??
+        frame.flowState,
+      proof: selectionFastPath.proof,
+      loop: duplicatePreflight.loop,
+    });
     nominalRoute = 'fast_path';
-    if (duplicatePreflight.loop) loop = duplicatePreflight.loop;
-    proof = selectionFastPath.proof;
-    selectionNextFlowState =
-      duplicatePreflight.nextFlowState ?? selectionFastPath.nextFlowState;
+    loop = consumed.loop;
+    proof = consumed.proof;
+    selectionNextFlowState = consumed.nextFlowState;
     primary = {
       ok: true,
-      value: selectionFastPath.result,
-      resolutionProof: selectionFastPath.proof,
+      value: consumed.result,
+      resolutionProof: consumed.proof,
       resolutionProofRejections: [],
     };
-    serverCopyProvenance = provenanceFromProducerPathV2({
-      producer: 'selection',
-      result: selectionFastPath.result,
-    });
+    if (!serviceContextOwnedTurn) {
+      serverCopyProvenance = provenanceFromProducerPathV2({
+        producer: 'selection',
+        result: consumed.result,
+      });
+    }
   } else if (interpreterResolved) {
     nominalRoute = 'interpreter_hit';
     loop = interpreterResolved.loop;
@@ -2670,6 +2887,23 @@ export async function getReceptionistReplyV2(input: {
       resolutionProofRejections: [],
     };
   } else {
+    if (serviceContextPlan.nextFlowState) {
+      const overlayFrame: TurnFrameV2 = {
+        ...frame,
+        flowState: serviceContextPlan.nextFlowState,
+      };
+      messages[0] = {
+        role: 'system',
+        content: v2RulesPrompt(
+          input.config,
+          services,
+          startedAt,
+          overlayFrame,
+          inboundTextsById,
+          elicitationVariant
+        ),
+      };
+    }
     const forcedToolChoice = resolveForcedToolChoiceV2({
       forceUpcomingRead: input.turnRuntime?.forceUpcomingRead === true,
     });
@@ -2724,6 +2958,9 @@ export async function getReceptionistReplyV2(input: {
   ) {
     selectionNextFlowState = confirmationDuplicatePreflight.nextFlowState;
   }
+  if (!selectionNextFlowState && serviceContextPlan.nextFlowState) {
+    selectionNextFlowState = serviceContextPlan.nextFlowState;
+  }
 
   writeCommitted = hasCommittedWrite(loop);
 
@@ -2739,13 +2976,15 @@ export async function getReceptionistReplyV2(input: {
       ? cancellationFastPath.actionRecorded === true
       : interpreterResolved?.actionRecorded === true;
 
-  const lifecycleOverride = cancellationOwnedTurn
-    ? null
-    : reduceToolLifecycleV2({
+  const lifecycleOverride =
+    cancellationOwnedTurn || serviceContextOwnedTurn
+      ? null
+      : reduceToolLifecycleV2({
         frame,
         toolTrace: loop.toolTrace,
         services,
         sourceInboundText: input.userMessage,
+        preserveDeferredAvailability: serviceContextEnabled,
       });
   if (lifecycleOverride) {
     primary = {
@@ -2765,7 +3004,7 @@ export async function getReceptionistReplyV2(input: {
     });
   }
 
-  if (primary.ok && nominalRoute === 'fast_path') {
+  if (primary.ok && nominalRoute === 'fast_path' && !serviceContextPlan.result) {
     const varied = varyUnanchoredServerCopyV2({
       result: primary.value,
       lastVariant: stored.lastAcceptedDelivery?.copyVariant,
@@ -2792,7 +3031,7 @@ export async function getReceptionistReplyV2(input: {
   const nextFlowStateRaw =
     selectionNextFlowState
       ? selectionNextFlowState
-      : flowStateWithProof(frame, proof, services);
+      : flowStateWithProof(frame, proof, services, serviceContextEnabled);
   const nextFlowState =
     cancellationAbandonment.kind === 'abandon'
       ? stripCancellationFlowV2(nextFlowStateRaw)
@@ -3040,7 +3279,8 @@ export async function getReceptionistReplyV2(input: {
     ? flowStateWithProof(
         { ...frame, flowState: nextFlowState },
         recovery.resolutionProof,
-        services
+        services,
+        serviceContextEnabled
       )
     : nextFlowState;
   const recoveredCandidate = enforceCanonicalTimeSummaryTransitionV2({
@@ -3073,7 +3313,7 @@ export async function getReceptionistReplyV2(input: {
   const voiceLayer = recovery.payload
     ? await applyConversationalVoiceV2({
         config: input.config,
-        enabled: voiceEnabled,
+        enabled: Boolean(voiceEnabled) && !serviceContextPlan.result,
         templatePayload: recovery.payload,
         provenance: serverCopyProvenance,
         lastAcceptedPayload: stored.lastAcceptedDelivery?.payload ?? null,

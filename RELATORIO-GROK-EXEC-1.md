@@ -2251,3 +2251,92 @@ Duas regressões de rota: (1) descrição clínica licenciada + enumeração ger
 | `npm run smoke:ana-v2-tau2` | 0 | hermético; schema 6; `FAIL:0`; macro `pass1=1`, `pass4=1`; juiz `pairwiseTone.status=not_run` / `reason=mock_harness` |
 
 HEAD permaneceu `e0330fe` destacado. Sem commit.
+
+## Exec IA-22-service-context
+
+**Status:** implementado, **reprovado** na conferência do Sol (IA-22b), retrabalhado e revalidado localmente sobre `HEAD` destacado `6ae93ff`. Árvore inicialmente limpa; WIP desta execução permanece uncommitted. Sem commit, troca de branch, deploy, push, `--real`, SSH, Postgres/ERP/WhatsApp reais. Executor fallback: Cursor Grok 4.6. ERP (`e873d55`) fora de escopo.
+
+A conferência do GPT 5.6 Sol **reprovou** o entregável IA-22 com quatro bloqueantes. O texto original desta seção afirmava três coisas que a conferência refutou: (1) que seleção externa só ocorria fora da pendência; (2) que flag off preservava o comportamento anterior; (3) que falha técnica da tool não virava negativa operacional. O retrabalho IA-22b corrige exatamente esses quatro pontos, sem ampliar escopo.
+
+### Contrato final
+
+REVISÃO 6 (2026-08-23) em `ANA-CONVERSATIONAL-V2-CONTRATO.md`, com o retrabalho IA-22b. Family fast-path list-only é vetado quando o lote tem data/hora/período operacional; saudações `Boa tarde`/`Boa noite` não contam como período. `DeferredAvailabilityConstraintV2` é server-owned, mesmo `flowId`, TTL 4h. Subset `SERVICE` não é soberano **apenas** em turno de correção: nome exato que pertence às opções, sem marcador de correção, segue o matcher fechado com `ResolutionProof`. Consumo delivery-aware: no máximo um `getAvailableSlots`, só slots da tool, zero write sem confirmação entregue; falha/shape inválido da tool usa fallback canônico de consulta e não afirma indisponibilidade. Flag off restaura o baseline de fato (constraint persistida ignorada/removida). Nenhuma camada genérica de sinônimos.
+
+### Decisões
+
+1. Planner `planServiceContextV2` corre **antes** dos family fast-paths e do short-circuit `NOVO_AGENDAMENTO`. Flag resolvida **uma vez** na entrada do turno (`input.serviceContextEnabled ?? deps.serviceContextEnabled`).
+2. Operadores fechados: `após/depois`=`AFTER_EXCLUSIVE`; `a partir de`=`AT_OR_AFTER`; `antes de`=`BEFORE_EXCLUSIVE`; `até`=`AT_OR_BEFORE`; nua=`EXACT`; `entre X e Y`=`BETWEEN_INCLUSIVE`. `segunda opção` mascarada; `terça` continua data civil. Conflito/vago não materializa janela inventada. Período vago exige contexto operacional (`à tarde`, `pela manhã`, `de noite`, `no período da tarde` ou data+período).
+3. Correção reusa `listCatalogEntityMatchesFromCurrentMessage`. A allowlist da pendência é consultada **antes** do early return de igualdade exata: nome exato nas opções, sem marcador de correção → `none`; nome exato fora das opções → `select_outside_pending`; turno corretivo resolve o catálogo inteiro. `não é só X mesmo` entrega copy binária sem fixar X.
+4. Overlay de frame só para dateSlots/prompt; o `frame` persistido original não é mutado antes da delivery. Consumo de constraint **não** re-roda depois de `TIME`/`CONFIRMATION`/`WRITE_CONFIRMATION`. `flowStateWithProof` com flag off restaura o baseline; com flag on, não reaplica troca de serviço se o id já está fixo (preserva `slotEvidence` do consumo).
+5. Copy de filtro vazio (`success:true` + array válido + filtro elimina todos) não ecoa `17h30`/`HH:MM`. Copy de família **pode** manter a restrição. `success:false`, exceção, JSON inválido ou array inválido usam `canonicalReadFailureCopyV2` e preservam a constraint.
+6. Troca de serviço no mesmo fluxo preserva a constraint consumível e limpa slot/draft/duplicate/profissional incompatível. Write confirmado e fluxo novo limpam. Constraint expirada não é recolocada pelo matcher normal.
+7. Recibo: `serviceContextDecision` enum redacted; omitido com flag off. IDs/texto/WAMID fora.
+8. Flag `ANA_V2_SERVICE_CONTEXT_ROLLOUT_TENANT_SLUGS`: default off, `*` proibido, exige v2 allowlist. `existingConstraint` em `resolveDateSlotsFastPathV2` só é lido com `serviceContextEnabled===true`; flag off remove a constraint do estado. `fixedStateForSlots` voltou ao baseline e só preserva `deferredAvailability` por opção explícita. Rollout inicial só `studio-viti`. Jackeline off até E2E. Sunset 7 dias após aprovação do Studio.
+
+### Retrabalho IA-22b (após reprovação do Sol)
+
+1. **Soberania normal.** `resolveServiceCorrectionDecisionV2` consulta a allowlist antes do early return exato. `Reposição de unha` na pendência `[Reposição, Unha infantil]` deixa de gerar `outside_pending_selection` e passa pelo matcher com `ResolutionProof`. `2` continua ordinal. `Manicure` continua escape externo.
+2. **Flag off = rollback real.** `resolveDateSlotsFastPathV2` não lê constraint persistida com a flag off; o estado sai sem `deferredAvailability`; oferta contém todos os slots da tool. `flowStateWithProof` e `fixedStateForSlots` restauram o baseline; o ramo novo preserva só `deferredAvailability` por opção explícita.
+3. **Saudação ≠ período.** `Boa tarde`/`Boa noite` não disparam `vague_period`. `Tem horário sexta à tarde?` continua `vague_period`.
+4. **Falha da tool ≠ “não encontrei”.** `executor_error`, JSON inválido e payload inválido usam fallback canônico de consulta, zero write, sem a frase “Não encontrei horário”. Filtro vazio com `success:true` + array válido permanece com a copy da restrição (aceita pelo Sol).
+
+### Arquivos
+
+- `src/services/conversationalV2/serviceContext.ts` (novo)
+- `src/services/conversationalV2/contracts.ts`
+- `src/services/conversationalV2/fastPaths.ts`
+- `src/services/conversationalV2/bookingProgressFastPaths.ts`
+- `src/services/conversationalV2/runtime.ts`
+- `src/services/conversationalV2/featureFlag.ts`
+- `src/services/conversationalV2/lifecycleReducer.ts`
+- `src/services/conversationalV2/receipts.ts`
+- `src/services/service-gate.ts` (export canônico; matcher não duplicado)
+- `scripts/smoke-ana-conversational-v2-service-context.ts` (novo)
+- `package.json`
+- `ANA-CONVERSATIONAL-V2-CONTRATO.md`
+- `RELATORIO-GROK-EXEC-1.md`
+
+Projeção em `TurnFrameForModelV2` via spread de `flowState` (campo sem IDs extras). `cancellationFlowV2.ts` e `flowSession.ts` não precisaram de patch dedicado.
+
+### Fixtures (smoke novo, exit 0 após IA-22b)
+
+Catálogo mínimo: Reposição de unha, Unha infantil, Manicure, Pedicure, Manicure e pedicure, Manicure tradicional + fillers. Relógio congelado `2026-08-13T15:00:00.000Z`.
+
+Cobre o conjunto IA-22 mais as regressões IA-22b: soberania `Reposição de unha`/`2`/`Manicure`; flag off + constraint persistida + tool `["17:00","18:00"]`; `Boa tarde`/`Boa noite` vs `sexta à tarde`; `executor_error`, JSON inválido e payload inválido sem “Não encontrei horário”.
+
+### Validação (exits reais desta execução)
+
+Exits reais da bateria IA-22b (reexecução nesta worktree, sem rede/DB reais):
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | |
+| `npx tsc --noEmit` | 0 | |
+| `npm run smoke:ana-conversational-v2-service-context` | 0 | soberania, flag off, saudação, falha de tool |
+| `npm run smoke:service-gate` | 0 | 83 checks |
+| `npm run smoke:ana-conversational-v2-route` | 0 | |
+| `npm run smoke:ana-conversational-v2-fallback-intent` | 0 | |
+| `npm run smoke:ana-conversational-v2-silent-escalation` | 0 | |
+| `npm run smoke:ana-conversational-v2-receipt-bookkeeping` | 0 | F1-F8 |
+| `npm run smoke:debounce-flush` | 0 | 56/56 |
+| `npm run smoke:receptionist-renata-regression` | 0 | |
+
+Nenhum comando dependeu de serviço externo ou banco real. Sem credencial viva.
+
+### Riscos
+
+- Copy de filtro vazio é genérica (sem eco de relógio) para não disparar boundary. A restrição original permanece no estado server-owned. Risco baixo de naturalidade, aceito pelo Sol.
+- Semântica de período coloquial (`sexta tarde` sem preposição, etc.) e sunset operacional da flag ainda exigem E2E no Studio Viti.
+- `Manicure` só vence homônimos hierárquicos por igualdade canônica completa; fuzzy continua o matcher existente (sem camada de sinônimos).
+- Nome de serviço que também casa outro item do catálogo (ex.: “unha” em Reposição/Unha infantil) **não** abre confirmação automática no smoke de unha; o gate de confirmação permanece fail-closed.
+- Flag off em produção até o operador setar allowlist. Jackeline permanece no ramo antigo.
+
+### Flag / sunset
+
+Default off. Produção pretendida: `ANA_V2_SERVICE_CONTEXT_ROLLOUT_TENANT_SLUGS=studio-viti` **depois** de deploy (fora deste exec). Jackeline off até E2E. Sete dias após aprovação do Studio: default único da v2 e remoção da flag.
+
+### Próximo passo exato — Studio Viti
+
+Não ligar env neste exec. Após merge+deploy do Receps-IA: (1) confirmar v2 allowlist já contém `studio-viti`; (2) setar somente `ANA_V2_SERVICE_CONTEXT_ROLLOUT_TENANT_SLUGS=studio-viti`; (3) reload `receps-ia`; (4) E2E no WhatsApp do Studio: `Tem horário hoje após as 17:30?` + unha/pé e mão → clarificação com restrição, zero write; escolher um serviço testemunhado → um `getAvailableSlots` e só horários depois de 17:30; correção `Não, quero Pedicure` / `Não é X` / `Manicure` fora do subset. Jackeline permanece off. Se o E2E passar, iniciar o sunset de 7 dias.
+
+HEAD permaneceu `6ae93ff` destacado. Sem commit.

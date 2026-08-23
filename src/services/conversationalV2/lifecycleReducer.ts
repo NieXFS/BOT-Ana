@@ -109,7 +109,8 @@ function latestSuccessfulSlots(input: {
 
 function fixedStateForSlots(
   frame: TurnFrameV2,
-  evidence: NonNullable<ReturnType<typeof latestSuccessfulSlots>>
+  evidence: NonNullable<ReturnType<typeof latestSuccessfulSlots>>,
+  preserveDeferredAvailability = false
 ): FlowStateV2 {
   const serviceChanged = frame.flowState.fixedServiceId !== evidence.serviceId;
   const serviceVersion = serviceChanged
@@ -139,6 +140,9 @@ function fixedStateForSlots(
       resolvedDate:
         (frame.flowState.fixedByProofVersion.resolvedDate ?? 0) + 1,
     },
+    ...(preserveDeferredAvailability && frame.flowState.deferredAvailability
+      ? { deferredAvailability: frame.flowState.deferredAvailability }
+      : {}),
   };
 }
 
@@ -163,6 +167,7 @@ export function reduceToolLifecycleV2(input: {
   toolTrace: readonly ReceptionistToolTraceEntry[];
   services: ServicesResult;
   sourceInboundText?: string;
+  preserveDeferredAvailability?: boolean;
 }): LifecycleOverrideV2 | null {
   const writeConfirmation = buildSafeWriteConfirmation(
     [...input.toolTrace] as ToolTraceLike[]
@@ -173,6 +178,7 @@ export function reduceToolLifecycleV2(input: {
       slotEvidence: _slots,
       duplicatePreflightClearance: _duplicatePreflightClearance,
       duplicateResolution: _duplicateResolution,
+      deferredAvailability: _deferredAvailability,
       ...rest
     } = input.frame.flowState;
     return {
@@ -191,7 +197,11 @@ export function reduceToolLifecycleV2(input: {
 
   const evidence = latestSuccessfulSlots(input);
   if (!evidence) return null;
-  const nextFlowState = fixedStateForSlots(input.frame, evidence);
+  const nextFlowState = fixedStateForSlots(
+    input.frame,
+    evidence,
+    input.preserveDeferredAvailability === true
+  );
   const inboundTimes = inboundTimesFromText(input.sourceInboundText);
   const matchingTime =
     inboundTimes.length === 1 && evidence.slots.includes(inboundTimes[0]!)

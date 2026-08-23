@@ -163,6 +163,40 @@ export interface CancellationFlowV2 {
   readonly sourceReadTurnId: string;
 }
 
+export type DeferredAvailabilityTimeWindowV2 =
+  | { kind: 'EXACT'; minuteOfDay: number }
+  | { kind: 'AFTER_EXCLUSIVE'; minuteOfDay: number }
+  | { kind: 'AT_OR_AFTER'; minuteOfDay: number }
+  | { kind: 'BEFORE_EXCLUSIVE'; minuteOfDay: number }
+  | { kind: 'AT_OR_BEFORE'; minuteOfDay: number }
+  | {
+      kind: 'BETWEEN_INCLUSIVE';
+      startMinute: number;
+      endMinute: number;
+    };
+
+/** Restrição temporal server-owned; nunca carrega texto cru, nome, telefone ou WAMID. */
+export interface DeferredAvailabilityConstraintV2 {
+  readonly schemaVersion: 1;
+  readonly capturedAt: string;
+  readonly capturedTurnId: string;
+  readonly capturedInputSequence: number;
+  readonly date?: string;
+  readonly timeWindow?: DeferredAvailabilityTimeWindowV2;
+}
+
+export const SERVICE_CONTEXT_RECEIPT_DECISIONS_V2 = [
+  'disabled',
+  'not_applicable',
+  'temporal_deferred',
+  'outside_pending_selection',
+  'positive_reclarification',
+  'negative_clarification',
+] as const;
+
+export type ServiceContextReceiptDecisionV2 =
+  (typeof SERVICE_CONTEXT_RECEIPT_DECISIONS_V2)[number];
+
 export interface FlowStateV2 {
   readonly flowId: string;
   /** Relógio server-owned do último avanço operacional commitado. */
@@ -182,6 +216,8 @@ export interface FlowStateV2 {
   readonly duplicatePreflightClearance?: DuplicatePreflightClearanceV2;
   /** Fluxo de cancelamento conversacional; appointmentId nunca é projetado. */
   readonly cancellation?: CancellationFlowV2;
+  /** Restrição temporal deferida; só vale no mesmo flowId e por 4h. */
+  readonly deferredAvailability?: DeferredAvailabilityConstraintV2;
   readonly fixedByProofVersion: FixedByProofVersionV2;
 }
 
@@ -441,6 +477,8 @@ export interface TurnPlanReceiptV2 {
   copyVariant?: CopyVariantIdV2;
   /** Subrecibo da camada de voz; hashes/enums apenas, sem copy. */
   voice?: VoiceReceiptV2;
+  /** Decisão redacted do planner de contexto de serviço; sem nomes/IDs/texto. */
+  serviceContextDecision?: ServiceContextReceiptDecisionV2;
   result: 'accepted_for_delivery';
 }
 

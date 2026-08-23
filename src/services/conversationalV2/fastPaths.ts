@@ -27,6 +27,10 @@ import {
 } from './serviceList';
 import { hasExplicitAvailabilityReadRequestV2 } from './readFastPaths';
 import { hasPositiveProceduralInterrogativeV2 } from './procedureInfo';
+import {
+  inboundHasOperationalTemporalComponentV2,
+  pruneDeferredAvailabilityV2,
+} from './serviceContext';
 
 export type FastPathResultV2 =
   | { kind: 'continue_model'; reason: string }
@@ -631,6 +635,7 @@ export function resolveInitialServiceQuestionFastPathV2(input: {
   inboundText: string;
   catalog: ServicesResult;
   now: Date;
+  serviceContextEnabled?: boolean;
 }): InitialServiceQuestionFastPathV2 {
   const services = input.catalog.services ?? [];
   if (!input.catalog.success || services.length < 2) {
@@ -638,6 +643,12 @@ export function resolveInitialServiceQuestionFastPathV2(input: {
   }
   if (input.frame.pending && pendingFresh(input.frame, input.now)) {
     return { kind: 'continue_model', reason: 'fresh_pending_is_authoritative' };
+  }
+  if (
+    input.serviceContextEnabled &&
+    inboundHasOperationalTemporalComponentV2(input.inboundText)
+  ) {
+    return { kind: 'continue_model', reason: 'temporal_service_context_veto' };
   }
   if (!hasPositiveExplicitBookingVerbV2(input.inboundText)) {
     return { kind: 'continue_model', reason: 'no_positive_booking_verb' };
@@ -690,6 +701,7 @@ export function resolveWitnessedServiceFamilyFastPathV2(input: {
   inboundText: string;
   catalog: ServicesResult;
   now: Date;
+  serviceContextEnabled?: boolean;
 }): InitialServiceQuestionFastPathV2 {
   const services = input.catalog.services ?? [];
   if (!input.catalog.success || services.length < 2) {
@@ -697,6 +709,12 @@ export function resolveWitnessedServiceFamilyFastPathV2(input: {
   }
   if (input.frame.pending && pendingFresh(input.frame, input.now)) {
     return { kind: 'continue_model', reason: 'fresh_pending_is_authoritative' };
+  }
+  if (
+    input.serviceContextEnabled &&
+    inboundHasOperationalTemporalComponentV2(input.inboundText)
+  ) {
+    return { kind: 'continue_model', reason: 'temporal_service_context_veto' };
   }
   if (hasPositiveExplicitBookingVerbV2(input.inboundText)) {
     return { kind: 'continue_model', reason: 'booking_verb_owned_by_initial_service' };
@@ -758,20 +776,64 @@ function exactCatalogMatch(
 function serviceFollowUp(
   serviceId: string,
   frame: TurnFrameV2,
-  catalog: ServicesResult
+  catalog: ServicesResult,
+  options?: { preserveDeferredAvailability?: boolean; now?: Date }
 ): { result: ModelTurnResultV2; nextFlowState: FlowStateV2 } {
   const service = catalog.services?.find((entry) => entry.id === serviceId);
   const active = catalog.professionals ?? [];
   const eligible = service?.professionalIds === undefined
     ? active
     : active.filter((entry) => service.professionalIds!.includes(entry.id));
-  const fixedBase: FlowStateV2 = {
-    flowId: frame.flowState.flowId,
-    fixedServiceId: serviceId,
-    fixedByProofVersion: {
-      fixedServiceId: (frame.flowState.fixedByProofVersion.fixedServiceId ?? 0) + 1,
-    },
-  };
+  const sourceState =
+    options?.preserveDeferredAvailability && options.now
+      ? pruneDeferredAvailabilityV2(frame.flowState, options.now)
+      : frame.flowState;
+  const fixedBase: FlowStateV2 = options?.preserveDeferredAvailability
+    ? (() => {
+        const {
+          slotEvidence: _slotEvidence,
+          bookingDraft: _bookingDraft,
+          duplicateResolution: _duplicateResolution,
+          duplicatePreflightClearance: _duplicatePreflightClearance,
+          resolvedDate: _resolvedDate,
+          fixedProfessionalId: previousProfessional,
+          ...rest
+        } = sourceState;
+        const nextVersion =
+          (frame.flowState.fixedByProofVersion.fixedServiceId ?? 0) + 1;
+        const professionalStillEligible = previousProfessional
+          ? eligible.some((entry) => entry.id === previousProfessional)
+          : false;
+        const keepProfessional =
+          eligible.length === 1
+            ? eligible[0]!.id
+            : professionalStillEligible
+              ? previousProfessional
+              : undefined;
+        const fixedByProofVersion = {
+          ...rest.fixedByProofVersion,
+          fixedServiceId: nextVersion,
+        };
+        delete fixedByProofVersion.resolvedDate;
+        if (keepProfessional) {
+          fixedByProofVersion.fixedProfessionalId = nextVersion;
+        } else {
+          delete fixedByProofVersion.fixedProfessionalId;
+        }
+        return {
+          ...rest,
+          fixedServiceId: serviceId,
+          ...(keepProfessional ? { fixedProfessionalId: keepProfessional } : {}),
+          fixedByProofVersion,
+        };
+      })()
+    : {
+        flowId: frame.flowState.flowId,
+        fixedServiceId: serviceId,
+        fixedByProofVersion: {
+          fixedServiceId: (frame.flowState.fixedByProofVersion.fixedServiceId ?? 0) + 1,
+        },
+      };
   if (eligible.length === 0) {
     const alternatives = (catalog.services ?? [])
       .filter((entry) => entry.id !== serviceId)
@@ -796,13 +858,21 @@ function serviceFollowUp(
       },
     };
   }
-  if (eligible.length === 1) {
+  if (eligible.length === 1 || fixedBase.fixedProfessionalId) {
     const nextFlowState: FlowStateV2 = {
       ...fixedBase,
-      fixedProfessionalId: eligible[0]!.id,
+      ...(eligible.length === 1
+        ? { fixedProfessionalId: eligible[0]!.id }
+        : {}),
       fixedByProofVersion: {
         ...fixedBase.fixedByProofVersion,
-        fixedProfessionalId: fixedBase.fixedByProofVersion.fixedServiceId,
+        ...(eligible.length === 1 || fixedBase.fixedProfessionalId
+          ? {
+              fixedProfessionalId:
+                fixedBase.fixedByProofVersion.fixedProfessionalId ??
+                fixedBase.fixedByProofVersion.fixedServiceId,
+            }
+          : {}),
       },
     };
     return {
@@ -964,6 +1034,7 @@ export function resolveInterpreterPendingOptionFastPathV2(input: {
   frame: TurnFrameV2;
   proof: Extract<ResolutionProof, { kind: 'catalog_entity' | 'pending_option' }>;
   catalog: ServicesResult;
+  serviceContextEnabled?: boolean;
 }): FastPathResultV2 {
   const pending = input.frame.pending;
   if (
@@ -1000,7 +1071,9 @@ export function resolveInterpreterPendingOptionFastPathV2(input: {
     return { kind: 'continue_model', reason: 'interpreter_catalog_kind_mismatch' };
   }
   const followUp = pending.kind === 'SERVICE'
-    ? serviceFollowUp(option.entityId, input.frame, input.catalog)
+    ? serviceFollowUp(option.entityId, input.frame, input.catalog, {
+        preserveDeferredAvailability: input.serviceContextEnabled === true,
+      })
     : professionalFollowUp(option.entityId, input.frame, input.catalog);
   return followUp
     ? { kind: 'resolved', ...followUp, proof: input.proof }
@@ -1016,6 +1089,7 @@ export function resolveSelectionFastPathV2(input: {
   proofVersion?: number;
   currentDateResolution?: CurrentDateResolutionV2;
   lastAcceptedAssistantText?: string;
+  serviceContextEnabled?: boolean;
 }): FastPathResultV2 {
   const { frame, inboundId, inboundText, catalog, now } = input;
   const proofVersion = input.proofVersion ?? 1;
@@ -1124,7 +1198,10 @@ export function resolveSelectionFastPathV2(input: {
   if (!selected) return { kind: 'continue_model', reason: 'no_allowlisted_match' };
 
   const followUp = selected.entityKind === 'service'
-    ? serviceFollowUp(selected.entityId, frame, catalog)
+    ? serviceFollowUp(selected.entityId, frame, catalog, {
+        preserveDeferredAvailability: input.serviceContextEnabled === true,
+        now: input.now,
+      })
     : professionalFollowUp(selected.entityId, frame, catalog);
   if (!followUp) {
     return { kind: 'continue_model', reason: 'professional_state_mismatch' };

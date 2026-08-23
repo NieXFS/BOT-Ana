@@ -659,6 +659,31 @@ export type CatalogEntityResolution =
   | { kind: 'ambiguous'; entityIds: string[] }
   | { kind: 'no_match'; reason: 'empty' | 'naked_weekday' | 'none' };
 
+export type CatalogEntityMatchKind = MatchKind;
+
+export type CatalogEntityMatchV2 = {
+  id: string;
+  kind: CatalogEntityMatchKind;
+};
+
+/**
+ * Lista colapsada do matcher canônico. Não escolhe; só expõe os IDs testemunhados
+ * no inbound atual para polaridade/correção server-owned.
+ */
+export function listCatalogEntityMatchesFromCurrentMessage(
+  message: string,
+  entities: ServiceLike[],
+  options: CatalogEntityMatchOptions = {}
+): CatalogEntityMatchV2[] {
+  const normalized = normalizeServiceText(message);
+  if (!normalized || entities.length === 0) return [];
+  if (NAKED_WEEKDAY_RE.test(normalized)) return [];
+  return collapseHierarchicalMatches(
+    matchedServices(normalized, entities, options),
+    entities
+  );
+}
+
 function resolveCatalogEntityFromCurrentMessage(
   message: string,
   entities: ServiceLike[],

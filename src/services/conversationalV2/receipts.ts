@@ -128,7 +128,12 @@ function assertRedactedValue(
       throw new Error(`Receipt v2 contém hash fora do formato SHA-256 em ${entryPath}.`);
     }
     const allowedHashedMessageId = key === 'providerMessageIdHash';
-    if (FORBIDDEN_KEY_FRAGMENT_RE.test(key) && !allowedHashedMessageId) {
+    const allowedServiceContextDecision = key === 'serviceContextDecision';
+    if (
+      FORBIDDEN_KEY_FRAGMENT_RE.test(key) &&
+      !allowedHashedMessageId &&
+      !allowedServiceContextDecision
+    ) {
       throw new Error(`Receipt v2 contém campo proibido em ${entryPath}.`);
     }
     if (/result/i.test(key)) {
