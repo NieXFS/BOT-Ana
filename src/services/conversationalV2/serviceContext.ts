@@ -783,8 +783,23 @@ export function planServiceContextV2(input: {
       receipt: temporal ? 'temporal_deferred' : 'not_applicable',
     };
   }
-  const constraint =
-    captured.kind === 'captured' ? captured.constraint : preservedConstraint ?? null;
+  const capturedConstraint =
+    captured.kind === 'captured' ? captured.constraint : null;
+  const constraint = capturedConstraint
+    ? {
+        ...capturedConstraint,
+        ...(capturedConstraint.date
+          ? {}
+          : preservedConstraint?.date
+            ? { date: preservedConstraint.date }
+            : {}),
+        ...(capturedConstraint.timeWindow
+          ? {}
+          : preservedConstraint?.timeWindow
+            ? { timeWindow: preservedConstraint.timeWindow }
+            : {}),
+      }
+    : preservedConstraint ?? null;
   if (!constraint || !availabilityOrBooking) {
     return {
       ...empty,

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import type { TenantBotConfig } from '../src/configProvider';
 import type {
+  FlowStateV2,
   PendingFrameSnapshotV2,
+  TurnDeliveryReceiptV2,
   TurnFrameV2,
   TurnPlanReceiptV2,
 } from '../src/services/conversationalV2/contracts';
@@ -20,11 +22,14 @@ import {
   CONVERSATIONAL_V2_SWEEP_MAX_BACKOFF_MS,
   MemoryConversationalV2StateStore,
   nextConversationalV2SweepDelayMs,
+  resolveLatestFlowStateV2,
   startConversationalV2Sweep,
   stopConversationalV2SweepForTest,
   SUCCESSOR_REARM_DEBOUNCE_MS_V2,
   type ConversationalV2StateStore,
   type MaterializedPendingTransitionV2,
+  type OutboundOutboxRecordV2,
+  type PendingFrameRecordV2,
 } from '../src/services/conversationalV2/stateStore';
 import {
   reprocessSuccessorBatchV2,
@@ -706,6 +711,455 @@ async function main(): Promise<void> {
     ia10DuplicateOptions.map((option) => option.entityId)
   );
 
+  const deferredConstraintFlow: FlowStateV2 = {
+    flowId: 'flow-ia22c',
+    lastOperationalAt: now.toISOString(),
+    deferredAvailability: {
+      schemaVersion: 1,
+      capturedAt: now.toISOString(),
+      capturedTurnId: 'turn-ia22c',
+      capturedInputSequence: 1,
+      date: '2026-08-13',
+      timeWindow: { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 },
+    },
+    fixedByProofVersion: {},
+  };
+  const otherFlow: FlowStateV2 = {
+    flowId: 'flow-pending',
+    lastOperationalAt: now.toISOString(),
+    fixedByProofVersion: {},
+  };
+
+  function receipt(input: {
+    transportOutcome: TurnDeliveryReceiptV2['transportOutcome'];
+    conversationCommitOutcome: TurnDeliveryReceiptV2['conversationCommitOutcome'];
+    terminalAt: string;
+    outboxState: TurnDeliveryReceiptV2['outboxState'];
+  }): TurnDeliveryReceiptV2 {
+    return {
+      schemaVersion: 2,
+      deliveryReceiptId: 'del-ia22c',
+      planReceiptId: 'plan-ia22c',
+      turnId: 'turn-ia22c',
+      deliveryAttemptId: 'da-ia22c',
+      transportStartedAt: now.toISOString(),
+      transportOutcome: input.transportOutcome,
+      providerMessageIdHash: 'hash-ia22c',
+      outboxState: input.outboxState,
+      conversationCommitOutcome: input.conversationCommitOutcome,
+      pendingCommitOutcome: 'not_applicable',
+      expectedPendingVersion: null,
+      observedPendingVersion: null,
+      terminalAt: input.terminalAt,
+    };
+  }
+
+  function outbox(input: {
+    state: OutboundOutboxRecordV2['state'];
+    conversationCommitOutcome: TurnDeliveryReceiptV2['conversationCommitOutcome'];
+    terminalAt: string;
+    nextFlowState?: FlowStateV2;
+    transportOutcome?: TurnDeliveryReceiptV2['transportOutcome'];
+    conversationKey?: string;
+    deliveryAttemptId?: string;
+  }): OutboundOutboxRecordV2 {
+    const transportOutcome = input.transportOutcome ?? (
+      input.state === 'accepted_by_provider'
+        ? 'accepted_by_provider'
+        : input.state === 'transport_failed'
+          ? 'transport_failed'
+          : input.state === 'transport_unknown'
+            ? 'transport_unknown'
+            : 'accepted_by_provider'
+    );
+    const transition: MaterializedPendingTransitionV2 = {
+      kind: 'preserve',
+      nextFlowState: input.nextFlowState ?? deferredConstraintFlow,
+    };
+    const deliveryAttemptId = input.deliveryAttemptId ?? 'da-ia22c';
+    return {
+      deliveryAttemptId,
+      conversationKey: input.conversationKey ?? 'PN:ia22c',
+      turnId: 'turn-ia22c',
+      planReceiptId: 'plan-ia22c',
+      state: input.state,
+      payload: 'Qual serviço você prefere?',
+      transition,
+      providerMessageIdHash: 'hash-ia22c',
+      providerStatus: null,
+      providerStatusAt: null,
+      providerFailureCode: null,
+      providerStatusVersion: 0,
+      transportStartedAt: now.toISOString(),
+      commitPayload: {
+        assistantText: 'Qual serviço você prefere?',
+        transition,
+        deliveryReceipt: receipt({
+          transportOutcome,
+          conversationCommitOutcome: input.conversationCommitOutcome,
+          terminalAt: input.terminalAt,
+          outboxState: input.state === 'accepted_uncommitted'
+            ? 'accepted_uncommitted'
+            : input.state === 'accepted_by_provider'
+              ? 'accepted_by_provider'
+              : input.state === 'transport_failed'
+                ? 'transport_failed'
+                : 'transport_unknown',
+        }),
+      },
+      createdAt: now.toISOString(),
+      updatedAt: input.terminalAt,
+    };
+  }
+
+  function pendingRecord(input: {
+    state: PendingFrameRecordV2['state'];
+    updatedAt: string;
+    flowState?: FlowStateV2;
+  }): PendingFrameRecordV2 {
+    return {
+      conversationKey: 'PN:ia22c',
+      state: input.state,
+      snapshot: {
+        questionId: 'q-ia22c',
+        askedAt: now.toISOString(),
+        kind: 'DATE',
+        flowId: input.flowState?.flowId ?? 'flow-pending',
+        version: 1,
+        options: [{ position: 1, entityId: 'date-freeform', displayName: 'dia' }],
+      },
+      flowState: input.flowState ?? otherFlow,
+      updatedAt: input.updatedAt,
+    };
+  }
+
+  const helperPreserve = resolveLatestFlowStateV2({
+    latestPendingRecord: null,
+    lastAcceptedOutbox: outbox({
+      state: 'accepted_by_provider',
+      conversationCommitOutcome: 'committed',
+      terminalAt: '2026-08-13T15:00:02.000Z',
+    }),
+    now,
+  });
+  assert.ok(helperPreserve?.deferredAvailability);
+  assert.equal(helperPreserve?.deferredAvailability?.date, '2026-08-13');
+
+  const helperOutboxBeatsTerminal = resolveLatestFlowStateV2({
+    latestPendingRecord: pendingRecord({
+      state: 'RESOLVED',
+      updatedAt: '2026-08-13T15:00:01.000Z',
+    }),
+    lastAcceptedOutbox: outbox({
+      state: 'accepted_by_provider',
+      conversationCommitOutcome: 'committed',
+      terminalAt: '2026-08-13T15:00:03.000Z',
+    }),
+    now,
+  });
+  assert.equal(helperOutboxBeatsTerminal?.flowId, 'flow-ia22c');
+  assert.ok(helperOutboxBeatsTerminal?.deferredAvailability);
+
+  const helperOpenWins = resolveLatestFlowStateV2({
+    latestPendingRecord: pendingRecord({
+      state: 'OPEN',
+      updatedAt: '2026-08-13T15:00:04.000Z',
+    }),
+    lastAcceptedOutbox: outbox({
+      state: 'accepted_by_provider',
+      conversationCommitOutcome: 'committed',
+      terminalAt: '2026-08-13T15:00:01.000Z',
+    }),
+    now,
+  });
+  assert.equal(helperOpenWins?.flowId, 'flow-pending');
+  assert.equal(helperOpenWins?.deferredAvailability, undefined);
+
+  for (const state of ['transport_unknown', 'transport_failed', 'accepted_uncommitted'] as const) {
+    const rejected = resolveLatestFlowStateV2({
+      latestPendingRecord: null,
+      lastAcceptedOutbox: outbox({
+        state,
+        conversationCommitOutcome:
+          state === 'accepted_uncommitted' ? 'accepted_uncommitted' : 'failed',
+        terminalAt: '2026-08-13T15:00:09.000Z',
+      }),
+      now,
+    });
+    assert.equal(rejected, null, `${state} nunca restaura flowState`);
+  }
+
+  const helperUncommittedAccepted = resolveLatestFlowStateV2({
+    latestPendingRecord: null,
+    lastAcceptedOutbox: outbox({
+      state: 'accepted_by_provider',
+      conversationCommitOutcome: 'accepted_uncommitted',
+      terminalAt: '2026-08-13T15:00:09.000Z',
+    }),
+    now,
+  });
+  assert.equal(helperUncommittedAccepted, null);
+
+  const helperMalformed = resolveLatestFlowStateV2({
+    latestPendingRecord: null,
+    lastAcceptedOutbox: outbox({
+      state: 'accepted_by_provider',
+      conversationCommitOutcome: 'committed',
+      terminalAt: '2026-08-13T15:00:09.000Z',
+      nextFlowState: { flowId: 'flow-bad', fixedByProofVersion: {} },
+    }),
+    now,
+  });
+  assert.equal(helperMalformed, null);
+
+  const memoryFallback = new MemoryConversationalV2StateStore();
+  const memoryKey = 'PN:ia22c-memory';
+  const memoryOutbox = outbox({
+    state: 'accepted_by_provider',
+    conversationCommitOutcome: 'committed',
+    terminalAt: '2026-08-13T15:00:02.000Z',
+  });
+  memoryOutbox.conversationKey = memoryKey;
+  memoryFallback.outbox.set(memoryOutbox.deliveryAttemptId, memoryOutbox);
+  const memoryLoaded = await memoryFallback.loadLatestState(memoryKey, now);
+  assert.equal(memoryLoaded.pending, null);
+  assert.deepEqual(
+    memoryLoaded.flowState,
+    resolveLatestFlowStateV2({
+      latestPendingRecord: null,
+      lastAcceptedOutbox: memoryOutbox,
+      now,
+    })
+  );
+
+  const memoryOpen = new MemoryConversationalV2StateStore();
+  const memoryOpenKey = 'PN:ia22c-open';
+  memoryOpen.pending.set(memoryOpenKey, [
+    pendingRecord({
+      state: 'OPEN',
+      updatedAt: '2026-08-13T15:00:05.000Z',
+    }),
+  ]);
+  const olderOutbox = outbox({
+    state: 'accepted_by_provider',
+    conversationCommitOutcome: 'committed',
+    terminalAt: '2026-08-13T15:00:01.000Z',
+  });
+  olderOutbox.conversationKey = memoryOpenKey;
+  memoryOpen.outbox.set(olderOutbox.deliveryAttemptId, olderOutbox);
+  const memoryOpenLoaded = await memoryOpen.loadLatestState(memoryOpenKey, now);
+  assert.equal(memoryOpenLoaded.pending?.state, 'OPEN');
+  assert.equal(memoryOpenLoaded.flowState?.flowId, 'flow-pending');
+  assert.equal(memoryOpenLoaded.flowState?.deferredAvailability, undefined);
+
+  // --- IA-22d: cutoff humano durável ---
+  const cutoffAt = '2026-08-13T16:00:00.000Z';
+  const cutoffNow = new Date(cutoffAt);
+  const humanInvalidation = {
+    conversationKey: 'PN:ia22d',
+    invalidatedAt: cutoffAt,
+    reason: 'HUMAN_OWNERSHIP' as const,
+  };
+
+  const helperInvalidatedStripsDeferred = resolveLatestFlowStateV2({
+    latestPendingRecord: pendingRecord({
+      state: 'INVALIDATED',
+      updatedAt: '2026-08-13T15:00:04.000Z',
+      flowState: deferredConstraintFlow,
+    }),
+    lastAcceptedOutbox: null,
+    now,
+  });
+  assert.equal(helperInvalidatedStripsDeferred?.flowId, 'flow-ia22c');
+  assert.equal(
+    helperInvalidatedStripsDeferred?.deferredAvailability,
+    undefined,
+    'invalidated-pending-strips-deferred'
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      helperInvalidatedStripsDeferred ?? {},
+      'deferredAvailability'
+    ),
+    false
+  );
+
+  const helperOpenBeforeCutoff = resolveLatestFlowStateV2({
+    latestPendingRecord: pendingRecord({
+      state: 'OPEN',
+      updatedAt: '2026-08-13T15:00:04.000Z',
+      flowState: deferredConstraintFlow,
+    }),
+    lastAcceptedOutbox: outbox({
+      state: 'accepted_by_provider',
+      conversationCommitOutcome: 'committed',
+      terminalAt: '2026-08-13T15:00:02.000Z',
+    }),
+    now,
+    flowStateInvalidation: humanInvalidation,
+  });
+  assert.equal(
+    helperOpenBeforeCutoff,
+    null,
+    'open-before-cutoff-does-not-resurrect'
+  );
+
+  const helperOutboxAfterCutoff = resolveLatestFlowStateV2({
+    latestPendingRecord: null,
+    lastAcceptedOutbox: outbox({
+      state: 'accepted_by_provider',
+      conversationCommitOutcome: 'committed',
+      terminalAt: '2026-08-13T16:00:01.000Z',
+      nextFlowState: {
+        flowId: 'flow-after-cutoff',
+        lastOperationalAt: '2026-08-13T16:00:01.000Z',
+        deferredAvailability: deferredConstraintFlow.deferredAvailability,
+        fixedByProofVersion: {},
+      },
+    }),
+    now: new Date('2026-08-13T16:00:02.000Z'),
+    flowStateInvalidation: humanInvalidation,
+  });
+  assert.equal(helperOutboxAfterCutoff?.flowId, 'flow-after-cutoff');
+  assert.ok(
+    helperOutboxAfterCutoff?.deferredAvailability,
+    'outbox-after-cutoff-restores-new-context'
+  );
+
+  const takeoverStore = new MemoryConversationalV2StateStore();
+  const takeoverKey = 'PN:ia22d-takeover';
+  const oldDeferredOutbox = outbox({
+    state: 'accepted_by_provider',
+    conversationCommitOutcome: 'committed',
+    terminalAt: '2026-08-13T15:00:02.000Z',
+    conversationKey: takeoverKey,
+    deliveryAttemptId: 'da-ia22d-old',
+  });
+  takeoverStore.outbox.set(oldDeferredOutbox.deliveryAttemptId, oldDeferredOutbox);
+  const beforeTakeover = await takeoverStore.loadLatestState(takeoverKey, now);
+  assert.ok(beforeTakeover.flowState?.deferredAvailability);
+  const takeoverCount = await takeoverStore.invalidateOpenPendingByHuman(
+    takeoverKey,
+    cutoffNow
+  );
+  assert.equal(takeoverCount, 0, 'invalidate-zero-rows-still-writes-cutoff');
+  assert.equal(
+    takeoverStore.flowStateInvalidations.get(takeoverKey)?.reason,
+    'HUMAN_OWNERSHIP'
+  );
+  const afterTakeover = await takeoverStore.loadLatestState(takeoverKey, cutoffNow);
+  assert.equal(afterTakeover.pending, null);
+  assert.equal(
+    afterTakeover.flowState,
+    null,
+    'takeover-without-pending-cuts-outbox'
+  );
+  assert.deepEqual(
+    afterTakeover.flowState,
+    resolveLatestFlowStateV2({
+      latestPendingRecord: null,
+      lastAcceptedOutbox: oldDeferredOutbox,
+      now: cutoffNow,
+      flowStateInvalidation: takeoverStore.flowStateInvalidations.get(takeoverKey) ?? null,
+    }),
+    'memory-and-pg-share-helper-cutoff'
+  );
+
+  const silentCutStore = new MemoryConversationalV2StateStore();
+  const silentKey = 'PN:ia22d-silent';
+  const silentOutbox = outbox({
+    state: 'accepted_by_provider',
+    conversationCommitOutcome: 'committed',
+    terminalAt: '2026-08-13T15:00:02.000Z',
+    conversationKey: silentKey,
+    deliveryAttemptId: 'da-ia22d-silent',
+  });
+  silentCutStore.outbox.set(silentOutbox.deliveryAttemptId, silentOutbox);
+  await silentCutStore.recordFlowStateInvalidation({
+    conversationKey: silentKey,
+    reason: 'SILENT_ESCALATION',
+    now: cutoffNow,
+  });
+  const afterSilent = await silentCutStore.loadLatestState(silentKey, cutoffNow);
+  assert.equal(
+    afterSilent.flowState?.deferredAvailability,
+    undefined,
+    'silent-escalation-cuts-outbox-fallback'
+  );
+  assert.equal(afterSilent.flowState, null);
+
+  const panelCutStore = new MemoryConversationalV2StateStore();
+  const panelKey = 'PN:ia22d-panel';
+  const panelOutbox = outbox({
+    state: 'accepted_by_provider',
+    conversationCommitOutcome: 'committed',
+    terminalAt: '2026-08-13T15:00:02.000Z',
+    conversationKey: panelKey,
+    deliveryAttemptId: 'da-ia22d-panel',
+  });
+  panelCutStore.outbox.set(panelOutbox.deliveryAttemptId, panelOutbox);
+  const panelCount = await panelCutStore.invalidateOpenPendingByHuman(
+    panelKey,
+    cutoffNow
+  );
+  assert.equal(panelCount, 0);
+  const afterPanel = await panelCutStore.loadLatestState(panelKey, cutoffNow);
+  assert.equal(
+    afterPanel.flowState,
+    null,
+    'panel-human-reply-cuts-outbox-fallback'
+  );
+
+  const resurrectOpenStore = new MemoryConversationalV2StateStore();
+  const resurrectKey = 'PN:ia22d-open';
+  resurrectOpenStore.pending.set(resurrectKey, [
+    pendingRecord({
+      state: 'OPEN',
+      updatedAt: '2026-08-13T15:00:04.000Z',
+      flowState: deferredConstraintFlow,
+    }),
+  ]);
+  resurrectOpenStore.pending.get(resurrectKey)![0]!.conversationKey = resurrectKey;
+  await resurrectOpenStore.recordFlowStateInvalidation({
+    conversationKey: resurrectKey,
+    reason: 'HUMAN_OWNERSHIP',
+    now: cutoffNow,
+  });
+  const afterStaleOpen = await resurrectOpenStore.loadLatestState(
+    resurrectKey,
+    cutoffNow
+  );
+  assert.equal(afterStaleOpen.pending, null);
+  assert.equal(afterStaleOpen.flowState, null);
+
+  const afterCutoffStore = new MemoryConversationalV2StateStore();
+  const afterCutoffKey = 'PN:ia22d-after';
+  await afterCutoffStore.recordFlowStateInvalidation({
+    conversationKey: afterCutoffKey,
+    reason: 'HUMAN_OWNERSHIP',
+    now: cutoffNow,
+  });
+  const newOutbox = outbox({
+    state: 'accepted_by_provider',
+    conversationCommitOutcome: 'committed',
+    terminalAt: '2026-08-13T16:00:05.000Z',
+    conversationKey: afterCutoffKey,
+    deliveryAttemptId: 'da-ia22d-new',
+    nextFlowState: {
+      flowId: 'flow-new-after-cutoff',
+      lastOperationalAt: '2026-08-13T16:00:05.000Z',
+      deferredAvailability: deferredConstraintFlow.deferredAvailability,
+      fixedByProofVersion: {},
+    },
+  });
+  afterCutoffStore.outbox.set(newOutbox.deliveryAttemptId, newOutbox);
+  const restoredAfterCutoff = await afterCutoffStore.loadLatestState(
+    afterCutoffKey,
+    new Date('2026-08-13T16:00:06.000Z')
+  );
+  assert.equal(restoredAfterCutoff.flowState?.flowId, 'flow-new-after-cutoff');
+  assert.ok(restoredAfterCutoff.flowState?.deferredAvailability);
+
   if (process.env.ANA_CONVERSATIONAL_V2_SMOKE_DB === '1') {
     const { ensureProcessedMessagesTable } = await import(
       '../src/services/processedMessages'
@@ -772,6 +1226,10 @@ async function main(): Promise<void> {
         await client.query('BEGIN');
         await client.query(
           'DELETE FROM ana_conversation_history WHERE "conversationKey" = $1',
+          [dbConversationKey]
+        );
+        await client.query(
+          'DELETE FROM ana_v2_flow_state_invalidations WHERE conversation_key = $1',
           [dbConversationKey]
         );
         await client.query(

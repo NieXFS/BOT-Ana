@@ -2340,3 +2340,120 @@ Default off. Produção pretendida: `ANA_V2_SERVICE_CONTEXT_ROLLOUT_TENANT_SLUGS
 Não ligar env neste exec. Após merge+deploy do Receps-IA: (1) confirmar v2 allowlist já contém `studio-viti`; (2) setar somente `ANA_V2_SERVICE_CONTEXT_ROLLOUT_TENANT_SLUGS=studio-viti`; (3) reload `receps-ia`; (4) E2E no WhatsApp do Studio: `Tem horário hoje após as 17:30?` + unha/pé e mão → clarificação com restrição, zero write; escolher um serviço testemunhado → um `getAvailableSlots` e só horários depois de 17:30; correção `Não, quero Pedicure` / `Não é X` / `Manicure` fora do subset. Jackeline permanece off. Se o E2E passar, iniciar o sunset de 7 dias.
 
 HEAD permaneceu `6ae93ff` destacado. Sem commit.
+
+## Exec IA-22c — reprovação de campo (constraint some entre turnos)
+
+**Status:** corrigido localmente sobre WIP `d013590`. Sem commit/push/deploy/PM2/`--real`/produção/ERP.
+
+A conferência/sonda do Sol e a primeira conversa real no canário `studio-viti` **reprovaram** o IA-22/IA-22b em campo. A flag estava ligada nos três turnos (`temporal_deferred` / `not_applicable` / `not_applicable`). O planner criou `deferredAvailability`. O descarte foi no commit: `preserve` sem PendingFrame OPEN devolve `not_applicable` e `loadLatestState` só lia `flowState` de `ana_v2_pending_frames`. A constraint ficou no `transition_json` do outbox aceito e o turno 2 começou estado novo.
+
+A lacuna que deixou IA-22 e IA-22b passarem: as fixtures testavam `consumeDeferredAvailabilityV2` / pending já semeado, **não** o round-trip real `getReceptionistReplyV2` → `deliverPreparedReceptionistTurnV2` → recarga do store.
+
+### Causa confirmada
+
+`applyTransition` (Memory `:478`, PG `:1060`) no `preserve` só grava `nextFlowState` se já existe OPEN. Sem OPEN, `pendingCommitOutcome=not_applicable`. `loadLatestState` ignorava o outbox. Hipótese de `serviceContextEnabled` perdido no booking progress: refutada.
+
+### Correção
+
+1. Helper puro `resolveLatestFlowStateV2` compartilhado por Memory e PG: OPEN vigente vence; senão, outbox `accepted_by_provider` + recibo aceito + `conversationCommitOutcome="committed"` + `deferredAvailability` bem-formada + terminal posterior ao pending terminal. `transport_unknown` / `failed` / `accepted_uncommitted` nunca restauram. Sem tabela/migration.
+2. Hidratação no runtime: flag off remove `deferredAvailability` antes de fast-path/modelo, inclusive o fallback do outbox.
+3. Recaptura parcial (`Hoje` só com data) funde com a janela de hora já persistida — necessário para o caminho legitimamente em três passos.
+
+### Fixtures C (entrega principal)
+
+Round-trip runtime no smoke `ana-conversational-v2-service-context`, **sem** chamar o consumidor direto como prova:
+
+| Nome | prova |
+|---|---|
+| `replay-studio-viti-literal` T1 | `Tem horário hoje após as 17:30?` → `interpreter_nenhuma` + `regen` + `preserve` + pending null; recarga do store restaura `deferredAvailability.date` + `AFTER_EXCLUSIVE 17:30` |
+| `replay-studio-viti-literal` T2 | `Drenagem linfática` resolve serviço, consome na hora, 1× `getAvailableSlots`, **não** pergunta data, abre `TIME` só `18:00`/`18:30`/`19:00` |
+| `replay-studio-viti-literal` T3 | `Hoje` redundante não expande; `slotEvidence` e opções `TIME` permanecem na janela |
+| `three-step-date-then-today` T1 | `Tem horário após as 17:30?` (sem data) → mesma rota `interpreter_nenhuma`; só janela de hora |
+| `three-step-date-then-today` T2 | `Drenagem linfática` abre `DATE`, preserva a janela |
+| `three-step-date-then-today` T3 | `Hoje` → 1 read; `TIME` só `18:00`/`18:30`/`19:00` |
+
+### Fixtures D (precedência)
+
+| Nome | prova |
+|---|---|
+| `helper-preserve-pending-null` | preserve aceito + pending null + deferred ⇒ `loadLatestState.flowState` do outbox |
+| `helper-outbox-beats-terminal-pending` | outbox aceito mais novo que pending `RESOLVED` ⇒ outbox vence |
+| `helper-open-pending-wins` | pending OPEN mais novo ⇒ pending vence |
+| `helper-transport-unknown-failed-uncommitted` | esses estados nunca restauram |
+| `helper-accepted-uncommitted-receipt` | recibo sem `committed` nunca restaura |
+| `helper-malformed-constraint` | `nextFlowState` sem `deferredAvailability` válida nunca restaura |
+| `memory-loadLatestState-matches-helper` | Memory usa o mesmo helper |
+| `memory-open-beats-older-outbox` | OPEN no store vence outbox mais velho |
+| `flag-off-sanitizes-outbox-fallback` | hidratação com flag off remove a constraint do fallback |
+
+### Validação (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` | 0 | |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-conversational-v2-service-context` | 0 | inclui C e D de hidratação |
+| `smoke:ana-conversational-v2-persistence` | 0 | helper D + Memory |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-receipt-bookkeeping` | 0 | F1-F8 |
+| `smoke:ana-conversational-v2-silent-escalation` | 0 | |
+| `smoke:debounce-flush` | 0 | 56/56 |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5 |
+| `smoke:ana-v2-tau2` | 0 | hermético; `FAIL:0`; macro `pass1=1`, `pass4=1` |
+
+HEAD permaneceu `d013590` destacado. Sem commit.
+
+## Exec IA-22d — cutoff humano durável (segunda reprovação do Sol)
+
+**Status:** corrigido localmente sobre o WIP de IA-22c. Sem commit/push/deploy/PM2/`--real`/produção/ERP.
+
+O Sol reprovou o IA-22c: o helper único e a Fixture C estavam certos, mas o `flowState` restaurado podia sobreviver a takeover humano. `resolveLatestFlowStateV2` devolveva o `flowState` de pending terminal (ainda com `deferredAvailability`), e `invalidateOpenPendingByHuman` com zero linhas OPEN não deixava marca — o outbox aceito antigo voltava depois da retomada.
+
+Correção da validação declarada no IA-22c: `git diff --check` nesta worktree **não** era 0; media `RELATORIO-GROK-EXEC-1.md:2407: new blank line at EOF` com **exit=2**. A tabela acima permanece como o exec declarou; o exit verdadeiro está nesta seção.
+
+### Contrato do cutoff
+
+`FlowStateInvalidationV2`: `{ conversationKey, invalidatedAt, reason }` com `HUMAN_OWNERSHIP | SILENT_ESCALATION | EXPLICIT_CONVERSATION_RESET`. Mapa Memory + tabela aditiva PG `ana_v2_flow_state_invalidations` (`conversation_key` PK, `invalidated_at` monotônico via `GREATEST`). Sem texto, serviço, telefone separado, WAMID ou payload.
+
+`invalidateOpenPendingByHuman` invalida OPEN e grava `HUMAN_OWNERSHIP` mesmo com 0 linhas. `resolveLatestFlowStateV2` / `projectLatestFlowStateV2` (Memory e PG) só restauram timestamp estritamente posterior a `invalidatedAt`. OPEN anterior ao cutoff falha fechado. Terminais `INVALIDATED`/`SUPERSEDED`/`RESOLVED` saem sem `deferredAvailability`. `EXPIRED` continua null. Outbox aceito depois do cutoff pode iniciar contexto novo.
+
+Fontes: echo Meta (já chamava o método); aba Perguntas/`sendQuestionReply`; `RESUME_APPROVED` → `EXPLICIT_CONVERSATION_RESET` antes do plano; escalada silenciosa autoritativa → `SILENT_ESCALATION`.
+
+### Fixtures (item 5)
+
+| Nome | smoke | prova |
+|---|---|---|
+| `takeover-without-pending-cuts-outbox` | persistence | outbox deferred + pending null + takeover → `flowState` null |
+| `invalidate-zero-rows-still-writes-cutoff` | persistence | `invalidateOpenPendingByHuman` retorna 0 e grava `HUMAN_OWNERSHIP` |
+| `invalidated-pending-strips-deferred` | persistence | pending `INVALIDATED` com deferred → retorno sem o campo |
+| `silent-escalation-cuts-outbox-fallback` | persistence + silent-escalation | cutoff `SILENT_ESCALATION` mata o outbox antigo |
+| `panel-human-reply-cuts-outbox-fallback` | persistence + reply-dedup | painel chama invalidate; `loadLatestState` sem deferred |
+| `outbox-after-cutoff-restores-new-context` | persistence | outbox aceito depois do cutoff restaura |
+| `open-before-cutoff-does-not-resurrect` | persistence | OPEN anterior ao cutoff não vence |
+| `memory-and-pg-share-helper-cutoff` | persistence | Memory `loadLatestState` === helper com o mesmo cutoff; PG usa `projectLatestFlowStateV2` |
+| quatro precedências IA-22c | persistence | preservadas |
+| Fixture C `replay-studio-viti-literal` / `three-step-date-then-today` | service-context | verde |
+| `flag-off-sanitizes-outbox-fallback` | service-context | flag off byte-equivalente |
+
+### Validação (exits reais desta execução)
+
+| Comando | exit | nota |
+|---|---:|---|
+| `git diff --check` (antes de corrigir o newline extra do IA-22c) | 2 | `RELATORIO-GROK-EXEC-1.md:2407: new blank line at EOF` — o IA-22c declarou 0 |
+| `git diff --check` (depois de remover o newline extra) | 0 | exit verdadeiro desta execução |
+| `npx tsc --noEmit` | 0 | |
+| `npm run build` | 0 | |
+| `smoke:ana-conversational-v2-service-context` | 0 | Fixture C + D + resume cutoff |
+| `smoke:ana-conversational-v2-persistence` | 0 | precedências + fixtures IA-22d |
+| `smoke:ana-conversational-v2-silent-escalation` | 0 | runtime grava `SILENT_ESCALATION` |
+| `ANA_SMOKE_SKIP_DB=1 smoke:ana-reply-dedup` | 0 | `panel-human-reply-cuts-outbox-fallback` |
+| `smoke:ana-conversational-v2-route` | 0 | |
+| `smoke:ana-conversational-v2-interpreter` | 0 | |
+| `smoke:ana-conversational-v2-receipt-bookkeeping` | 0 | F1-F8 |
+| `smoke:debounce-flush` | 0 | 56/56 |
+| `smoke:ana-v2-behavioral-receipt` | 0 | schema 5 |
+| `smoke:ana-v2-tau2` | 0 | hermético; `FAIL:0`; macro `pass1=1`, `pass4=1` |
+
+O `git diff --check` depois de remover o newline extra saiu 0. HEAD permaneceu `d013590` destacado. Sem commit.

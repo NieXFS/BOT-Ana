@@ -6,7 +6,7 @@ import {
   sendFreeformMessageWithReceipt,
   WhatsAppReceiptMissingError,
 } from '../whatsappCloudService';
-import { pool } from './contextManager';
+import { parseConversationKey, pool } from './contextManager';
 import {
   canonicalCustomerPhone,
   canonicalConversationKey,
@@ -346,6 +346,15 @@ export interface QuestionReplyDeps {
     idempotencyKey: string;
     conversationKey: string;
   }) => Promise<void>;
+  /**
+   * Ownership humano da aba Perguntas. Opcional nos testes; produção grava o
+   * cutoff v2 mesmo sem PendingFrame OPEN.
+   */
+  invalidateConversationalFlowStateByHuman?: (
+    phoneNumberId: string,
+    customerPhone: string,
+    now?: Date
+  ) => Promise<number>;
 }
 
 async function projectHumanHistoryDefault(
@@ -369,6 +378,38 @@ async function withdrawHumanHistoryDefault(input: {
     input.idempotencyKey,
     input.conversationKey
   );
+}
+
+async function invalidateConversationalFlowStateByHumanDefault(
+  phoneNumberId: string,
+  customerPhone: string,
+  now?: Date
+): Promise<number> {
+  const raw = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS?.trim();
+  if (!raw) return 0;
+  const { getTenantConfig } = await import('../configProvider');
+  const config = await getTenantConfig(phoneNumberId);
+  if (!config) return 0;
+  const [{ isAnaConversationalV2Enabled }, { pgConversationalV2StateStore }] =
+    await Promise.all([
+      import('./conversationalV2/featureFlag'),
+      import('./conversationalV2/stateStore'),
+    ]);
+  if (!isAnaConversationalV2Enabled(config.tenantSlug, raw)) return 0;
+  return pgConversationalV2StateStore.invalidateOpenPendingByHuman(
+    canonicalConversationKey(phoneNumberId, customerPhone),
+    now
+  );
+}
+
+async function recordHumanOwnershipCutoff(
+  phoneNumberId: string,
+  customerPhone: string,
+  deps: QuestionReplyDeps
+): Promise<void> {
+  const invalidate = deps.invalidateConversationalFlowStateByHuman;
+  if (!invalidate) return;
+  await invalidate(phoneNumberId, customerPhone, new Date(deps.now()));
 }
 
 function captureHumanHistoryProjectionFailure(
@@ -468,6 +509,8 @@ const defaultDeps: QuestionReplyDeps = {
   sendReceipt: sendFreeformMessageWithReceipt,
   projectHumanHistory: projectHumanHistoryDefault,
   withdrawHumanHistory: withdrawHumanHistoryDefault,
+  invalidateConversationalFlowStateByHuman:
+    invalidateConversationalFlowStateByHumanDefault,
 };
 
 export function createQuestionReplyDeps(
@@ -539,6 +582,11 @@ async function maybeProjectAcceptedReply(
       acceptedAt: row.humanHistoryAcceptedAt!,
     },
     deps.projectHumanHistory
+  );
+  await recordHumanOwnershipCutoff(
+    row.phoneNumberId,
+    parseConversationKey(row.conversationKey).customerPhone,
+    deps
   );
 }
 
@@ -666,6 +714,11 @@ export async function sendQuestionReply(
             payload: intended.payload,
             acceptedAt: intended.acceptedAt,
           });
+          await recordHumanOwnershipCutoff(
+            input.phoneNumberId,
+            input.customerPhone,
+            deps
+          );
         } catch {
           const row = await deps.store.update(
             input.idempotencyKey,

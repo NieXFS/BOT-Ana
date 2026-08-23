@@ -1341,6 +1341,79 @@ async function main(): Promise<void> {
     '+5511999000200'
   );
   store.setInputSequence(conversationKey, 1);
+  const silentDeferredAt = '2026-08-19T15:00:00.000Z';
+  store.outbox.set('da-silent-old', {
+    deliveryAttemptId: 'da-silent-old',
+    conversationKey,
+    turnId: 'turn-silent-old',
+    planReceiptId: 'plan-silent-old',
+    state: 'accepted_by_provider',
+    payload: 'Qual serviço você prefere?',
+    transition: {
+      kind: 'preserve',
+      nextFlowState: {
+        flowId: 'flow-silent-old',
+        lastOperationalAt: silentDeferredAt,
+        deferredAvailability: {
+          schemaVersion: 1,
+          capturedAt: silentDeferredAt,
+          capturedTurnId: 'turn-silent-old',
+          capturedInputSequence: 1,
+          date: '2026-08-19',
+          timeWindow: { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 },
+        },
+        fixedByProofVersion: {},
+      },
+    },
+    providerMessageIdHash: 'hash-silent-old',
+    providerStatus: null,
+    providerStatusAt: null,
+    providerFailureCode: null,
+    providerStatusVersion: 0,
+    transportStartedAt: silentDeferredAt,
+    commitPayload: {
+      assistantText: 'Qual serviço você prefere?',
+      transition: {
+        kind: 'preserve',
+        nextFlowState: {
+          flowId: 'flow-silent-old',
+          lastOperationalAt: silentDeferredAt,
+          deferredAvailability: {
+            schemaVersion: 1,
+            capturedAt: silentDeferredAt,
+            capturedTurnId: 'turn-silent-old',
+            capturedInputSequence: 1,
+            date: '2026-08-19',
+            timeWindow: { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 },
+          },
+          fixedByProofVersion: {},
+        },
+      },
+      deliveryReceipt: {
+        schemaVersion: 2,
+        deliveryReceiptId: 'del-silent-old',
+        planReceiptId: 'plan-silent-old',
+        turnId: 'turn-silent-old',
+        deliveryAttemptId: 'da-silent-old',
+        transportStartedAt: silentDeferredAt,
+        transportOutcome: 'accepted_by_provider',
+        providerMessageIdHash: 'hash-silent-old',
+        outboxState: 'accepted_by_provider',
+        conversationCommitOutcome: 'committed',
+        pendingCommitOutcome: 'not_applicable',
+        expectedPendingVersion: null,
+        observedPendingVersion: null,
+        terminalAt: silentDeferredAt,
+      },
+    },
+    createdAt: silentDeferredAt,
+    updatedAt: silentDeferredAt,
+  });
+  assert.ok(
+    (await store.loadLatestState(conversationKey, now)).flowState
+      ?.deferredAvailability,
+    'silent-escalation precondição: outbox antigo restaurava deferred'
+  );
   const runtimeHold = new holdMod.MemorySilentEscalationHoldStore();
   const runtimePosts: unknown[] = [];
   const prepared = await runtime.getReceptionistReplyV2({
@@ -1437,6 +1510,15 @@ async function main(): Promise<void> {
   assert.equal(delivered.delivery, 'silent');
   assert.equal(delivered.receipt.transportOutcome, 'silent_escalation');
   assert.equal(delivered.receipt.conversationCommitOutcome, 'not_applicable');
+  assert.equal(
+    store.flowStateInvalidations.get(conversationKey)?.reason,
+    'SILENT_ESCALATION'
+  );
+  assert.equal(
+    (await store.loadLatestState(conversationKey, now)).flowState,
+    null,
+    'silent-escalation-cuts-outbox-fallback'
+  );
 
   // IA-19D F10: os três resultados de reconciliação preservam os recibos
   // IA-19C. Nenhum deles gera providerMessageIdHash, WhatsApp ou write.

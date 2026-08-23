@@ -165,6 +165,10 @@ async function main(): Promise<void> {
 
   let sends = 0;
   let humanObservedBeforeSend = false;
+  const flowStateCutoffs: Array<{
+    phoneNumberId: string;
+    customerPhone: string;
+  }> = [];
   const phoneNumberId = 'pnid-reply-smoke';
   const customerPhone = '5511000000000';
   const sourceInboundMessageId = 'wamid-source-smoke';
@@ -182,6 +186,10 @@ async function main(): Promise<void> {
     projectHumanHistory,
     withdrawHumanHistory: async ({ idempotencyKey }) => {
       withdrawHumanHistoryFrom(humanHistory, rows, idempotencyKey);
+    },
+    invalidateConversationalFlowStateByHuman: async (pnid, phone) => {
+      flowStateCutoffs.push({ phoneNumberId: pnid, customerPhone: phone });
+      return 0;
     },
   };
   const waConfig = {
@@ -228,6 +236,13 @@ async function main(): Promise<void> {
       humanLinesFor(first.providerMessageId)[0]?.content ===
         `[atendente] ${input.text}` &&
       rows.get(input.idempotencyKey)?.humanHistoryRecordedAt != null
+  );
+  check(
+    'panel-human-reply-cuts-outbox-fallback',
+    first.kind === 'sent' &&
+      flowStateCutoffs.length >= 1 &&
+      flowStateCutoffs[0]?.phoneNumberId === phoneNumberId &&
+      flowStateCutoffs[0]?.customerPhone === customerPhone
   );
   check(
     'retry/idempotência não duplica a linha HUMAN',

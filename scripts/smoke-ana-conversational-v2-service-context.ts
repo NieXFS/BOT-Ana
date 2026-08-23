@@ -6,6 +6,7 @@ import {
 } from '../src/services/bookingConfirmationGate';
 import type {
   DeferredAvailabilityConstraintV2,
+  FlowStateV2,
   PendingFrameSnapshotV2,
   TurnFrameV2,
 } from '../src/services/conversationalV2/contracts';
@@ -24,8 +25,11 @@ import {
   buildPolarityAmbiguityCopyV2,
 } from '../src/services/conversationalV2/serviceContext';
 import { getReceptionistReplyV2 } from '../src/services/conversationalV2/runtime';
+import type { ReceptionistTurnControl } from '../src/services/receptionistTurnDecision';
 import {
   MemoryConversationalV2StateStore,
+  resolveLatestFlowStateV2,
+  type OutboundOutboxRecordV2,
   type PendingFrameRecordV2,
 } from '../src/services/conversationalV2/stateStore';
 
@@ -99,6 +103,14 @@ const catalog: ServicesResult = {
       priceFormatted: 'R$ 35,00',
       professionalIds: ['prof-ana'],
     },
+    {
+      id: 'svc-drenagem',
+      name: 'Drenagem linfática',
+      durationMinutes: 50,
+      price: 160,
+      priceFormatted: 'R$ 160,00',
+      professionalIds: ['prof-ana'],
+    },
     ...fillers,
   ],
   professionals: [
@@ -144,7 +156,20 @@ const config = {
 const FAMILY_INBOUND =
   'Tem horário hoje após as 17:30? unha/pé e mão';
 const FULL_SLOTS = ['16:00', '17:00', '17:30', '18:00', '18:30', '19:00'];
+const DAY_SLOTS = [
+  '08:00',
+  '08:30',
+  '09:00',
+  '16:00',
+  '17:00',
+  '17:30',
+  '18:00',
+  '18:30',
+  '19:00',
+];
 const AFTER_EXCLUSIVE_SLOTS = ['18:00', '18:30', '19:00'];
+const SERVICE_QUESTION_COPY = 'Qual serviço você prefere?';
+const DATE_QUESTION_COPY = 'Qual dia você prefere?';
 
 function dateResolutionFor(text: string) {
   return resolveCurrentInboundDateV2({
@@ -201,12 +226,31 @@ function toolSlots(slots: readonly string[]) {
   return JSON.stringify({ success: true, slots: [...slots] });
 }
 
+function interpreterNenhumaLoop() {
+  return {
+    rawReply: '{"choice":"NENHUMA"}',
+    exhausted: false,
+    provider: 'openai' as const,
+    model: 'gpt-4o-mini',
+    providerReportedModels: ['gpt-4o-mini'],
+    rounds: 1,
+    messages: [],
+    toolTrace: [],
+    usage: [{ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }],
+  };
+}
+
 async function runTurn(input: {
   phone: string;
   text: string;
   store: MemoryConversationalV2StateStore;
   enabled: boolean;
   interpreterEnabled?: boolean;
+  interpreterNenhuma?: boolean;
+  regenerateServiceQuestion?: boolean;
+  modelRawReply?: string;
+  modelReply?: string;
+  modelNextPending?: 'SERVICE' | 'PRESERVE';
   sequence?: number;
   slots?: readonly string[];
   toolResponse?: string;
@@ -214,6 +258,7 @@ async function runTurn(input: {
   now?: Date;
   paused?: boolean;
   allowModel?: boolean;
+  turnControl?: ReceptionistTurnControl;
 }) {
   const toolNames: string[] = [];
   const slotPayload = input.slots ?? FULL_SLOTS;
@@ -224,6 +269,7 @@ async function runTurn(input: {
     config,
     interpreterEnabled: input.interpreterEnabled ?? false,
     serviceContextEnabled: input.enabled,
+    ...(input.turnControl ? { turnControl: input.turnControl } : {}),
     turnRuntime: turnRuntime(
       input.text,
       input.sequence ?? 1,
@@ -242,14 +288,51 @@ async function runTurn(input: {
         JSON.stringify({ success: true, appointments: [] }),
       escalateSilent: async () => ({ kind: 'pending' as const }),
       runInterpreter: async () => {
+        if (input.interpreterNenhuma) {
+          return {
+            kind: 'nenhuma' as const,
+            loop: interpreterNenhumaLoop(),
+            reason: 'model_nenhuma',
+          };
+        }
         throw new Error('planner/service-context não deve chamar o intérprete');
       },
+      ...(input.regenerateServiceQuestion
+        ? {
+            regenerate: async () => ({
+              ok: true as const,
+              result: {
+                schemaVersion: 2 as const,
+                reply: SERVICE_QUESTION_COPY,
+                replyPurpose: 'SERVICE_QUESTION' as const,
+                pendingTransitionCandidate: { kind: 'preserve' as const },
+                resolutionCandidate: null,
+                unknownServiceEvidence: null,
+              },
+              resolutionProof: null,
+              providerCalls: 1 as const,
+            }),
+          }
+        : {}),
       runModelLoop: async () => {
+        if (input.modelRawReply !== undefined) {
+          return {
+            rawReply: input.modelRawReply,
+            exhausted: false,
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            providerReportedModels: ['gpt-4o-mini'],
+            rounds: 1,
+            messages: [],
+            toolTrace: [],
+            usage: [{ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }],
+          };
+        }
         if (input.allowModel) {
           return {
             rawReply: JSON.stringify({
-              reply: 'Qual serviço você prefere?',
-              nextPending: 'SERVICE',
+              reply: input.modelReply ?? SERVICE_QUESTION_COPY,
+              nextPending: input.modelNextPending ?? 'SERVICE',
               chosenOptionText: null,
               unknownServiceText: null,
             }),
@@ -313,6 +396,21 @@ function nextFlowState(
     return prepared.transition.nextFlowState ?? prepared.frame.flowState;
   }
   return prepared.transition.nextFlowState;
+}
+
+function openedTimeSlots(
+  prepared: Awaited<ReturnType<typeof getReceptionistReplyV2>>
+): string[] {
+  if (prepared.transition.kind !== 'open') return [];
+  if (prepared.transition.frame.kind !== 'TIME') return [];
+  return prepared.transition.frame.options.map((option) => option.entityId);
+}
+
+function assertWindowOnlySlots(slots: readonly string[]): void {
+  assert.deepEqual([...slots], [...AFTER_EXCLUSIVE_SLOTS]);
+  for (const forbidden of ['08:00', '08:30', '09:00', '16:00', '17:00', '17:30']) {
+    assert.equal(slots.includes(forbidden), false);
+  }
 }
 
 function servicePendingFrame(
@@ -1448,6 +1546,328 @@ async function main(): Promise<void> {
   assert.equal(
     thrownTool.prepared.planReceipt.toolEffects.some((entry) => entry.writeCommitted),
     false
+  );
+
+  // --- IA-22c fixture C: round-trip real pelo store, não o consumidor direto ---
+  const replayStore = new MemoryConversationalV2StateStore();
+  const replayPhone = '5511000000301';
+  const replayKey = `${config.phoneNumberId}:${replayPhone}`;
+  replayStore.setInputSequence(replayKey, 1);
+  const replayTurn1 = await runTurn({
+    phone: replayPhone,
+    text: 'Tem horário hoje após as 17:30?',
+    store: replayStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    regenerateServiceQuestion: true,
+    modelRawReply: '{not-json',
+    sequence: 1,
+  });
+  assert.equal(replayTurn1.prepared.planReceipt.route, 'interpreter_nenhuma');
+  assert.equal(replayTurn1.prepared.planReceipt.recoveryKind, 'regen');
+  assert.equal(replayTurn1.prepared.transition.kind, 'preserve');
+  assert.equal(replayTurn1.prepared.payload, SERVICE_QUESTION_COPY);
+  await deliver(replayTurn1.prepared, replayStore, 1);
+  const replayAfter1 = await replayStore.loadLatestState(replayKey, new Date(clockMs));
+  assert.equal(replayAfter1.pending, null);
+  assert.ok(replayAfter1.flowState?.deferredAvailability);
+  assert.equal(replayAfter1.flowState?.deferredAvailability?.date, '2026-08-13');
+  assert.deepEqual(replayAfter1.flowState?.deferredAvailability?.timeWindow, {
+    kind: 'AFTER_EXCLUSIVE',
+    minuteOfDay: 17 * 60 + 30,
+  });
+
+  replayStore.setInputSequence(replayKey, 2);
+  const replayTurn2 = await runTurn({
+    phone: replayPhone,
+    text: 'Drenagem linfática',
+    store: replayStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    sequence: 2,
+    slots: DAY_SLOTS,
+  });
+  assert.equal(replayTurn2.prepared.planReceipt.route, 'fast_path');
+  assert.equal(nextFlowState(replayTurn2.prepared).fixedServiceId, 'svc-drenagem');
+  assert.equal(
+    replayTurn2.toolNames.filter((name) => name === 'getAvailableSlots').length,
+    1
+  );
+  assert.doesNotMatch(
+    replayTurn2.prepared.payload ?? '',
+    new RegExp(DATE_QUESTION_COPY, 'u')
+  );
+  assert.equal(replayTurn2.prepared.transition.kind, 'open');
+  if (replayTurn2.prepared.transition.kind === 'open') {
+    assert.equal(replayTurn2.prepared.transition.frame.kind, 'TIME');
+  }
+  assertWindowOnlySlots(openedTimeSlots(replayTurn2.prepared));
+  assertWindowOnlySlots(nextFlowState(replayTurn2.prepared).slotEvidence?.slots ?? []);
+  await deliver(replayTurn2.prepared, replayStore, 2);
+  const replayAfter2 = await replayStore.loadLatestState(replayKey, new Date(clockMs));
+  assert.equal(replayAfter2.pending?.snapshot.kind, 'TIME');
+  assertWindowOnlySlots(
+    (replayAfter2.pending?.snapshot.options ?? []).map((option) => option.entityId)
+  );
+  assertWindowOnlySlots(
+    replayAfter2.pending?.flowState.slotEvidence?.slots ??
+      replayAfter2.flowState?.slotEvidence?.slots ??
+      []
+  );
+
+  replayStore.setInputSequence(replayKey, 3);
+  const replayTurn3 = await runTurn({
+    phone: replayPhone,
+    text: 'Hoje',
+    store: replayStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    allowModel: true,
+    modelReply: 'Qual horário você prefere?',
+    modelNextPending: 'PRESERVE',
+    sequence: 3,
+    slots: DAY_SLOTS,
+  });
+  const replayTurn3Slots =
+    openedTimeSlots(replayTurn3.prepared).length > 0
+      ? openedTimeSlots(replayTurn3.prepared)
+      : nextFlowState(replayTurn3.prepared).slotEvidence?.slots ??
+        (replayAfter2.pending?.snapshot.options ?? []).map((option) => option.entityId);
+  assertWindowOnlySlots(replayTurn3Slots);
+  assert.doesNotMatch(replayTurn3.prepared.payload ?? '', /08h|8h30|17h30/u);
+
+  const threeStepStore = new MemoryConversationalV2StateStore();
+  const threeStepPhone = '5511000000302';
+  const threeStepKey = `${config.phoneNumberId}:${threeStepPhone}`;
+  threeStepStore.setInputSequence(threeStepKey, 1);
+  const threeStepTurn1 = await runTurn({
+    phone: threeStepPhone,
+    text: 'Tem horário após as 17:30?',
+    store: threeStepStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    regenerateServiceQuestion: true,
+    modelRawReply: '{not-json',
+    sequence: 1,
+  });
+  assert.equal(threeStepTurn1.prepared.planReceipt.route, 'interpreter_nenhuma');
+  assert.equal(threeStepTurn1.prepared.transition.kind, 'preserve');
+  await deliver(threeStepTurn1.prepared, threeStepStore, 1);
+  const threeStepAfter1 = await threeStepStore.loadLatestState(
+    threeStepKey,
+    new Date(clockMs)
+  );
+  assert.equal(threeStepAfter1.pending, null);
+  assert.equal(threeStepAfter1.flowState?.deferredAvailability?.date, undefined);
+  assert.deepEqual(threeStepAfter1.flowState?.deferredAvailability?.timeWindow, {
+    kind: 'AFTER_EXCLUSIVE',
+    minuteOfDay: 17 * 60 + 30,
+  });
+
+  threeStepStore.setInputSequence(threeStepKey, 2);
+  const threeStepTurn2 = await runTurn({
+    phone: threeStepPhone,
+    text: 'Drenagem linfática',
+    store: threeStepStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    sequence: 2,
+    slots: DAY_SLOTS,
+  });
+  assert.equal(threeStepTurn2.prepared.transition.kind, 'open');
+  if (threeStepTurn2.prepared.transition.kind === 'open') {
+    assert.equal(threeStepTurn2.prepared.transition.frame.kind, 'DATE');
+  }
+  assert.match(threeStepTurn2.prepared.payload ?? '', new RegExp(DATE_QUESTION_COPY, 'u'));
+  assert.equal(
+    threeStepTurn2.toolNames.filter((name) => name === 'getAvailableSlots').length,
+    0
+  );
+  assert.ok(nextFlowState(threeStepTurn2.prepared).deferredAvailability?.timeWindow);
+  assert.equal(nextFlowState(threeStepTurn2.prepared).deferredAvailability?.date, undefined);
+  await deliver(threeStepTurn2.prepared, threeStepStore, 2);
+
+  threeStepStore.setInputSequence(threeStepKey, 3);
+  const threeStepTurn3 = await runTurn({
+    phone: threeStepPhone,
+    text: 'Hoje',
+    store: threeStepStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    sequence: 3,
+    slots: DAY_SLOTS,
+  });
+  assert.equal(
+    threeStepTurn3.toolNames.filter((name) => name === 'getAvailableSlots').length,
+    1
+  );
+  assert.equal(threeStepTurn3.prepared.transition.kind, 'open');
+  if (threeStepTurn3.prepared.transition.kind === 'open') {
+    assert.equal(threeStepTurn3.prepared.transition.frame.kind, 'TIME');
+  }
+  assertWindowOnlySlots(openedTimeSlots(threeStepTurn3.prepared));
+  assertWindowOnlySlots(nextFlowState(threeStepTurn3.prepared).slotEvidence?.slots ?? []);
+
+  // --- IA-22c D: persistência/precedência + kill-switch na hidratação ---
+  const deferredFlow: FlowStateV2 = {
+    flowId: 'flow-outbox-fallback',
+    lastOperationalAt: now.toISOString(),
+    deferredAvailability: {
+      schemaVersion: 1,
+      capturedAt: now.toISOString(),
+      capturedTurnId: 'turn-outbox',
+      capturedInputSequence: 1,
+      date: '2026-08-13',
+      timeWindow: { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 },
+    },
+    fixedByProofVersion: {},
+  };
+  const outboxFallbackStore = new MemoryConversationalV2StateStore();
+  const outboxFallbackPhone = '5511000000303';
+  const outboxFallbackKey = `${config.phoneNumberId}:${outboxFallbackPhone}`;
+  outboxFallbackStore.setInputSequence(outboxFallbackKey, 1);
+  const acceptedOutbox: OutboundOutboxRecordV2 = {
+    deliveryAttemptId: 'da-outbox-fallback',
+    conversationKey: outboxFallbackKey,
+    turnId: 'turn-outbox',
+    planReceiptId: 'plan-outbox',
+    state: 'accepted_by_provider',
+    payload: SERVICE_QUESTION_COPY,
+    transition: { kind: 'preserve', nextFlowState: deferredFlow },
+    providerMessageIdHash: 'hash-outbox',
+    providerStatus: null,
+    providerStatusAt: null,
+    providerFailureCode: null,
+    providerStatusVersion: 0,
+    transportStartedAt: now.toISOString(),
+    commitPayload: {
+      assistantText: SERVICE_QUESTION_COPY,
+      transition: { kind: 'preserve', nextFlowState: deferredFlow },
+      deliveryReceipt: {
+        schemaVersion: 2,
+        deliveryReceiptId: 'del-outbox',
+        planReceiptId: 'plan-outbox',
+        turnId: 'turn-outbox',
+        deliveryAttemptId: 'da-outbox-fallback',
+        transportStartedAt: now.toISOString(),
+        transportOutcome: 'accepted_by_provider',
+        providerMessageIdHash: 'hash-outbox',
+        outboxState: 'accepted_by_provider',
+        conversationCommitOutcome: 'committed',
+        pendingCommitOutcome: 'not_applicable',
+        expectedPendingVersion: null,
+        observedPendingVersion: null,
+        terminalAt: '2026-08-13T15:00:02.000Z',
+      },
+    },
+    createdAt: now.toISOString(),
+    updatedAt: '2026-08-13T15:00:02.000Z',
+  };
+  outboxFallbackStore.outbox.set(acceptedOutbox.deliveryAttemptId, acceptedOutbox);
+  const restored = await outboxFallbackStore.loadLatestState(outboxFallbackKey, now);
+  assert.equal(restored.pending, null);
+  assert.deepEqual(
+    restored.flowState?.deferredAvailability,
+    deferredFlow.deferredAvailability
+  );
+
+  const flagOffHydrate = await runTurn({
+    phone: outboxFallbackPhone,
+    text: 'Drenagem linfática',
+    store: outboxFallbackStore,
+    enabled: false,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    sequence: 1,
+    slots: DAY_SLOTS,
+  });
+  assert.equal(flagOffHydrate.prepared.planReceipt.serviceContextDecision, undefined);
+  assert.equal(nextFlowState(flagOffHydrate.prepared).deferredAvailability, undefined);
+  assert.match(flagOffHydrate.prepared.payload ?? '', new RegExp(DATE_QUESTION_COPY, 'u'));
+  if (flagOffHydrate.prepared.transition.kind === 'open') {
+    assert.equal(flagOffHydrate.prepared.transition.frame.kind, 'DATE');
+  }
+
+  const helperOpen = resolveLatestFlowStateV2({
+    latestPendingRecord: {
+      conversationKey: 'PN:helper',
+      state: 'OPEN',
+      snapshot: {
+        questionId: 'q-open',
+        askedAt: now.toISOString(),
+        kind: 'DATE',
+        flowId: 'flow-open',
+        version: 1,
+        options: [{ position: 1, entityId: 'date-freeform', displayName: 'dia' }],
+      },
+      flowState: {
+        flowId: 'flow-open',
+        lastOperationalAt: '2026-08-13T15:00:05.000Z',
+        fixedByProofVersion: {},
+      },
+      updatedAt: '2026-08-13T15:00:05.000Z',
+    },
+    lastAcceptedOutbox: {
+      ...acceptedOutbox,
+      commitPayload: {
+        ...acceptedOutbox.commitPayload!,
+        deliveryReceipt: {
+          ...acceptedOutbox.commitPayload!.deliveryReceipt,
+          terminalAt: '2026-08-13T15:00:01.000Z',
+        },
+      },
+    },
+    now,
+  });
+  assert.equal(helperOpen?.flowId, 'flow-open');
+  assert.equal(helperOpen?.deferredAvailability, undefined);
+
+  const resumeCutStore = new MemoryConversationalV2StateStore();
+  const resumeCutPhone = '5511000000304';
+  const resumeCutKey = `${config.phoneNumberId}:${resumeCutPhone}`;
+  resumeCutStore.setInputSequence(resumeCutKey, 1);
+  const resumeOutbox: OutboundOutboxRecordV2 = {
+    ...acceptedOutbox,
+    deliveryAttemptId: 'da-resume-cutoff',
+    conversationKey: resumeCutKey,
+  };
+  resumeCutStore.outbox.set(resumeOutbox.deliveryAttemptId, resumeOutbox);
+  assert.ok(
+    (await resumeCutStore.loadLatestState(resumeCutKey, now)).flowState
+      ?.deferredAvailability
+  );
+  const resumeHydrate = await runTurn({
+    phone: resumeCutPhone,
+    text: 'Tem horário hoje após as 17:30?',
+    store: resumeCutStore,
+    enabled: true,
+    interpreterEnabled: true,
+    interpreterNenhuma: true,
+    regenerateServiceQuestion: true,
+    modelRawReply: '{not-json',
+    sequence: 1,
+    turnControl: {
+      disposition: 'RESUME_APPROVED',
+      resumeDecision: 'RESUME_ANA',
+    },
+  });
+  assert.equal(
+    resumeCutStore.flowStateInvalidations.get(resumeCutKey)?.reason,
+    'EXPLICIT_CONVERSATION_RESET'
+  );
+  assert.notEqual(
+    nextFlowState(resumeHydrate.prepared).deferredAvailability?.capturedTurnId,
+    'turn-outbox'
+  );
+  assert.equal(
+    (await resumeCutStore.loadLatestState(resumeCutKey, new Date(clockMs))).flowState,
+    null
   );
 
   console.log('smoke-ana-conversational-v2-service-context: ok');

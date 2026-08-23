@@ -77,6 +77,7 @@ import {
   consumeDeferredAvailabilityV2,
   planServiceContextV2,
   serviceSelectionFollowUpWithConstraintV2,
+  withDeferredAvailabilityV2,
   type ServiceContextPlanV2,
 } from './serviceContext';
 import { isAnaV2ServiceContextEnabled } from './featureFlag';
@@ -977,6 +978,13 @@ export async function getReceptionistReplyV2(input: {
   const startedAt = nowFn();
   const turnId = input.turnRuntime?.turnId ?? id();
   const humanControl = resolveTurnControl(input.turnControl);
+  if (humanControl.disposition === 'RESUME_APPROVED') {
+    await store.recordFlowStateInvalidation({
+      conversationKey,
+      reason: 'EXPLICIT_CONVERSATION_RESET',
+      now: startedAt,
+    });
+  }
   const currentInboundIds =
     input.turnRuntime?.currentInboundIds.length
       ? [...input.turnRuntime.currentInboundIds]
@@ -1040,7 +1048,14 @@ export async function getReceptionistReplyV2(input: {
     now: startedAt,
     timezone: input.config.timezone,
   });
-  const storedFlowState = pendingRecord?.flowState ?? stored.flowState;
+  const storedFlowStateRaw =
+    guard.kind === 'reconstructed'
+      ? pendingRecord?.flowState ?? stored.flowState
+      : stored.flowState;
+  const storedFlowState =
+    storedFlowStateRaw && !serviceContextEnabled
+      ? withDeferredAvailabilityV2(storedFlowStateRaw, null)
+      : storedFlowStateRaw;
   const hydratedStoredFlowState =
     storedFlowState &&
     !storedFlowState.lastOperationalAt &&
@@ -3198,6 +3213,11 @@ export async function getReceptionistReplyV2(input: {
         'silent escalation missing durable hold or authoritative concurrent state'
       );
     }
+    await store.recordFlowStateInvalidation({
+      conversationKey,
+      reason: 'SILENT_ESCALATION',
+      now: nowFn(),
+    });
     emitRouteComparisonShadow({
       legacyRoute: legacyShadowRoute,
       v2Route: 'fallback',

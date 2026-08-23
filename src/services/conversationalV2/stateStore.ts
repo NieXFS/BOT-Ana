@@ -174,6 +174,17 @@ export interface ReceiptReconciliationV2 {
   duplicateDeliveryForPlanCount: number;
 }
 
+export type FlowStateInvalidationReasonV2 =
+  | 'HUMAN_OWNERSHIP'
+  | 'SILENT_ESCALATION'
+  | 'EXPLICIT_CONVERSATION_RESET';
+
+export interface FlowStateInvalidationV2 {
+  conversationKey: string;
+  invalidatedAt: string;
+  reason: FlowStateInvalidationReasonV2;
+}
+
 export interface ConversationalV2LatestState {
   pending: PendingFrameRecordV2 | null;
   flowState: FlowStateV2 | null;
@@ -224,6 +235,11 @@ export interface ConversationalV2StateStore {
   reconcileAcceptedCommit(deliveryAttemptId: string, now?: Date): Promise<PendingCommitResultV2>;
   inspectInboundGuard(conversationKey: string, now?: Date): Promise<InboundDeliveryGuardV2>;
   invalidateOpenPendingByHuman(conversationKey: string, now?: Date): Promise<number>;
+  recordFlowStateInvalidation(input: {
+    conversationKey: string;
+    reason: FlowStateInvalidationReasonV2;
+    now?: Date;
+  }): Promise<void>;
   enqueueSuccessor(input: Omit<
     DurableSuccessorBatchV2,
     'status' | 'nextAttemptAt' | 'createdAt' | 'updatedAt'
@@ -318,6 +334,175 @@ function isCommittedOpeningOutboxForPending(
   );
 }
 
+function transitionNextFlowStateV2(
+  transition: MaterializedPendingTransitionV2
+): FlowStateV2 | undefined {
+  return transition.nextFlowState;
+}
+
+function isPersistedDeferredFlowStateV2(
+  flowState: FlowStateV2 | null | undefined
+): flowState is FlowStateV2 {
+  const constraint = flowState?.deferredAvailability;
+  if (!constraint || constraint.schemaVersion !== 1) return false;
+  if (typeof constraint.capturedAt !== 'string') return false;
+  if (!Number.isFinite(Date.parse(constraint.capturedAt))) return false;
+  if (
+    typeof constraint.capturedTurnId !== 'string' ||
+    constraint.capturedTurnId.trim().length === 0
+  ) {
+    return false;
+  }
+  if (
+    typeof constraint.capturedInputSequence !== 'number' ||
+    !Number.isFinite(constraint.capturedInputSequence)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function committedDeferredFlowStateFromOutboxV2(
+  record: OutboundOutboxRecordV2 | null
+): FlowStateV2 | null {
+  if (!record) return null;
+  if (record.state !== 'accepted_by_provider') return null;
+  const receipt = record.commitPayload?.deliveryReceipt;
+  if (!receipt) return null;
+  if (receipt.transportOutcome !== 'accepted_by_provider') return null;
+  if (receipt.conversationCommitOutcome !== 'committed') return null;
+  const nextFlowState = transitionNextFlowStateV2(record.transition);
+  return isPersistedDeferredFlowStateV2(nextFlowState) ? nextFlowState : null;
+}
+
+function outboxTerminalIsAfterPendingV2(
+  record: OutboundOutboxRecordV2,
+  pending: PendingFrameRecordV2 | null
+): boolean {
+  if (!pending || pending.state === 'EXPIRED') return true;
+  const terminalAt = Date.parse(
+    record.commitPayload?.deliveryReceipt.terminalAt ?? ''
+  );
+  const pendingAt = Date.parse(pending.updatedAt);
+  return Number.isFinite(terminalAt) && Number.isFinite(pendingAt) && terminalAt > pendingAt;
+}
+
+function isStrictlyAfterCutoffV2(
+  timestamp: string | null | undefined,
+  cutoffAt: string | null | undefined
+): boolean {
+  if (!cutoffAt) return true;
+  const value = Date.parse(timestamp ?? '');
+  const cutoff = Date.parse(cutoffAt);
+  return Number.isFinite(value) && Number.isFinite(cutoff) && value > cutoff;
+}
+
+function withoutDeferredAvailabilityV2(flowState: FlowStateV2): FlowStateV2 {
+  const { deferredAvailability: _deferred, ...rest } = clone(flowState);
+  return rest;
+}
+
+function mergeFlowStateInvalidationV2(
+  existing: FlowStateInvalidationV2 | undefined,
+  next: FlowStateInvalidationV2
+): FlowStateInvalidationV2 {
+  if (!existing) return clone(next);
+  const existingAt = Date.parse(existing.invalidatedAt);
+  const nextAt = Date.parse(next.invalidatedAt);
+  if (!Number.isFinite(nextAt)) return clone(existing);
+  if (!Number.isFinite(existingAt) || nextAt > existingAt) return clone(next);
+  return clone(existing);
+}
+
+function restorableOpenPendingV2(
+  open: PendingFrameRecordV2 | null,
+  invalidation: FlowStateInvalidationV2 | null | undefined
+): PendingFrameRecordV2 | null {
+  if (!open) return null;
+  return isStrictlyAfterCutoffV2(open.updatedAt, invalidation?.invalidatedAt)
+    ? open
+    : null;
+}
+
+/**
+ * Precedência da projeção de leitura do flowState v2.
+ * PendingFrame OPEN vigente continua autoritativa só se for estritamente
+ * posterior ao cutoff humano. Sem pending aplicável, um outbox já
+ * aceito/commitado pode restaurar `nextFlowState` somente quando carrega
+ * `deferredAvailability` e o terminal também é posterior ao cutoff.
+ * Terminais INVALIDATED/SUPERSEDED/RESOLVED nunca devolvem
+ * `deferredAvailability`. Não escreve nem reenvia transporte.
+ */
+export function resolveLatestFlowStateV2(input: {
+  latestPendingRecord: PendingFrameRecordV2 | null;
+  lastAcceptedOutbox: OutboundOutboxRecordV2 | null;
+  now: Date;
+  flowStateInvalidation?: FlowStateInvalidationV2 | null;
+}): FlowStateV2 | null {
+  const pending = input.latestPendingRecord;
+  const cutoffAt = input.flowStateInvalidation?.invalidatedAt ?? null;
+  const openApplicable =
+    pending &&
+    pending.state === 'OPEN' &&
+    !isExpired(pending.snapshot, input.now)
+      ? pending
+      : null;
+  const openRestorable = restorableOpenPendingV2(openApplicable, input.flowStateInvalidation);
+  if (openRestorable) return clone(openRestorable.flowState);
+  // OPEN anterior ao cutoff não vence: invalidação incompleta falha fechada.
+  const pendingForFallback = openApplicable && !openRestorable ? null : pending;
+
+  const fromOutbox = committedDeferredFlowStateFromOutboxV2(input.lastAcceptedOutbox);
+  if (
+    fromOutbox &&
+    input.lastAcceptedOutbox &&
+    isStrictlyAfterCutoffV2(
+      input.lastAcceptedOutbox.commitPayload?.deliveryReceipt.terminalAt,
+      cutoffAt
+    ) &&
+    outboxTerminalIsAfterPendingV2(input.lastAcceptedOutbox, pendingForFallback)
+  ) {
+    return clone(fromOutbox);
+  }
+  if (pendingForFallback && pendingForFallback.state !== 'EXPIRED') {
+    if (!isStrictlyAfterCutoffV2(pendingForFallback.updatedAt, cutoffAt)) {
+      return null;
+    }
+    const restored = clone(pendingForFallback.flowState);
+    if (
+      pendingForFallback.state === 'INVALIDATED' ||
+      pendingForFallback.state === 'SUPERSEDED' ||
+      pendingForFallback.state === 'RESOLVED'
+    ) {
+      return withoutDeferredAvailabilityV2(restored);
+    }
+    return restored;
+  }
+  return null;
+}
+
+export function projectLatestFlowStateV2(input: {
+  openPending: PendingFrameRecordV2 | null;
+  latestPending: PendingFrameRecordV2 | null;
+  lastAcceptedOutbox: OutboundOutboxRecordV2 | null;
+  invalidation: FlowStateInvalidationV2 | null;
+  now: Date;
+}): Pick<ConversationalV2LatestState, 'pending' | 'flowState'> {
+  const restorableOpen = restorableOpenPendingV2(
+    input.openPending,
+    input.invalidation
+  );
+  return {
+    pending: restorableOpen ? clone(restorableOpen) : null,
+    flowState: resolveLatestFlowStateV2({
+      latestPendingRecord: input.openPending ?? input.latestPending,
+      lastAcceptedOutbox: input.lastAcceptedOutbox,
+      now: input.now,
+      flowStateInvalidation: input.invalidation,
+    }),
+  };
+}
+
 function reconstructedPending(
   conversationKey: string,
   transition: MaterializedPendingTransitionV2,
@@ -340,6 +525,7 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
   readonly deliveries = new Map<string, TurnDeliveryReceiptV2>();
   readonly successors = new Map<string, DurableSuccessorBatchV2>();
   readonly inputSequences = new Map<string, number>();
+  readonly flowStateInvalidations = new Map<string, FlowStateInvalidationV2>();
   failNextAcceptedCommit = false;
   transportPostCount = 0;
 
@@ -392,16 +578,25 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
             compareAcceptedOutboxByTerminal(left, right, 'asc')
           )[0]
       : undefined;
+    const invalidation = this.flowStateInvalidations.get(conversationKey) ?? null;
+    const projected = projectLatestFlowStateV2({
+      openPending: open,
+      latestPending: latest,
+      lastAcceptedOutbox: lastAccepted ?? null,
+      invalidation,
+      now,
+    });
     return {
-      pending: open ? clone(open) : null,
-      // Uma linha EXPIRED continua física por auditoria, mas nunca ressuscita
-      // o flowState operacional da sessão encerrada.
-      flowState:
-        latest && latest.state !== 'EXPIRED' ? clone(latest.flowState) : null,
+      pending: projected.pending,
+      // OPEN vigente continua autoritativa depois do cutoff. Sem pending
+      // aplicável, o outbox aceito/commitado pode projetar deferredAvailability
+      // já persistida em transition_json — sem escrever de novo nem reenviar
+      // transporte, e nunca após um cutoff humano.
+      flowState: projected.flowState,
       lastAcceptedDelivery: lastAccepted
         ? acceptedDeliveryEvidenceFromOutbox(lastAccepted)
         : null,
-      openingAcceptedDelivery: openingAccepted
+      openingAcceptedDelivery: projected.pending && openingAccepted
         ? acceptedDeliveryEvidenceFromOutbox(openingAccepted)
         : null,
     };
@@ -648,7 +843,32 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
       row.updatedAt = iso(now);
       count += 1;
     }
+    await this.recordFlowStateInvalidation({
+      conversationKey,
+      reason: 'HUMAN_OWNERSHIP',
+      now,
+    });
     return count;
+  }
+
+  async recordFlowStateInvalidation(input: {
+    conversationKey: string;
+    reason: FlowStateInvalidationReasonV2;
+    now?: Date;
+  }): Promise<void> {
+    const now = input.now ?? new Date();
+    const next: FlowStateInvalidationV2 = {
+      conversationKey: input.conversationKey,
+      invalidatedAt: iso(now),
+      reason: input.reason,
+    };
+    this.flowStateInvalidations.set(
+      input.conversationKey,
+      mergeFlowStateInvalidationV2(
+        this.flowStateInvalidations.get(input.conversationKey),
+        next
+      )
+    );
   }
 
   async enqueueSuccessor(input: Omit<
@@ -922,6 +1142,17 @@ export async function ensureConversationalV2Tables(): Promise<void> {
     ON ana_v2_successor_batches (next_attempt_at, created_at)
     WHERE status = 'queued'
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ana_v2_flow_state_invalidations (
+      conversation_key text PRIMARY KEY,
+      invalidated_at timestamptz NOT NULL,
+      reason text NOT NULL CHECK (reason IN (
+        'HUMAN_OWNERSHIP',
+        'SILENT_ESCALATION',
+        'EXPLICIT_CONVERSATION_RESET'
+      ))
+    )
+  `);
   await ensureProviderStatusV2Tables();
 }
 
@@ -976,6 +1207,38 @@ interface RawSuccessorRowV2 {
 function dateIso(value: Date | string): string {
   return (value instanceof Date ? value : new Date(value)).toISOString();
 }
+
+interface RawFlowStateInvalidationRowV2 {
+  conversation_key: string;
+  invalidated_at: Date | string;
+  reason: FlowStateInvalidationReasonV2;
+}
+
+function invalidationFromRow(
+  row: RawFlowStateInvalidationRowV2
+): FlowStateInvalidationV2 {
+  return {
+    conversationKey: row.conversation_key,
+    invalidatedAt: dateIso(row.invalidated_at),
+    reason: row.reason,
+  };
+}
+
+const UPSERT_FLOW_STATE_INVALIDATION_SQL = `
+INSERT INTO ana_v2_flow_state_invalidations (
+  conversation_key, invalidated_at, reason
+) VALUES ($1, $2, $3)
+ON CONFLICT (conversation_key) DO UPDATE SET
+  invalidated_at = GREATEST(
+    ana_v2_flow_state_invalidations.invalidated_at,
+    EXCLUDED.invalidated_at
+  ),
+  reason = CASE
+    WHEN EXCLUDED.invalidated_at > ana_v2_flow_state_invalidations.invalidated_at
+    THEN EXCLUDED.reason
+    ELSE ana_v2_flow_state_invalidations.reason
+  END
+`;
 
 function pendingFromRow(row: RawPendingRowV2): PendingFrameRecordV2 {
   return {
@@ -1335,27 +1598,40 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
           ]
         )
       : Promise.resolve({ rows: [] as RawOutboxRowV2[] });
-    const [latestResult, acceptedResult, openingResult] = await Promise.all([
-      latest,
-      accepted,
-      opening,
-    ]);
+    const invalidationQuery = pool.query<RawFlowStateInvalidationRowV2>(
+      `SELECT conversation_key, invalidated_at, reason
+       FROM ana_v2_flow_state_invalidations
+       WHERE conversation_key = $1`,
+      [conversationKey]
+    );
+    const [latestResult, acceptedResult, openingResult, invalidationResult] =
+      await Promise.all([latest, accepted, opening, invalidationQuery]);
     const lastAccepted = acceptedResult.rows[0]
       ? outboxFromRow(acceptedResult.rows[0])
       : null;
     const openingAccepted = openingResult.rows[0]
       ? outboxFromRow(openingResult.rows[0])
       : null;
+    const latestPending = latestResult.rows[0]
+      ? pendingFromRow(latestResult.rows[0])
+      : null;
+    const invalidation = invalidationResult.rows[0]
+      ? invalidationFromRow(invalidationResult.rows[0])
+      : null;
+    const projected = projectLatestFlowStateV2({
+      openPending: open,
+      latestPending,
+      lastAcceptedOutbox: lastAccepted,
+      invalidation,
+      now,
+    });
     return {
-      pending: open,
-      flowState:
-        latestResult.rows[0] && latestResult.rows[0].state !== 'EXPIRED'
-          ? latestResult.rows[0].flow_state_json
-          : null,
+      pending: projected.pending,
+      flowState: projected.flowState,
       lastAcceptedDelivery: lastAccepted
         ? acceptedDeliveryEvidenceFromOutbox(lastAccepted)
         : null,
-      openingAcceptedDelivery: openingAccepted
+      openingAcceptedDelivery: projected.pending && openingAccepted
         ? acceptedDeliveryEvidenceFromOutbox(openingAccepted)
         : null,
     };
@@ -1504,13 +1780,35 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
     return { kind: 'clear', pending: state.pending };
   },
   async invalidateOpenPendingByHuman(conversationKey, now = new Date()) {
-    const result = await pool.query(
-      `UPDATE ana_v2_pending_frames
-       SET state = 'INVALIDATED', version = version + 1, updated_at = $2
-       WHERE conversation_key = $1 AND state = 'OPEN'`,
-      [conversationKey, now]
-    );
-    return result.rowCount ?? 0;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `UPDATE ana_v2_pending_frames
+         SET state = 'INVALIDATED', version = version + 1, updated_at = $2
+         WHERE conversation_key = $1 AND state = 'OPEN'`,
+        [conversationKey, now]
+      );
+      await client.query(UPSERT_FLOW_STATE_INVALIDATION_SQL, [
+        conversationKey,
+        now,
+        'HUMAN_OWNERSHIP',
+      ]);
+      await client.query('COMMIT');
+      return result.rowCount ?? 0;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch { /* preserve */ }
+      throw error;
+    } finally {
+      client.release();
+    }
+  },
+  async recordFlowStateInvalidation(input) {
+    await pool.query(UPSERT_FLOW_STATE_INVALIDATION_SQL, [
+      input.conversationKey,
+      input.now ?? new Date(),
+      input.reason,
+    ]);
   },
   async enqueueSuccessor(input) {
     const result = await pool.query<RawSuccessorRowV2>(
