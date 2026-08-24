@@ -1,6 +1,7 @@
 import type { HumanControlDisposition } from '../receptionistTurnDecision';
 import type { CopyVariantIdV2 } from './copyVariants';
 import type { VoiceReceiptV2 } from './voice/types';
+import type { SemanticServiceResolverReceipt } from './semanticServiceResolver';
 
 export const MODEL_REPLY_PURPOSES_V2 = [
   'SOCIAL',
@@ -505,6 +506,8 @@ export interface TurnPlanReceiptV2 {
   voice?: VoiceReceiptV2;
   /** Decisão redacted do planner de contexto de serviço; sem nomes/IDs/texto. */
   serviceContextDecision?: ServiceContextReceiptDecisionV2;
+  /** IA-25: subrecibo fechado da Camada B, sem evidência/PII/catálogo. */
+  semanticServiceResolution?: SemanticServiceResolverReceipt;
   result: 'accepted_for_delivery';
 }
 

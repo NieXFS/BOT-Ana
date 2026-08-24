@@ -7,6 +7,10 @@ export const ANA_V2_SERVICE_CONTEXT_ROLLOUT_TENANT_SLUGS_ENV =
 export const ANA_V2_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS_ENV =
   'ANA_V2_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS';
 
+/** IA-25: rollout estreito da camada semântica separada (default vazio/off). */
+export const ANA_V2_SEMANTIC_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS_ENV =
+  'ANA_V2_SEMANTIC_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS';
+
 /**
  * Allowlist deliberadamente fechada. O contrato v2 proíbe `*`; vazio, ausente
  * ou uma entrada inválida mantêm o tenant integralmente na rota v1.
@@ -64,6 +68,41 @@ export function isAnaV2ServiceResolverEnabled(
   }
   if (!isAnaConversationalV2Enabled(tenantSlug)) return false;
   if (serviceContextEnabled !== true) return false;
+  const slug = tenantSlug.trim();
+  if (!slug || !rawAllowlist?.trim()) return false;
+  const entries = rawAllowlist
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (entries.includes('*')) return false;
+  return entries.includes(slug);
+}
+
+/**
+ * IA-25 é um braço estritamente posterior aos gates da IA-24: um tenant só
+ * pode chamar o classificador semântico quando já está na V2, com contexto de
+ * serviço e com o resolvedor determinístico IA-24 ativos. `*` permanece
+ * proibido; fixtures podem injetar o booleano sem mutar o ambiente.
+ */
+export function isAnaV2SemanticServiceResolverEnabled(
+  tenantSlug: string,
+  explicit?: boolean,
+  serviceContextEnabled?: boolean,
+  serviceResolverEnabled?: boolean,
+  rawAllowlist =
+    process.env[ANA_V2_SEMANTIC_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS_ENV]
+): boolean {
+  if (typeof explicit === 'boolean') {
+    return (
+      explicit &&
+      serviceContextEnabled === true &&
+      serviceResolverEnabled === true
+    );
+  }
+  if (!isAnaConversationalV2Enabled(tenantSlug)) return false;
+  if (serviceContextEnabled !== true || serviceResolverEnabled !== true) {
+    return false;
+  }
   const slug = tenantSlug.trim();
   if (!slug || !rawAllowlist?.trim()) return false;
   const entries = rawAllowlist

@@ -81,11 +81,23 @@ import {
   withDeferredAvailabilityV2,
   type ServiceContextPlanV2,
 } from './serviceContext';
-import { mergeAuthoritativeServiceAliases } from './serviceResolver';
+import {
+  mergeAuthoritativeServiceAliases,
+  resolveServiceFromCatalog,
+  type ServiceResolverResult,
+} from './serviceResolver';
 import {
   isAnaV2ServiceContextEnabled,
+  isAnaV2SemanticServiceResolverEnabled,
   isAnaV2ServiceResolverEnabled,
 } from './featureFlag';
+import {
+  resolveSemanticService,
+  semanticDecisionToServiceResolverResult,
+  SEMANTIC_SERVICE_SAFE_CLARIFICATION_V2,
+  type SemanticServiceCompletionFactory,
+  type SemanticServiceResolverReceipt,
+} from './semanticServiceResolver';
 import {
   hasExplicitAvailabilityReadRequestV2,
   hasExplicitUpcomingReadRequestV2,
@@ -277,6 +289,12 @@ export interface ReceptionistV2RuntimeDeps {
   serviceContextEnabled?: boolean;
   /** IA-24: rollout do resolvedor tenant-scoped; default OFF. */
   serviceResolverEnabled?: boolean;
+  /** IA-25: rollout estreito da Camada B; produção omite e fica OFF. */
+  semanticServiceResolverEnabled?: boolean;
+  /** Fixture-only completion; produção usa o adapter DeepSeek fixo. */
+  semanticServiceCompletionFactory?: SemanticServiceCompletionFactory;
+  /** Versão aditiva do catálogo, quando o contrato externo a fornecer. */
+  semanticCatalogVersion?: string;
   /** Somente observabilidade injetada; não é recibo nem log de produção. */
   onRejectedBoundaryCandidate?: (input: {
     stage: 'primary' | 'regen';
@@ -966,6 +984,8 @@ export async function getReceptionistReplyV2(input: {
   serviceContextEnabled?: boolean;
   /** IA-24: rollout do resolvedor tenant-scoped; fixtures injetam explicitamente. */
   serviceResolverEnabled?: boolean;
+  /** IA-25: rollout da Camada B; default vazio/off. */
+  semanticServiceResolverEnabled?: boolean;
   deps?: ReceptionistV2RuntimeDeps;
 }): Promise<PreparedReceptionistTurnV2> {
   const deps = input.deps ?? {};
@@ -990,6 +1010,16 @@ export async function getReceptionistReplyV2(input: {
     input.serviceResolverEnabled ?? deps.serviceResolverEnabled,
     serviceContextEnabled
   );
+  // Resolvido uma única vez no início do turno: IA-25 nunca pode ser ligado
+  // no meio do fluxo por uma leitura tardia de env/configuração.
+  const semanticServiceResolverEnabled =
+    isAnaV2SemanticServiceResolverEnabled(
+      input.config.tenantSlug,
+      input.semanticServiceResolverEnabled ??
+        deps.semanticServiceResolverEnabled,
+      serviceContextEnabled,
+      serviceResolverEnabled
+    );
   const elicitationVariant = resolveElicitationVariantV2(
     input.elicitationVariant
   );
@@ -1181,6 +1211,7 @@ export async function getReceptionistReplyV2(input: {
   let provenancedPayload: string | null = null;
   let voiceReceipt: TurnPlanReceiptV2['voice'];
   let serviceContextDecisionReceipt: TurnPlanReceiptV2['serviceContextDecision'];
+  let semanticServiceResolutionReceipt: SemanticServiceResolverReceipt | undefined;
   let serviceContextOwnedTurn = false;
 
   const makePlan = (args: {
@@ -1226,6 +1257,9 @@ export async function getReceptionistReplyV2(input: {
     ...(args.voice ? { voice: args.voice } : {}),
     ...(serviceContextDecisionReceipt
       ? { serviceContextDecision: serviceContextDecisionReceipt }
+      : {}),
+    ...(semanticServiceResolutionReceipt
+      ? { semanticServiceResolution: semanticServiceResolutionReceipt }
       : {}),
     result: 'accepted_for_delivery',
   });
@@ -1961,7 +1995,7 @@ export async function getReceptionistReplyV2(input: {
       : []),
   ];
 
-  const serviceContextPlan: ServiceContextPlanV2 = planServiceContextV2({
+  let serviceContextPlan: ServiceContextPlanV2 = planServiceContextV2({
     enabled: serviceContextEnabled,
     serviceResolverEnabled,
     frame,
@@ -1977,6 +2011,100 @@ export async function getReceptionistReplyV2(input: {
     turnId,
     inputSequence,
   });
+  // IA-25 fica depois do primeiro passe da IA-24 (Camada A), mas antes de
+  // qualquer intérprete, loop principal ou recovery. O segundo passe abaixo é
+  // puro: ele só materializa a decisão B já validada no mesmo planner
+  // server-owned, preservando constraints/janelas capturadas neste turno.
+  if (semanticServiceResolverEnabled) {
+    const deterministicServiceResult: ServiceResolverResult =
+      resolveServiceFromCatalog({
+        text: currentInboundBatchText,
+        catalog: services,
+      });
+    const semanticFlow = hasPositiveExplicitBookingVerbV2(currentInboundBatchText)
+      ? 'booking' as const
+      : hasExplicitAvailabilityReadRequestV2(currentInboundBatchText)
+        ? 'availability' as const
+        : frame.pending?.kind === 'SERVICE'
+          ? 'service_selection' as const
+          : 'other' as const;
+    const semanticOutcome = await resolveSemanticService({
+      tenantSlug: input.config.tenantSlug,
+      currentBatch: currentInboundBatchText,
+      catalog: services,
+      config: input.config,
+      deterministicResult: deterministicServiceResult,
+      ...(deps.semanticCatalogVersion
+        ? { catalogVersion: deps.semanticCatalogVersion }
+        : {}),
+      context: {
+        flow: semanticFlow,
+        pendingKind: frame.pending?.kind ?? null,
+        fixedServiceId: frame.flowState.fixedServiceId ?? null,
+      },
+      ...(deps.semanticServiceCompletionFactory
+        ? { completionFactory: deps.semanticServiceCompletionFactory }
+        : {}),
+      now: () => Date.now(),
+    });
+    semanticServiceResolutionReceipt = semanticOutcome.receipt;
+    const semanticServiceResult = semanticOutcome.decision
+      ? semanticDecisionToServiceResolverResult(
+          semanticOutcome.decision,
+          services
+        )
+      : null;
+    if (semanticServiceResult) {
+      serviceContextPlan = planServiceContextV2({
+        enabled: serviceContextEnabled,
+        serviceResolverEnabled,
+        semanticServiceResolverResult: semanticServiceResult,
+        frame,
+        inboundText: currentInboundBatchText,
+        inboundMessages: currentInboundIds.map((inboundId) => ({
+          inboundId,
+          text: inboundTextsById[inboundId] ?? '',
+        })),
+        catalog: services,
+        now: startedAt,
+        dateResolution,
+        timezone: input.config.timezone,
+        turnId,
+        inputSequence,
+      });
+    } else if (
+      semanticOutcome.reason === 'provider_error' ||
+      semanticOutcome.reason === 'invalid_response' ||
+      semanticOutcome.reason === 'rejected_evidence' ||
+      (semanticOutcome.decision !== null && semanticServiceResult === null) ||
+      (semanticOutcome.reason === 'accepted' &&
+        semanticOutcome.receipt.status === 'none')
+    ) {
+      // Falha da Camada B não devolve o turno ao modelo geral: mantém o
+      // estado temporal já capturado e abre uma pergunta SERVICE tipada, sem
+      // candidatos inventados. A resposta é server-owned e não chama agenda.
+      serviceContextPlan = {
+        decision: { kind: 'none' },
+        receipt: serviceContextPlan.receipt,
+        vetoFamilyFastPath: true,
+        capturedConstraint: serviceContextPlan.capturedConstraint,
+        result: {
+          schemaVersion: 2,
+          reply: SEMANTIC_SERVICE_SAFE_CLARIFICATION_V2,
+          replyPurpose: 'SERVICE_QUESTION',
+          pendingTransitionCandidate: {
+            kind: 'open',
+            pendingKind: 'SERVICE',
+            flowId: frame.flowState.flowId,
+            optionEntityIds: [],
+          },
+          resolutionCandidate: null,
+          unknownServiceEvidence: null,
+        },
+        nextFlowState: serviceContextPlan.nextFlowState ?? frame.flowState,
+      };
+    }
+  }
   if (serviceContextEnabled) {
     serviceContextDecisionReceipt = serviceContextPlan.receipt;
   }

@@ -903,6 +903,8 @@ function findSelectedDeferredWindowV2(input: {
 export function planServiceContextV2(input: {
   enabled: boolean;
   serviceResolverEnabled?: boolean;
+  /** IA-25: decisão B já validada; substitui somente a decisão A deste passe. */
+  semanticServiceResolverResult?: ServiceResolverResult;
   frame: TurnFrameV2;
   inboundText: string;
   inboundMessages?: readonly { inboundId: string; text: string }[];
@@ -997,9 +999,11 @@ export function planServiceContextV2(input: {
             : {}),
       }
     : preservedConstraint ?? null;
-  const resolverDecision: ServiceResolverResult | null = input.serviceResolverEnabled
-    ? resolveServiceFromCatalog({ text: input.inboundText, catalog: input.catalog })
-    : null;
+  const resolverDecision: ServiceResolverResult | null =
+    input.semanticServiceResolverResult ??
+    (input.serviceResolverEnabled
+      ? resolveServiceFromCatalog({ text: input.inboundText, catalog: input.catalog })
+      : null);
   if (resolverDecision?.kind === 'negative_clarification') {
     return {
       decision: { kind: 'ambiguous_negation', mentionedServiceIds: resolverDecision.mentionedServiceIds },

@@ -9,7 +9,11 @@ import type { AuthoritativeOutboundCatalog } from '../receptionistOutbound';
  * instrução.
  */
 
-export type ServiceResolverSource = 'canonical_exact' | 'alias_exact';
+export type ServiceResolverSource =
+  | 'canonical_exact'
+  | 'alias_exact'
+  /** IA-25: decisão já validada pela camada semântica separada. */
+  | 'semantic';
 
 export type ServiceResolverReason =
   | 'catalog_unavailable'

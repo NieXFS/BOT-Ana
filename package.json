@@ -63,6 +63,7 @@
     "smoke:ana-conversational-v2-route": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-route.ts",
     "smoke:ana-conversational-v2-service-context": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-service-context.ts",
     "smoke:ana-service-resolver": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-service-resolver.ts",
+    "smoke:ana-semantic-service-resolver": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid DEEPSEEK_API_KEY=sk-deepseek-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-semantic-service-resolver.ts",
     "smoke:ana-ia24-deepseek-real": "ts-node -T scripts/smoke-ana-ia24-deepseek-real.ts",
     "smoke:ana-ia24-pg-real": "ts-node -T scripts/smoke-ana-ia24-pg-real.ts",
     "smoke:ana-ia24-field-pg-real": "ts-node -T scripts/smoke-ana-ia24-field-route-pg-real.ts",
