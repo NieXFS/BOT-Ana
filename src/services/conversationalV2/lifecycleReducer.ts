@@ -49,6 +49,26 @@ function joinedTimes(slots: readonly string[]): string {
   return `${displayed.slice(0, -1).join(', ')} e ${displayed.at(-1)}`;
 }
 
+/**
+ * Copy viva da oferta de slots. Os dois produtores de disponibilidade (o
+ * reducer normal e o consumo de disponibilidade adiada) precisam compartilhar
+ * o elicitor que o contrato matcher testa. `rawSlots` preserva os bytes do
+ * caminho legado de serviceContext, que historicamente transporta HH:MM;
+ * o reducer usa a forma humana (18h/18h30).
+ */
+export function buildSlotOfferCopyV2(input: {
+  date: string;
+  slots: readonly string[];
+  courtesyAcknowledgement?: boolean;
+  rawSlots?: boolean;
+}): string {
+  const slotText = input.rawSlots
+    ? input.slots.join(', ')
+    : joinedTimes(input.slots);
+  const courtesy = input.courtesyAcknowledgement ? 'Obrigada! ' : '';
+  return `${courtesy}Encontrei horários para ${displayDateV2(input.date)}: ${slotText}. Qual você prefere?`;
+}
+
 function latestSuccessfulSlots(input: {
   toolTrace: readonly ReceptionistToolTraceEntry[];
   services: ServicesResult;
@@ -247,16 +267,18 @@ export function reduceToolLifecycleV2(input: {
   const socialAcknowledgement = /\bobrigad[ao]s?\b/iu.test(
     input.sourceInboundText ?? ''
   )
-    ? 'Obrigada! '
-    : '';
+    ? true
+    : false;
   return {
     kind: 'canonical_slots',
     nextFlowState,
     result: {
       schemaVersion: 2,
-      reply: `${socialAcknowledgement}Encontrei horários para ${displayDateV2(
-        evidence.date
-      )}: ${joinedTimes(evidence.slots)}. Qual você prefere?`,
+      reply: buildSlotOfferCopyV2({
+        date: evidence.date,
+        slots: evidence.slots,
+        courtesyAcknowledgement: socialAcknowledgement,
+      }),
       replyPurpose: 'DATE_TIME_QUESTION',
       pendingTransitionCandidate: {
         kind: 'open',

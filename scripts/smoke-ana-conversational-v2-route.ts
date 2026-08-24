@@ -2741,7 +2741,7 @@ async function main(): Promise<void> {
   const duplicatePassRead = async () => {
     duplicatePassReads += 1;
     return duplicatePassReads === 1
-      ? JSON.stringify({ success: false, reason: 'executor_error' })
+      ? JSON.stringify({ success: true, appointments: [] })
       : conflictingUpcoming;
   };
   duplicatePassStore.setInputSequence(duplicatePassKey, 1);
@@ -2784,6 +2784,19 @@ async function main(): Promise<void> {
       ?.snapshot.kind,
     'CONFIRMATION'
   );
+  // The first no-conflict read is intentionally consumed by the canonical
+  // summary. For this conflict branch, force a fresh preflight on the next
+  // turn instead of reusing that clearance as a test-only shortcut.
+  const duplicatePassPendingRecord = duplicatePassStore.pending
+    .get(duplicatePassKey)
+    ?.at(-1);
+  if (duplicatePassPendingRecord) {
+    const {
+      duplicatePreflightClearance: _clearance,
+      ...flowWithoutClearance
+    } = duplicatePassPendingRecord.flowState;
+    duplicatePassPendingRecord.flowState = flowWithoutClearance;
+  }
 
   duplicatePassStore.setInputSequence(duplicatePassKey, 2);
   const duplicateQuestionPrepared = await getReceptionistReplyV2({

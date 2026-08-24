@@ -111,7 +111,13 @@ function compactPendingAffirmativePosition(
       ? option.position
       : null;
   }
-  return compactAffirmative(inboundText) ? option.position : null;
+  const normalized = normalize(inboundText);
+  const singleOptionDemonstrative = /^(?:esse|essa|este|esta|aquele|aquela)$/u.test(
+    normalized
+  );
+  return compactAffirmative(inboundText) || singleOptionDemonstrative
+    ? option.position
+    : null;
 }
 
 function pendingFresh(frame: TurnFrameV2, now: Date): boolean {

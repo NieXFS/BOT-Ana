@@ -1299,8 +1299,8 @@ export async function resolveTimeDuplicatePreflightV2(input: {
   }
   if (conflicts.length === 0) {
     return {
-      kind: 'continue_model',
-      reason: 'no_duplicate_conflict',
+      kind: 'resolved',
+      result: followUp.result,
       loop,
       proof,
       nextFlowState: withNoConflictClearanceV2({

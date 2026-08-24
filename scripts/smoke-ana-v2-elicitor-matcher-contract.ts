@@ -53,6 +53,22 @@ async function main(): Promise<void> {
     'linha de DATE'
   );
   assert.ok(
+    rows.some((row) => row.nome === 'oferta de horário — opção única'),
+    'linha TIME de opção única derivada da copy viva'
+  );
+  assert.ok(
+    rows.some((row) => row.nome === 'oferta de horário — serviceContext HH:MM'),
+    'linha TIME HH:MM do serviceContext'
+  );
+  assert.ok(
+    rows.some((row) => row.nome === 'oferta de horário — duas opções'),
+    'linha TIME multi-opção derivada da copy viva'
+  );
+  assert.ok(
+    rows.some((row) => row.nome === 'legado SERVICE — copy viva Algum desses'),
+    'linha da copy legada SERVICE também coberta'
+  );
+  assert.ok(
     rows.some(
       (row) =>
         row.nome ===

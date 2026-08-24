@@ -26,7 +26,7 @@ export interface ReceptionistTurnPermissionContext {
 }
 
 const SERVICE_CHOICE_QUESTION_RE =
-  /\b(?:qual|prefere|escolh(?:e|a|er|eu)|opcao)\b/u;
+  /\b(?:qual|prefere|escolh(?:e|a|er|eu)|opcao|algum(?:a)?\s+d(?:esses|essas)(?:\s+te)?\s+interessa)\b/u;
 const EXACT_SELECTION_ARTICLE_PREFIX_RE = /^(?:a|o|um|uma|esse|essa|este|esta)\s+/u;
 const EXACT_SELECTION_COURTESY_SUFFIX_RE =
   /\s+(?:por favor|pfv|pf|please)$/u;

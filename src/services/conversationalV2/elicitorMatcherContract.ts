@@ -1,4 +1,6 @@
 import type { UpcomingAppointment } from '../calendarService';
+import { buildServiceQuestion } from '../service-gate';
+import { resolveReceptionistTurnDecision } from '../receptionistTurnDecision';
 import {
   bookingConfirmationGate,
   CONFIRMATION_HINT,
@@ -18,15 +20,20 @@ import {
   buildBareHourDisambiguationV2,
   resolvePendingOptionProofV2,
 } from './fastPaths';
-import { buildCanonicalBookingSummaryV2 } from './lifecycleReducer';
+import {
+  buildCanonicalBookingSummaryV2,
+  buildSlotOfferCopyV2,
+} from './lifecycleReducer';
 import { NATURAL_AFFIRMATIVE_REPLIES_V2 } from './naturalAffirmative';
 import {
   DATE_PENDING_QUESTION_V2,
   DUPLICATE_RESOLUTION_CHOICE_QUESTION_V2,
   DUPLICATE_RESOLUTION_OPTIONS_V2,
+  buildPendingQuestionV2,
 } from './pendingQuestion';
 import { buildDuplicateResolutionQuestionV2 } from './bookingProgressFastPaths';
 import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
+import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
 
 export interface ElicitorMatcherContractRowV2 {
   readonly nome: string;
@@ -56,7 +63,14 @@ const PODE_LEXICON_REPLIES_V2 = ['sim', 'confirmo', 'pode marcar'] as const;
 
 function catalog() {
   return {
-    services: [{ id: 'svc-drenagem', name: 'Drenagem Linfática' }],
+    success: true,
+    services: [{
+      id: 'svc-drenagem',
+      name: 'Drenagem Linfática',
+      durationMinutes: 60,
+      price: null,
+      priceFormatted: null,
+    }],
     professionals: [{ id: 'prof-carla', name: 'Carla Mendes' }],
   };
 }
@@ -279,6 +293,162 @@ function halfHourClarifierMatcher(reply: string): boolean {
   return proof?.kind === 'pending_option';
 }
 
+function timeOfferOptionsFromCopy(
+  elicitor: string
+): readonly PendingFrameSnapshotV2['options'][number][] {
+  const match = /:\s*([^.!?]+)\.\s*Qual você prefere\?$/u.exec(elicitor);
+  if (!match?.[1]) return [];
+  const slots = [
+    ...new Set(
+      normalizeTemporalAssertionsV2(match[1])
+        .filter((assertion) => assertion.kind === 'time')
+        .map((assertion) => assertion.normalized)
+    ),
+  ];
+  return slots.map((slot, index) => ({
+    position: index + 1,
+    entityId: slot,
+    displayName: slot,
+  }));
+}
+
+/** Derives the natural replies from the live copy's witnessed slot(s). */
+function timeOfferRepliesFromCopy(elicitor: string): readonly string[] {
+  const options = timeOfferOptionsFromCopy(elicitor);
+  return options.flatMap((option) => {
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/u.exec(option.entityId);
+    if (!match) return [];
+    const hour = String(Number(match[1]));
+    const display = Number(match[2]) === 0
+      ? `${Number(match[1])}h`
+      : `${Number(match[1])}h${match[2]}`;
+    return [display, option.entityId, `Pode ser ${display}`];
+  });
+}
+
+function singleTimeOfferRepliesFromCopy(elicitor: string): readonly string[] {
+  if (timeOfferOptionsFromCopy(elicitor).length !== 1) return [];
+  const options = timeOfferOptionsFromCopy(elicitor);
+  const slot = options[0]!.entityId;
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/u.exec(slot);
+  if (!match) return [];
+  const hour = String(Number(match[1]));
+  const display = Number(match[2]) === 0
+    ? `${Number(match[1])}h`
+    : `${Number(match[1])}h${match[2]}`;
+  return [
+    ...timeOfferRepliesFromCopy(elicitor),
+    `pode ser as ${hour}`,
+    `quero ${display}`,
+    `o de ${display}`,
+    'esse',
+    'pode ser',
+  ];
+}
+
+function timeOfferMatcher(reply: string, elicitor: string): boolean {
+  const options = timeOfferOptionsFromCopy(elicitor);
+  if (options.length === 0) return false;
+  const pending = pendingFrame('TIME', options);
+  const flowState: FlowStateV2 = {
+    flowId: pending.flowId,
+    fixedServiceId: 'svc-drenagem',
+    resolvedDate: '2026-08-17',
+    slotEvidence: {
+      turnId: 'turn-slots-contract',
+      serviceId: 'svc-drenagem',
+      date: '2026-08-17',
+      slots: options.map((option) => option.entityId),
+    },
+    fixedByProofVersion: { fixedServiceId: 1, resolvedDate: 1 },
+  };
+  const proof = resolvePendingOptionProofV2({
+    frame: turnFrame(pending, flowState),
+    inboundId: 'in-contract-time',
+    inboundText: reply,
+    now: CONTRACT_NOW,
+    lastAcceptedAssistantText: elicitor,
+  });
+  return proof?.kind === 'pending_option';
+}
+
+function selectionRepliesFromCopy(elicitor: string): readonly string[] {
+  const optionName = elicitor
+    .replace(/^Qual (?:serviço|profissional) você prefere:\s*/u, '')
+    .replace(/\?$/u, '')
+    .trim();
+  if (!optionName) return [];
+  return [
+    optionName,
+    `Pode ser ${optionName}`,
+    `Quero ${optionName}`,
+    'esse',
+    'pode ser',
+  ];
+}
+
+function singleSelectionMatcher(
+  reply: string,
+  kind: 'SERVICE' | 'PROFESSIONAL',
+  option: { entityId: string; displayName: string }
+): boolean {
+  const pending = pendingFrame(kind, [
+    { position: 1, entityId: option.entityId, displayName: option.displayName },
+  ]);
+  const flowState: FlowStateV2 = {
+    flowId: pending.flowId,
+    fixedServiceId: kind === 'PROFESSIONAL' ? 'svc-drenagem' : undefined,
+    fixedByProofVersion: {},
+  };
+  const proof = resolvePendingOptionProofV2({
+    frame: turnFrame(pending, flowState),
+    inboundId: `in-contract-${kind.toLowerCase()}`,
+    inboundText: reply,
+    now: CONTRACT_NOW,
+    catalog: catalog(),
+  });
+  return proof?.kind === 'pending_option';
+}
+
+const LEGACY_SERVICE_OPTIONS = [
+  { id: 'svc-drenagem', name: 'Drenagem Linfática' },
+  { id: 'svc-peeling', name: 'Peeling facial' },
+] as const;
+
+function legacyServiceQuestionMatcher(reply: string, elicitor: string): boolean {
+  const decision = resolveReceptionistTurnDecision({
+    inbound: reply,
+    history: [
+      { role: 'user', content: 'Quero agendar' },
+      { role: 'assistant', content: elicitor },
+      { role: 'user', content: reply },
+    ],
+    catalog: {
+      success: true,
+      services: LEGACY_SERVICE_OPTIONS.map((service) => ({
+        ...service,
+        durationMinutes: 60,
+        price: null,
+        priceFormatted: null,
+      })),
+      professionals: [],
+    },
+  });
+  return decision.action === 'follow_up_datetime';
+}
+
+function legacyServiceRepliesFromCopy(elicitor: string): readonly string[] {
+  const names = LEGACY_SERVICE_OPTIONS.filter((service) =>
+    elicitor.toLocaleLowerCase().includes(service.name.toLocaleLowerCase())
+  ).map((service) => service.name);
+  return [
+    ...names,
+    `${names[0]}?`,
+    `Não, quero ${names[1]}`,
+    `Não é ${names[0]}, mas pode ser ${names[1]}`,
+  ];
+}
+
 function dateQuestionMatcher(reply: string): boolean {
   return (
     resolveCurrentInboundDateV2({
@@ -325,6 +495,45 @@ export function elicitorMatcherContractRowsV2(): readonly ElicitorMatcherContrac
     ...NATURAL_AFFIRMATIVE_REPLIES_V2,
     ...PODE_LEXICON_REPLIES_V2,
   ];
+  const timeOfferElicitor = buildSlotOfferCopyV2({
+    date: '2026-08-17',
+    slots: ['18:00'],
+  });
+  const timeOfferReplies = singleTimeOfferRepliesFromCopy(timeOfferElicitor);
+  const rawTimeOfferElicitor = buildSlotOfferCopyV2({
+    date: '2026-08-17',
+    slots: ['18:00'],
+    rawSlots: true,
+  });
+  const rawTimeOfferReplies = singleTimeOfferRepliesFromCopy(rawTimeOfferElicitor);
+  const multiTimeOfferElicitor = buildSlotOfferCopyV2({
+    date: '2026-08-17',
+    slots: ['18:00', '18:30'],
+  });
+  const multiTimeOfferReplies = timeOfferRepliesFromCopy(multiTimeOfferElicitor);
+  const serviceOption = { entityId: 'svc-drenagem', displayName: 'Drenagem Linfática' };
+  const professionalOption = { entityId: 'prof-carla', displayName: 'Carla Mendes' };
+  const serviceElicitor = buildPendingQuestionV2({
+    pending: pendingFrame('SERVICE', [
+      { position: 1, ...serviceOption },
+    ]),
+    flowState: { flowId: 'flow-elicitor-contract', fixedByProofVersion: {} },
+    catalog: catalog(),
+  })!;
+  const professionalElicitor = buildPendingQuestionV2({
+    pending: pendingFrame('PROFESSIONAL', [
+      { position: 1, ...professionalOption },
+    ]),
+    flowState: {
+      flowId: 'flow-elicitor-contract',
+      fixedServiceId: 'svc-drenagem',
+      fixedByProofVersion: {},
+    },
+    catalog: catalog(),
+  })!;
+  const legacyServiceElicitor = buildServiceQuestion(
+    LEGACY_SERVICE_OPTIONS.map((service) => ({ id: service.id, name: service.name }))
+  );
   return [
     {
       nome: 'resumo canônico booking — recibo compatível',
@@ -369,6 +578,58 @@ export function elicitorMatcherContractRowsV2(): readonly ElicitorMatcherContrac
         'pode decidir depois?',
       ],
       matcher: duplicateOptionMatcher,
+    },
+    {
+      nome: 'oferta de horário — opção única',
+      elicitor: timeOfferElicitor,
+      respostasNaturais: timeOfferReplies,
+      negacoes: ['não sei', 'não quero'],
+      interrogativas: ['qual horário?', 'qual opção?'],
+      matcher: (reply) => timeOfferMatcher(reply, timeOfferElicitor),
+    },
+    {
+      nome: 'oferta de horário — serviceContext HH:MM',
+      elicitor: rawTimeOfferElicitor,
+      respostasNaturais: rawTimeOfferReplies,
+      negacoes: ['não sei', 'não quero'],
+      interrogativas: ['qual horário?', 'qual opção?'],
+      matcher: (reply) => timeOfferMatcher(reply, rawTimeOfferElicitor),
+    },
+    {
+      nome: 'oferta de horário — duas opções',
+      elicitor: multiTimeOfferElicitor,
+      respostasNaturais: multiTimeOfferReplies,
+      negacoes: ['nenhuma', 'não sei', 'esse', 'pode ser'],
+      interrogativas: ['qual horário?', 'qual opção?'],
+      matcher: (reply) => timeOfferMatcher(reply, multiTimeOfferElicitor),
+    },
+    {
+      nome: 'pergunta de SERVICE — opção única',
+      elicitor: serviceElicitor,
+      respostasNaturais: selectionRepliesFromCopy(serviceElicitor),
+      negacoes: ['não quero Drenagem Linfática'],
+      interrogativas: ['qual serviço?'],
+      matcher: (reply) => singleSelectionMatcher(reply, 'SERVICE', serviceOption),
+    },
+    {
+      nome: 'pergunta de PROFESSIONAL — opção única',
+      elicitor: professionalElicitor,
+      respostasNaturais: selectionRepliesFromCopy(professionalElicitor),
+      negacoes: ['não quero Carla Mendes'],
+      interrogativas: ['qual profissional?'],
+      matcher: (reply) =>
+        singleSelectionMatcher(reply, 'PROFESSIONAL', professionalOption),
+    },
+    {
+      nome: 'legado SERVICE — copy viva Algum desses',
+      elicitor: legacyServiceElicitor,
+      respostasNaturais: legacyServiceRepliesFromCopy(legacyServiceElicitor),
+      negacoes: [
+        `não quero ${LEGACY_SERVICE_OPTIONS[0]!.name}`,
+        `Não é ${LEGACY_SERVICE_OPTIONS[0]!.name}`,
+      ],
+      interrogativas: ['qual serviço?'],
+      matcher: (reply) => legacyServiceQuestionMatcher(reply, legacyServiceElicitor),
     },
     {
       nome: 'clarificador de meia-hora',

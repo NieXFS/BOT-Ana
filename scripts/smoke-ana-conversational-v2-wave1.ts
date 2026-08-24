@@ -1151,6 +1151,7 @@ async function main(): Promise<void> {
     servicesResult: services,
     toolTrace: conflict.loop.toolTrace,
     sourceInboundText: '14h',
+    temporalContext: { now, timezone: config.timezone },
     currentInboundIds: ['in-1'],
     inboundTextsById: { 'in-1': '14h' },
     flowState: conflict.nextFlowState,
@@ -1219,9 +1220,15 @@ async function main(): Promise<void> {
   });
   assert.equal(
     noConflict.kind,
-    'continue_model',
-    'serviço diferente sem sobreposição não expõe nem abre duplicidade'
+    'resolved',
+    'serviço diferente sem sobreposição entrega resumo canônico sem modelo'
   );
+  if (noConflict.kind === 'resolved') {
+    assert.match(noConflict.result.reply, /^Confirmando:/u);
+    assert.equal(noConflict.loop.rounds, 0);
+    assert.equal(noConflict.loop.toolTrace.length, 1);
+    assert.equal(noConflict.nextFlowState.duplicatePreflightClearance?.kind, 'no_conflict');
+  }
   const sameServiceOtherDay = await progressModule.resolveTimeDuplicatePreflightV2({
     frame: timeFrame,
     inboundId: 'in-1',

@@ -42,6 +42,7 @@ import {
 import { hasExplicitAvailabilityReadRequestV2 } from './readFastPaths';
 import {
   buildCanonicalBookingSummaryV2,
+  buildSlotOfferCopyV2,
   displayDateV2,
   reduceToolLifecycleV2,
 } from './lifecycleReducer';
@@ -1665,7 +1666,11 @@ export async function consumeDeferredAvailabilityV2(input: {
     const evidence = stateWithoutDraft.slotEvidence;
     const timeReply =
       evidence && offered.length > 0
-        ? `Encontrei horários para ${displayDateV2(evidence.date)}: ${offered.join(', ')}. Qual você prefere?`
+        ? buildSlotOfferCopyV2({
+            date: evidence.date,
+            slots: offered,
+            rawSlots: true,
+          })
         : reducer.result.reply;
     return {
       kind: 'resolved',

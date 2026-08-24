@@ -32,6 +32,7 @@ import {
   type ReceptionistTurnPermission,
 } from './receptionistSocialSafety';
 import { uniqueCatalogServiceFromCurrentMessage, buildServiceSelectedFollowUp } from './service-gate';
+import { splitClausesV2 } from './conversationalV2/polarity';
 
 export type ExpectedSlot =
   | 'SERVICE'
@@ -501,6 +502,20 @@ function uniqueServiceWithSafeTypo(
   return hits.length === 1 ? hits[0]!.name : undefined;
 }
 
+/**
+ * SERVICE pendente usa apenas a parte positiva da resposta para seleção. A
+ * projeção é local ao matcher legado: negação isolada não escolhe serviço,
+ * enquanto uma correção adversativa posterior (`não ..., mas pode ser X`)
+ * continua elegível. `splitClausesV2` separa pontuação e conectivos
+ * adversativos sem alterar os matchers de TIME/IA-24.
+ */
+function positiveServiceSelectionProjection(value: string): string {
+  return splitClausesV2(value)
+    .filter((clause) => !/\b(?:nao|nunca)\b/u.test(clause))
+    .join(' ')
+    .trim();
+}
+
 export function matchInboundToExpectedSlot(
   inbound: string,
   pending: PendingOperationalQuestion,
@@ -579,41 +594,42 @@ export function matchInboundToExpectedSlot(
   }
 
   if (pending.expectedSlot === 'SERVICE') {
-    const ordinal = resolveListedServiceOrdinal(inbound, listed);
+    const serviceInbound = positiveServiceSelectionProjection(inbound);
+    const ordinal = resolveListedServiceOrdinal(serviceInbound, listed);
     if (ordinal.kind === 'unequivocal') {
       return { kind: 'unequivocal', serviceName: ordinal.serviceName };
     }
     if (ordinal.kind === 'out_of_range') {
       return { kind: 'unresolved_ordinal' };
     }
-    const named = uniqueServiceWithSafeTypo(inbound, services);
+    const named = uniqueServiceWithSafeTypo(serviceInbound, services);
     if (named && listed.includes(named)) {
       return { kind: 'unequivocal', serviceName: named };
     }
-    const byDuration = uniqueServiceByDuration(inbound, services);
+    const byDuration = uniqueServiceByDuration(serviceInbound, services);
     if (byDuration && listed.includes(byDuration)) {
       return { kind: 'unequivocal', serviceName: byDuration };
     }
-    if (isAffirmativeCompact(inbound)) {
+    if (isAffirmativeCompact(serviceInbound)) {
       if (listed.length === 1) {
         return { kind: 'unequivocal', serviceName: listed[0] };
       }
       return { kind: 'ambiguous', candidates: listed.length === 1 ? listed : [] };
     }
     const professional = uniqueProfessionalName(
-      inbound,
+      serviceInbound,
       catalog.professionals ?? []
     );
     if (professional) {
       return { kind: 'ambiguous', candidates: [] };
     }
     if (
-      looksLikeStandaloneServiceAttempt(inbound) &&
-      !currentMessageMentionsCatalogService(inbound, serviceNames)
+      looksLikeStandaloneServiceAttempt(serviceInbound) &&
+      !currentMessageMentionsCatalogService(serviceInbound, serviceNames)
     ) {
       return { kind: 'unknown' };
     }
-    if (currentMessageMentionsCatalogService(inbound, serviceNames)) {
+    if (currentMessageMentionsCatalogService(serviceInbound, serviceNames)) {
       return { kind: 'ambiguous', candidates: [] };
     }
     return { kind: 'incompatible' };

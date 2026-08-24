@@ -212,6 +212,27 @@ function fallbackCandidate(
         .trim()
     );
   const now = input.now ?? new Date();
+  // A valid answer to a live TIME question is still an active booking turn.
+  // If model and regeneration both fail, do not let the generic OTHER path
+  // turn that turn into an accidental silent escalation. Re-anchor the
+  // canonical question (which names the fixed service/date) or take the
+  // recorded visible-handoff path when the state is no longer renderable.
+  if (
+    input.fallbackIntent === 'ANSWER_TO_PENDING' &&
+    input.frame.pending?.kind === 'TIME' &&
+    input.frame.pending.flowId === input.frame.flowState.flowId
+  ) {
+    const reanchored = buildPendingQuestionV2({
+      pending: input.frame.pending,
+      flowState: input.frame.flowState,
+      catalog: input.boundaryContext.servicesResult,
+      reanchor: true,
+    });
+    if (reanchored?.trim() && !wasJustDelivered(reanchored)) {
+      return { kind: 'copy', text: reanchored };
+    }
+    return { kind: 'visible_escalation', text: VISIBLE_HANDOFF_CANONICAL_V2 };
+  }
   if (isEmptyOpenServicePendingWithConsumableDeferredV2(input.frame, now)) {
     if (
       wasJustDelivered(EMPTY_OPEN_SERVICE_CLARIFICATION_V2) ||

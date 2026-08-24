@@ -143,8 +143,16 @@ function parseSuccessfulAppointmentReads(
   toolTrace: ToolTraceLike[]
 ): AuthoritativeAppointment[] {
   const appointments: AuthoritativeAppointment[] = [];
+  const turns = toolTrace
+    .map((entry) => entry.userTurn)
+    .filter((turn): turn is number => Number.isInteger(turn));
+  const currentTurn = turns.length > 0 ? Math.max(...turns) : null;
   for (const entry of toolTrace) {
     if (entry.name !== 'getUpcomingAppointments') continue;
+    // Reaudits can carry more than one user turn in a single trace. A
+    // successful read from an older turn is not provenance for this copy;
+    // production traces omit userTurn because they are already turn-scoped.
+    if (currentTurn !== null && entry.userTurn !== currentTurn) continue;
     try {
       const parsed = JSON.parse(entry.result) as {
         success?: unknown;
@@ -760,7 +768,7 @@ function appointmentMatchesStateClause(
       /\bagendamento\s+de\s+(.{2,80}?)\s+(?:esta|ta|foi|ficou)\s+(?:agendad|marcad|confirmad|reservad)/
     )?.[1] ??
     clause.match(
-      /\b(?:retorno|atendimento|agendamento|horario)\s+de\s+(.{2,60}?)(?=\s+(?:com|para|pra|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b|[,?.!]|$)/
+      /\b(?:retorno|atendimento|agendamento|horario)\s+de\s+(.{2,60}?)(?=\s+(?:com|para|pra|em|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b|[,?.!]|$)/
     )?.[1];
   let claimedService = rawClaimedService;
   if (claimedService) {
@@ -980,6 +988,17 @@ const APPOINTMENT_NOUN_RE =
 
 function isExistingAppointmentContextClause(clause: string): boolean {
   if (EXPLICIT_EXISTING_APPOINTMENT_REFERENCE_RE.test(clause)) return true;
+  // This is the canonical duplicate-preflight elicitor: it describes an
+  // existing appointment without using "seu agendamento".  It still requires
+  // an authoritative read below; this branch only classifies the sentence as
+  // appointment context, never licenses it by itself.
+  if (
+    /\b(?:vi|notei|confirmei|encontrei)\s+que\s+(?:voce\s+)?(?:ja\s+)?tem\b[^.!?\n]{0,160}\b(?:agendamento|horario|reserva)\b/u.test(
+      clause
+    )
+  ) {
+    return true;
+  }
   if (
     EXISTING_APPOINTMENT_ACTION_RE.test(clause) &&
     (APPOINTMENT_NOUN_RE.test(clause) || SPECIFIC_APPOINTMENT_DETAIL_RE.test(clause))
@@ -1088,7 +1107,7 @@ function appointmentGroundingFacts(value: string): string[] {
     }
   }
   for (const match of normalized.matchAll(
-    /\b(?:retorno|atendimento|agendamento|horario)\s+de\s+(.{2,60}?)(?=\s+(?:com|para|pra|pro|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b|[,?.!]|$)/g
+    /\b(?:retorno|atendimento|agendamento|horario)\s+de\s+(.{2,60}?)(?=\s+(?:com|para|pra|pro|em|no|na|dia|as|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b|[,?.!]|$)/g
   )) {
     const service = match[1]?.trim();
     if (service) facts.add(`service:${service}`);

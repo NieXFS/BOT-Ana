@@ -2292,6 +2292,11 @@ export async function getReceptionistReplyV2(input: {
           serviceContextEnabled,
         })
       : null;
+  const duplicatePreflightReadFailed =
+    duplicatePreflight.kind === 'continue_model' &&
+    (duplicatePreflight.reason === 'preflight_read_failed' ||
+      duplicatePreflight.reason === 'draft_conflict_unavailable' ||
+      duplicatePreflight.reason === 'draft_service_missing');
   const selectionFastPath =
     bookingReentryFastPath.kind === 'continue_model' &&
     dateSlotsFastPath.kind === 'continue_model' &&
@@ -2301,6 +2306,7 @@ export async function getReceptionistReplyV2(input: {
     cancellationFastPath.kind === 'continue_model' &&
     readFastPath.kind === 'continue_model' &&
     duplicatePreflight.kind === 'continue_model' &&
+    !duplicatePreflightReadFailed &&
     !serviceContextPlan.result &&
     !serviceContextPlan.selectedServiceId &&
     initialServiceQuestionFastPath?.kind !== 'resolved' &&
@@ -3161,6 +3167,10 @@ export async function getReceptionistReplyV2(input: {
     boundaryContext: {
       servicesResult: services,
       sourceInboundText: input.userMessage,
+      temporalContext: {
+        now: startedAt,
+        timezone: input.config.timezone,
+      },
       currentInboundIds,
       inboundTextsById,
       forbiddenAppointmentIds: forbiddenAppointmentIdsV2(

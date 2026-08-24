@@ -27,6 +27,7 @@ import {
   ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
   isClosedCatalogResidualForEntity,
   resolveUniqueCatalogEntityFromCurrentMessage,
+  resolveUniqueCatalogEntityFromCurrentMessageForRead,
   uniqueCatalogServiceFromCurrentMessage,
 } from '../service-gate';
 import type {
@@ -1353,11 +1354,22 @@ function looksLikeServiceRelist(
   catalog: AuthoritativeOutboundCatalog
 ): boolean {
   const normalized = normalize(candidate);
-  const mentioned = catalog.services.filter((service) =>
-    normalized.includes(normalize(service.name))
+  // Service names can be hierarchical.  A copy that says the single
+  // canonical option "Manicure e pedicure" also contains the sibling tokens
+  // "Manicure" and "Pedicure"; substring counting misclassified that one
+  // mention as a re-list.  The read resolver preserves full-name spans and
+  // absorbs sibling tokens contained by the combined span, while two
+  // independent names remain ambiguous and continue to be blocked.
+  const resolution = resolveUniqueCatalogEntityFromCurrentMessageForRead(
+    candidate,
+    catalog.services,
+    {
+      allowRestrictedDistanceTwo:
+        ENABLE_RESTRICTED_DISTANCE_TWO_CATALOG_MATCH,
+    }
   );
   return (
-    mentioned.length >= 2 ||
+    resolution.kind === 'ambiguous' ||
     /\b(?:qual|quais)\s+(?:servico|procedimento)|qual\s+(?:servico|procedimento)\s+(?:voce\s+)?(?:prefere|quer)\b/iu.test(
       normalized
     )
