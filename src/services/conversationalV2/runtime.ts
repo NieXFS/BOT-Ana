@@ -75,6 +75,7 @@ import {
 import {
   applyServiceChangeToFlowStateV2,
   consumeDeferredAvailabilityV2,
+  deriveSemanticServiceInvocationV2,
   planServiceContextV2,
   serviceSelectionFollowUpWithConstraintV2,
   withoutServiceResolverStateV2,
@@ -93,6 +94,7 @@ import {
 } from './featureFlag';
 import {
   resolveSemanticService,
+  semanticServiceResolverNotInvokedReceipt,
   semanticDecisionToServiceResolverResult,
   SEMANTIC_SERVICE_SAFE_CLARIFICATION_V2,
   type SemanticServiceCompletionFactory,
@@ -2021,88 +2023,117 @@ export async function getReceptionistReplyV2(input: {
         text: currentInboundBatchText,
         catalog: services,
       });
-    const semanticFlow = hasPositiveExplicitBookingVerbV2(currentInboundBatchText)
-      ? 'booking' as const
-      : hasExplicitAvailabilityReadRequestV2(currentInboundBatchText)
-        ? 'availability' as const
-        : frame.pending?.kind === 'SERVICE'
-          ? 'service_selection' as const
-          : 'other' as const;
-    const semanticOutcome = await resolveSemanticService({
-      tenantSlug: input.config.tenantSlug,
-      currentBatch: currentInboundBatchText,
+    const semanticInvocation = deriveSemanticServiceInvocationV2({
+      enabled: semanticServiceResolverEnabled,
+      plan: serviceContextPlan,
       catalog: services,
-      config: input.config,
       deterministicResult: deterministicServiceResult,
-      ...(deps.semanticCatalogVersion
-        ? { catalogVersion: deps.semanticCatalogVersion }
-        : {}),
-      context: {
-        flow: semanticFlow,
-        pendingKind: frame.pending?.kind ?? null,
-        fixedServiceId: frame.flowState.fixedServiceId ?? null,
-      },
-      ...(deps.semanticServiceCompletionFactory
-        ? { completionFactory: deps.semanticServiceCompletionFactory }
-        : {}),
-      now: () => Date.now(),
     });
-    semanticServiceResolutionReceipt = semanticOutcome.receipt;
-    const semanticServiceResult = semanticOutcome.decision
-      ? semanticDecisionToServiceResolverResult(
-          semanticOutcome.decision,
-          services
-        )
-      : null;
-    if (semanticServiceResult) {
-      serviceContextPlan = planServiceContextV2({
-        enabled: serviceContextEnabled,
-        serviceResolverEnabled,
-        semanticServiceResolverResult: semanticServiceResult,
-        frame,
-        inboundText: currentInboundBatchText,
-        inboundMessages: currentInboundIds.map((inboundId) => ({
-          inboundId,
-          text: inboundTextsById[inboundId] ?? '',
-        })),
+    if (!semanticInvocation.invoke) {
+      semanticServiceResolutionReceipt =
+        semanticServiceResolverNotInvokedReceipt(
+          services,
+          deps.semanticCatalogVersion,
+          semanticInvocation.invocationReason
+        );
+    } else {
+      const semanticFlow = hasPositiveExplicitBookingVerbV2(currentInboundBatchText)
+        ? 'booking' as const
+        : hasExplicitAvailabilityReadRequestV2(currentInboundBatchText)
+          ? 'availability' as const
+          : frame.pending?.kind === 'SERVICE'
+            ? 'service_selection' as const
+            : 'other' as const;
+      const semanticOutcome = await resolveSemanticService({
+        tenantSlug: input.config.tenantSlug,
+        currentBatch: currentInboundBatchText,
         catalog: services,
-        now: startedAt,
-        dateResolution,
-        timezone: input.config.timezone,
-        turnId,
-        inputSequence,
-      });
-    } else if (
-      semanticOutcome.reason === 'provider_error' ||
-      semanticOutcome.reason === 'invalid_response' ||
-      semanticOutcome.reason === 'rejected_evidence' ||
-      (semanticOutcome.decision !== null && semanticServiceResult === null) ||
-      (semanticOutcome.reason === 'accepted' &&
-        semanticOutcome.receipt.status === 'none')
-    ) {
-      // Falha da Camada B não devolve o turno ao modelo geral: mantém o
-      // estado temporal já capturado e abre uma pergunta SERVICE tipada, sem
-      // candidatos inventados. A resposta é server-owned e não chama agenda.
-      serviceContextPlan = {
-        decision: { kind: 'none' },
-        receipt: serviceContextPlan.receipt,
-        vetoFamilyFastPath: true,
-        capturedConstraint: serviceContextPlan.capturedConstraint,
-        result: {
-          schemaVersion: 2,
-          reply: SEMANTIC_SERVICE_SAFE_CLARIFICATION_V2,
-          replyPurpose: 'SERVICE_QUESTION',
-          pendingTransitionCandidate: {
-            kind: 'open',
-            pendingKind: 'SERVICE',
-            flowId: frame.flowState.flowId,
-            optionEntityIds: [],
-          },
-          resolutionCandidate: null,
-          unknownServiceEvidence: null,
+        config: input.config,
+        deterministicResult: semanticInvocation.deterministicResult,
+        ...(deps.semanticCatalogVersion
+          ? { catalogVersion: deps.semanticCatalogVersion }
+          : {}),
+        context: {
+          flow: semanticFlow,
+          pendingKind: frame.pending?.kind ?? null,
+          // A just opened a positive candidate clarification. Its legacy fixed
+          // service must not suppress the one B call; the second planner pass
+          // still applies the validated result against the original frame.
+          fixedServiceId: semanticInvocation.forceEligibility
+            ? null
+            : frame.flowState.fixedServiceId ?? null,
         },
-        nextFlowState: serviceContextPlan.nextFlowState ?? frame.flowState,
-      };
+        invocationReason: semanticInvocation.invocationReason,
+        ...(deps.semanticServiceCompletionFactory
+          ? { completionFactory: deps.semanticServiceCompletionFactory }
+          : {}),
+        now: () => Date.now(),
+      });
+      semanticServiceResolutionReceipt = semanticOutcome.receipt;
+      const semanticServiceResult = semanticOutcome.decision
+        ? semanticDecisionToServiceResolverResult(
+            semanticOutcome.decision,
+            services
+          )
+        : null;
+      if (
+        semanticServiceResult?.kind === 'resolved' ||
+        (!semanticInvocation.preservePlanOnFailure && semanticServiceResult)
+      ) {
+        serviceContextPlan = planServiceContextV2({
+          enabled: serviceContextEnabled,
+          serviceResolverEnabled,
+          semanticServiceResolverResult: semanticServiceResult,
+          frame,
+          inboundText: currentInboundBatchText,
+          inboundMessages: currentInboundIds.map((inboundId) => ({
+            inboundId,
+            text: inboundTextsById[inboundId] ?? '',
+          })),
+          catalog: services,
+          now: startedAt,
+          dateResolution,
+          timezone: input.config.timezone,
+          turnId,
+          inputSequence,
+        });
+      } else if (
+        !semanticInvocation.preservePlanOnFailure &&
+        (semanticOutcome.reason === 'provider_error' ||
+          semanticOutcome.reason === 'invalid_response' ||
+          semanticOutcome.reason === 'rejected_evidence' ||
+          (semanticOutcome.decision !== null && semanticServiceResult === null) ||
+          (semanticOutcome.reason === 'accepted' &&
+            semanticOutcome.receipt.status === 'none'))
+      ) {
+        // Falha da Camada B não devolve o turno ao modelo geral: mantém o
+        // estado temporal já capturado e abre uma pergunta SERVICE tipada, sem
+        // candidatos inventados. A resposta é server-owned e não chama agenda.
+        serviceContextPlan = {
+          decision: { kind: 'none' },
+          receipt: serviceContextPlan.receipt,
+          vetoFamilyFastPath: true,
+          capturedConstraint: serviceContextPlan.capturedConstraint,
+          result: {
+            schemaVersion: 2,
+            reply: SEMANTIC_SERVICE_SAFE_CLARIFICATION_V2,
+            replyPurpose: 'SERVICE_QUESTION',
+            pendingTransitionCandidate: {
+              kind: 'open',
+              pendingKind: 'SERVICE',
+              flowId: frame.flowState.flowId,
+              optionEntityIds: [],
+            },
+            resolutionCandidate: null,
+            unknownServiceEvidence: null,
+          },
+          nextFlowState: serviceContextPlan.nextFlowState ?? frame.flowState,
+        };
+      } else if (semanticInvocation.preservePlanOnFailure) {
+        // A positive/deferred clarification is the safe fallback. B may say
+        // ambiguous/none or fail closed; every one of those outcomes keeps
+        // the original plan object byte-for-byte.
+      }
     }
   }
   if (serviceContextEnabled) {

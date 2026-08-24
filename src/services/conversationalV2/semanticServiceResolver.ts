@@ -71,6 +71,17 @@ export type SemanticServiceResolverReceiptStatus =
   | 'rejected_evidence'
   | 'cache_hit';
 
+/** Enum fechado de proveniência da porta de entrada da Camada B. */
+export const SEMANTIC_SERVICE_INVOCATION_REASONS_V2 = [
+  'positive_reclarification',
+  'deferred_family',
+  'direct_unresolved',
+  'not_invoked',
+] as const;
+
+export type SemanticServiceInvocationReasonV2 =
+  (typeof SEMANTIC_SERVICE_INVOCATION_REASONS_V2)[number];
+
 export interface SemanticServiceResolverReceipt {
   status: SemanticServiceResolverReceiptStatus;
   provider: 'deepseek' | null;
@@ -82,6 +93,8 @@ export interface SemanticServiceResolverReceipt {
   cacheHit: boolean;
   candidateCount: number;
   catalogFingerprintHash: string;
+  /** Motivo fechado/redacted da política de invocação e porta da Camada A. */
+  invocationReason: SemanticServiceInvocationReasonV2;
   /** Hash do cache key; nunca contém frase, conteúdo ou identificador do cliente. */
   cacheKeyHash?: string;
 }
@@ -277,11 +290,14 @@ export function semanticCatalogFingerprintHash(
 
 export function semanticServiceResolverNotInvokedReceipt(
   catalog: ServicesResult,
-  explicitVersion?: string
+  explicitVersion?: string,
+  trigger: SemanticServiceInvocationReasonV2 = 'not_invoked'
 ): SemanticServiceResolverReceipt {
   return notInvokedReceipt(
     'not_invoked',
-    catalogFingerprint(catalog, explicitVersion)
+    catalogFingerprint(catalog, explicitVersion),
+    0,
+    trigger
   );
 }
 
@@ -394,7 +410,8 @@ function shouldInvokeSemanticService(input: {
 function notInvokedReceipt(
   status: SemanticServiceResolverReceiptStatus,
   catalogFingerprintHash: string,
-  candidateCount = 0
+  candidateCount = 0,
+  invocationReason: SemanticServiceInvocationReasonV2 = 'not_invoked'
 ): SemanticServiceResolverReceipt {
   return {
     status,
@@ -407,6 +424,7 @@ function notInvokedReceipt(
     cacheHit: false,
     candidateCount,
     catalogFingerprintHash,
+    invocationReason,
   };
 }
 
@@ -666,6 +684,39 @@ export function parseAndValidateSemanticServiceDecision(input: {
   ) {
     return { ok: false, reason: 'ambiguous_missing_canonical_candidate' };
   }
+  // When A supplied an explicit positive candidate set, B is a resolver of
+  // that set, not a second catalog search. Keep the server-owned candidate
+  // fence after the existing canonical-inclusion rule: canonical evidence
+  // remains authoritative for direct IA-24 ambiguity, while an otherwise
+  // active service (for example Reposição de unha) cannot enter a
+  // Manicure/Pedicure clarification merely because the model returned its ID.
+  // `none` has no candidate claim and remains governed by the existing
+  // evidence/negative rules below.
+  if (input.deterministicResult?.kind === 'ambiguous') {
+    const deterministicCandidateIds = new Set(
+      input.deterministicResult.serviceIds
+    );
+    // `shared_partial` may be the legacy direct trigger with no candidate
+    // set at all (for example "serviço completo"). There is no universe to
+    // fence in that case; forced IA-25b invocations always carry 2+ IDs.
+    if (
+      deterministicCandidateIds.size > 0 &&
+      decision === 'resolved' &&
+      serviceId !== null &&
+      !deterministicCandidateIds.has(serviceId)
+    ) {
+      return { ok: false, reason: 'deterministic_candidate_conflict' };
+    }
+    if (
+      deterministicCandidateIds.size > 0 &&
+      decision === 'ambiguous' &&
+      candidateServiceIds.some(
+        (candidate) => !deterministicCandidateIds.has(candidate)
+      )
+    ) {
+      return { ok: false, reason: 'deterministic_candidate_conflict' };
+    }
+  }
   if (
     decision === 'resolved' &&
     input.deterministicResult?.kind === 'resolved' &&
@@ -812,7 +863,13 @@ function outcomeForNotInvoked(input: {
     deterministicResult: input.deterministicResult,
     receipt: notInvokedReceipt(
       input.reason === 'catalog_unavailable' ? 'none' : 'not_invoked',
-      input.catalogFingerprintHash
+      input.catalogFingerprintHash,
+      0,
+      // A resolver call that was considered but rejected by its own evidence
+      // gate is still observable as `not_invoked`; a forced A trigger never
+      // reaches this branch because its server-owned ambiguous result passes
+      // the gate.
+      'not_invoked'
     ),
     reason: input.reason,
   };
@@ -831,6 +888,8 @@ export async function resolveSemanticService(input: {
   catalogVersion?: string;
   deterministicResult?: ServiceResolverResult;
   completionFactory?: SemanticServiceCompletionFactory;
+  /** Proveniência redacted calculada pelo planner da Camada A. */
+  invocationReason?: SemanticServiceInvocationReasonV2;
   now?: () => number;
 }): Promise<SemanticServiceResolverOutcome> {
   const context = input.context ?? {};
@@ -854,6 +913,8 @@ export async function resolveSemanticService(input: {
       catalogFingerprintHash,
     });
   }
+
+  const invocationReason = input.invocationReason ?? 'direct_unresolved';
 
   const now = input.now?.() ?? Date.now();
   const normalizedBatch = normalizeSemanticPhrase(input.currentBatch);
@@ -890,6 +951,7 @@ export async function resolveSemanticService(input: {
           cacheHit: true,
           candidateCount: cachedValidation.value.candidateServiceIds.length,
           catalogFingerprintHash,
+          invocationReason,
           cacheKeyHash,
         },
         reason: 'accepted',
@@ -936,6 +998,7 @@ export async function resolveSemanticService(input: {
         cacheHit: false,
         candidateCount: 0,
         catalogFingerprintHash,
+        invocationReason,
         cacheKeyHash,
       },
       reason: 'provider_error',
@@ -962,6 +1025,7 @@ export async function resolveSemanticService(input: {
         cacheHit: false,
         candidateCount: 0,
         catalogFingerprintHash,
+        invocationReason,
         cacheKeyHash,
       },
       reason: 'invalid_response',
@@ -986,7 +1050,8 @@ export async function resolveSemanticService(input: {
           parsed.reason.includes('correction') ||
           parsed.reason.includes('disjunctive') ||
           parsed.reason.includes('canonical') ||
-          parsed.reason.includes('ambiguous_missing')
+          parsed.reason.includes('ambiguous_missing') ||
+          parsed.reason.includes('deterministic_candidate')
             ? 'rejected_evidence'
             : 'invalid_response',
         provider: 'deepseek',
@@ -997,6 +1062,7 @@ export async function resolveSemanticService(input: {
         cacheHit: false,
         candidateCount: 0,
         catalogFingerprintHash,
+        invocationReason,
         cacheKeyHash,
       },
       reason: parsed.reason.includes('evidence') ||
@@ -1005,7 +1071,8 @@ export async function resolveSemanticService(input: {
         parsed.reason.includes('correction') ||
         parsed.reason.includes('disjunctive') ||
         parsed.reason.includes('canonical') ||
-        parsed.reason.includes('ambiguous_missing')
+        parsed.reason.includes('ambiguous_missing') ||
+        parsed.reason.includes('deterministic_candidate')
         ? 'rejected_evidence'
         : 'invalid_response',
     };
@@ -1034,6 +1101,7 @@ export async function resolveSemanticService(input: {
       cacheHit: false,
       candidateCount: parsed.value.candidateServiceIds.length,
       catalogFingerprintHash,
+      invocationReason,
       cacheKeyHash,
     },
     reason: 'accepted',

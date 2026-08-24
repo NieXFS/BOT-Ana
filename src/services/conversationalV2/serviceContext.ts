@@ -98,6 +98,34 @@ export type ServiceContextPlanV2 = {
   selectedServiceId?: string;
 };
 
+/**
+ * Porta redacted pela qual a Camada B foi (ou não foi) considerada depois
+ * do resultado real da Camada A. Os valores são deliberadamente fechados:
+ * nenhum texto, nome ou ID do catálogo atravessa a observabilidade.
+ */
+export const SERVICE_CONTEXT_SEMANTIC_INVOCATION_REASONS_V2 = [
+  'positive_reclarification',
+  'deferred_family',
+  'direct_unresolved',
+  'not_invoked',
+] as const;
+
+export type ServiceContextSemanticInvocationReasonV2 =
+  (typeof SERVICE_CONTEXT_SEMANTIC_INVOCATION_REASONS_V2)[number];
+
+export type ServiceContextSemanticInvocationV2 = {
+  invoke: boolean;
+  invocationReason: ServiceContextSemanticInvocationReasonV2;
+  /** Resultado deterministicamente construído quando a A acabou de abrir
+   * uma clarificação positiva; nunca é inferido por eliminação. */
+  deterministicResult: ServiceResolverResult;
+  /** Só os gatilhos positivos/deferred ignoram o fixedService legado para
+   * consultar B; a reentrada da A continua sendo soberana depois. */
+  forceEligibility: boolean;
+  /** Falha/ambiguidade da B mantém o plano A byte-a-byte nesses gatilhos. */
+  preservePlanOnFailure: boolean;
+};
+
 const TIME_TOKEN_SRC =
   '(?:[01]?\\d|2[0-3])(?:[:h][0-5]\\d)?|(?:[01]?\\d|2[0-3])\\s+e\\s+meia';
 const PERIOD_TOKEN = '(?:manha|tarde|noite|madrugada)';
@@ -841,6 +869,155 @@ function receiptForDecision(
     default:
       return 'not_applicable';
   }
+}
+
+function activeCurrentServicesByIds(
+  catalog: ServicesResult,
+  serviceIds: readonly string[]
+): NonNullable<ServicesResult['services']> {
+  const allow = new Set(serviceIds);
+  return (catalog.services ?? []).filter((entry) => {
+    const raw = entry as NonNullable<ServicesResult['services']>[number] & {
+      active?: unknown;
+      isActive?: unknown;
+    };
+    return (
+      allow.has(entry.id) &&
+      raw.active !== false &&
+      raw.isActive !== false
+    );
+  });
+}
+
+function deterministicAmbiguousFromLayerA(
+  catalog: ServicesResult,
+  serviceIds: readonly string[]
+): ServiceResolverResult | null {
+  const services = activeCurrentServicesByIds(catalog, serviceIds);
+  const unique = [...new Map(services.map((entry) => [entry.id, entry])).values()];
+  if (unique.length < 2) return null;
+  const names = unique.map((entry) => entry.name.trim()).filter(Boolean);
+  const joined =
+    names.length === 2
+      ? `${names[0]} ou ${names[1]}`
+      : `${names.slice(0, -1).join(', ')} ou ${names.at(-1)}`;
+  return {
+    kind: 'ambiguous',
+    // This is server-owned evidence of the A candidate set, not a claim that
+    // the inbound contained canonical names. `shared_partial` deliberately
+    // avoids the parser's stricter multiple-canonical/duplicate-alias fence.
+    reason: 'shared_partial',
+    serviceIds: unique.map((entry) => entry.id),
+    services: unique,
+    clarification: `Você quer ${joined}?`,
+  };
+}
+
+function isInactiveOnlyPlan(plan: ServiceContextPlanV2): boolean {
+  if (plan.decision.kind !== 'none' || plan.receipt !== 'negative_clarification') {
+    return false;
+  }
+  // The production inactive-only branch carries this exact pair even when a
+  // caller omits the materialized safe copy. Keep the polarity fence closed
+  // for that redacted shape too.
+  if (!plan.result) return true;
+  const transition = plan.result?.pendingTransitionCandidate;
+  return Boolean(
+    plan.result?.replyPurpose === 'SERVICE_QUESTION' &&
+      transition?.kind === 'open' &&
+      transition.pendingKind === 'SERVICE' &&
+      transition.optionEntityIds.length === 0
+  );
+}
+
+/**
+ * Deriva a porta da Camada B a partir do plano produzido pela Camada A.
+ *
+ * O caso importante aqui é positivo: A já encontrou dois ou mais candidatos
+ * positivos, portanto B recebe um `ambiguous` deterministicamente construído
+ * desses IDs atuais. Isso evita depender de uma segunda leitura lexical (que
+ * não reconhece, por exemplo, "pé e mão" sem alias) e, ao mesmo tempo, não
+ * transforma um pending/negativo em evidência semântica.
+ */
+export function deriveSemanticServiceInvocationV2(input: {
+  enabled: boolean;
+  plan: ServiceContextPlanV2;
+  catalog: ServicesResult;
+  deterministicResult: ServiceResolverResult;
+}): ServiceContextSemanticInvocationV2 {
+  const notInvoked = (): ServiceContextSemanticInvocationV2 => ({
+    invoke: false,
+    invocationReason: 'not_invoked',
+    deterministicResult: input.deterministicResult,
+    forceEligibility: false,
+    preservePlanOnFailure: false,
+  });
+
+  if (!input.enabled) return notInvoked();
+
+  // These are already resolved by A (or are intentionally negative). The
+  // receipt alone is never enough: the decision and selectedServiceId must
+  // agree before this early return is taken.
+  if (
+    input.plan.selectedServiceId ||
+    input.plan.decision.kind === 'select_outside_pending'
+  ) {
+    return notInvoked();
+  }
+  if (
+    input.plan.decision.kind === 'ambiguous_negation' ||
+    input.plan.decision.kind === 'reject_pending' ||
+    isInactiveOnlyPlan(input.plan)
+  ) {
+    return notInvoked();
+  }
+
+  const positiveCandidates =
+    input.plan.receipt === 'positive_reclarification' &&
+    input.plan.decision.kind === 'clarify_positive_candidates'
+      ? deterministicAmbiguousFromLayerA(
+          input.catalog,
+          input.plan.decision.serviceIds
+        )
+      : null;
+  if (positiveCandidates) {
+    return {
+      invoke: true,
+      invocationReason: 'positive_reclarification',
+      deterministicResult: positiveCandidates,
+      forceEligibility: true,
+      preservePlanOnFailure: true,
+    };
+  }
+
+  const deferredFamilyCandidates =
+    input.plan.receipt === 'temporal_deferred' &&
+    input.plan.decision.kind === 'deferred_family_clarification'
+      ? deterministicAmbiguousFromLayerA(
+          input.catalog,
+          input.plan.decision.serviceIds
+        )
+      : null;
+  if (deferredFamilyCandidates) {
+    return {
+      invoke: true,
+      invocationReason: 'deferred_family',
+      deterministicResult: deferredFamilyCandidates,
+      forceEligibility: true,
+      preservePlanOnFailure: true,
+    };
+  }
+
+  // `none`/`not_applicable` and an open deferred service question retain the
+  // old semantic trigger. The resolver itself still checks current evidence;
+  // no evidence means a redacted not_invoked receipt and zero provider calls.
+  return {
+    invoke: true,
+    invocationReason: 'direct_unresolved',
+    deterministicResult: input.deterministicResult,
+    forceEligibility: false,
+    preservePlanOnFailure: false,
+  };
 }
 
 function findSelectedDeferredWindowV2(input: {

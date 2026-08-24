@@ -4,12 +4,17 @@ import type { TenantBotConfig } from '../src/configProvider';
 import type { ServiceSummary, ServicesResult } from '../src/services/calendarService';
 import {
   clearSemanticServiceResolverCache,
+  semanticServiceResolverNotInvokedReceipt,
   parseAndValidateSemanticServiceDecision,
   resolveSemanticService,
   semanticServiceResolverCacheSize,
   type SemanticServiceCompletionFactory,
 } from '../src/services/conversationalV2/semanticServiceResolver';
 import { resolveServiceFromCatalog } from '../src/services/conversationalV2/serviceResolver';
+import {
+  deriveSemanticServiceInvocationV2,
+  planServiceContextV2,
+} from '../src/services/conversationalV2/serviceContext';
 import {
   isAnaV2SemanticServiceResolverEnabled,
 } from '../src/services/conversationalV2/featureFlag';
@@ -18,10 +23,16 @@ import { MemoryConversationalV2StateStore } from '../src/services/conversational
 import { serializeTurnPlanReceiptV2 } from '../src/services/conversationalV2/receipts';
 import { deliverPreparedReceptionistTurnV2 } from '../src/services/conversationalV2/delivery';
 import { resolveReceptionistAiRuntime } from '../src/services/receptionistLlmProvider';
+import { resolveCurrentInboundDateV2 } from '../src/services/conversationalV2/currentDateResolution';
+import { newFlowStateV2 } from '../src/services/conversationalV2/flowSession';
 
 const MANICURE_ID = '11111111-1111-4111-8111-111111111111';
 const PEDICURE_ID = '22222222-2222-4222-8222-222222222222';
 const COMBO_ID = '33333333-3333-4333-8333-333333333333';
+const MANICURE_TRADICIONAL_ID = '44444444-4444-4444-8444-444444444444';
+const PEDICURE_TRADICIONAL_ID = '55555555-5555-4555-8555-555555555555';
+const REPOSICAO_ID = '66666666-6666-4666-8666-666666666666';
+const UNHA_INFANTIL_ID = '77777777-7777-4777-8777-777777777777';
 
 process.env.DATABASE_URL ??= 'postgresql://smoke:smoke@127.0.0.1:1/smoke';
 process.env.OPENAI_API_KEY ??= 'sk-smoke-invalid';
@@ -48,6 +59,34 @@ const catalog: ServicesResult = {
   ],
   professionals: [{ id: 'prof-1', name: 'Profissional' }],
 };
+
+// IA-25b field replay: 7 núcleo services + 100 unrelated lab fillers, with
+// zero aliases anywhere. The additional nail entries are important because
+// the production A planner sees the same catalog topology as the canary.
+const fieldCatalog107: ServicesResult = {
+  success: true,
+  services: [
+    service(MANICURE_ID, 'Manicure'),
+    service(PEDICURE_ID, 'Pedicure'),
+    service(COMBO_ID, 'Manicure e pedicure'),
+    service(MANICURE_TRADICIONAL_ID, 'Manicure tradicional'),
+    service(PEDICURE_TRADICIONAL_ID, 'Pedicure tradicional'),
+    service(REPOSICAO_ID, 'Reposição de unha'),
+    service(UNHA_INFANTIL_ID, 'Unha infantil'),
+    ...Array.from({ length: 100 }, (_, index) =>
+      service(
+        `88888888-8888-4888-8888-${String(index + 1).padStart(12, '0')}`,
+        `Serviço de laboratório ${index + 1}`
+      )
+    ),
+  ],
+  professionals: [{ id: 'prof-1', name: 'Profissional' }],
+};
+assert.equal(fieldCatalog107.services?.length, 107);
+assert.equal(
+  fieldCatalog107.services?.every((entry) => (entry.aliases ?? []).length === 0),
+  true
+);
 
 const config = {
   tenantSlug: 'studio-viti',
@@ -792,8 +831,419 @@ async function main(): Promise<void> {
   assert.equal(runtimePrepared.planReceipt.regenProviderCalls, 0);
   assert.equal(runtimePrepared.planReceipt.semanticServiceResolution?.status, 'resolved');
   assert.equal(runtimePrepared.planReceipt.semanticServiceResolution?.providerCallCount, 1);
+  assert.equal(
+    runtimePrepared.planReceipt.semanticServiceResolution?.invocationReason,
+    'positive_reclarification'
+  );
   assert.doesNotThrow(() => serializeTurnPlanReceiptV2(runtimePrepared.planReceipt));
   assert.match(runtimePrepared.payload ?? '', /qual.*(janela|consultar primeiro)|hoje.*ou.*amanhã/iu);
+
+  /**
+   * IA-25b field fixture: the store/history/pending start empty, but the
+   * current three-bubble batch is passed through the real A planner. The
+   * first bubble is the same broad nail request that makes A produce its
+   * positive candidate clarification; the tested inbound is the literal
+   * phrase from the field. No ambiguous plan is seeded.
+   */
+  async function positiveReclarificationFixture(input: {
+    literal: string;
+    texts: readonly string[];
+    idSuffix: string;
+    factory: SemanticServiceCompletionFactory;
+    expectedStatus: 'resolved' | 'ambiguous' | 'none' | 'provider_error' | 'invalid_response' | 'rejected_evidence';
+  }) {
+    clearSemanticServiceResolverCache();
+    const store = new MemoryConversationalV2StateStore();
+    const phone = `551199998${input.idSuffix}`;
+    const phoneKey = `${config.phoneNumberId}:${phone}`;
+    store.setInputSequence(phoneKey, 1);
+    const providerCounts = { semantic: 0, model: 0, tools: 0 };
+    const ids = input.texts.map((_text, index) => `${input.idSuffix}-${index + 1}`);
+    const inboundTextsById = Object.fromEntries(
+      ids.map((id, index) => [id, input.texts[index]!])
+    );
+    const now = new Date('2026-08-24T15:00:00.000Z');
+    const emptyFrame = {
+      schemaVersion: 2 as const,
+      turnId: `${input.idSuffix}-turn`,
+      inputSequence: 1,
+      catalogSnapshotHash: 'fixture-catalog',
+      catalogState: 'available' as const,
+      humanControl: { disposition: 'NO_ACTIVE_TAKEOVER' as const, resumeDecision: 'NONE' as const },
+      currentInboundIds: ids,
+      pending: null,
+      flowState: newFlowStateV2(`${input.idSuffix}-flow`, now),
+    };
+    const planBeforeRuntime = planServiceContextV2({
+      enabled: true,
+      serviceResolverEnabled: true,
+      frame: emptyFrame,
+      inboundText: input.texts.join(' '),
+      inboundMessages: ids.map((inboundId, index) => ({
+        inboundId,
+        text: input.texts[index]!,
+      })),
+      catalog: fieldCatalog107,
+      now,
+      dateResolution: resolveCurrentInboundDateV2({
+        currentInboundIds: ids,
+        inboundTextsById,
+        now,
+        timezone: config.timezone,
+      }),
+      timezone: config.timezone,
+      turnId: emptyFrame.turnId,
+      inputSequence: 1,
+    });
+    assert.equal(
+      planBeforeRuntime.receipt,
+      'positive_reclarification',
+      `${input.literal}: productive A receipt before runtime`
+    );
+    assert.equal(
+      planBeforeRuntime.decision.kind,
+      'clarify_positive_candidates',
+      `${input.literal}: productive A decision before runtime`
+    );
+    const prepared = await getReceptionistReplyV2({
+      phone,
+      userMessage: input.literal,
+      userName: 'Fixture',
+      config,
+      serviceContextEnabled: true,
+      serviceResolverEnabled: true,
+      semanticServiceResolverEnabled: true,
+      turnRuntime: {
+        inputSequence: 1,
+        currentInboundIds: ids,
+        currentInboundTextsById: inboundTextsById,
+        checkpoint: async () => ({
+          paused: false,
+          latestInputSequence: 1,
+          successorInputSequence: null,
+          successorInboundMessageIds: [],
+        }),
+      },
+      deps: {
+        store,
+        now: () => now,
+        id: () => `${input.idSuffix}-id`,
+        loadServices: async () => fieldCatalog107,
+        loadHistory: async () => [],
+        isPaused: async () => false,
+        semanticServiceCompletionFactory: async (request) => {
+          providerCounts.semantic += 1;
+          assert.deepEqual(request.tools, [], `${input.literal}: no tools`);
+          assert.equal(request.thinkingMode, 'disabled', `${input.literal}: thinking`);
+          assert.equal(request.maxTokens, 160, `${input.literal}: max tokens`);
+          return input.factory(request);
+        },
+        escalate: async () => ({ matched: false }),
+        escalateSilent: async () => ({ kind: 'pending' as const }),
+        runModelLoop: async () => {
+          providerCounts.model += 1;
+          throw new Error(`${input.literal}: main model must not run`);
+        },
+        executeTool: async () => {
+          providerCounts.tools += 1;
+          throw new Error(`${input.literal}: tool must not run`);
+        },
+      },
+    });
+    assert.equal(providerCounts.semantic, 1, `${input.literal}: B exactly once`);
+    assert.equal(providerCounts.model, 0, `${input.literal}: primary 0`);
+    assert.equal(providerCounts.tools, 0, `${input.literal}: tools 0`);
+    assert.equal(prepared.planReceipt.primaryProviderCalls, 0, `${input.literal}: primary calls`);
+    assert.equal(prepared.planReceipt.regenProviderCalls, 0, `${input.literal}: regen calls`);
+    assert.equal(prepared.planReceipt.route, 'fast_path', `${input.literal}: fast path`);
+    assert.equal(prepared.planReceipt.semanticServiceResolution?.status, input.expectedStatus);
+    assert.equal(
+      prepared.planReceipt.semanticServiceResolution?.invocationReason,
+      'positive_reclarification',
+      `${input.literal}: invocation reason`
+    );
+    assert.doesNotThrow(() => serializeTurnPlanReceiptV2(prepared.planReceipt));
+    return { prepared, providerCounts };
+  }
+
+  const positiveLiteralFixtures = [
+    {
+      literal: 'pé e mão',
+      texts: ['Tem horário hoje após as 17:30?', 'ou amanhã de manhã pra fazer a unha?', 'pé e mão'],
+      idSuffix: '301',
+    },
+  ] as const;
+  for (const fixture of positiveLiteralFixtures) {
+    const count = { value: 0 };
+    const successful = await positiveReclarificationFixture({
+      ...fixture,
+      expectedStatus: 'resolved',
+      factory: factoryFor(
+        JSON.stringify({
+          decision: 'resolved',
+          serviceId: COMBO_ID,
+          candidateServiceIds: [COMBO_ID],
+          evidenceText: fixture.literal,
+        }),
+        count
+      ),
+    });
+    assert.equal(count.value, 1, `${fixture.literal}: factory once`);
+    assert.equal(successful.prepared.frame.flowState.fixedServiceId, COMBO_ID);
+    assert.equal(successful.prepared.transition.kind, 'open');
+    assert.equal(
+      successful.prepared.transition.nextFlowState.fixedServiceId,
+      COMBO_ID,
+      `${fixture.literal}: B resolution enters IA-24 follow-up`
+    );
+    assert.match(successful.prepared.payload ?? '', /data|dia|consulte primeiro|manh[ãa]/iu);
+    assert.doesNotMatch(successful.prepared.payload ?? '', /Você quer Manicure/iu);
+  }
+
+  // When B cannot validate a result, A's positive clarification is unchanged:
+  // same visible candidate question, transition and next flow state. The
+  // helper is also exercised directly for the closed decision table below.
+  const preservedBOutcomeCases: Array<{
+    status: 'ambiguous' | 'none' | 'provider_error' | 'invalid_response' | 'rejected_evidence';
+    factory: SemanticServiceCompletionFactory;
+  }> = [
+    {
+      status: 'ambiguous',
+      factory: factoryFor(
+        JSON.stringify({
+          decision: 'ambiguous',
+          serviceId: null,
+          candidateServiceIds: [MANICURE_ID, COMBO_ID, PEDICURE_ID],
+          evidenceText: 'pé e mão',
+        }),
+        { value: 0 }
+      ),
+    },
+    {
+      status: 'none',
+      factory: factoryFor(
+        JSON.stringify({ decision: 'none', serviceId: null, candidateServiceIds: [], evidenceText: '' }),
+        { value: 0 }
+      ),
+    },
+    {
+      status: 'provider_error',
+      factory: async () => {
+        throw new Error('fixture timeout');
+      },
+    },
+    {
+      status: 'invalid_response',
+      factory: factoryFor('{}', { value: 0 }),
+    },
+    {
+      status: 'rejected_evidence',
+      factory: factoryFor(
+        JSON.stringify({
+          decision: 'resolved',
+          serviceId: COMBO_ID,
+          candidateServiceIds: [COMBO_ID],
+          evidenceText: 'texto que não está no lote',
+        }),
+        { value: 0 }
+      ),
+    },
+    {
+      // Active in the 107-service snapshot, but not in A's positive set.
+      status: 'rejected_evidence',
+      factory: factoryFor(
+        JSON.stringify({
+          decision: 'resolved',
+          serviceId: REPOSICAO_ID,
+          candidateServiceIds: [REPOSICAO_ID],
+          evidenceText: 'pé e mão',
+        }),
+        { value: 0 }
+      ),
+    },
+    {
+      // Ambiguous output is fenced too: one out-of-set candidate is enough to
+      // preserve A instead of letting B widen the candidate universe.
+      status: 'rejected_evidence',
+      factory: factoryFor(
+        JSON.stringify({
+          decision: 'ambiguous',
+          serviceId: null,
+          candidateServiceIds: [MANICURE_ID, UNHA_INFANTIL_ID],
+          evidenceText: 'pé e mão',
+        }),
+        { value: 0 }
+      ),
+    },
+  ];
+  for (const [index, testCase] of preservedBOutcomeCases.entries()) {
+    const { prepared } = await positiveReclarificationFixture({
+      literal: 'pé e mão',
+      texts: ['Tem horário hoje após as 17:30?', 'ou amanhã de manhã pra fazer a unha?', 'pé e mão'],
+      idSuffix: `31${index}`,
+      expectedStatus: testCase.status,
+      factory: testCase.factory,
+    });
+    assert.equal(prepared.payload, 'Você quer Manicure, Pedicure ou Manicure e pedicure?');
+    assert.equal(prepared.transition.kind, 'open');
+    if (prepared.transition.kind === 'open') {
+      assert.deepEqual(
+        prepared.transition.frame.options.map((option) => option.entityId),
+        [MANICURE_ID, PEDICURE_ID, COMBO_ID]
+      );
+    }
+    assert.equal(prepared.transition.nextFlowState.fixedServiceId, undefined);
+    assert.equal(prepared.planReceipt.serviceContextDecision, 'positive_reclarification');
+  }
+
+  const emptyNextFlowState = {
+    flowId: 'table-flow',
+    fixedByProofVersion: {},
+  };
+  const directNoMatch = { kind: 'no_match', reason: 'no_match' } as const;
+  const tablePlan = (input: Record<string, unknown>) => ({
+    decision: { kind: 'none' },
+    receipt: 'not_applicable',
+    vetoFamilyFastPath: false,
+    capturedConstraint: null,
+    result: null,
+    nextFlowState: emptyNextFlowState,
+    ...input,
+  }) as never;
+  const invocationTable = [
+    {
+      name: 'disabled',
+      enabled: false,
+      plan: tablePlan({}),
+      invoke: false,
+      trigger: 'not_invoked',
+    },
+    {
+      name: 'outside pending selection',
+      enabled: true,
+      plan: tablePlan({
+        receipt: 'outside_pending_selection',
+        decision: { kind: 'select_outside_pending', serviceId: MANICURE_ID },
+        selectedServiceId: MANICURE_ID,
+      }),
+      invoke: false,
+      trigger: 'not_invoked',
+    },
+    {
+      name: 'negative clarification',
+      enabled: true,
+      plan: tablePlan({
+        receipt: 'negative_clarification',
+        decision: { kind: 'reject_pending', negatedServiceIds: [MANICURE_ID] },
+      }),
+      invoke: false,
+      trigger: 'not_invoked',
+    },
+    {
+      name: 'inactive-only',
+      enabled: true,
+      plan: tablePlan({
+        receipt: 'negative_clarification',
+        result: {
+          replyPurpose: 'SERVICE_QUESTION',
+          pendingTransitionCandidate: {
+            kind: 'open',
+            pendingKind: 'SERVICE',
+            flowId: 'table-flow',
+            optionEntityIds: [],
+          },
+        },
+      }),
+      invoke: false,
+      trigger: 'not_invoked',
+    },
+    {
+      name: 'positive reclarification',
+      enabled: true,
+      plan: tablePlan({
+        receipt: 'positive_reclarification',
+        decision: {
+          kind: 'clarify_positive_candidates',
+          serviceIds: [MANICURE_ID, PEDICURE_ID, COMBO_ID],
+        },
+      }),
+      invoke: true,
+      trigger: 'positive_reclarification',
+      force: true,
+    },
+    {
+      name: 'deferred family',
+      enabled: true,
+      plan: tablePlan({
+        receipt: 'temporal_deferred',
+        decision: {
+          kind: 'deferred_family_clarification',
+          serviceIds: [MANICURE_ID, PEDICURE_ID, COMBO_ID],
+          constraint: { schemaVersion: 1 },
+        },
+      }),
+      invoke: true,
+      trigger: 'deferred_family',
+      force: true,
+    },
+    {
+      name: 'deferred open without evidence',
+      enabled: true,
+      plan: tablePlan({
+        receipt: 'temporal_deferred',
+        decision: {
+          kind: 'deferred_open_service_question',
+          constraint: { schemaVersion: 1 },
+        },
+      }),
+      invoke: true,
+      trigger: 'direct_unresolved',
+    },
+    {
+      name: 'not applicable direct unresolved',
+      enabled: true,
+      plan: tablePlan({}),
+      invoke: true,
+      trigger: 'direct_unresolved',
+    },
+    {
+      name: 'temporal resolved selected service',
+      enabled: true,
+      plan: tablePlan({
+        receipt: 'temporal_deferred',
+        selectedServiceId: COMBO_ID,
+      }),
+      invoke: false,
+      trigger: 'not_invoked',
+    },
+  ] as const;
+  for (const row of invocationTable) {
+    const decision = deriveSemanticServiceInvocationV2({
+      enabled: row.enabled,
+      plan: row.plan,
+      catalog,
+      deterministicResult: directNoMatch,
+    });
+    assert.equal(decision.invoke, row.invoke, row.name);
+    assert.equal(decision.invocationReason, row.trigger, row.name);
+    assert.equal(decision.forceEligibility, row.force ?? false, row.name);
+    if (row.force) {
+      assert.equal(decision.deterministicResult.kind, 'ambiguous', row.name);
+      assert.deepEqual(
+        decision.deterministicResult.kind === 'ambiguous'
+          ? decision.deterministicResult.serviceIds
+          : [],
+        [MANICURE_ID, PEDICURE_ID, COMBO_ID],
+        row.name
+      );
+    }
+  }
+  const notInvoked = semanticServiceResolverNotInvokedReceipt(
+    catalog,
+    undefined,
+    'not_invoked'
+  );
+  assert.equal(notInvoked.invocationReason, 'not_invoked');
 
   const runtimeNow = new Date('2026-08-24T15:00:00.000Z');
   const deliverRuntime = async (
