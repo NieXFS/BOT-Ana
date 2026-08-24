@@ -649,6 +649,30 @@ function lastCorrectionOffset(normalizedBatch: string): number {
   return last;
 }
 
+function nearestPolarityClauseStart(
+  normalizedBatch: string,
+  beforeOffset: number
+): number {
+  const boundaries = [0];
+  for (const match of normalizedBatch.matchAll(/[.!?,;:\n]+/gu)) {
+    const end = (match.index ?? 0) + match[0].length;
+    if (end <= beforeOffset) boundaries.push(end);
+  }
+  for (const match of normalizedBatch.matchAll(
+    /\b(?:mas|porem|contudo|entretanto|so que)\b/gu
+  )) {
+    const end = (match.index ?? 0) + match[0].length;
+    if (end <= beforeOffset) boundaries.push(end);
+  }
+  for (const match of normalizedBatch.matchAll(
+    /\b(?:na verdade|melhor|quer dizer|corrigindo|pera(?:i)?|alias|mudei de ideia|agora quero|em vez|ao inves|troquei|trocar)\b/gu
+  )) {
+    const end = (match.index ?? 0) + match[0].length;
+    if (end <= beforeOffset) boundaries.push(end);
+  }
+  return Math.max(...boundaries);
+}
+
 function evidenceIsPositive(
   currentBatch: string,
   evidenceText: string
@@ -665,24 +689,26 @@ function evidenceIsPositive(
   const index = normalizedBatch.indexOf(normalizedEvidence);
   if (index < 0) return { ok: false, reason: 'evidence_not_current_substring' };
 
-  const separators = [...normalizedBatch.matchAll(/[.!?,;:\n]+/gu)]
-    .map((match) => (match.index ?? 0) + match[0].length)
-    .filter((offset) => offset <= index);
-  const clauseStart = separators.at(-1) ?? 0;
-  const clause = normalizedBatch.slice(clauseStart, index + normalizedEvidence.length);
   const lastEvidenceSeparator = [...normalizedEvidence.matchAll(/[.!?,;:\n]+/gu)]
     .map((match) => (match.index ?? 0) + match[0].length)
     .at(-1) ?? 0;
-  // A correction may carry a negative clause before the positive evidence
-  // (`não, quero pé e mão`). Evaluate the final evidence clause, not the
-  // prefix that the client explicitly replaced.
-  const polarityEvidence = normalizedEvidence.slice(lastEvidenceSeparator);
-  const evidenceClause = clause.slice(
-    Math.max(0, clause.length - polarityEvidence.length)
+  // A short model span can omit the polarity-bearing prefix. Keep the clause
+  // that contains the span, after the last separator internal to the evidence,
+  // so `não quero pé e mão` stays negative while `não, quero pé e mão` starts
+  // a fresh positive clause. Adversatives/correction markers also delimit a
+  // new clause when the client omitted punctuation.
+  const polarityEvidenceStart = index + lastEvidenceSeparator;
+  const polarityClauseStart = nearestPolarityClauseStart(
+    normalizedBatch,
+    polarityEvidenceStart
   );
-  const evidenceIndexInClause = evidenceClause.lastIndexOf(polarityEvidence);
+  const evidenceClause = normalizedBatch.slice(
+    polarityClauseStart,
+    index + normalizedEvidence.length
+  );
+  const evidenceIndexInClause = polarityEvidenceStart - polarityClauseStart;
   const priorClauseStartsNegative =
-    /^\s*(?:nao|nunca)\b/u.test(normalizedBatch.slice(0, clauseStart));
+    /^\s*(?:nao|nunca)\b/u.test(normalizedBatch.slice(0, polarityClauseStart));
   const positiveCorrectionCue =
     /\b(?:quero|queria|gostaria|prefiro|preciso|desejo|vou|pode\s+ser|escolho|mas|na\s+verdade|melhor|trocar|troquei)\b/u.test(
       evidenceClause

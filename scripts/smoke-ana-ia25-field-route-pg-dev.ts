@@ -184,14 +184,31 @@ async function counts(db: Pool): Promise<Record<string, number> | null> {
 async function reloadCheck(conversationKey: string, now: Date): Promise<void> {
   const state = await import('../src/services/conversationalV2/stateStore');
   const loaded = await state.pgConversationalV2StateStore.loadLatestState(conversationKey, now);
+  const expectedFlowId = process.env.ANA_IA25_FIELD_RELOAD_FLOW_ID?.trim();
+  if (!expectedFlowId) fail('reload flow id missing');
   assert.equal(loaded.flowState?.fixedServiceId, COMBO_ID);
-  assert.ok(loaded.pending);
-  console.log(JSON.stringify({ status: 'PASS', reload: 'fresh_process', serviceResolved: true }));
+  assert.equal(loaded.pending?.snapshot.kind, 'DATE');
+  assert.equal(loaded.pending?.snapshot.flowId, expectedFlowId);
+  assert.equal(loaded.flowState?.flowId, expectedFlowId);
+  assert.equal(loaded.flowState?.deferredAvailability?.schemaVersion, 2);
+  assert.equal(loaded.flowState?.deferredAvailability?.windows?.length, 2);
+  console.log(JSON.stringify({
+    status: 'PASS',
+    reload: 'fresh_process',
+    serviceResolved: true,
+    pendingKind: 'DATE',
+    deferredAvailabilitySchemaVersion: 2,
+    deferredAvailabilityWindows: 2,
+  }));
   const contextManager = await import('../src/services/contextManager');
   await contextManager.pool.end();
 }
 
-function reloadCheckInNewProcess(conversationKey: string, now: Date): void {
+function reloadCheckInNewProcess(
+  conversationKey: string,
+  now: Date,
+  flowId: string
+): void {
   const output = execFileSync(
     process.execPath,
     ['-r', 'ts-node/register/transpile-only', __filename, '--reload-check'],
@@ -200,6 +217,7 @@ function reloadCheckInNewProcess(conversationKey: string, now: Date): void {
         ...process.env,
         ANA_IA25_FIELD_RELOAD_CONVERSATION: conversationKey,
         ANA_IA25_FIELD_RELOAD_NOW: now.toISOString(),
+        ANA_IA25_FIELD_RELOAD_FLOW_ID: flowId,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
@@ -281,7 +299,8 @@ async function main(): Promise<void> {
     let primaryCalls = 0;
     let regenCalls = 0;
     const targetToolCalls: string[] = [];
-    const allToolCalls: string[] = [];
+    const ordinaryToolCalls: string[] = [];
+    const proactiveReadCalls: string[] = [];
 
     const completionFactory = async (request: {
       messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
@@ -390,7 +409,11 @@ async function main(): Promise<void> {
           loadHistory: async (conversationKey) => contextManager!.getHistory(conversationKey),
           isPaused: async () => false,
           semanticServiceCompletionFactory: completionFactory,
-          executeProactiveDuplicateRead: async () => JSON.stringify({ success: true, appointments: [] }),
+          executeProactiveDuplicateRead: async () => {
+            proactiveReadCalls.push('getUpcomingAppointments');
+            if (input.semantic) targetToolCalls.push('getUpcomingAppointments');
+            return JSON.stringify({ success: true, appointments: [] });
+          },
           escalate: async () => ({ matched: false }),
           escalateSilent: async () => ({ kind: 'pending' as const }),
           runModelLoop: async () => {
@@ -402,7 +425,7 @@ async function main(): Promise<void> {
             throw new Error('IA-25 PG field route must not regenerate');
           },
           executeTool: async (name) => {
-            allToolCalls.push(name);
+            ordinaryToolCalls.push(name);
             if (input.semantic) targetToolCalls.push(name);
             if (name === 'getAvailableSlots') return JSON.stringify({ success: true, slots: ['18:00'] });
             if (name === 'getUpcomingAppointments') return JSON.stringify({ success: true, appointments: [] });
@@ -447,7 +470,16 @@ async function main(): Promise<void> {
     assert.equal(setupTwo.transition.kind, 'open');
     assert.equal(setupTwo.transition.kind === 'open' ? setupTwo.transition.frame.kind : null, 'CONFIRMATION');
     await deliver(setupTwo, setupTwoIntake.sequence ?? 2, 'setup-two');
-    assert.deepEqual(allToolCalls, ['getAvailableSlots', 'getUpcomingAppointments']);
+    assert.deepEqual(
+      setupOne.planReceipt.toolEffects.map((effect) => effect.tool),
+      ['getAvailableSlots']
+    );
+    assert.deepEqual(
+      setupTwo.planReceipt.toolEffects.map((effect) => effect.tool),
+      ['getUpcomingAppointments']
+    );
+    assert.deepEqual(ordinaryToolCalls, ['getAvailableSlots']);
+    assert.deepEqual(proactiveReadCalls, ['getUpcomingAppointments']);
 
     semanticCalls = 0;
     primaryCalls = 0;
@@ -486,10 +518,31 @@ async function main(): Promise<void> {
     assert.equal(target.hasCommittedWrite, false);
     assert.equal(target.transition.kind, 'open');
     assert.equal(target.transition.kind === 'open' ? target.transition.nextFlowState.fixedServiceId : null, COMBO_ID);
+    assert.equal(target.transition.kind === 'open' ? target.transition.frame.kind : null, 'DATE');
+    const targetFlowId = target.transition.kind === 'open'
+      ? target.transition.nextFlowState.flowId
+      : null;
+    assert.ok(targetFlowId);
+    assert.equal(
+      target.transition.kind === 'open' ? target.transition.frame.flowId : null,
+      targetFlowId
+    );
+    assert.equal(
+      target.transition.kind === 'open'
+        ? target.transition.nextFlowState.deferredAvailability?.schemaVersion
+        : null,
+      2
+    );
+    assert.equal(
+      target.transition.kind === 'open'
+        ? target.transition.nextFlowState.deferredAvailability?.windows?.length
+        : null,
+      2
+    );
     const targetDelivery = await deliver(target, targetSequence, 'target');
     assert.equal(targetDelivery.receipt.outboxState, 'accepted_by_provider');
     assert.equal(targetDelivery.receipt.flowStateCommitOutcome, 'committed');
-    reloadCheckInNewProcess(targetConversationKey, baseNow);
+    reloadCheckInNewProcess(targetConversationKey, baseNow, targetFlowId);
 
     const beforeCleanup = await counts(db);
     assert.ok(beforeCleanup);
@@ -513,6 +566,11 @@ async function main(): Promise<void> {
       writes: 0,
       route: 'fast_path',
       idempotency: { first: true, replay: false, repeatedTextNewId: true },
+      toolCalls: {
+        ordinary: ordinaryToolCalls,
+        proactiveRead: proactiveReadCalls,
+        target: targetToolCalls,
+      },
       reload: 'fresh_process',
       cleanup: 'zero',
       beforeCleanupCounts: beforeCleanup,

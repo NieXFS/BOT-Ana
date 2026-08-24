@@ -700,6 +700,63 @@ async function main(): Promise<void> {
   assert.equal(correctionRuntime.receipt.status, 'resolved');
   assert.equal(correctionRuntime.decision?.serviceId, PEDICURE_ID);
 
+  const shortEvidencePolarityMatrix = [
+    {
+      currentBatch: 'não quero pé e mão',
+      evidenceText: 'pé e mão',
+      serviceId: COMBO_ID,
+      expected: 'rejected_evidence' as const,
+    },
+    {
+      currentBatch: 'não, quero pé e mão',
+      evidenceText: 'pé e mão',
+      serviceId: COMBO_ID,
+      expected: 'resolved' as const,
+    },
+    {
+      currentBatch: 'não, quero pé e mão',
+      evidenceText: 'não, quero pé e mão',
+      serviceId: COMBO_ID,
+      expected: 'resolved' as const,
+    },
+    {
+      currentBatch: 'quero manicure, não quero pedicure',
+      evidenceText: 'pedicure',
+      serviceId: PEDICURE_ID,
+      expected: 'rejected_evidence' as const,
+    },
+    {
+      currentBatch: 'não quero manicure, mas quero pé e mão',
+      evidenceText: 'pé e mão',
+      serviceId: COMBO_ID,
+      expected: 'resolved' as const,
+    },
+    {
+      currentBatch: 'não quero manicure, na verdade quero pé e mão',
+      evidenceText: 'pé e mão',
+      serviceId: COMBO_ID,
+      expected: 'resolved' as const,
+    },
+  ];
+  for (const test of shortEvidencePolarityMatrix) {
+    const parsed = parseAndValidateSemanticServiceDecision({
+      raw: JSON.stringify({
+        decision: 'resolved',
+        serviceId: test.serviceId,
+        candidateServiceIds: [test.serviceId],
+        evidenceText: test.evidenceText,
+      }),
+      currentBatch: test.currentBatch,
+      catalog,
+    });
+    if (test.expected === 'resolved') {
+      assert.equal(parsed.ok, true, `${test.currentBatch} + ${test.evidenceText}`);
+    } else {
+      assert.equal(parsed.ok, false, `${test.currentBatch} + ${test.evidenceText}`);
+      if (!parsed.ok) assert.equal(parsed.reason, 'negated_evidence', test.currentBatch);
+    }
+  }
+
   const inactiveCatalog: ServicesResult = {
     success: true,
     services: [service('cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'Serviço inativo', { active: false })],
