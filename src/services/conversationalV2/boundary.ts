@@ -60,6 +60,10 @@ import {
   SERVICE_LIST_TRANSPORT_CEILING_V2,
   stripExactCanonicalServiceListSegmentV2,
 } from './serviceList';
+import {
+  materializePreBookingSummaryV2,
+  preBookingSummaryEvidenceMatchesFlowStateV2,
+} from './preBookingSummary';
 
 export const UNKNOWN_SERVICE_UNAVAILABLE_CANONICAL_V2 =
   'Esse procedimento não está disponível no momento. Posso te ajudar com outro serviço?';
@@ -973,67 +977,76 @@ function pendingTimeSlotEvidenceV2(
 }
 
 /**
- * Exceção v2 estrita para um resumo ainda não escrito. As quatro condições são
- * cumulativas; falha em qualquer uma preserva integralmente o reason herdado.
+ * Exceção v2 estrita para um resumo ainda não escrito. A proposta nova (A) e
+ * a reancoragem de uma CONFIRMATION já aberta (B) são modos fechados; falha em
+ * qualquer condição preserva integralmente o reason herdado.
  */
 export function isLicensedPreBookingSummaryV2(
   candidate: string,
-  input: BoundaryEvaluationInputV2,
-  catalog = input.authoritativeCatalog ??
-    catalogFromServicesResult(input.servicesResult)
+  input: BoundaryEvaluationInputV2
 ): boolean {
+  // A proposal is licensed only as a server-owned segment. In particular,
+  // the same bytes from a model/regen candidate are still unverified.
+  if (input.source !== 'CANONICAL') return false;
+  if (input.replyPurpose !== 'WRITE_CONFIRMATION') return false;
+  const transition = input.pendingTransitionCandidate;
+  const evidence = input.outboundEvidence?.preBookingSummary;
+  const flowState = input.flowState;
+  const transitionIsAuthorized = Boolean(
+    (transition?.kind === 'open' &&
+      transition.pendingKind === 'CONFIRMATION' &&
+      transition.flowId === flowState?.flowId) ||
+      (transition?.kind === 'preserve' &&
+        input.pendingAnaOpen === true &&
+        input.pendingSnapshot?.kind === 'CONFIRMATION' &&
+        input.pendingSnapshot.flowId === flowState?.flowId &&
+        input.pendingSnapshot.flowId === evidence?.flowId &&
+        input.pendingSnapshot.options.length === 1 &&
+        input.pendingSnapshot.options[0]?.position === 1 &&
+        input.pendingSnapshot.options[0]?.entityId ===
+          `booking-confirmation:${flowState?.flowId}`)
+  );
+  if (
+    !evidence ||
+    !flowState ||
+    flowState.flowId !== evidence.flowId ||
+    !transitionIsAuthorized ||
+    hasSuccessfulAppointmentWriteV2(input.toolTrace ?? []) ||
+    !preBookingSummaryEvidenceMatchesFlowStateV2({
+      evidence,
+      flowState,
+      services: input.servicesResult,
+    })
+  ) {
+    return false;
+  }
+
   const normalized = normalize(candidate);
   if (!PRE_BOOKING_CONFIRMATION_QUESTION_RE.test(normalized)) return false;
   if (/\bnao\s+(?:posso|podemos|confirma)\b/u.test(normalized)) return false;
   if (CONSUMMATED_APPOINTMENT_STATE_RE.test(normalized)) return false;
-
-  const fixedServiceId = input.flowState?.fixedServiceId;
-  if (!fixedServiceId) return false;
-  const serviceResolution = resolveCatalogEntityV2(
-    candidate,
-    catalog.services
-  );
-  if (
-    serviceResolution.kind !== 'resolved' ||
-    serviceResolution.entity.id !== fixedServiceId
-  ) {
-    return false;
-  }
-
-  const licensedTimes = currentTurnSlotEvidenceV2(input.toolTrace ?? []);
-  const pendingEvidence = pendingTimeSlotEvidenceV2(input);
-  for (const slot of pendingEvidence?.slots ?? []) licensedTimes.add(slot);
-  const draft = input.flowState?.bookingDraft;
-  const slotEvidence = input.flowState?.slotEvidence;
-  if (
+  // Equality with the exact server materialization is the only copy check.
+  // There is deliberately no catalog/name/span resolver here.
+  const draft = flowState.bookingDraft;
+  return Boolean(
     draft &&
-    slotEvidence &&
-    draft.slotEvidenceTurnId === slotEvidence.turnId &&
-    draft.serviceId === slotEvidence.serviceId &&
-    draft.date === slotEvidence.date &&
-    slotEvidence.slots.includes(draft.time)
-  ) {
-    licensedTimes.add(draft.time);
-  }
-  const candidateTimes = normalizeTemporalAssertionsV2(candidate).filter(
-    (assertion) => assertion.kind === 'time'
+    candidate.trim() ===
+      materializePreBookingSummaryV2({
+        bookingDraft: draft,
+        services: input.servicesResult,
+      })
   );
-  if (
-    candidateTimes.length === 0 ||
-    !candidateTimes.every((time) => licensedTimes.has(time.normalized))
-  ) {
-    return false;
-  }
-  const expectedDate =
-    draft?.date ?? pendingEvidence?.date ?? input.flowState?.resolvedDate;
-  if (!expectedDate || !candidateMentionsResolvedDateV2(candidate, expectedDate, input.temporalContext)) {
-    return false;
-  }
-  const claims = professionalClaimsV2(candidate, catalog);
-  return (
-    claims.claimCount === 0 ||
-    shouldDiscardUnknownProfessionalV2(candidate, input, catalog)
-  );
+}
+
+function hasSuccessfulAppointmentWriteV2(
+  toolTrace: readonly ToolTraceLike[]
+): boolean {
+  return toolTrace.some((entry) => {
+    if (entry.name !== 'bookAppointment' && entry.name !== 'cancelAppointment') {
+      return false;
+    }
+    return parseToolResult(entry.result)?.success === true;
+  });
 }
 
 function isLicensedCancelCopyV2(
@@ -1079,78 +1092,6 @@ function isLicensedCancelCopyV2(
     'esse cancelamento precisa da equipe do estabelecimento. eu nao consegue conclui-lo por aqui.',
     'esse cancelamento precisa da equipe do estabelecimento. eu nao consigo conclui-lo por aqui.',
   ].includes(normalized);
-}
-
-function zonedCivilDate(now: Date, timezone: string): string | null {
-  try {
-    const values = Object.fromEntries(
-      new Intl.DateTimeFormat('en-CA', {
-        timeZone: timezone,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      })
-        .formatToParts(now)
-        .map((part) => [part.type, part.value])
-    );
-    return values.year && values.month && values.day
-      ? `${values.year}-${values.month}-${values.day}`
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function plusCivilDays(iso: string, days: number): string | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(iso);
-  if (!match) return null;
-  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + days, 12));
-  return date.toISOString().slice(0, 10);
-}
-
-function candidateMentionsResolvedDateV2(
-  candidate: string,
-  expectedDate: string,
-  temporalContext?: AppointmentTemporalContext
-): boolean {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(expectedDate);
-  if (!match) return false;
-  const normalized = normalize(candidate);
-  const [, year, month, day] = match;
-  const dayNumber = String(Number(day));
-  const monthNumber = String(Number(month));
-  if (
-    [
-      expectedDate,
-      `${day}/${month}`,
-      `${dayNumber}/${monthNumber}`,
-      `${day}/${month}/${year}`,
-      `${dayNumber}/${monthNumber}/${year}`,
-    ].some((value) => normalized.includes(value))
-  ) {
-    return true;
-  }
-  const now = temporalContext
-    ? temporalContext.now instanceof Date
-      ? temporalContext.now
-      : new Date(temporalContext.now)
-    : null;
-  const today =
-    now && !Number.isNaN(now.getTime()) && temporalContext
-      ? zonedCivilDate(now, temporalContext.timezone)
-      : null;
-  if (today === expectedDate && /\bhoje\b/u.test(normalized)) return true;
-  if (today && plusCivilDays(today, 1) === expectedDate && /\bamanha\b/u.test(normalized)) return true;
-  const weekday = [
-    'domingo',
-    'segunda',
-    'terca',
-    'quarta',
-    'quinta',
-    'sexta',
-    'sabado',
-  ][new Date(`${expectedDate}T12:00:00.000Z`).getUTCDay()];
-  return Boolean(weekday && new RegExp(`\\b${weekday}(?: feira)?\\b`, 'u').test(normalized));
 }
 
 function hasIneligibleProfessionalForFlow(
@@ -1691,7 +1632,7 @@ export function evaluateBoundaryV2(
   );
   const discardedPreBookingAppointmentContext =
     inspection.reasons.includes('unverified_appointment_context') &&
-    (isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog) ||
+    (isLicensedPreBookingSummaryV2(normalizedCandidate, input) ||
       isLicensedCancelCopyV2(normalizedCandidate, input) ||
       licensedAddressDiscardsUnverifiedAppointmentContextV2(
         factCheckedCandidate,
@@ -1785,7 +1726,7 @@ export function evaluateBoundaryV2(
     : mappedOutboundReasons;
   const discardedOutboundPreBookingContext =
     temporalFilteredReasons.includes('UNVERIFIED_APPOINTMENT_CONTEXT') &&
-    (isLicensedPreBookingSummaryV2(normalizedCandidate, input, catalog) ||
+    (isLicensedPreBookingSummaryV2(normalizedCandidate, input) ||
       isLicensedCancelCopyV2(normalizedCandidate, input) ||
       licensedAddressDiscardsUnverifiedAppointmentContextV2(
         factCheckedCandidate,

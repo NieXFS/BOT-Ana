@@ -88,12 +88,36 @@ const TARGET_SERVICES = [
     // not acquire an unrecorded professional question.
     professionalIds: ['prof-field-one'],
   },
+  {
+    id: 'svc-field-manicure-tradicional',
+    name: 'Manicure tradicional',
+    durationMinutes: 50,
+    price: 80,
+    priceFormatted: 'R$ 80,00',
+    professionalIds: ['prof-field-one'],
+  },
+  {
+    id: 'svc-field-reposicao',
+    name: 'Reposição de unha',
+    durationMinutes: 60,
+    price: 100,
+    priceFormatted: 'R$ 100,00',
+    professionalIds: ['prof-field-one'],
+  },
+  {
+    id: 'svc-field-unha-infantil',
+    name: 'Unha infantil',
+    durationMinutes: 50,
+    price: 70,
+    priceFormatted: 'R$ 70,00',
+    professionalIds: ['prof-field-one'],
+  },
 ] as const;
 
 const SERVICES: ServicesResult = {
   success: true,
   services: [
-    ...Array.from({ length: 104 }, (_, index) => ({
+    ...Array.from({ length: 101 }, (_, index) => ({
       id: `svc-field-generic-${String(index + 1).padStart(3, '0')}`,
       name: `Serviço de laboratório ${index + 1}`,
       durationMinutes: 30,
@@ -104,7 +128,7 @@ const SERVICES: ServicesResult = {
     ...TARGET_SERVICES,
   ],
   professionals: [
-    { id: 'prof-field-one', name: 'Júlia Costa' },
+    { id: 'prof-field-one', name: 'Vitin' },
     { id: 'prof-field-two', name: 'Marina Alves' },
   ],
 };
@@ -317,6 +341,8 @@ async function main(): Promise<void> {
   const conversationKey = `${CONFIG.phoneNumberId}:fixture-${safeTechnicalToken()}`;
   const conversationKeys = [conversationKey];
   const baseNow = new Date('2026-08-24T15:00:00.000Z');
+  const onlyNoConflict = process.env.ANA_IA24D_ONLY_NOCONFLICT === '1';
+  const beforeProbe = process.env.ANA_IA24D_BEFORE === '1';
   await cleanup(db);
   const before = await counts(db, conversationKey);
   if (!before || Object.values(before).some((value) => value !== 0)) fail('synthetic prefix not clean before test');
@@ -418,7 +444,15 @@ async function main(): Promise<void> {
   };
 
   let cleanupFailures: string[] = [];
+  let third: Awaited<ReturnType<typeof runTurn>> | null = null;
+  let conflictReadCount = 0;
+  let conflictWriteCount = 0;
+  const { evaluateBoundaryV2 } = await import('../src/services/conversationalV2/boundary');
+  const preBooking = beforeProbe
+    ? null
+    : await import('../src/services/conversationalV2/preBookingSummary');
   try {
+    if (!onlyNoConflict) {
     const first = await runTurn(1, 'turn-one', [
       'Tem horário hoje após as 17:30?',
       'ou amanhã de manhã pra fazer a unha?',
@@ -443,7 +477,7 @@ async function main(): Promise<void> {
     reloadCheckInNewProcess(conversationKey, 'TIME', new Date(baseNow.getTime() + 45 * 60 * 1_000));
 
     toolCalls.length = 0;
-    const third = await runTurn(3, 'turn-three', ['Pode ser 18h']);
+    third = await runTurn(3, 'turn-three', ['Pode ser 18h']);
     assert.equal(
       third.payload,
       'Vi que você já tem outro agendamento de Esmaltação em gel em 24/08/2026 às 18:00. Quer manter os dois, remarcar, só cancelar o anterior ou decidir depois?'
@@ -467,7 +501,6 @@ async function main(): Promise<void> {
     }
     assert.deepEqual(rejected, []);
     assert.deepEqual(regenCalls, []);
-    const { evaluateBoundaryV2 } = await import('../src/services/conversationalV2/boundary');
     const boundaryInput = {
       servicesResult: SERVICES,
       sourceInboundText: 'Pode ser 18h',
@@ -559,8 +592,9 @@ async function main(): Promise<void> {
     assert.equal(airbag.status, 'accepted');
     assert.equal(airbag.recoveryKind, 'direct_fallback');
     assert.ok(airbag.payload.trim().length > 0);
-    const conflictReadCount = toolCalls.length;
-    const conflictWriteCount = third.planReceipt.toolEffects.filter((effect) => effect.class === 'write').length;
+    conflictReadCount = toolCalls.length;
+    conflictWriteCount = third.planReceipt.toolEffects.filter((effect) => effect.class === 'write').length;
+    }
     activeConversationKey = `${CONFIG.phoneNumberId}:fixture-noconflict-${safeTechnicalToken()}`;
     conversationKeys.push(activeConversationKey);
     upcomingResult = JSON.stringify({ success: true, appointments: [] });
@@ -583,9 +617,40 @@ async function main(): Promise<void> {
     );
     toolCalls.length = 0;
     const noConflictThird = await runTurn(3, 'turn-noconflict-three', ['Pode ser 18h']);
+    if (beforeProbe) {
+      assert.equal(noConflictThird.planReceipt.route, 'regen');
+      assert.equal(noConflictThird.planReceipt.primaryProviderCalls, 0);
+      assert.equal(noConflictThird.planReceipt.regenProviderCalls, 1);
+      assert.ok(
+        noConflictThird.planReceipt.boundaryAttempts[0]?.reasonCodes.includes(
+          'UNVERIFIED_APPOINTMENT_CONTEXT'
+        )
+      );
+      assert.equal(noConflictThird.transition.kind, 'preserve');
+      assert.equal(
+        noConflictThird.payload,
+        'A gente estava marcando Manicure e pedicure para 24/08/2026 — qual horário você prefere?'
+      );
+      console.log(JSON.stringify({
+        status: 'EXPECTED_RED_BEFORE_IA24D',
+        route: noConflictThird.planReceipt.route,
+        primaryProviderCalls: noConflictThird.planReceipt.primaryProviderCalls,
+        regenProviderCalls: noConflictThird.planReceipt.regenProviderCalls,
+        boundaryReasonCodes: noConflictThird.planReceipt.boundaryAttempts[0]?.reasonCodes ?? [],
+        pendingAfter: noConflictThird.transition.kind === 'open'
+          ? noConflictThird.transition.frame.kind
+          : null,
+        bookingDraftTime: noConflictThird.transition.kind === 'open'
+          ? noConflictThird.transition.nextFlowState.bookingDraft?.time ?? null
+          : null,
+        payload: noConflictThird.payload,
+        writeCommitted: noConflictThird.hasCommittedWrite,
+      }));
+      return;
+    }
     assert.equal(
       noConflictThird.payload,
-      'Confirmando: Manicure e pedicure, em 24/08/2026, às 18h, com Júlia Costa. Posso marcar?'
+      'Confirmando: Manicure e pedicure, em 24/08/2026, às 18h, com Vitin. Posso marcar?'
     );
     assert.equal(noConflictThird.planReceipt.route, 'fast_path');
     assert.equal(noConflictThird.planReceipt.recoveryKind, 'none');
@@ -594,28 +659,60 @@ async function main(): Promise<void> {
     assert.deepEqual(toolCalls.map((call) => call.name), ['getUpcomingAppointments']);
     assert.equal(noConflictThird.planReceipt.toolEffects.filter((effect) => effect.class === 'write').length, 0);
     assert.equal(noConflictThird.transition.kind, 'open');
-    if (noConflictThird.transition.kind === 'open') {
+    if (noConflictThird.transition.kind === 'open' && !beforeProbe && preBooking) {
       assert.equal(noConflictThird.transition.frame.kind, 'CONFIRMATION');
       assert.equal(noConflictThird.transition.nextFlowState.bookingDraft?.time, '18:00');
       assert.equal(noConflictThird.transition.nextFlowState.duplicatePreflightClearance?.kind, 'no_conflict');
+      assert.equal(
+        preBooking.materializePreBookingSummaryV2({
+          bookingDraft: noConflictThird.transition.nextFlowState.bookingDraft!,
+          services: SERVICES,
+        }),
+        noConflictThird.payload
+      );
+      const preBookingSummaryEvidence = preBooking.buildPreBookingSummaryEvidenceV2({
+        flowState: noConflictThird.transition.nextFlowState,
+        services: SERVICES,
+      });
+      assert.ok(preBookingSummaryEvidence);
+      const finalBoundary = evaluateBoundaryV2({
+        rawCandidate: noConflictThird.payload!,
+        servicesResult: SERVICES,
+        flowState: noConflictThird.transition.nextFlowState,
+        pendingTransitionCandidate: {
+          kind: 'open',
+          pendingKind: 'CONFIRMATION',
+          flowId: noConflictThird.transition.frame.flowId,
+          optionEntityIds: noConflictThird.transition.frame.options.map((option) => option.entityId),
+        },
+        replyPurpose: 'WRITE_CONFIRMATION',
+        source: 'CANONICAL',
+        outboundEvidence: { preBookingSummary: preBookingSummaryEvidence },
+        toolTrace: toolCalls.map((call) => ({ name: call.name, result: call.result })),
+        sourceInboundText: 'Pode ser 18h',
+        pendingAnaOpen: true,
+        pendingSnapshot: noConflictThird.frame.pending,
+      });
+      assert.deepEqual(finalBoundary.reasonCodes, []);
+      assert.equal(noConflictThird.hasCommittedWrite, false);
     }
     console.log(JSON.stringify({
       status: 'PASS',
-      route: third.planReceipt.route,
-      recoveryKind: third.planReceipt.recoveryKind,
-      source: 'CANONICAL_FAST_PATH',
-      primaryCandidateHash: hash(third.payload ?? ''),
-      primaryModelRounds: third.planReceipt.primaryModelRounds,
-      primaryProviderCalls: third.planReceipt.primaryProviderCalls,
-      regenProviderCalls: third.planReceipt.regenProviderCalls,
+      route: third?.planReceipt.route ?? noConflictThird.planReceipt.route,
+      recoveryKind: third?.planReceipt.recoveryKind ?? noConflictThird.planReceipt.recoveryKind,
+      source: onlyNoConflict ? 'CANONICAL_FAST_PATH_NO_CONFLICT' : 'CANONICAL_FAST_PATH',
+      primaryCandidateHash: hash(third?.payload ?? noConflictThird.payload ?? ''),
+      primaryModelRounds: third?.planReceipt.primaryModelRounds ?? noConflictThird.planReceipt.primaryModelRounds,
+      primaryProviderCalls: third?.planReceipt.primaryProviderCalls ?? noConflictThird.planReceipt.primaryProviderCalls,
+      regenProviderCalls: third?.planReceipt.regenProviderCalls ?? noConflictThird.planReceipt.regenProviderCalls,
       readOrigin: 'resolveTimeDuplicatePreflightV2',
       readCount: conflictReadCount,
       writeCount: conflictWriteCount,
-      pendingAfter: third.transition.kind === 'open' ? third.transition.frame.kind : null,
-      bookingDraftTime: third.transition.kind === 'open' ? third.transition.nextFlowState.bookingDraft?.time ?? null : null,
+      pendingAfter: third?.transition.kind === 'open' ? third.transition.frame.kind : null,
+      bookingDraftTime: third?.transition.kind === 'open' ? third.transition.nextFlowState.bookingDraft?.time ?? null : null,
       staleReadLicense: false,
-      airbagPreserved: true,
-      serviceRelistProtected: true,
+      airbagPreserved: !onlyNoConflict,
+      serviceRelistProtected: !onlyNoConflict,
       noConflict: {
         route: noConflictThird.planReceipt.route,
         primaryCandidateHash: hash(noConflictThird.payload ?? ''),
@@ -624,6 +721,10 @@ async function main(): Promise<void> {
         writeCount: noConflictThird.planReceipt.toolEffects.filter((effect) => effect.class === 'write').length,
         pendingAfter: noConflictThird.transition.kind === 'open' ? noConflictThird.transition.frame.kind : null,
         bookingDraftTime: noConflictThird.transition.kind === 'open' ? noConflictThird.transition.nextFlowState.bookingDraft?.time ?? null : null,
+        replyPurpose: noConflictThird.transition.kind === 'open' && noConflictThird.transition.frame.kind === 'CONFIRMATION'
+          ? 'WRITE_CONFIRMATION'
+          : null,
+        writeCommitted: noConflictThird.hasCommittedWrite,
       },
     }));
   } finally {
@@ -633,6 +734,10 @@ async function main(): Promise<void> {
     if (after.some((countsForConversation) =>
       !countsForConversation || Object.values(countsForConversation).some((value) => value !== 0)
     )) fail('cleanup verification failed');
+    console.log(JSON.stringify({
+      status: 'CLEANUP_ZERO',
+      conversationCount: conversationKeys.length,
+    }));
     await contextManager.pool.end();
     await db.end();
   }

@@ -60,6 +60,19 @@ export interface RecoveryCoordinatorInputV2 {
   /** Prosa final sem envelope; só pode virar copy segura + PRESERVE. */
   unparsedCandidate?: string;
   boundaryContext: BoundaryContextV2;
+  /** Proveniência separada: só o primary server-owned pode carregar esta prova. */
+  primarySource?: 'GENERATED' | 'CANONICAL';
+  primaryOutboundEvidence?: {
+    preBookingSummary?: NonNullable<
+      BoundaryEvaluationInputV2['outboundEvidence']
+    >['preBookingSummary'];
+  };
+  /** Evidência isolada da reancoragem CANONICAL da CONFIRMATION já aberta. */
+  canonicalPendingOutboundEvidence?: {
+    preBookingSummary?: NonNullable<
+      BoundaryEvaluationInputV2['outboundEvidence']
+    >['preBookingSummary'];
+  };
   toolTrace: ToolTraceLike[];
   fallbackIntent: RecoveryFallbackIntentV2;
   preemption?: DeliveryPreemptionV2;
@@ -307,8 +320,17 @@ export async function coordinateRecoveryV2(
   const boundaryAttempts: RecoveryBoundaryAttemptV2[] = [];
   const evaluate = (
     result: ModelTurnResultV2,
-    source: 'GENERATED' | 'CANONICAL'
+    source: 'GENERATED' | 'CANONICAL',
+    preBookingSummary?: NonNullable<
+      BoundaryEvaluationInputV2['outboundEvidence']
+    >['preBookingSummary']
   ): BoundaryEvaluation => {
+    const outboundEvidence = preBookingSummary
+      ? {
+          ...input.boundaryContext.outboundEvidence,
+          preBookingSummary,
+        }
+      : input.boundaryContext.outboundEvidence;
     const evaluation = evaluateBoundaryV2({
       ...input.boundaryContext,
       rawCandidate: result.reply,
@@ -318,6 +340,7 @@ export async function coordinateRecoveryV2(
       unknownServiceEvidence: result.unknownServiceEvidence,
       replyPurpose: result.replyPurpose,
       source,
+      outboundEvidence,
       route: input.boundaryContext.route ?? 'model',
       pendingAnaOpen:
         input.boundaryContext.pendingAnaOpen ?? input.frame.pending !== null,
@@ -404,7 +427,13 @@ export async function coordinateRecoveryV2(
   }
 
   const primaryEvaluation = primaryModelResult
-    ? evaluate(primaryModelResult, 'GENERATED')
+    ? evaluate(
+        primaryModelResult,
+        input.primarySource ?? 'GENERATED',
+        input.primarySource === 'CANONICAL'
+          ? input.primaryOutboundEvidence?.preBookingSummary
+          : undefined
+      )
     : null;
   if (primaryEvaluation && !boundaryAccepted(primaryEvaluation)) {
     input.onRejectedBoundaryCandidate?.({
@@ -591,12 +620,28 @@ export async function coordinateRecoveryV2(
   const fallbackResult: ModelTurnResultV2 = {
     schemaVersion: 2,
     reply: directedFallback.text,
-    replyPurpose: 'CLARIFICATION',
+    replyPurpose:
+      directedFallback.kind === 'copy' &&
+      input.canonicalPendingQuestion &&
+      directedFallback.text === input.canonicalPendingQuestion &&
+      input.canonicalPendingOutboundEvidence?.preBookingSummary
+        ? 'WRITE_CONFIRMATION'
+        : 'CLARIFICATION',
     pendingTransitionCandidate: fallbackTransition,
     resolutionCandidate: null,
     unknownServiceEvidence: null,
   };
-  const fallbackEvaluation = evaluate(fallbackResult, 'CANONICAL');
+  const canonicalPendingEvidence =
+    directedFallback.kind === 'copy' &&
+    input.canonicalPendingQuestion &&
+    directedFallback.text === input.canonicalPendingQuestion
+      ? input.canonicalPendingOutboundEvidence?.preBookingSummary
+      : undefined;
+  const fallbackEvaluation = evaluate(
+    fallbackResult,
+    'CANONICAL',
+    canonicalPendingEvidence
+  );
   if (!boundaryAccepted(fallbackEvaluation)) {
     if (directedFallback.kind === 'visible_escalation') {
       throw new Error(

@@ -26,6 +26,7 @@ import type {
   LicensedServiceDescriptionEvidenceV2,
   LicensedServiceDescriptionV2,
 } from './licensedServiceDescription';
+import type { PreBookingSummaryEvidenceV2 } from './conversationalV2/contracts';
 import {
   normalizeLicensedServiceDescriptionV2,
   validDescriptionTermAcceptanceV2,
@@ -147,6 +148,12 @@ export interface ReceptionistOutboundEvidence {
   licensedServiceDescription?: LicensedServiceDescriptionEvidenceV2;
   /** Endereço operacional testemunhado do payload `businessAddress`. */
   businessAddress?: TenantBusinessAddress;
+  /**
+   * Prova exclusiva da copy canônica de proposta ainda não escrita. Nunca é
+   * colocada no contexto global de regen/modelo; só a rota CANONICAL pode
+   * carregá-la até a boundary.
+   */
+  preBookingSummary?: PreBookingSummaryEvidenceV2;
 }
 
 export interface ReceptionistOutboundEnvelope {

@@ -8,6 +8,10 @@ import type {
   PendingTransitionCandidate,
   TurnFrameV2,
 } from './contracts';
+import {
+  displayDateV2 as displayDateMaterializedV2,
+  materializePreBookingSummaryV2,
+} from './preBookingSummary';
 import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
 
 interface ParsedToolResult {
@@ -304,8 +308,7 @@ function inboundTimesFromText(value: string | undefined): string[] {
 }
 
 export function displayDateV2(date: string): string {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(date);
-  return match ? `${match[3]}/${match[2]}/${match[1]}` : date;
+  return displayDateMaterializedV2(date);
 }
 
 export function buildCanonicalBookingSummaryV2(input: {
@@ -315,16 +318,8 @@ export function buildCanonicalBookingSummaryV2(input: {
     professionals?: readonly { id: string; name: string }[];
   };
 }): string {
-  const service = input.services.services?.find(
-    (entry) => entry.id === input.draft.serviceId
-  );
-  const professional = input.draft.professionalId
-    ? input.services.professionals?.find(
-        (entry) => entry.id === input.draft.professionalId
-      )
-    : null;
-  const professionalPart = professional ? `, com ${professional.name}` : '';
-  return `Confirmando: ${service?.name ?? 'o serviço escolhido'}, em ${displayDateV2(
-    input.draft.date
-  )}, às ${displayTime(input.draft.time)}${professionalPart}. Posso marcar?`;
+  return materializePreBookingSummaryV2({
+    bookingDraft: input.draft,
+    services: input.services,
+  });
 }

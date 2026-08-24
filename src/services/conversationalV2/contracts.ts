@@ -95,6 +95,20 @@ export interface BookingDraftV2 {
   readonly slotEvidenceTurnId: string;
 }
 
+/**
+ * Prova tipada da proposta pré-booking produzida pelo servidor. A prova não
+ * autoriza write; apenas permite que a boundary valide a copy sem reanalisar
+ * a prosa contra o catálogo.
+ */
+export interface PreBookingSummaryEvidenceV2 {
+  readonly flowId: string;
+  readonly serviceId: string;
+  readonly professionalId?: string;
+  readonly date: string;
+  readonly time: string;
+  readonly slotEvidenceTurnId: string;
+}
+
 export interface SlotEvidenceV2 {
   readonly turnId: string;
   readonly serviceId: string;

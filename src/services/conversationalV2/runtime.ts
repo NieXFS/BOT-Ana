@@ -185,6 +185,11 @@ import {
   reduceToolLifecycleV2,
 } from './lifecycleReducer';
 import {
+  buildPreBookingSummaryEvidenceForCanonicalResultV2,
+  buildPreBookingSummaryEvidenceV2,
+  materializePreBookingSummaryV2,
+} from './preBookingSummary';
+import {
   BOOKING_REENTRY_OPTION_IDS_V2,
   DUPLICATE_RESOLUTION_OPTIONS_V2,
   buildPendingQuestionV2,
@@ -3099,6 +3104,21 @@ export async function getReceptionistReplyV2(input: {
   const primaryCandidate: ModelTurnResultV2 | null = primary.ok
     ? primary.value
     : null;
+  const serverOwnedPrimaryPath = Boolean(
+    lifecycleOverride ||
+      nominalRoute === 'fast_path' ||
+      nominalRoute === 'interpreter_hit'
+  );
+  const primaryPreBookingSummaryEvidence =
+    serverOwnedPrimaryPath && primaryCandidate
+      ? buildPreBookingSummaryEvidenceForCanonicalResultV2({
+          result: primaryCandidate,
+          flowState: nextFlowState,
+          services,
+        })
+      : null;
+  const primarySource: 'GENERATED' | 'CANONICAL' =
+    primaryPreBookingSummaryEvidence ? 'CANONICAL' : 'GENERATED';
   const primaryFailedWithEmptyOutput =
     !primary.ok && isEmptyFinalModelOutputV2(loop);
   const rejectedPrimaryRaw = primaryCandidate?.reply ?? loop.rawReply ?? '';
@@ -3160,9 +3180,53 @@ export async function getReceptionistReplyV2(input: {
     now: startedAt,
     lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
   });
+  const recoveryCanonicalPendingQuestion = canonicalPendingQuestion(
+    { ...frame, flowState: nextFlowState },
+    services,
+    shouldReanchorPendingQuestion
+  );
+  const pendingConfirmationIsExact = Boolean(
+    frame.pending?.kind === 'CONFIRMATION' &&
+      frame.pending.flowId === nextFlowState.flowId &&
+      frame.pending.options.length === 1 &&
+      frame.pending.options[0]?.position === 1 &&
+      frame.pending.options[0]?.entityId ===
+        `booking-confirmation:${nextFlowState.flowId}`
+  );
+  const recoveryCanonicalPendingEvidence = pendingConfirmationIsExact
+    ? buildPreBookingSummaryEvidenceV2({
+        flowState: nextFlowState,
+        services,
+      })
+    : null;
+  const exactCanonicalPendingEvidence =
+    recoveryCanonicalPendingEvidence &&
+    recoveryCanonicalPendingQuestion &&
+    recoveryCanonicalPendingQuestion ===
+      materializePreBookingSummaryV2({
+        bookingDraft: nextFlowState.bookingDraft!,
+        services,
+      })
+      ? recoveryCanonicalPendingEvidence
+      : null;
   const recovery = await coordinateRecoveryV2({
     frame: recoveryFrame,
     primaryResult: primary,
+    primarySource,
+    ...(primaryPreBookingSummaryEvidence
+      ? {
+          primaryOutboundEvidence: {
+            preBookingSummary: primaryPreBookingSummaryEvidence,
+          },
+        }
+      : {}),
+    ...(exactCanonicalPendingEvidence
+      ? {
+          canonicalPendingOutboundEvidence: {
+            preBookingSummary: exactCanonicalPendingEvidence,
+          },
+        }
+      : {}),
     unparsedCandidate: primary.ok ? undefined : loop.rawReply ?? undefined,
     boundaryContext: {
       servicesResult: services,
@@ -3200,12 +3264,7 @@ export async function getReceptionistReplyV2(input: {
     fallbackIntent: recoveryFallbackIntent,
     now: startedAt,
     canonicalPendingQuestion:
-      canonicalPendingQuestion(
-        { ...frame, flowState: nextFlowState },
-        services,
-        shouldReanchorPendingQuestion
-      ) ??
-      undefined,
+      recoveryCanonicalPendingQuestion ?? undefined,
     beforeRegenerate: () => checkRace('before_regen'),
     afterRegenerate: () => checkRace('during_regen'),
     onRejectedBoundaryCandidate: deps.onRejectedBoundaryCandidate,

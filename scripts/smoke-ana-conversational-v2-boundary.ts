@@ -15,6 +15,10 @@ import {
   materializeServiceListCopyV2,
   SERVICE_LIST_TRANSPORT_CEILING_V2,
 } from '../src/services/conversationalV2/serviceList';
+import {
+  buildPreBookingSummaryEvidenceV2,
+  materializePreBookingSummaryV2,
+} from '../src/services/conversationalV2/preBookingSummary';
 import { EMPTY_OPEN_SERVICE_CLARIFICATION_V2 } from '../src/services/conversationalV2/recoveryCoordinator';
 import { hasPositiveClauseMatchV2 } from '../src/services/conversationalV2/polarity';
 import { normalizeTemporalAssertionsV2 } from '../src/services/conversationalV2/temporalNormalizer';
@@ -617,6 +621,47 @@ const cleaningFlowState = {
   resolvedDate: '2026-08-13',
   fixedByProofVersion: { fixedServiceId: 2, fixedProfessionalId: 2 },
 };
+const preBookingFlowState = {
+  ...cleaningFlowState,
+  resolvedDate: '2026-08-13',
+  slotEvidence: {
+    turnId: 'turn-pre-booking',
+    serviceId: 'svc-limpeza',
+    professionalId: 'prof-carla',
+    date: '2026-08-13',
+    slots: ['14:00', '15:00', '17:00'],
+  },
+  bookingDraft: {
+    serviceId: 'svc-limpeza',
+    professionalId: 'prof-carla',
+    date: '2026-08-13',
+    time: '15:00',
+    slotEvidenceTurnId: 'turn-pre-booking',
+  },
+};
+const preBookingEvidence = buildPreBookingSummaryEvidenceV2({
+  flowState: preBookingFlowState,
+  services: preBookingServices,
+});
+assert.ok(preBookingEvidence);
+const canonicalPreBookingText = materializePreBookingSummaryV2({
+  bookingDraft: preBookingFlowState.bookingDraft,
+  services: preBookingServices,
+});
+const canonicalPreBookingBoundaryContext = {
+  servicesResult: preBookingServices,
+  flowState: preBookingFlowState,
+  source: 'CANONICAL' as const,
+  replyPurpose: 'WRITE_CONFIRMATION' as const,
+  pendingTransitionCandidate: {
+    kind: 'open' as const,
+    pendingKind: 'CONFIRMATION' as const,
+    flowId: preBookingFlowState.flowId,
+    optionEntityIds: [`booking-confirmation:${preBookingFlowState.flowId}`],
+  },
+  outboundEvidence: { preBookingSummary: preBookingEvidence },
+  pendingAnaOpen: true,
+};
 const slotEvidence = [
   {
     name: 'getAvailableSlots',
@@ -641,15 +686,26 @@ const exactR24Regression = boundary(exactR24Text, {
 });
 assert.equal(
   exactR24Regression.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
-  false,
-  'texto exato do reject real R2.4 é resumo pré-booking licenciado'
+  true,
+  'copy composta não é a rematerialização exata e continua bloqueada'
 );
-assert.equal(exactR24Regression.safe, true, exactR24Regression.reasonCodes.join(','));
+assert.equal(exactR24Regression.safe, false);
+const exactCanonicalPreBooking = boundary(canonicalPreBookingText, {
+  ...canonicalPreBookingBoundaryContext,
+  sourceInboundText: 'pode ser às 15h',
+  inboundTextsById: { 'in-current': 'pode ser às 15h' },
+  toolTrace: slotEvidence,
+});
 assert.equal(
-  isLicensedPreBookingSummaryV2(exactR24Text, {
-    rawCandidate: exactR24Text,
-    servicesResult: preBookingServices,
-    flowState: cleaningFlowState,
+  exactCanonicalPreBooking.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
+  false,
+  exactCanonicalPreBooking.reasonCodes.join(',')
+);
+assert.equal(exactCanonicalPreBooking.safe, true);
+assert.equal(
+  isLicensedPreBookingSummaryV2(canonicalPreBookingText, {
+    rawCandidate: canonicalPreBookingText,
+    ...canonicalPreBookingBoundaryContext,
     sourceInboundText: 'pode ser às 15h',
     toolTrace: slotEvidence,
     temporalContext: { now: new Date('2026-08-13T12:00:00.000Z'), timezone: 'America/Sao_Paulo' },
@@ -723,8 +779,8 @@ const crossTurnSummary = boundary(
 );
 assert.equal(
   crossTurnSummary.safe,
-  true,
-  `TIME OPEN entregue licencia seu próprio slot: ${crossTurnSummary.reasonCodes.join(',')}`
+  false,
+  'slot entregue sem bookingDraft/evidência de proposta não licencia resumo'
 );
 assert.equal(
   crossTurnSummary.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
@@ -732,7 +788,7 @@ assert.equal(
 );
 assert.equal(
   crossTurnSummary.reasonCodes.includes('UNVERIFIED_APPOINTMENT_CONTEXT'),
-  false
+  true
 );
 
 const crossTurnOutsideOptions = boundary(
