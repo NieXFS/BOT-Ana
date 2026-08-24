@@ -1,4 +1,5 @@
 import type { ServicesResult } from './calendarService';
+import { buildCanonicalDuplicateAppointmentContextV2 } from './conversationalV2/duplicateAppointmentCopy';
 
 export type CustomerReplyLeakReason =
   | 'internal_hint'
@@ -364,6 +365,29 @@ function appointmentLocalParts(startTime: string, timezone?: string): {
   };
 }
 
+const CANONICAL_DUPLICATE_LEAD_RE =
+  /^vi\s+que\s+voce\s+ja\s+tem\s+outro\s+agendamento\s+de\b/u;
+
+/**
+ * The v2 duplicate preflight owns one exact sentence. Rebuild it from the
+ * appointment read and the runtime timezone; a canonical-looking clause that
+ * differs in any semantic token must not fall through to generic prose
+ * matching.
+ */
+function matchesCanonicalDuplicateClause(
+  clause: string,
+  appointment: AuthoritativeAppointment,
+  timezone?: string
+): boolean {
+  if (!timezone || !appointment.serviceName) return false;
+  const expected = buildCanonicalDuplicateAppointmentContextV2({
+    serviceName: appointment.serviceName,
+    startTime: appointment.startTime,
+    timezone,
+  });
+  return expected !== null && normalizeClaimText(clause) === normalizeClaimText(expected);
+}
+
 const HOUR_WORD_VALUES: Record<string, number> = {
   zero: 0,
   uma: 1,
@@ -682,6 +706,14 @@ function appointmentMatchesStateClause(
     /cancel|reject|no_show|deleted/i.test(appointment.status)
   ) {
     return false;
+  }
+  const normalizedClause = normalizeClaimText(clause);
+  if (CANONICAL_DUPLICATE_LEAD_RE.test(normalizedClause)) {
+    return matchesCanonicalDuplicateClause(
+      normalizedClause,
+      appointment,
+      temporalContext?.timezone
+    );
   }
   if (
     /\bconfirmad[oa]s?\b/.test(clause) &&

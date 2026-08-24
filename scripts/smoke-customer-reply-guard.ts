@@ -87,6 +87,86 @@ for (const reply of [
   );
 }
 
+const appointmentWithPrepositionServiceTrace = [
+  {
+    userTurn: 3,
+    name: 'getUpcomingAppointments',
+    result: JSON.stringify({
+      success: true,
+      appointments: [
+        {
+          id: 'appt-preposition',
+          startTime: '2026-08-24T21:00:00.000Z',
+          endTime: '2026-08-24T23:00:00.000Z',
+          serviceName: 'Esmaltação em gel',
+          professionalName: 'Júlia',
+          status: 'CONFIRMED',
+        },
+      ],
+    }),
+  },
+];
+const appointmentWithPrepositionReply =
+  'Vi que você já tem outro agendamento de Esmaltação em gel em 24/08/2026 às 18:00. Quer manter os dois, remarcar, só cancelar o anterior ou decidir depois?';
+assert.deepEqual(
+  inspectCustomerReply(
+    appointmentWithPrepositionReply,
+    services,
+    [],
+    appointmentWithPrepositionServiceTrace,
+    undefined,
+    { now: new Date('2026-08-24T15:00:00.000Z'), timezone: 'America/Sao_Paulo' }
+  ),
+  { safe: true, reasons: [] },
+  'nome de serviço com "em" usa o span inteiro testemunhado pela leitura do turno'
+);
+assert.equal(
+  inspectCustomerReply(
+    appointmentWithPrepositionReply,
+    services,
+    [],
+    appointmentWithPrepositionServiceTrace.map((entry) => ({
+      ...entry,
+      result: entry.result.replace('CONFIRMED', 'CANCELLED'),
+    })),
+    undefined,
+    { now: new Date('2026-08-24T15:00:00.000Z'), timezone: 'America/Sao_Paulo' }
+  ).safe,
+  false,
+  'appointment cancelado não licencia o contexto canônico'
+);
+assert.equal(
+  inspectCustomerReply(
+    appointmentWithPrepositionReply.replace('Esmaltação em gel', 'Esmaltação em creme'),
+    services,
+    [],
+    appointmentWithPrepositionServiceTrace,
+    undefined,
+    { now: new Date('2026-08-24T15:00:00.000Z'), timezone: 'America/Sao_Paulo' }
+  ).safe,
+  false,
+  'nome adulterado não herda a licença do appointment read'
+);
+for (const mutation of [
+  appointmentWithPrepositionReply.replace('Esmaltação em gel', 'Esmaltação em gel premium'),
+  appointmentWithPrepositionReply.replace('Esmaltação em gel', 'Esmaltação em gel em creme'),
+  appointmentWithPrepositionReply.replace('agendamento de Esmaltação', 'agendamento de Nova Esmaltação'),
+  appointmentWithPrepositionReply.replace('agendamento de Esmaltação', 'agendamento de Nova e Esmaltação'),
+]) {
+  assert.equal(
+    inspectCustomerReply(
+      mutation,
+      services,
+      [],
+      appointmentWithPrepositionServiceTrace,
+      undefined,
+      { now: new Date('2026-08-24T15:00:00.000Z'), timezone: 'America/Sao_Paulo' }
+    ).safe,
+    false,
+    'prefixo/sufixo adulterado não herda span de serviço testemunhado'
+  );
+}
+
 const legitimateOpeningThenMeta =
   'Olá! Como posso ajudar?\n\nO cliente quer Peeling amanhã.';
 assert.equal(

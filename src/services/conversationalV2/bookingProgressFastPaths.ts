@@ -48,6 +48,7 @@ import {
   isRepeatedEmptyAvailabilityDayV2,
   validatedBookingDraftForPendingV2,
 } from './pendingQuestion';
+import { buildCanonicalDuplicateAppointmentContextV2 } from './duplicateAppointmentCopy';
 import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 import {
   buildEmptyDeferredAvailabilityCopyV2,
@@ -989,15 +990,12 @@ export function buildDuplicateResolutionQuestionV2(
   appointment: UpcomingAppointment,
   timezone: string
 ): string {
-  const start = localDateTimeParts(appointment.startTime, timezone);
-  const time = start
-    ? `${String(Math.floor(start.minutes / 60)).padStart(2, '0')}:${String(
-        start.minutes % 60
-      ).padStart(2, '0')}`
-    : '';
-  return `Vi que você já tem outro agendamento de ${appointment.serviceName} em ${
-    start ? displayDateV2(start.date) : 'uma data próxima'
-  } às ${time}. ${DUPLICATE_RESOLUTION_CHOICE_QUESTION_V2}`;
+  const context = buildCanonicalDuplicateAppointmentContextV2({
+    serviceName: appointment.serviceName,
+    startTime: appointment.startTime,
+    timezone,
+  });
+  return `${context ?? `Vi que você já tem outro agendamento de ${appointment.serviceName} em uma data próxima.`} ${DUPLICATE_RESOLUTION_CHOICE_QUESTION_V2}`;
 }
 
 function withNoConflictClearanceV2(input: {
