@@ -154,6 +154,49 @@ export function assertReceiptRedactedV2(
   context: ReceiptRedactionContextV2 = {}
 ): void {
   assertRedactedValue(receipt, '$', context, new Set<object>());
+  const semantic = (receipt as TurnPlanReceiptV2).semanticServiceResolution;
+  if (!semantic) return;
+  if (semantic.attemptedInvocationReason !== semantic.invocationReason) {
+    throw new Error(
+      'Receipt semântico contém attemptedInvocationReason divergente de invocationReason.'
+    );
+  }
+  if (semantic.status === 'not_invoked') {
+    if (semantic.providerCallCount !== 0 || semantic.cacheHit) {
+      throw new Error('Receipt semântico not_invoked contém chamada/cache incompatível.');
+    }
+    if (!semantic.skipReason) {
+      throw new Error('Receipt semântico not_invoked exige skipReason.');
+    }
+    if (
+      (semantic.attemptedInvocationReason === 'positive_reclarification' ||
+        semantic.attemptedInvocationReason === 'deferred_family') &&
+      ![
+        'feature_disabled',
+        'catalog_unavailable',
+        'candidate_set_invalid',
+        'provider_incompatible',
+      ].includes(semantic.skipReason)
+    ) {
+      throw new Error(
+        'Porta planner_authorized não pode ser vetada por matcher lexical/estado legado.'
+      );
+    }
+  }
+  if (semantic.status === 'cache_hit') {
+    if (semantic.providerCallCount !== 0 || !semantic.cacheHit) {
+      throw new Error('Receipt semântico cache_hit contém contagem/cache incompatível.');
+    }
+    if (semantic.skipReason !== null) {
+      throw new Error('Receipt semântico cache_hit não pode conter skipReason.');
+    }
+  }
+  if (semantic.providerCallCount === 1 && semantic.skipReason !== null) {
+    throw new Error('Receipt semântico chamado não pode conter skipReason.');
+  }
+  if (semantic.providerCallCount === 0 && semantic.status === 'provider_error' && !semantic.skipReason) {
+    throw new Error('Erro de provider sem chamada exige skipReason factual.');
+  }
 }
 
 export function serializeTurnPlanReceiptV2(

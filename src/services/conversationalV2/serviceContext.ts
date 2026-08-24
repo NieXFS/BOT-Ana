@@ -56,6 +56,10 @@ import {
   resolveServiceFromCatalog,
   type ServiceResolverResult,
 } from './serviceResolver';
+import type {
+  SemanticServiceInvocationPolicyV2,
+  SemanticServiceInvocationReasonV2,
+} from './semanticServiceResolver';
 
 export const DEFERRED_AVAILABILITY_MAX_AGE_MS_V2 = 4 * 60 * 60 * 1_000;
 
@@ -107,23 +111,18 @@ export const SERVICE_CONTEXT_SEMANTIC_INVOCATION_REASONS_V2 = [
   'positive_reclarification',
   'deferred_family',
   'direct_unresolved',
-  'not_invoked',
+  'not_considered',
 ] as const;
 
 export type ServiceContextSemanticInvocationReasonV2 =
-  (typeof SERVICE_CONTEXT_SEMANTIC_INVOCATION_REASONS_V2)[number];
+  SemanticServiceInvocationReasonV2;
 
 export type ServiceContextSemanticInvocationV2 = {
-  invoke: boolean;
-  invocationReason: ServiceContextSemanticInvocationReasonV2;
+  /** Política fechada: o runtime passa esta autoridade única à Camada B. */
+  policy: SemanticServiceInvocationPolicyV2;
   /** Resultado deterministicamente construído quando a A acabou de abrir
    * uma clarificação positiva; nunca é inferido por eliminação. */
   deterministicResult: ServiceResolverResult;
-  /** Só os gatilhos positivos/deferred ignoram o fixedService legado para
-   * consultar B; a reentrada da A continua sendo soberana depois. */
-  forceEligibility: boolean;
-  /** Falha/ambiguidade da B mantém o plano A byte-a-byte nesses gatilhos. */
-  preservePlanOnFailure: boolean;
 };
 
 const TIME_TOKEN_SRC =
@@ -945,15 +944,16 @@ export function deriveSemanticServiceInvocationV2(input: {
   catalog: ServicesResult;
   deterministicResult: ServiceResolverResult;
 }): ServiceContextSemanticInvocationV2 {
-  const notInvoked = (): ServiceContextSemanticInvocationV2 => ({
-    invoke: false,
-    invocationReason: 'not_invoked',
+  const notConsidered = (): ServiceContextSemanticInvocationV2 => ({
+    policy: {
+      mode: 'not_considered',
+      attemptedInvocationReason: 'not_considered',
+      preservePlanOnFailure: false,
+    },
     deterministicResult: input.deterministicResult,
-    forceEligibility: false,
-    preservePlanOnFailure: false,
   });
 
-  if (!input.enabled) return notInvoked();
+  if (!input.enabled) return notConsidered();
 
   // These are already resolved by A (or are intentionally negative). The
   // receipt alone is never enough: the decision and selectedServiceId must
@@ -962,14 +962,14 @@ export function deriveSemanticServiceInvocationV2(input: {
     input.plan.selectedServiceId ||
     input.plan.decision.kind === 'select_outside_pending'
   ) {
-    return notInvoked();
+    return notConsidered();
   }
   if (
     input.plan.decision.kind === 'ambiguous_negation' ||
     input.plan.decision.kind === 'reject_pending' ||
     isInactiveOnlyPlan(input.plan)
   ) {
-    return notInvoked();
+    return notConsidered();
   }
 
   const positiveCandidates =
@@ -980,16 +980,25 @@ export function deriveSemanticServiceInvocationV2(input: {
           input.plan.decision.serviceIds
         )
       : null;
-  if (positiveCandidates) {
+  if (
+    input.plan.receipt === 'positive_reclarification' &&
+    input.plan.decision.kind === 'clarify_positive_candidates'
+  ) {
     return {
-      invoke: true,
-      invocationReason: 'positive_reclarification',
-      deterministicResult: positiveCandidates,
-      forceEligibility: true,
-      preservePlanOnFailure: true,
+      policy: {
+        mode: 'planner_authorized',
+        attemptedInvocationReason: 'positive_reclarification',
+        candidateServiceIds: [...input.plan.decision.serviceIds],
+        preservePlanOnFailure: true,
+      },
+      deterministicResult: positiveCandidates ?? input.deterministicResult,
     };
   }
 
+  const deferredFamilyCandidateIds =
+    input.plan.decision.kind === 'deferred_family_clarification'
+      ? [...input.plan.decision.serviceIds]
+      : [];
   const deferredFamilyCandidates =
     input.plan.receipt === 'temporal_deferred' &&
     input.plan.decision.kind === 'deferred_family_clarification'
@@ -998,25 +1007,32 @@ export function deriveSemanticServiceInvocationV2(input: {
           input.plan.decision.serviceIds
         )
       : null;
-  if (deferredFamilyCandidates) {
+  if (
+    input.plan.receipt === 'temporal_deferred' &&
+    input.plan.decision.kind === 'deferred_family_clarification'
+  ) {
     return {
-      invoke: true,
-      invocationReason: 'deferred_family',
-      deterministicResult: deferredFamilyCandidates,
-      forceEligibility: true,
-      preservePlanOnFailure: true,
+      policy: {
+        mode: 'planner_authorized',
+        attemptedInvocationReason: 'deferred_family',
+        candidateServiceIds: deferredFamilyCandidateIds,
+        preservePlanOnFailure: true,
+      },
+      deterministicResult: deferredFamilyCandidates ?? input.deterministicResult,
     };
   }
 
   // `none`/`not_applicable` and an open deferred service question retain the
-  // old semantic trigger. The resolver itself still checks current evidence;
-  // no evidence means a redacted not_invoked receipt and zero provider calls.
+  // cheap direct trigger. Its resolver-side eligibility remains intentionally
+  // conservative; no evidence means a redacted not_considered receipt and
+  // zero provider calls.
   return {
-    invoke: true,
-    invocationReason: 'direct_unresolved',
+    policy: {
+      mode: 'direct_unresolved',
+      attemptedInvocationReason: 'direct_unresolved',
+      preservePlanOnFailure: false,
+    },
     deterministicResult: input.deterministicResult,
-    forceEligibility: false,
-    preservePlanOnFailure: false,
   };
 }
 

@@ -94,6 +94,7 @@ import {
 } from './featureFlag';
 import {
   resolveSemanticService,
+  deriveSemanticServiceEligibilityV2,
   semanticServiceResolverNotInvokedReceipt,
   semanticDecisionToServiceResolverResult,
   SEMANTIC_SERVICE_SAFE_CLARIFICATION_V2,
@@ -2013,6 +2014,12 @@ export async function getReceptionistReplyV2(input: {
     turnId,
     inputSequence,
   });
+  // O receipt identifica a decisão da Camada A que abriu a porta; a segunda
+  // aplicação do planner materializa o estado validado por B, mas não pode
+  // apagar a proveniência da porta original.
+  if (serviceContextEnabled) {
+    serviceContextDecisionReceipt = serviceContextPlan.receipt;
+  }
   // IA-25 fica depois do primeiro passe da IA-24 (Camada A), mas antes de
   // qualquer intérprete, loop principal ou recovery. O segundo passe abaixo é
   // puro: ele só materializa a decisão B já validada no mesmo planner
@@ -2029,41 +2036,54 @@ export async function getReceptionistReplyV2(input: {
       catalog: services,
       deterministicResult: deterministicServiceResult,
     });
-    if (!semanticInvocation.invoke) {
+    const semanticFlow = hasPositiveExplicitBookingVerbV2(currentInboundBatchText)
+      ? 'booking' as const
+      : hasExplicitAvailabilityReadRequestV2(currentInboundBatchText)
+        ? 'availability' as const
+        : frame.pending?.kind === 'SERVICE'
+          ? 'service_selection' as const
+          : 'other' as const;
+    const semanticContext = {
+      flow: semanticFlow,
+      pendingKind: frame.pending?.kind ?? null,
+      fixedServiceId: frame.flowState.fixedServiceId ?? null,
+    };
+    const semanticEligibility = deriveSemanticServiceEligibilityV2({
+      enabled: semanticServiceResolverEnabled,
+      currentBatch: currentInboundBatchText,
+      deterministicResult: semanticInvocation.deterministicResult,
+      context: semanticContext,
+      catalog: services,
+      policy: semanticInvocation.policy,
+      // The actual provider/runtime compatibility check remains inside B;
+      // this preflight is only for the planner port and cheap direct gate.
+      providerCompatible: true,
+    });
+    if (!semanticEligibility.eligibility.invoke) {
       semanticServiceResolutionReceipt =
         semanticServiceResolverNotInvokedReceipt(
           services,
           deps.semanticCatalogVersion,
-          semanticInvocation.invocationReason
+          semanticInvocation.policy.attemptedInvocationReason,
+          semanticEligibility.eligibility.skipReason,
+          semanticEligibility.diagnostics.candidateCount
         );
     } else {
-      const semanticFlow = hasPositiveExplicitBookingVerbV2(currentInboundBatchText)
-        ? 'booking' as const
-        : hasExplicitAvailabilityReadRequestV2(currentInboundBatchText)
-          ? 'availability' as const
-          : frame.pending?.kind === 'SERVICE'
-            ? 'service_selection' as const
-            : 'other' as const;
       const semanticOutcome = await resolveSemanticService({
         tenantSlug: input.config.tenantSlug,
         currentBatch: currentInboundBatchText,
         catalog: services,
         config: input.config,
         deterministicResult: semanticInvocation.deterministicResult,
+        invocationPolicy: semanticInvocation.policy,
         ...(deps.semanticCatalogVersion
           ? { catalogVersion: deps.semanticCatalogVersion }
           : {}),
         context: {
           flow: semanticFlow,
           pendingKind: frame.pending?.kind ?? null,
-          // A just opened a positive candidate clarification. Its legacy fixed
-          // service must not suppress the one B call; the second planner pass
-          // still applies the validated result against the original frame.
-          fixedServiceId: semanticInvocation.forceEligibility
-            ? null
-            : frame.flowState.fixedServiceId ?? null,
+          fixedServiceId: frame.flowState.fixedServiceId ?? null,
         },
-        invocationReason: semanticInvocation.invocationReason,
         ...(deps.semanticServiceCompletionFactory
           ? { completionFactory: deps.semanticServiceCompletionFactory }
           : {}),
@@ -2078,7 +2098,7 @@ export async function getReceptionistReplyV2(input: {
         : null;
       if (
         semanticServiceResult?.kind === 'resolved' ||
-        (!semanticInvocation.preservePlanOnFailure && semanticServiceResult)
+        (!semanticInvocation.policy.preservePlanOnFailure && semanticServiceResult)
       ) {
         serviceContextPlan = planServiceContextV2({
           enabled: serviceContextEnabled,
@@ -2098,8 +2118,9 @@ export async function getReceptionistReplyV2(input: {
           inputSequence,
         });
       } else if (
-        !semanticInvocation.preservePlanOnFailure &&
+        !semanticInvocation.policy.preservePlanOnFailure &&
         (semanticOutcome.reason === 'provider_error' ||
+          semanticOutcome.reason === 'provider_incompatible' ||
           semanticOutcome.reason === 'invalid_response' ||
           semanticOutcome.reason === 'rejected_evidence' ||
           (semanticOutcome.decision !== null && semanticServiceResult === null) ||
@@ -2129,15 +2150,12 @@ export async function getReceptionistReplyV2(input: {
           },
           nextFlowState: serviceContextPlan.nextFlowState ?? frame.flowState,
         };
-      } else if (semanticInvocation.preservePlanOnFailure) {
+      } else if (semanticInvocation.policy.preservePlanOnFailure) {
         // A positive/deferred clarification is the safe fallback. B may say
         // ambiguous/none or fail closed; every one of those outcomes keeps
         // the original plan object byte-for-byte.
       }
     }
-  }
-  if (serviceContextEnabled) {
-    serviceContextDecisionReceipt = serviceContextPlan.receipt;
   }
   const serviceContextPlanningFrame: TurnFrameV2 = {
     ...frame,

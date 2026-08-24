@@ -48,6 +48,7 @@ export const SEMANTIC_SERVICE_RESOLVER_SYSTEM_PROMPT = [
   'resolved exige exatamente um serviço ativo e uma evidência positiva no lote atual.',
   'ambiguous exige pelo menos dois serviços ativos plausíveis e serviceId nulo.',
   'none exige serviceId nulo e candidateServiceIds vazio quando não houver serviço identificado.',
+  'Quando o catálogo recebido for um conjunto de candidatos do planner, escolha somente dentro desse conjunto; não introduza serviços ausentes.',
   'evidenceText deve ser um trecho literal, com a mesma grafia, do lote atual; para none pode ser a string vazia.',
   'Não retorne confidence, explicação, markdown, chaves extras, tool calls ou pseudo-tools.',
 ].join(' ');
@@ -76,11 +77,69 @@ export const SEMANTIC_SERVICE_INVOCATION_REASONS_V2 = [
   'positive_reclarification',
   'deferred_family',
   'direct_unresolved',
-  'not_invoked',
+  'not_considered',
 ] as const;
 
 export type SemanticServiceInvocationReasonV2 =
   (typeof SEMANTIC_SERVICE_INVOCATION_REASONS_V2)[number];
+
+export const SEMANTIC_SERVICE_SKIP_REASONS_V2 = [
+  'feature_disabled',
+  'catalog_unavailable',
+  'deterministic_resolved',
+  'no_current_service_evidence',
+  'fixed_service_preserved',
+  'temporal_or_confirmation_only',
+  'candidate_set_invalid',
+  'provider_incompatible',
+  'not_considered',
+] as const;
+
+export type SemanticServiceSkipReasonV2 =
+  (typeof SEMANTIC_SERVICE_SKIP_REASONS_V2)[number];
+
+export type SemanticServiceInvocationPolicyV2 =
+  | {
+      mode: 'planner_authorized';
+      attemptedInvocationReason: 'positive_reclarification' | 'deferred_family';
+      candidateServiceIds: string[];
+      preservePlanOnFailure: true;
+    }
+  | {
+      mode: 'direct_unresolved';
+      attemptedInvocationReason: 'direct_unresolved';
+      preservePlanOnFailure: false;
+    }
+  | {
+      mode: 'not_considered';
+      attemptedInvocationReason: 'not_considered';
+      preservePlanOnFailure: false;
+    };
+
+export type SemanticServiceEligibilityV2 =
+  | { invoke: true; skipReason: null }
+  | { invoke: false; skipReason: SemanticServiceSkipReasonV2 };
+
+export interface SemanticServiceEligibilityDiagnosticsV2 {
+  catalogAvailable: boolean;
+  activeServiceCount: number;
+  candidateCount: number;
+  candidateSetValid: boolean | null;
+  deterministicResultKind: ServiceResolverResult['kind'];
+  plannerPortAttempted: boolean;
+  currentServiceEvidence: boolean;
+  fixedServiceIdPresent: boolean;
+  correctionActive: boolean;
+  pendingKind: string | null;
+  temporalOrConfirmationOnly: boolean;
+  finalResult: 'invoke' | 'not_invoked';
+  skipReason: SemanticServiceSkipReasonV2 | null;
+}
+
+export interface SemanticServiceEligibilityEvaluationV2 {
+  eligibility: SemanticServiceEligibilityV2;
+  diagnostics: SemanticServiceEligibilityDiagnosticsV2;
+}
 
 export interface SemanticServiceResolverReceipt {
   status: SemanticServiceResolverReceiptStatus;
@@ -95,6 +154,10 @@ export interface SemanticServiceResolverReceipt {
   catalogFingerprintHash: string;
   /** Motivo fechado/redacted da política de invocação e porta da Camada A. */
   invocationReason: SemanticServiceInvocationReasonV2;
+  /** Nome explícito da proveniência; `invocationReason` é alias compatível. */
+  attemptedInvocationReason: SemanticServiceInvocationReasonV2;
+  /** Predicado fechado que impediu a chamada; nulo após chamada/cache hit. */
+  skipReason: SemanticServiceSkipReasonV2 | null;
   /** Hash do cache key; nunca contém frase, conteúdo ou identificador do cliente. */
   cacheKeyHash?: string;
 }
@@ -146,6 +209,10 @@ export type SemanticServiceResolverOutcome = {
     | 'fixed_service_preserved'
     | 'temporal_or_confirmation_only'
     | 'catalog_unavailable'
+    | 'feature_disabled'
+    | 'candidate_set_invalid'
+    | 'provider_incompatible'
+    | 'not_considered'
     | 'provider_error'
     | 'invalid_response'
     | 'rejected_evidence'
@@ -291,13 +358,16 @@ export function semanticCatalogFingerprintHash(
 export function semanticServiceResolverNotInvokedReceipt(
   catalog: ServicesResult,
   explicitVersion?: string,
-  trigger: SemanticServiceInvocationReasonV2 = 'not_invoked'
+  trigger: SemanticServiceInvocationReasonV2 = 'not_considered',
+  skipReason: SemanticServiceSkipReasonV2 = 'not_considered',
+  candidateCount = 0
 ): SemanticServiceResolverReceipt {
   return notInvokedReceipt(
     'not_invoked',
     catalogFingerprint(catalog, explicitVersion),
-    0,
-    trigger
+    candidateCount,
+    trigger,
+    skipReason
   );
 }
 
@@ -364,54 +434,156 @@ function hasCorrectionMarker(text: string): boolean {
   );
 }
 
-function shouldInvokeSemanticService(input: {
+function makeEligibilityEvaluation(
+  input: {
+    catalog: ServicesResult;
+    deterministicResult: ServiceResolverResult;
+    policy: SemanticServiceInvocationPolicyV2;
+    candidateCount: number;
+    candidateSetValid: boolean | null;
+    currentServiceEvidence: boolean;
+    fixedServiceIdPresent: boolean;
+    correctionActive: boolean;
+    pendingKind: string | null;
+    temporalOrConfirmationOnly: boolean;
+  },
+  eligibility: SemanticServiceEligibilityV2
+): SemanticServiceEligibilityEvaluationV2 {
+  return {
+    eligibility,
+    diagnostics: {
+      catalogAvailable:
+        input.catalog.success && activeServices(input.catalog).length > 0,
+      activeServiceCount: activeServices(input.catalog).length,
+      candidateCount: input.candidateCount,
+      candidateSetValid: input.candidateSetValid,
+      deterministicResultKind: input.deterministicResult.kind,
+      plannerPortAttempted: input.policy.mode === 'planner_authorized',
+      currentServiceEvidence: input.currentServiceEvidence,
+      fixedServiceIdPresent: input.fixedServiceIdPresent,
+      correctionActive: input.correctionActive,
+      pendingKind: input.pendingKind,
+      temporalOrConfirmationOnly: input.temporalOrConfirmationOnly,
+      finalResult: eligibility.invoke ? 'invoke' : 'not_invoked',
+      skipReason: eligibility.skipReason,
+    },
+  };
+}
+
+/**
+ * Política de elegibilidade extraída do resolver para diagnóstico local e
+ * smokes. A porta `planner_authorized` é soberana depois da validação do
+ * catálogo/conjunto/provider; somente `direct_unresolved` usa os gates baratos
+ * de custo e contexto.
+ */
+export function deriveSemanticServiceEligibilityV2(input: {
+  enabled?: boolean;
   currentBatch: string;
   deterministicResult: ServiceResolverResult;
   context: SemanticServiceResolverContext;
   catalog: ServicesResult;
-}): { invoke: true } | { invoke: false; reason: SemanticServiceResolverOutcome['reason'] } {
-  if (!input.catalog.success || activeServices(input.catalog).length === 0) {
-    return { invoke: false, reason: 'catalog_unavailable' };
-  }
-  if (input.deterministicResult.kind === 'resolved') {
-    return { invoke: false, reason: 'deterministic_resolved' };
-  }
+  policy?: SemanticServiceInvocationPolicyV2;
+  providerCompatible?: boolean;
+}): SemanticServiceEligibilityEvaluationV2 {
+  const policy = input.policy ?? {
+    mode: 'direct_unresolved',
+    attemptedInvocationReason: 'direct_unresolved',
+    preservePlanOnFailure: false,
+  } satisfies SemanticServiceInvocationPolicyV2;
   const text = input.currentBatch.trim();
-  if (
-    !text ||
-    (!currentServiceEvidence(text, input.catalog) &&
-      input.deterministicResult.kind !== 'ambiguous')
-  ) {
-    return { invoke: false, reason: 'no_current_service_evidence' };
-  }
+  const normalized = normalizeSemanticPhrase(text);
   const correction =
     input.context.correctionActive === true || hasCorrectionMarker(text);
-  const fixedServiceId = input.context.fixedServiceId?.trim();
-  if (fixedServiceId && !correction) {
-    return { invoke: false, reason: 'fixed_service_preserved' };
-  }
-  if (input.context.pendingKind === 'CONFIRMATION' && !correction) {
-    return { invoke: false, reason: 'temporal_or_confirmation_only' };
-  }
-  if (
+  const fixedServiceIdPresent = Boolean(input.context.fixedServiceId?.trim());
+  const hasCurrentEvidence = currentServiceEvidence(text, input.catalog);
+  const temporalOrConfirmationOnly =
     (input.context.pendingKind === 'DATE' ||
       input.context.pendingKind === 'TIME' ||
       input.context.pendingKind === 'CONFIRMATION') &&
     !correction &&
     !/\b(?:servic\w*|unh\w*|manicure\w*|pedicure\w*|mao\b|pe\b|manutenc\w*|complet\w*)/u.test(
-      normalizeSemanticPhrase(text)
-    )
-  ) {
-    return { invoke: false, reason: 'temporal_or_confirmation_only' };
+      normalized
+    );
+
+  const base = {
+    catalog: input.catalog,
+    deterministicResult: input.deterministicResult,
+    policy,
+    candidateCount:
+      policy.mode === 'planner_authorized' ? policy.candidateServiceIds.length : 0,
+    candidateSetValid: null as boolean | null,
+    currentServiceEvidence: hasCurrentEvidence,
+    fixedServiceIdPresent,
+    correctionActive: correction,
+    pendingKind: input.context.pendingKind ?? null,
+    temporalOrConfirmationOnly,
+  };
+  const skip = (skipReason: SemanticServiceSkipReasonV2) =>
+    makeEligibilityEvaluation(base, { invoke: false, skipReason });
+
+  if (input.enabled === false) return skip('feature_disabled');
+  if (policy.mode === 'not_considered') return skip('not_considered');
+  if (!input.catalog.success || activeServices(input.catalog).length === 0) {
+    return skip('catalog_unavailable');
   }
-  return { invoke: true };
+  if (policy.mode === 'planner_authorized') {
+    const candidateSetValid =
+      policy.candidateServiceIds.length >= 2 &&
+      policy.candidateServiceIds.every(
+        (candidateId) =>
+          typeof candidateId === 'string' &&
+          candidateId.trim() === candidateId &&
+          candidateId.length > 0
+      ) &&
+      new Set(policy.candidateServiceIds).size ===
+        policy.candidateServiceIds.length &&
+      policy.candidateServiceIds.every((candidateId) =>
+        activeServices(input.catalog).some((service) => service.id === candidateId)
+      );
+    base.candidateSetValid = candidateSetValid;
+    if (!candidateSetValid) return skip('candidate_set_invalid');
+    if (input.providerCompatible === false) {
+      return skip('provider_incompatible');
+    }
+    return makeEligibilityEvaluation(base, { invoke: true, skipReason: null });
+  }
+  if (
+    input.deterministicResult.kind === 'negative_clarification' ||
+    (input.deterministicResult.kind === 'no_match' &&
+      input.deterministicResult.reason === 'inactive_only')
+  ) {
+    return skip('not_considered');
+  }
+  if (input.deterministicResult.kind === 'resolved') {
+    return skip('deterministic_resolved');
+  }
+  if (
+    !text ||
+    (!hasCurrentEvidence && input.deterministicResult.kind !== 'ambiguous')
+  ) {
+    return skip('no_current_service_evidence');
+  }
+  if (fixedServiceIdPresent && !correction) {
+    return skip('fixed_service_preserved');
+  }
+  if (input.context.pendingKind === 'CONFIRMATION' && !correction) {
+    return skip('temporal_or_confirmation_only');
+  }
+  if (temporalOrConfirmationOnly) {
+    return skip('temporal_or_confirmation_only');
+  }
+  if (input.providerCompatible === false) {
+    return skip('provider_incompatible');
+  }
+  return makeEligibilityEvaluation(base, { invoke: true, skipReason: null });
 }
 
 function notInvokedReceipt(
   status: SemanticServiceResolverReceiptStatus,
   catalogFingerprintHash: string,
   candidateCount = 0,
-  invocationReason: SemanticServiceInvocationReasonV2 = 'not_invoked'
+  invocationReason: SemanticServiceInvocationReasonV2 = 'not_considered',
+  skipReason: SemanticServiceSkipReasonV2 = 'not_considered'
 ): SemanticServiceResolverReceipt {
   return {
     status,
@@ -425,6 +597,8 @@ function notInvokedReceipt(
     candidateCount,
     catalogFingerprintHash,
     invocationReason,
+    attemptedInvocationReason: invocationReason,
+    skipReason,
   };
 }
 
@@ -499,20 +673,39 @@ function evidenceIsPositive(
   const lastEvidenceSeparator = [...normalizedEvidence.matchAll(/[.!?,;:\n]+/gu)]
     .map((match) => (match.index ?? 0) + match[0].length)
     .at(-1) ?? 0;
-  if (/\b(?:nao|nunca)\b/u.test(normalizedEvidence.slice(0, lastEvidenceSeparator))) {
+  // A correction may carry a negative clause before the positive evidence
+  // (`não, quero pé e mão`). Evaluate the final evidence clause, not the
+  // prefix that the client explicitly replaced.
+  const polarityEvidence = normalizedEvidence.slice(lastEvidenceSeparator);
+  const evidenceClause = clause.slice(
+    Math.max(0, clause.length - polarityEvidence.length)
+  );
+  const evidenceIndexInClause = evidenceClause.lastIndexOf(polarityEvidence);
+  const priorClauseStartsNegative =
+    /^\s*(?:nao|nunca)\b/u.test(normalizedBatch.slice(0, clauseStart));
+  const positiveCorrectionCue =
+    /\b(?:quero|queria|gostaria|prefiro|preciso|desejo|vou|pode\s+ser|escolho|mas|na\s+verdade|melhor|trocar|troquei)\b/u.test(
+      evidenceClause
+    );
+  if (
+    (/^\s*(?:nao|nunca)\b/u.test(normalizedEvidence) ||
+      priorClauseStartsNegative) &&
+    !positiveCorrectionCue
+  ) {
     return { ok: false, reason: 'negated_evidence' };
   }
-  const polarityEvidence = normalizedEvidence.slice(lastEvidenceSeparator);
-  const evidenceIndexInClause = clause.lastIndexOf(polarityEvidence);
   if (
     evidenceIndexInClause < 0 ||
-    !localPositivePolarity(clause, evidenceIndexInClause)
+    !localPositivePolarity(evidenceClause, evidenceIndexInClause)
   ) {
     return { ok: false, reason: 'negated_evidence' };
   }
 
   const correctionOffset = lastCorrectionOffset(normalizedBatch);
-  if (correctionOffset >= 0 && index < correctionOffset) {
+  if (
+    correctionOffset >= 0 &&
+    index + lastEvidenceSeparator < correctionOffset
+  ) {
     return { ok: false, reason: 'evidence_before_last_correction' };
   }
   return { ok: true, normalizedIndex: index };
@@ -771,6 +964,7 @@ function requestMessages(input: {
   currentBatch: string;
   catalog: ServicesResult;
   context: SemanticServiceResolverContext;
+  policy?: SemanticServiceInvocationPolicyV2;
 }): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
   // Deliberately JSON-encode untrusted tenant data as one user message. The
   // system message says it is data; no catalog field is promoted to prompt
@@ -780,10 +974,17 @@ function requestMessages(input: {
     catalog: semanticCatalogEntries(input.catalog),
     context: {
       flow: input.context.flow ?? 'other',
-      pendingKind: input.context.pendingKind ?? null,
-      fixedServiceId: input.context.fixedServiceId ?? null,
-      correctionActive: input.context.correctionActive === true,
+      ...(input.policy?.mode === 'planner_authorized'
+        ? {}
+        : {
+            pendingKind: input.context.pendingKind ?? null,
+            fixedServiceId: input.context.fixedServiceId ?? null,
+            correctionActive: input.context.correctionActive === true,
+          }),
     },
+    ...(input.policy?.mode === 'planner_authorized'
+      ? { candidateSetMode: 'planner_authorized' as const }
+      : {}),
   };
   return [
     { role: 'system', content: SEMANTIC_SERVICE_RESOLVER_SYSTEM_PROMPT },
@@ -845,6 +1046,45 @@ function cachePut(key: string, entry: SemanticCacheEntry): void {
   }
 }
 
+function relLicenseCachedEvidence(
+  currentBatch: string,
+  evidenceText: string
+): string | null {
+  if (!evidenceText) return '';
+  if (currentBatch.includes(evidenceText)) return evidenceText;
+  const lowerBatch = currentBatch.toLocaleLowerCase('pt-BR');
+  const lowerEvidence = evidenceText.toLocaleLowerCase('pt-BR');
+  const directIndex = lowerBatch.indexOf(lowerEvidence);
+  if (directIndex >= 0) {
+    return currentBatch.slice(directIndex, directIndex + evidenceText.length);
+  }
+  const target = normalizeSemanticPhrase(evidenceText);
+  if (!target) return null;
+  const tokens = [...currentBatch.matchAll(/\S+/gu)].map((match) => ({
+    start: match.index ?? 0,
+    end: (match.index ?? 0) + match[0].length,
+  }));
+  for (let start = 0; start < tokens.length; start += 1) {
+    for (let end = start; end < tokens.length; end += 1) {
+      const candidate = currentBatch.slice(tokens[start]!.start, tokens[end]!.end);
+      if (normalizeSemanticPhrase(candidate) === target) return candidate;
+    }
+  }
+  return null;
+}
+
+function reLicenseCachedDecision(
+  currentBatch: string,
+  decision: SemanticServiceDecision
+): SemanticServiceDecision | null {
+  if (!decision.evidenceText) return decision;
+  const evidenceText = relLicenseCachedEvidence(
+    currentBatch,
+    decision.evidenceText
+  );
+  return evidenceText === null ? null : { ...decision, evidenceText };
+}
+
 export function clearSemanticServiceResolverCache(): void {
   semanticCache.clear();
 }
@@ -857,21 +1097,110 @@ function outcomeForNotInvoked(input: {
   deterministicResult: ServiceResolverResult;
   reason: SemanticServiceResolverOutcome['reason'];
   catalogFingerprintHash: string;
+  invocationReason: SemanticServiceInvocationReasonV2;
+  skipReason: SemanticServiceSkipReasonV2;
+  candidateCount?: number;
 }): SemanticServiceResolverOutcome {
   return {
     decision: null,
     deterministicResult: input.deterministicResult,
     receipt: notInvokedReceipt(
-      input.reason === 'catalog_unavailable' ? 'none' : 'not_invoked',
+      'not_invoked',
       input.catalogFingerprintHash,
-      0,
-      // A resolver call that was considered but rejected by its own evidence
-      // gate is still observable as `not_invoked`; a forced A trigger never
-      // reaches this branch because its server-owned ambiguous result passes
-      // the gate.
-      'not_invoked'
+      input.candidateCount ?? 0,
+      input.invocationReason,
+      input.skipReason
     ),
     reason: input.reason,
+  };
+}
+
+function legacyPolicyForInvocation(
+  invocationReason: SemanticServiceInvocationReasonV2,
+  deterministicResult: ServiceResolverResult
+): SemanticServiceInvocationPolicyV2 {
+  if (
+    invocationReason === 'positive_reclarification' ||
+    invocationReason === 'deferred_family'
+  ) {
+    return {
+      mode: 'planner_authorized',
+      attemptedInvocationReason: invocationReason,
+      candidateServiceIds:
+        deterministicResult.kind === 'ambiguous'
+          ? [...deterministicResult.serviceIds]
+          : [],
+      preservePlanOnFailure: true,
+    };
+  }
+  if (invocationReason === 'not_considered') {
+    return {
+      mode: 'not_considered',
+      attemptedInvocationReason: 'not_considered',
+      preservePlanOnFailure: false,
+    };
+  }
+  return {
+    mode: 'direct_unresolved',
+    attemptedInvocationReason: 'direct_unresolved',
+    preservePlanOnFailure: false,
+  };
+}
+
+function catalogForInvocationPolicy(
+  catalog: ServicesResult,
+  policy: SemanticServiceInvocationPolicyV2
+): ServicesResult {
+  if (policy.mode !== 'planner_authorized') return catalog;
+  const allowed = new Set(policy.candidateServiceIds);
+  return {
+    ...catalog,
+    services: activeServices(catalog).filter((service) => allowed.has(service.id)),
+  };
+}
+
+function contextForInvocationPolicy(
+  context: SemanticServiceResolverContext,
+  policy: SemanticServiceInvocationPolicyV2
+): SemanticServiceResolverContext {
+  if (policy.mode !== 'planner_authorized') return context;
+  // A planner-authorized port is already a positive multi-candidate proof.
+  // Do not expose legacy fixed/pending veto inputs as semantic authority.
+  return {
+    flow: context.flow,
+    pendingKind: null,
+    fixedServiceId: null,
+    correctionActive: false,
+  };
+}
+
+function providerIncompatibleOutcome(input: {
+  deterministicResult: ServiceResolverResult;
+  catalogFingerprintHash: string;
+  invocationReason: SemanticServiceInvocationReasonV2;
+  candidateCount: number;
+  cacheKeyHash?: string;
+}): SemanticServiceResolverOutcome {
+  return {
+    decision: null,
+    deterministicResult: input.deterministicResult,
+    receipt: {
+      status: 'provider_error',
+      provider: 'deepseek',
+      requestedModel: DEEPSEEK_V4_FLASH_MODEL,
+      responseModel: null,
+      fingerprintStatus: 'absent',
+      latencyMs: 0,
+      providerCallCount: 0,
+      cacheHit: false,
+      candidateCount: input.candidateCount,
+      catalogFingerprintHash: input.catalogFingerprintHash,
+      invocationReason: input.invocationReason,
+      attemptedInvocationReason: input.invocationReason,
+      skipReason: 'provider_incompatible',
+      ...(input.cacheKeyHash ? { cacheKeyHash: input.cacheKeyHash } : {}),
+    },
+    reason: 'provider_incompatible',
   };
 }
 
@@ -888,7 +1217,9 @@ export async function resolveSemanticService(input: {
   catalogVersion?: string;
   deterministicResult?: ServiceResolverResult;
   completionFactory?: SemanticServiceCompletionFactory;
-  /** Proveniência redacted calculada pelo planner da Camada A. */
+  /** Política fechada calculada pelo planner da Camada A. */
+  invocationPolicy?: SemanticServiceInvocationPolicyV2;
+  /** Alias de compatibilidade para callers antigos; a política vence quando presente. */
   invocationReason?: SemanticServiceInvocationReasonV2;
   now?: () => number;
 }): Promise<SemanticServiceResolverOutcome> {
@@ -896,33 +1227,73 @@ export async function resolveSemanticService(input: {
   const deterministicResult =
     input.deterministicResult ??
     resolveServiceFromCatalog({ text: input.currentBatch, catalog: input.catalog });
+  const legacyInvocationReason = input.invocationReason ?? 'direct_unresolved';
+  const policy =
+    input.invocationPolicy ??
+    legacyPolicyForInvocation(legacyInvocationReason, deterministicResult);
+  const invocationReason = policy.attemptedInvocationReason;
   const catalogFingerprintHash = catalogFingerprint(
     input.catalog,
     input.catalogVersion
   );
-  const eligibility = shouldInvokeSemanticService({
+  let providerCompatible = true;
+  try {
+    fixedDeepSeekRuntime(input.config);
+  } catch {
+    providerCompatible = false;
+  }
+  const eligibility = deriveSemanticServiceEligibilityV2({
+    enabled: true,
     currentBatch: input.currentBatch,
     deterministicResult,
     context,
     catalog: input.catalog,
+    policy,
+    providerCompatible,
   });
-  if (!eligibility.invoke) {
+  if (!eligibility.eligibility.invoke) {
+    if (eligibility.eligibility.skipReason === 'provider_incompatible') {
+      return providerIncompatibleOutcome({
+        deterministicResult,
+        catalogFingerprintHash,
+        invocationReason,
+        candidateCount:
+          policy.mode === 'planner_authorized'
+            ? policy.candidateServiceIds.length
+            : 0,
+      });
+    }
     return outcomeForNotInvoked({
       deterministicResult,
-      reason: eligibility.reason,
+      reason: eligibility.eligibility.skipReason,
       catalogFingerprintHash,
+      invocationReason,
+      skipReason: eligibility.eligibility.skipReason,
+      candidateCount:
+        policy.mode === 'planner_authorized'
+          ? policy.candidateServiceIds.length
+          : 0,
     });
   }
 
-  const invocationReason = input.invocationReason ?? 'direct_unresolved';
-
   const now = input.now?.() ?? Date.now();
   const normalizedBatch = normalizeSemanticPhrase(input.currentBatch);
+  const requestContext = contextForInvocationPolicy(context, policy);
+  const requestCatalog = catalogForInvocationPolicy(input.catalog, policy);
+  const plannerCandidateCount =
+    policy.mode === 'planner_authorized'
+      ? policy.candidateServiceIds.length
+      : 0;
   const cacheKey = [
     input.tenantSlug.trim(),
     catalogFingerprintHash,
     normalizedBatch,
-    contextKey(context),
+    contextKey(requestContext),
+    policy.mode,
+    policy.attemptedInvocationReason,
+    policy.mode === 'planner_authorized'
+      ? [...policy.candidateServiceIds].sort().join(',')
+      : '',
   ].join('|');
   const cacheKeyHash = sha256(cacheKey);
   const cached = cacheGet(cacheKey, now);
@@ -930,12 +1301,18 @@ export async function resolveSemanticService(input: {
     // A normalized cache key may collide on case/spacing. Re-license the
     // cached envelope against the CURRENT raw batch before using it; a cached
     // evidence span from another rendering is never proof for this turn.
-    const cachedValidation = parseAndValidateSemanticServiceDecision({
-      raw: cached.decision,
-      currentBatch: input.currentBatch,
-      catalog: input.catalog,
-      deterministicResult,
-    });
+    const reLicensedCachedDecision = reLicenseCachedDecision(
+      input.currentBatch,
+      cached.decision
+    );
+    const cachedValidation = reLicensedCachedDecision
+      ? parseAndValidateSemanticServiceDecision({
+          raw: reLicensedCachedDecision,
+          currentBatch: input.currentBatch,
+          catalog: requestCatalog,
+          deterministicResult,
+        })
+      : { ok: false as const, reason: 'cached_evidence_not_current' };
     if (cachedValidation.ok) {
       return {
         decision: cachedValidation.value,
@@ -949,9 +1326,14 @@ export async function resolveSemanticService(input: {
           latencyMs: 0,
           providerCallCount: 0,
           cacheHit: true,
-          candidateCount: cachedValidation.value.candidateServiceIds.length,
+          candidateCount:
+            policy.mode === 'planner_authorized'
+              ? plannerCandidateCount
+              : cachedValidation.value.candidateServiceIds.length,
           catalogFingerprintHash,
           invocationReason,
+          attemptedInvocationReason: invocationReason,
+          skipReason: null,
           cacheKeyHash,
         },
         reason: 'accepted',
@@ -963,8 +1345,9 @@ export async function resolveSemanticService(input: {
   const request: SemanticServiceCompletionRequest = {
     messages: requestMessages({
       currentBatch: input.currentBatch,
-      catalog: input.catalog,
-      context,
+      catalog: requestCatalog,
+      context: requestContext,
+      policy,
     }),
     tools: [],
     temperature: SEMANTIC_SERVICE_RESOLVER_TEMPERATURE,
@@ -996,9 +1379,11 @@ export async function resolveSemanticService(input: {
         latencyMs: Math.max(0, (input.now?.() ?? Date.now()) - started),
         providerCallCount: providerAttempted ? 1 : 0,
         cacheHit: false,
-        candidateCount: 0,
+        candidateCount: plannerCandidateCount,
         catalogFingerprintHash,
         invocationReason,
+        attemptedInvocationReason: invocationReason,
+        skipReason: null,
         cacheKeyHash,
       },
       reason: 'provider_error',
@@ -1023,9 +1408,11 @@ export async function resolveSemanticService(input: {
         latencyMs: Math.max(0, (input.now?.() ?? Date.now()) - started),
         providerCallCount: 1,
         cacheHit: false,
-        candidateCount: 0,
+        candidateCount: plannerCandidateCount,
         catalogFingerprintHash,
         invocationReason,
+        attemptedInvocationReason: invocationReason,
+        skipReason: null,
         cacheKeyHash,
       },
       reason: 'invalid_response',
@@ -1035,46 +1422,40 @@ export async function resolveSemanticService(input: {
   const parsed = parseAndValidateSemanticServiceDecision({
     raw: typeof rawContent === 'string' ? rawContent : null,
     currentBatch: input.currentBatch,
-    catalog: input.catalog,
+    catalog: requestCatalog,
     deterministicResult,
   });
   if (!parsed.ok) {
+    const rejectedEvidence =
+      parsed.reason.includes('evidence') ||
+      parsed.reason.includes('negated') ||
+      parsed.reason.includes('conflicting') ||
+      parsed.reason.includes('correction') ||
+      parsed.reason.includes('disjunctive') ||
+      parsed.reason.includes('canonical') ||
+      parsed.reason.includes('ambiguous_missing') ||
+      parsed.reason.includes('deterministic_candidate') ||
+      (policy.mode === 'planner_authorized' &&
+        parsed.reason === 'invented_or_inactive_id');
     return {
       decision: null,
       deterministicResult,
       receipt: {
-        status:
-          parsed.reason.includes('evidence') ||
-          parsed.reason.includes('negated') ||
-          parsed.reason.includes('conflicting') ||
-          parsed.reason.includes('correction') ||
-          parsed.reason.includes('disjunctive') ||
-          parsed.reason.includes('canonical') ||
-          parsed.reason.includes('ambiguous_missing') ||
-          parsed.reason.includes('deterministic_candidate')
-            ? 'rejected_evidence'
-            : 'invalid_response',
+        status: rejectedEvidence ? 'rejected_evidence' : 'invalid_response',
         provider: 'deepseek',
         requestedModel: DEEPSEEK_V4_FLASH_MODEL,
         ...metadata,
         latencyMs: Math.max(0, (input.now?.() ?? Date.now()) - started),
         providerCallCount: 1,
         cacheHit: false,
-        candidateCount: 0,
+        candidateCount: plannerCandidateCount,
         catalogFingerprintHash,
         invocationReason,
+        attemptedInvocationReason: invocationReason,
+        skipReason: null,
         cacheKeyHash,
       },
-      reason: parsed.reason.includes('evidence') ||
-        parsed.reason.includes('negated') ||
-        parsed.reason.includes('conflicting') ||
-        parsed.reason.includes('correction') ||
-        parsed.reason.includes('disjunctive') ||
-        parsed.reason.includes('canonical') ||
-        parsed.reason.includes('ambiguous_missing') ||
-        parsed.reason.includes('deterministic_candidate')
-        ? 'rejected_evidence'
-        : 'invalid_response',
+      reason: rejectedEvidence ? 'rejected_evidence' : 'invalid_response',
     };
   }
 
@@ -1099,9 +1480,14 @@ export async function resolveSemanticService(input: {
       latencyMs: Math.max(0, (input.now?.() ?? Date.now()) - started),
       providerCallCount: 1,
       cacheHit: false,
-      candidateCount: parsed.value.candidateServiceIds.length,
+      candidateCount:
+        policy.mode === 'planner_authorized'
+          ? plannerCandidateCount
+          : parsed.value.candidateServiceIds.length,
       catalogFingerprintHash,
       invocationReason,
+      attemptedInvocationReason: invocationReason,
+      skipReason: null,
       cacheKeyHash,
     },
     reason: 'accepted',
@@ -1156,9 +1542,9 @@ export const __semanticServiceResolverInternals = {
   activeServices,
   catalogFingerprint,
   currentServiceEvidence,
+  deriveSemanticServiceEligibilityV2,
   evidenceIsPositive,
   hasCorrectionMarker,
   lastCorrectionOffset,
   requestMessages,
-  shouldInvokeSemanticService,
 };

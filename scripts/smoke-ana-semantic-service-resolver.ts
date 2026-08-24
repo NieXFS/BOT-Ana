@@ -4,6 +4,7 @@ import type { TenantBotConfig } from '../src/configProvider';
 import type { ServiceSummary, ServicesResult } from '../src/services/calendarService';
 import {
   clearSemanticServiceResolverCache,
+  deriveSemanticServiceEligibilityV2,
   semanticServiceResolverNotInvokedReceipt,
   parseAndValidateSemanticServiceDecision,
   resolveSemanticService,
@@ -95,8 +96,8 @@ const config = {
   systemPrompt: 'fixture',
   greetingMessage: null,
   fallbackMessage: null,
-  aiProvider: 'openai',
-  aiModel: 'gpt-4o-mini',
+  aiProvider: 'deepseek',
+  aiModel: 'deepseek-v4-flash',
   aiTemperature: 0.2,
   aiMaxTokens: 500,
   openaiApiKey: 'sk-smoke-invalid',
@@ -160,6 +161,9 @@ async function main(): Promise<void> {
   assert.equal(exact.deterministicResult.kind, 'resolved');
   assert.equal(exact.receipt.status, 'not_invoked');
   assert.equal(exact.receipt.providerCallCount, 0);
+  assert.equal(exact.receipt.attemptedInvocationReason, 'direct_unresolved');
+  assert.equal(exact.receipt.invocationReason, 'direct_unresolved');
+  assert.equal(exact.receipt.skipReason, 'deterministic_resolved');
   assert.equal(exactCount.value, 0);
 
   const aliasCatalog: ServicesResult = {
@@ -189,16 +193,22 @@ async function main(): Promise<void> {
   assert.equal(aliasCount.value, 0, 'learned alias never calls B');
 
   clearSemanticServiceResolverCache();
+  const incompatibleConfig = {
+    ...config,
+    aiProvider: 'openai',
+    aiModel: 'gpt-4o-mini',
+  } as TenantBotConfig;
   const incompatibleProvider = await resolveSemanticService({
     tenantSlug: 'studio-viti',
     currentBatch: 'pé e mão',
     catalog,
-    config,
+    config: incompatibleConfig,
     // No factory: production path must resolve the configured Ana runtime and
     // reject this OpenAI tenant before creating/using any provider client.
   });
   assert.equal(incompatibleProvider.receipt.status, 'provider_error');
   assert.equal(incompatibleProvider.receipt.providerCallCount, 0);
+  assert.equal(incompatibleProvider.receipt.skipReason, 'provider_incompatible');
 
   const deepSeekConfig = {
     ...config,
@@ -224,6 +234,7 @@ async function main(): Promise<void> {
     });
     assert.equal(gatedDeepSeek.receipt.status, 'provider_error');
     assert.equal(gatedDeepSeek.receipt.providerCallCount, 0);
+    assert.equal(gatedDeepSeek.receipt.skipReason, 'provider_incompatible');
   } finally {
     if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = savedNodeEnv;
@@ -246,6 +257,75 @@ async function main(): Promise<void> {
   assert.equal(ordinal.receipt.providerCallCount, 0, 'ordinal pending is not semantic evidence');
   assert.equal(ordinalCount.value, 0);
 
+  const fixedCount = { value: 0 };
+  const fixed = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'quero fazer a unha amanhã',
+    catalog,
+    config,
+    context: { fixedServiceId: MANICURE_ID },
+    completionFactory: factoryFor('{}', fixedCount),
+  });
+  assert.equal(fixed.receipt.status, 'not_invoked');
+  assert.equal(fixed.receipt.skipReason, 'fixed_service_preserved');
+  assert.equal(fixedCount.value, 0);
+
+  const negativeResult = resolveServiceFromCatalog({
+    text: 'não quero Manicure',
+    catalog,
+  });
+  assert.equal(negativeResult.kind, 'negative_clarification');
+  const negativeCount = { value: 0 };
+  const negative = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'não quero Manicure',
+    catalog,
+    config,
+    deterministicResult: negativeResult,
+    completionFactory: factoryFor('{}', negativeCount),
+  });
+  assert.equal(negative.receipt.status, 'not_invoked');
+  assert.equal(negative.receipt.skipReason, 'not_considered');
+  assert.equal(negativeCount.value, 0);
+
+  const temporalAmbiguous = {
+    kind: 'ambiguous',
+    reason: 'shared_partial',
+    serviceIds: [MANICURE_ID, PEDICURE_ID],
+    services: catalog.services!.slice(0, 2),
+    clarification: 'fixture',
+  } as const;
+  for (const [text, pendingKind] of [
+    ['amanhã às 15h', 'DATE'],
+    ['sim, pode marcar', 'CONFIRMATION'],
+  ] as const) {
+    const temporalCount = { value: 0 };
+    const temporal = await resolveSemanticService({
+      tenantSlug: 'studio-viti',
+      currentBatch: text,
+      catalog,
+      config,
+      context: { pendingKind },
+      deterministicResult: temporalAmbiguous,
+      completionFactory: factoryFor('{}', temporalCount),
+    });
+    assert.equal(temporal.receipt.status, 'not_invoked', text);
+    assert.equal(temporal.receipt.skipReason, 'temporal_or_confirmation_only', text);
+    assert.equal(temporalCount.value, 0, text);
+  }
+
+  const socialCount = { value: 0 };
+  const social = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'obrigada',
+    catalog,
+    config,
+    completionFactory: factoryFor('{}', socialCount),
+  });
+  assert.equal(social.receipt.status, 'not_invoked');
+  assert.equal(social.receipt.skipReason, 'no_current_service_evidence');
+  assert.equal(socialCount.value, 0);
+
   const combos = [
     'pé e mão',
     'mão e pé',
@@ -255,6 +335,7 @@ async function main(): Promise<void> {
     'manicure e pedicure juntas',
     'quero fazer unha da mão e do pé',
     'quero o serviço completo de pé e mão',
+    'não, quero pé e mão',
   ];
   for (const text of combos) {
     clearSemanticServiceResolverCache();
@@ -300,6 +381,129 @@ async function main(): Promise<void> {
     assert.doesNotMatch(userPayload, /hist(ó|o)rico|assistant|cliente anterior/iu, `${text}: no history`);
     assert.match(String(seen.requests[0]?.messages[0]?.content ?? ''), /Não use histórico/iu);
   }
+
+  for (const text of [
+    'oi, queria fazer pé e mão amanhã',
+    'gostaria de fazer as unhas dos pés e das mãos',
+  ]) {
+    clearSemanticServiceResolverCache();
+    const count = { value: 0 };
+    const natural = await resolveSemanticService({
+      tenantSlug: 'studio-viti',
+      currentBatch: text,
+      catalog: fieldCatalog107,
+      config,
+      completionFactory: factoryFor(
+        JSON.stringify({
+          decision: 'resolved',
+          serviceId: COMBO_ID,
+          candidateServiceIds: [COMBO_ID],
+          evidenceText: text,
+        }),
+        count
+      ),
+    });
+    assert.equal(natural.receipt.status, 'resolved', text);
+    assert.equal(natural.receipt.attemptedInvocationReason, 'direct_unresolved', text);
+    assert.equal(natural.receipt.providerCallCount, 1, text);
+    assert.equal(count.value, 1, text);
+  }
+
+  const plannerCandidateIds = [MANICURE_ID, PEDICURE_ID, COMBO_ID];
+  const plannerPolicy = {
+    mode: 'planner_authorized' as const,
+    attemptedInvocationReason: 'positive_reclarification' as const,
+    candidateServiceIds: plannerCandidateIds,
+    preservePlanOnFailure: true as const,
+  };
+  const plannerDeterministic = {
+    ...temporalAmbiguous,
+    serviceIds: plannerCandidateIds,
+    services: catalog.services!.slice(0, 3),
+  } as const;
+  const plannerCalls = { value: 0 };
+  const plannerSeen = { requests: [] as Parameters<SemanticServiceCompletionFactory>[0][] };
+  const planner = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'pé e mão',
+    catalog,
+    config,
+    context: { pendingKind: 'CONFIRMATION', fixedServiceId: MANICURE_ID },
+    deterministicResult: plannerDeterministic,
+    invocationPolicy: plannerPolicy,
+    completionFactory: factoryFor(
+      JSON.stringify({
+        decision: 'resolved',
+        serviceId: COMBO_ID,
+        candidateServiceIds: [COMBO_ID],
+        evidenceText: 'pé e mão',
+      }),
+      plannerCalls,
+      plannerSeen
+    ),
+  });
+  assert.equal(planner.receipt.status, 'resolved');
+  assert.equal(planner.receipt.attemptedInvocationReason, 'positive_reclarification');
+  assert.equal(planner.receipt.invocationReason, 'positive_reclarification');
+  assert.equal(planner.receipt.skipReason, null);
+  assert.equal(planner.receipt.candidateCount, 3);
+  assert.equal(planner.receipt.providerCallCount, 1);
+  assert.equal(plannerCalls.value, 1);
+  assert.equal(plannerSeen.requests.length, 1);
+  assert.doesNotMatch(
+    String(plannerSeen.requests[0]?.messages[1]?.content ?? ''),
+    /fixedServiceId|CONFIRMATION/iu,
+    'planner-authorized request does not reuse legacy veto context'
+  );
+
+  const deferredCalls = { value: 0 };
+  const deferred = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'pé e mão',
+    catalog,
+    config,
+    context: { pendingKind: 'TIME', fixedServiceId: MANICURE_ID },
+    deterministicResult: plannerDeterministic,
+    invocationPolicy: {
+      mode: 'planner_authorized',
+      attemptedInvocationReason: 'deferred_family',
+      candidateServiceIds: plannerCandidateIds,
+      preservePlanOnFailure: true,
+    },
+    completionFactory: factoryFor(
+      JSON.stringify({
+        decision: 'resolved',
+        serviceId: COMBO_ID,
+        candidateServiceIds: [COMBO_ID],
+        evidenceText: 'pé e mão',
+      }),
+      deferredCalls
+    ),
+  });
+  assert.equal(deferred.receipt.status, 'resolved');
+  assert.equal(deferred.receipt.attemptedInvocationReason, 'deferred_family');
+  assert.equal(deferred.receipt.skipReason, null);
+  assert.equal(deferredCalls.value, 1);
+
+  const invalidCandidateCalls = { value: 0 };
+  const invalidCandidate = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'pé e mão',
+    catalog,
+    config,
+    deterministicResult: plannerDeterministic,
+    invocationPolicy: {
+      mode: 'planner_authorized',
+      attemptedInvocationReason: 'positive_reclarification',
+      candidateServiceIds: [MANICURE_ID, 'outside-current-catalog'],
+      preservePlanOnFailure: true,
+    },
+    completionFactory: factoryFor('{}', invalidCandidateCalls),
+  });
+  assert.equal(invalidCandidate.receipt.status, 'not_invoked');
+  assert.equal(invalidCandidate.receipt.skipReason, 'candidate_set_invalid');
+  assert.equal(invalidCandidate.receipt.providerCallCount, 0);
+  assert.equal(invalidCandidateCalls.value, 0);
 
   const ambiguousTexts = [
     'quero fazer a unha',
@@ -411,11 +615,16 @@ async function main(): Promise<void> {
     {
       raw: JSON.stringify({ decision: 'resolved', serviceId: PEDICURE_ID, candidateServiceIds: [PEDICURE_ID], evidenceText: 'pedicure' }),
       text: 'quero manicure, não quero pedicure',
-      reason: /negated|evidence/u,
+      reason: /negated|evidence|deterministic/u,
     },
     {
       raw: JSON.stringify({ decision: 'resolved', serviceId: PEDICURE_ID, candidateServiceIds: [PEDICURE_ID], evidenceText: 'pedicure' }),
       text: 'manicure, não pedicure',
+      reason: /negated|evidence|deterministic/u,
+    },
+    {
+      raw: JSON.stringify({ decision: 'resolved', serviceId: PEDICURE_ID, candidateServiceIds: [PEDICURE_ID], evidenceText: 'pedicure' }),
+      text: 'não, pedicure',
       reason: /negated|evidence/u,
     },
     {
@@ -667,6 +876,62 @@ async function main(): Promise<void> {
   assert.equal(semanticServiceResolverCacheSize(), 1);
 
   clearSemanticServiceResolverCache();
+  let plannerCacheCalls = 0;
+  const plannerCacheFactory: SemanticServiceCompletionFactory = async () => {
+    plannerCacheCalls += 1;
+    return completion(JSON.stringify({
+      decision: 'resolved',
+      serviceId: COMBO_ID,
+      candidateServiceIds: [COMBO_ID],
+      evidenceText: 'pé e mão',
+    }));
+  };
+  const plannerCacheFirst = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'pé e mão',
+    catalog,
+    config,
+    deterministicResult: plannerDeterministic,
+    invocationPolicy: plannerPolicy,
+    completionFactory: plannerCacheFactory,
+  });
+  const plannerCacheHit = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'PÉ E MÃO',
+    catalog,
+    config,
+    deterministicResult: plannerDeterministic,
+    invocationPolicy: plannerPolicy,
+    completionFactory: plannerCacheFactory,
+  });
+  assert.equal(plannerCacheFirst.receipt.providerCallCount, 1);
+  assert.equal(plannerCacheFirst.receipt.cacheHit, false);
+  assert.equal(plannerCacheHit.receipt.status, 'cache_hit');
+  assert.equal(plannerCacheHit.receipt.providerCallCount, 0);
+  assert.equal(plannerCacheHit.receipt.skipReason, null);
+  assert.equal(plannerCacheCalls, 1);
+  const narrowedPlannerPolicy = {
+    ...plannerPolicy,
+    candidateServiceIds: [MANICURE_ID, PEDICURE_ID],
+  } as const;
+  const plannerSetChanged = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'pé e mão',
+    catalog,
+    config,
+    deterministicResult: {
+      ...temporalAmbiguous,
+      serviceIds: [MANICURE_ID, PEDICURE_ID],
+      services: catalog.services!.slice(0, 2),
+    },
+    invocationPolicy: narrowedPlannerPolicy,
+    completionFactory: plannerCacheFactory,
+  });
+  assert.equal(plannerSetChanged.receipt.status, 'rejected_evidence');
+  assert.equal(plannerSetChanged.receipt.providerCallCount, 1);
+  assert.equal(plannerCacheCalls, 2, 'candidate set changes cache authority');
+
+  clearSemanticServiceResolverCache();
   let variantCalls = 0;
   const variantFactory: SemanticServiceCompletionFactory = async (request) => {
     variantCalls += 1;
@@ -693,9 +958,9 @@ async function main(): Promise<void> {
     completionFactory: variantFactory,
   });
   assert.equal(variantUpper.receipt.status, 'resolved');
-  assert.equal(variantLower.receipt.status, 'resolved', 'stale evidence is re-called');
+  assert.equal(variantLower.receipt.status, 'cache_hit', 'equivalent evidence is re-licensed');
   assert.equal(variantLowerHit.receipt.status, 'cache_hit');
-  assert.equal(variantCalls, 2, 'normalized key never licenses stale raw evidence');
+  assert.equal(variantCalls, 1, 'equivalent normalized phrase uses the cache');
 
   clearSemanticServiceResolverCache();
   let punctuationCalls = 0;
@@ -720,8 +985,8 @@ async function main(): Promise<void> {
     completionFactory: punctuationFactory,
   });
   assert.equal(punctuationA.receipt.status, 'resolved');
-  assert.equal(punctuationB.receipt.status, 'resolved');
-  assert.equal(punctuationCalls, 2, 'punctuation-normalized key revalidates raw evidence');
+  assert.equal(punctuationB.receipt.status, 'cache_hit');
+  assert.equal(punctuationCalls, 1, 'punctuation-equivalent evidence uses the cache');
 
   clearSemanticServiceResolverCache();
   let correctionContextCalls = 0;
@@ -1115,8 +1380,9 @@ async function main(): Promise<void> {
       name: 'disabled',
       enabled: false,
       plan: tablePlan({}),
-      invoke: false,
-      trigger: 'not_invoked',
+      mode: 'not_considered',
+      trigger: 'not_considered',
+      preserve: false,
     },
     {
       name: 'outside pending selection',
@@ -1126,8 +1392,9 @@ async function main(): Promise<void> {
         decision: { kind: 'select_outside_pending', serviceId: MANICURE_ID },
         selectedServiceId: MANICURE_ID,
       }),
-      invoke: false,
-      trigger: 'not_invoked',
+      mode: 'not_considered',
+      trigger: 'not_considered',
+      preserve: false,
     },
     {
       name: 'negative clarification',
@@ -1136,8 +1403,9 @@ async function main(): Promise<void> {
         receipt: 'negative_clarification',
         decision: { kind: 'reject_pending', negatedServiceIds: [MANICURE_ID] },
       }),
-      invoke: false,
-      trigger: 'not_invoked',
+      mode: 'not_considered',
+      trigger: 'not_considered',
+      preserve: false,
     },
     {
       name: 'inactive-only',
@@ -1154,8 +1422,9 @@ async function main(): Promise<void> {
           },
         },
       }),
-      invoke: false,
-      trigger: 'not_invoked',
+      mode: 'not_considered',
+      trigger: 'not_considered',
+      preserve: false,
     },
     {
       name: 'positive reclarification',
@@ -1167,9 +1436,9 @@ async function main(): Promise<void> {
           serviceIds: [MANICURE_ID, PEDICURE_ID, COMBO_ID],
         },
       }),
-      invoke: true,
+      mode: 'planner_authorized',
       trigger: 'positive_reclarification',
-      force: true,
+      preserve: true,
     },
     {
       name: 'deferred family',
@@ -1182,9 +1451,9 @@ async function main(): Promise<void> {
           constraint: { schemaVersion: 1 },
         },
       }),
-      invoke: true,
+      mode: 'planner_authorized',
       trigger: 'deferred_family',
-      force: true,
+      preserve: true,
     },
     {
       name: 'deferred open without evidence',
@@ -1196,15 +1465,17 @@ async function main(): Promise<void> {
           constraint: { schemaVersion: 1 },
         },
       }),
-      invoke: true,
+      mode: 'direct_unresolved',
       trigger: 'direct_unresolved',
+      preserve: false,
     },
     {
       name: 'not applicable direct unresolved',
       enabled: true,
       plan: tablePlan({}),
-      invoke: true,
+      mode: 'direct_unresolved',
       trigger: 'direct_unresolved',
+      preserve: false,
     },
     {
       name: 'temporal resolved selected service',
@@ -1213,8 +1484,9 @@ async function main(): Promise<void> {
         receipt: 'temporal_deferred',
         selectedServiceId: COMBO_ID,
       }),
-      invoke: false,
-      trigger: 'not_invoked',
+      mode: 'not_considered',
+      trigger: 'not_considered',
+      preserve: false,
     },
   ] as const;
   for (const row of invocationTable) {
@@ -1224,10 +1496,10 @@ async function main(): Promise<void> {
       catalog,
       deterministicResult: directNoMatch,
     });
-    assert.equal(decision.invoke, row.invoke, row.name);
-    assert.equal(decision.invocationReason, row.trigger, row.name);
-    assert.equal(decision.forceEligibility, row.force ?? false, row.name);
-    if (row.force) {
+    assert.equal(decision.policy.mode, row.mode, row.name);
+    assert.equal(decision.policy.attemptedInvocationReason, row.trigger, row.name);
+    assert.equal(decision.policy.preservePlanOnFailure, row.preserve, row.name);
+    if (row.mode === 'planner_authorized') {
       assert.equal(decision.deterministicResult.kind, 'ambiguous', row.name);
       assert.deepEqual(
         decision.deterministicResult.kind === 'ambiguous'
@@ -1241,9 +1513,60 @@ async function main(): Promise<void> {
   const notInvoked = semanticServiceResolverNotInvokedReceipt(
     catalog,
     undefined,
-    'not_invoked'
+    'not_considered',
+    'not_considered'
   );
-  assert.equal(notInvoked.invocationReason, 'not_invoked');
+  assert.equal(notInvoked.invocationReason, 'not_considered');
+  assert.equal(notInvoked.attemptedInvocationReason, 'not_considered');
+  assert.equal(notInvoked.skipReason, 'not_considered');
+
+  const plannerEligibility = deriveSemanticServiceEligibilityV2({
+    enabled: true,
+    currentBatch: 'pé e mão',
+    deterministicResult: plannerDeterministic,
+    context: { pendingKind: 'CONFIRMATION', fixedServiceId: MANICURE_ID },
+    catalog,
+    policy: plannerPolicy,
+    providerCompatible: true,
+  });
+  assert.deepEqual(plannerEligibility.eligibility, { invoke: true, skipReason: null });
+  assert.equal(plannerEligibility.diagnostics.plannerPortAttempted, true);
+  assert.equal(plannerEligibility.diagnostics.fixedServiceIdPresent, true);
+  assert.equal(plannerEligibility.diagnostics.pendingKind, 'CONFIRMATION');
+  assert.equal(plannerEligibility.diagnostics.candidateCount, 3);
+  assert.equal(plannerEligibility.diagnostics.candidateSetValid, true);
+  const directEligibility = deriveSemanticServiceEligibilityV2({
+    enabled: true,
+    currentBatch: 'obrigada',
+    deterministicResult: directNoMatch,
+    context: {},
+    catalog,
+    policy: {
+      mode: 'direct_unresolved',
+      attemptedInvocationReason: 'direct_unresolved',
+      preservePlanOnFailure: false,
+    },
+  });
+  assert.deepEqual(directEligibility.eligibility, {
+    invoke: false,
+    skipReason: 'no_current_service_evidence',
+  });
+  const disabledEligibility = deriveSemanticServiceEligibilityV2({
+    enabled: false,
+    currentBatch: 'pé e mão',
+    deterministicResult: directNoMatch,
+    context: {},
+    catalog,
+    policy: {
+      mode: 'direct_unresolved',
+      attemptedInvocationReason: 'direct_unresolved',
+      preservePlanOnFailure: false,
+    },
+  });
+  assert.deepEqual(disabledEligibility.eligibility, {
+    invoke: false,
+    skipReason: 'feature_disabled',
+  });
 
   const runtimeNow = new Date('2026-08-24T15:00:00.000Z');
   const deliverRuntime = async (
