@@ -95,6 +95,8 @@ export interface OutboundCatalogService {
   priceCents?: number | null;
   durationMinutes?: number | null;
   professionalIds?: string[];
+  /** Contrato aditivo: aliases tenant-scoped, nunca materializados no prompt. */
+  aliases?: string[];
   licensedDescription?: LicensedServiceDescriptionV2 | null;
 }
 
@@ -406,6 +408,7 @@ export function catalogFromServicesResult(result: ServicesResult): Authoritative
       price: service.price,
       durationMinutes: service.durationMinutes,
       professionalIds: service.professionalIds,
+      aliases: service.aliases,
       licensedDescription: service.licensedDescription,
     })),
     professionals: (result.professionals ?? []).map((professional) => ({

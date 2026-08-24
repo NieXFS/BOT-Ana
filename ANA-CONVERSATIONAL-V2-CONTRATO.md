@@ -406,3 +406,49 @@ O fence de takeover tem duas APIs: wrappers autônomos adquirem a autoridade uma
 ## REVISÃO 14 (2026-08-23) — IA-23c: takeover pending+cutoff atômico
 
 `invalidateOpenPendingByHumanWithClient` agora executa UPDATE da PendingFrame e UPSERT de `ana_v2_flow_state_invalidations` numa única CTE modificadora. A instrução retorna `invalidated_count` factual e `cutoff_written=true`; zero OPEN continua gravando tombstone. O helper não abre transação, não adquire advisory lock e não faz segunda query: o client lock-owned continua pertencendo à sessão A, enquanto wrappers autônomos preservam seu único owner/transação. Falha da instrução reverte pending e cutoff juntos; a fixture IA-23c injeta a falha antes de aplicar qualquer uma das duas mutações.
+
+## REVISÃO 15 (2026-08-24) — IA-24: resolvedor tenant-scoped e múltiplas janelas
+
+`authoritativeCatalog.services[].aliases` e `services[].aliases` são dados
+estruturados opcionais do catálogo, nunca prompt, histórico ou instrução. O
+runtime aplica a mesma forma canônica do ERP (NFKC, remoção de diacríticos,
+lowercase pt-BR, trim e colapso de espaços), revalida o array fail-closed e
+remove `aliases` antes de montar o bloco visível ao modelo.
+
+O resolvedor determinístico lê somente o catálogo ativo do tenant. Precedência:
+(1) nome canônico exato e unívoco; (2) alias exato com um único proprietário;
+(3) ambiguidade tipada. Alias duplicado, inativo, malformado ou ausente nunca
+seleciona. `unha` isolado não escolhe por substring e não materializa o subset
+histórico Reposição/Unha infantil; a clarificação contém apenas serviços
+plausíveis derivados de nomes/aliases do catálogo. Negação nunca seleciona por
+eliminação: evidência negativa só clarifica, enquanto um span positivo atual
+(`não, quero pé e mão`) pode resolver independentemente. Troca de serviço limpa
+slot/draft/duplicidade e profissional incompatível pelos reducers existentes;
+nenhum gate de write ou confirmação foi relaxado.
+
+Quando um lote traz duas restrições temporais inequívocas, o servidor grava
+`DeferredAvailabilityConstraintV2.schemaVersion=2` com `windows[]` tipadas; o
+novo `PERIOD` representa manhã/tarde/noite/madrugada sem texto cru. A copy
+server-owned pergunta somente qual janela consultar primeiro e abre uma
+PendingFrame DATE com opções opacas `window:N`. Uma resposta parcial que
+identifique exatamente uma janela (`Hoje`, `amanhã`, `de manhã`) reduz o estado
+para schema 1; só então ocorre um `getAvailableSlots`, e apenas o subconjunto
+compatível vira `slotEvidence` e PendingFrame TIME. Nenhuma resposta da Ana é
+parseada como fonte de verdade.
+
+Flag `ANA_V2_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS`: default vazio/off; `*`
+proibido; produção exige allowlist geral v2 e service-context ativo; fixtures
+podem injetar booleano explícito. O valor é resolvido uma vez na entrada do
+turno. Com a flag off, aliases não influenciam matching, `windows` é removido do
+FlowState hidratado e uma PendingFrame experimental já entregue é encerrada
+pelo reset/CAS normal do turno — nunca por `HUMAN_OWNERSHIP`, cutoff artificial
+ou alteração do stateStore. IA-23 (outbox, receipts, locks, cutoff, terminalAt e
+reconcile) permanece byte-idêntico.
+
+Gates obrigatórios: a conversa literal da Laura em um único lote deve ter zero
+provider/model/tool/write no primeiro turno; escolha parcial de janela faz uma
+única leitura; normalização wire ERP→runtime é testada com aliases já
+normalizados e inbound acentuado; DeepSeek real continua funcional em cenário
+adjacente; round-trip PostgreSQL DEV direto confirma pending/outbox/receipts,
+reload e takeover sem ressurreição, com cleanup zero. E2E Meta e rollout real
+continuam fora desta revisão.

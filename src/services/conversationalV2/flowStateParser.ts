@@ -7,6 +7,7 @@ import {
   type CancellationFlowV2,
   type DeferredAvailabilityConstraintV2,
   type DeferredAvailabilityTimeWindowV2,
+  type DeferredAvailabilityWindowV2,
   type DuplicatePreflightClearanceV2,
   type DuplicateResolutionEvidenceV2,
   type FixedByProofVersionV2,
@@ -112,6 +113,17 @@ function parseTimeWindow(value: unknown): DeferredAvailabilityTimeWindowV2 | nul
         startMinute: raw.startMinute,
         endMinute: raw.endMinute,
       };
+    case 'PERIOD':
+      if (
+        !keysOnly(raw, ['kind', 'period']) ||
+        !['morning', 'afternoon', 'evening', 'night'].includes(String(raw.period))
+      ) {
+        return null;
+      }
+      return {
+        kind: 'PERIOD',
+        period: raw.period as 'morning' | 'afternoon' | 'evening' | 'night',
+      };
     default:
       return null;
   }
@@ -128,9 +140,10 @@ function parseDeferred(value: unknown): DeferredAvailabilityConstraintV2 | null 
       'capturedInputSequence',
       'date',
       'timeWindow',
+      'windows',
     ]) ||
     !requiredKeys(raw, ['schemaVersion', 'capturedAt', 'capturedTurnId', 'capturedInputSequence']) ||
-    raw.schemaVersion !== 1 ||
+    ![1, 2].includes(Number(raw.schemaVersion)) ||
     !validIso(raw.capturedAt) ||
     !nonEmptyString(raw.capturedTurnId) ||
     !nonNegativeInteger(raw.capturedInputSequence)
@@ -140,14 +153,38 @@ function parseDeferred(value: unknown): DeferredAvailabilityConstraintV2 | null 
   if (raw.date !== undefined && !validCivilDate(raw.date)) return null;
   const timeWindow = raw.timeWindow === undefined ? undefined : parseTimeWindow(raw.timeWindow);
   if (raw.timeWindow !== undefined && !timeWindow) return null;
-  if (raw.date === undefined && raw.timeWindow === undefined) return null;
+  let windows: DeferredAvailabilityWindowV2[] | undefined;
+  if (raw.windows !== undefined) {
+    if (raw.schemaVersion !== 2 || !Array.isArray(raw.windows) || raw.windows.length < 2) {
+      return null;
+    }
+    windows = [];
+    for (const candidate of raw.windows) {
+      const entry = dict(candidate);
+      if (!entry || !keysOnly(entry, ['date', 'timeWindow'])) return null;
+      if (entry.date !== undefined && !validCivilDate(entry.date)) return null;
+      const entryWindow = entry.timeWindow === undefined ? undefined : parseTimeWindow(entry.timeWindow);
+      if (entry.timeWindow !== undefined && !entryWindow) return null;
+      if (entry.date === undefined && entry.timeWindow === undefined) return null;
+      windows.push({
+        ...(entry.date !== undefined ? { date: entry.date } : {}),
+        ...(entryWindow ? { timeWindow: entryWindow } : {}),
+      });
+    }
+  }
+  if (
+    raw.schemaVersion === 1 && raw.windows !== undefined ||
+    raw.schemaVersion === 2 && windows === undefined ||
+    (raw.date === undefined && raw.timeWindow === undefined && windows === undefined)
+  ) return null;
   return {
-    schemaVersion: 1,
+    schemaVersion: raw.schemaVersion as 1 | 2,
     capturedAt: raw.capturedAt,
     capturedTurnId: raw.capturedTurnId,
     capturedInputSequence: raw.capturedInputSequence,
     ...(raw.date !== undefined ? { date: raw.date } : {}),
     ...(timeWindow ? { timeWindow } : {}),
+    ...(windows ? { windows } : {}),
   };
 }
 

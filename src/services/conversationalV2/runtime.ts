@@ -77,10 +77,15 @@ import {
   consumeDeferredAvailabilityV2,
   planServiceContextV2,
   serviceSelectionFollowUpWithConstraintV2,
+  withoutServiceResolverStateV2,
   withDeferredAvailabilityV2,
   type ServiceContextPlanV2,
 } from './serviceContext';
-import { isAnaV2ServiceContextEnabled } from './featureFlag';
+import { mergeAuthoritativeServiceAliases } from './serviceResolver';
+import {
+  isAnaV2ServiceContextEnabled,
+  isAnaV2ServiceResolverEnabled,
+} from './featureFlag';
 import {
   hasExplicitAvailabilityReadRequestV2,
   hasExplicitUpcomingReadRequestV2,
@@ -265,6 +270,8 @@ export interface ReceptionistV2RuntimeDeps {
   rephraseCompletion?: VoiceRephraseCompletionFactoryV2;
   /** Rollout temporário do planner de contexto de serviço (IA-22). */
   serviceContextEnabled?: boolean;
+  /** IA-24: rollout do resolvedor tenant-scoped; default OFF. */
+  serviceResolverEnabled?: boolean;
   /** Somente observabilidade injetada; não é recibo nem log de produção. */
   onRejectedBoundaryCandidate?: (input: {
     stage: 'primary' | 'regen';
@@ -295,7 +302,11 @@ function modelVisibleServicesV2(services: ServicesResult): ServicesResult {
   return {
     ...services,
     services: services.services?.map(
-      ({ licensedDescription: _licensedDescription, ...service }) => service
+      ({
+        licensedDescription: _licensedDescription,
+        aliases: _aliases,
+        ...service
+      }) => service
     ),
   };
 }
@@ -948,6 +959,8 @@ export async function getReceptionistReplyV2(input: {
   voiceEnabled?: boolean;
   /** Rollout temporário do planner de contexto de serviço; default OFF. */
   serviceContextEnabled?: boolean;
+  /** IA-24: rollout do resolvedor tenant-scoped; fixtures injetam explicitamente. */
+  serviceResolverEnabled?: boolean;
   deps?: ReceptionistV2RuntimeDeps;
 }): Promise<PreparedReceptionistTurnV2> {
   const deps = input.deps ?? {};
@@ -966,6 +979,11 @@ export async function getReceptionistReplyV2(input: {
   const serviceContextEnabled = isAnaV2ServiceContextEnabled(
     input.config.tenantSlug,
     input.serviceContextEnabled ?? deps.serviceContextEnabled
+  );
+  const serviceResolverEnabled = isAnaV2ServiceResolverEnabled(
+    input.config.tenantSlug,
+    input.serviceResolverEnabled ?? deps.serviceResolverEnabled,
+    serviceContextEnabled
   );
   const elicitationVariant = resolveElicitationVariantV2(
     input.elicitationVariant
@@ -1025,14 +1043,24 @@ export async function getReceptionistReplyV2(input: {
     }
   }
   const stored = await store.loadLatestState(conversationKey, startedAt);
-  const pendingRecord: PendingFrameRecordV2 | null =
+  const pendingRecordRaw: PendingFrameRecordV2 | null =
     guard.kind === 'reconstructed'
       ? guard.pending
       : guard.kind === 'clear'
         ? guard.pending
         : null;
+  const pendingRecord = pendingRecordRaw;
+  const experimentalPendingWhenResolverOff = Boolean(
+    !serviceResolverEnabled &&
+    pendingRecordRaw?.snapshot.options.some((option) =>
+      option.entityId.startsWith('window:')
+    )
+  );
   const services = hydrateLicensedServiceDescriptionsV2({
-    servicesResult: await loadServices(input.config),
+    servicesResult: mergeAuthoritativeServiceAliases(
+      await loadServices(input.config),
+      input.config.authoritativeCatalog
+    ),
     authoritativeCatalog: input.config.authoritativeCatalog,
     termAcceptance: input.config.descriptionTermAcceptance,
     contractVersion: input.config.contractVersion,
@@ -1052,10 +1080,13 @@ export async function getReceptionistReplyV2(input: {
     guard.kind === 'reconstructed'
       ? pendingRecord?.flowState ?? stored.flowState
       : stored.flowState;
-  const storedFlowState =
-    storedFlowStateRaw && !serviceContextEnabled
+  const storedFlowState = storedFlowStateRaw
+    ? !serviceContextEnabled
       ? withDeferredAvailabilityV2(storedFlowStateRaw, null)
-      : storedFlowStateRaw;
+      : !serviceResolverEnabled
+        ? withoutServiceResolverStateV2(storedFlowStateRaw)
+        : storedFlowStateRaw
+    : storedFlowStateRaw;
   const hydratedStoredFlowState =
     storedFlowState &&
     !storedFlowState.lastOperationalAt &&
@@ -1072,7 +1103,9 @@ export async function getReceptionistReplyV2(input: {
         catalog: services,
       })
   );
-  const flowResetReason = deferResetToBookingReentry
+  const flowResetReason = experimentalPendingWhenResolverOff
+    ? 'explicit_restart' as const
+    : deferResetToBookingReentry
     ? null
     : decideFlowResetV2({
         flowState: hydratedStoredFlowState,
@@ -1925,8 +1958,13 @@ export async function getReceptionistReplyV2(input: {
 
   const serviceContextPlan: ServiceContextPlanV2 = planServiceContextV2({
     enabled: serviceContextEnabled,
+    serviceResolverEnabled,
     frame,
     inboundText: currentInboundBatchText,
+    inboundMessages: currentInboundIds.map((inboundId) => ({
+      inboundId,
+      text: inboundTextsById[inboundId] ?? '',
+    })),
     catalog: services,
     now: startedAt,
     dateResolution,
@@ -2024,7 +2062,8 @@ export async function getReceptionistReplyV2(input: {
     newFlowId: id,
     lastAcceptedAssistantText: stored.lastAcceptedDelivery?.payload,
   });
-  const dateSlotsFastPath = bookingReentryFastPath.kind === 'continue_model'
+  const dateSlotsFastPath = bookingReentryFastPath.kind === 'continue_model' &&
+    !serviceContextPlan.result
     ? await resolveDateSlotsFastPathV2({
         frame: serviceContextPlanningFrame,
         dateResolution,

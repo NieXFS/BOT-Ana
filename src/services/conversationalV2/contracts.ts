@@ -173,16 +173,27 @@ export type DeferredAvailabilityTimeWindowV2 =
       kind: 'BETWEEN_INCLUSIVE';
       startMinute: number;
       endMinute: number;
+    }
+  | {
+      kind: 'PERIOD';
+      period: 'morning' | 'afternoon' | 'evening' | 'night';
     };
+
+export interface DeferredAvailabilityWindowV2 {
+  readonly date?: string;
+  readonly timeWindow?: DeferredAvailabilityTimeWindowV2;
+}
 
 /** Restrição temporal server-owned; nunca carrega texto cru, nome, telefone ou WAMID. */
 export interface DeferredAvailabilityConstraintV2 {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
   readonly capturedAt: string;
   readonly capturedTurnId: string;
   readonly capturedInputSequence: number;
   readonly date?: string;
   readonly timeWindow?: DeferredAvailabilityTimeWindowV2;
+  /** IA-24: múltiplas janelas do mesmo lote; não é tabela nem prompt. */
+  readonly windows?: readonly DeferredAvailabilityWindowV2[];
 }
 
 export const SERVICE_CONTEXT_RECEIPT_DECISIONS_V2 = [

@@ -15,6 +15,7 @@ import type {
   BookingDraftV2,
   DeferredAvailabilityConstraintV2,
   DeferredAvailabilityTimeWindowV2,
+  DeferredAvailabilityWindowV2,
   FlowStateV2,
   ModelTurnResultV2,
   ServiceContextReceiptDecisionV2,
@@ -23,6 +24,7 @@ import type {
 import {
   maskOrdinalOptionSpansV2,
   type CurrentDateResolutionV2,
+  resolveCurrentInboundDateV2,
 } from './currentDateResolution';
 import { civilTodayV2, normalizeTemporalAssertionsV2 } from './temporalNormalizer';
 import {
@@ -49,6 +51,10 @@ import {
   canonicalReadFailureCopyV2,
   type ReadFastPathReasonV2,
 } from './readFastPaths';
+import {
+  resolveServiceFromCatalog,
+  type ServiceResolverResult,
+} from './serviceResolver';
 
 export const DEFERRED_AVAILABILITY_MAX_AGE_MS_V2 = 4 * 60 * 60 * 1_000;
 
@@ -166,6 +172,9 @@ function sameTimeWindow(
   if (left.kind === 'BETWEEN_INCLUSIVE' && right.kind === 'BETWEEN_INCLUSIVE') {
     return left.startMinute === right.startMinute && left.endMinute === right.endMinute;
   }
+  if (left.kind === 'PERIOD' && right.kind === 'PERIOD') {
+    return left.period === right.period;
+  }
   if ('minuteOfDay' in left && 'minuteOfDay' in right) {
     return left.minuteOfDay === right.minuteOfDay;
   }
@@ -195,7 +204,7 @@ function collectOperatorWindows(masked: string): {
   }
   const operators: Array<{
     re: RegExp;
-    kind: Exclude<DeferredAvailabilityTimeWindowV2['kind'], 'BETWEEN_INCLUSIVE'>;
+    kind: Exclude<DeferredAvailabilityTimeWindowV2['kind'], 'BETWEEN_INCLUSIVE' | 'PERIOD'>;
   }> = [
     {
       re: new RegExp(
@@ -245,6 +254,20 @@ function collectOperatorWindows(masked: string): {
     if (minutes === null) continue;
     windows.push({ kind: 'EXACT', minuteOfDay: minutes });
   }
+  const period = masked.match(/\b(?:de|pela|a|ao|na|no)\s+(manha|tarde|noite|madrugada)\b/u)?.[1];
+  if (period) {
+    windows.push({
+      kind: 'PERIOD',
+      period:
+        period === 'manha'
+          ? 'morning'
+          : period === 'tarde'
+            ? 'afternoon'
+            : period === 'noite'
+              ? 'evening'
+              : 'night',
+    });
+  }
   if (windows.length === 0) return { windows: [], conflict: false };
   const first = windows[0]!;
   if (windows.some((window) => !sameTimeWindow(window, first))) {
@@ -268,7 +291,12 @@ export function captureDeferredAvailabilityConstraintV2(input: {
   if (collected.conflict) return { kind: 'conflict' };
   const timeWindow = collected.windows[0];
   const vague = inboundHasVaguePeriodV2(input.inboundText);
-  if (vague && !timeWindow) return { kind: 'vague_period' };
+  // Preserve the IA-22 public helper contract: a lone vague period remains a
+  // clarification marker. IA-24's batch helper materializes it into a typed
+  // window below, where the user can choose among multiple windows.
+  if (vague && (!timeWindow || timeWindow.kind === 'PERIOD')) {
+    return { kind: 'vague_period' };
+  }
   const date =
     input.dateResolution.kind === 'resolved' ? input.dateResolution.date : undefined;
   if (!date && !timeWindow) return { kind: 'none' };
@@ -285,12 +313,111 @@ export function captureDeferredAvailabilityConstraintV2(input: {
   };
 }
 
+/**
+ * Captura cada bolha do lote separadamente. O resolvedor de data agregado
+ * retorna ambiguidade quando há hoje+amanhã; aqui mantemos a ordem e
+ * materializamos um snapshot versionado de janelas para a confirmação humana.
+ */
+export function captureDeferredAvailabilityBatchV2(input: {
+  inboundText: string;
+  inboundMessages?: readonly { inboundId: string; text: string }[];
+  dateResolution: CurrentDateResolutionV2;
+  now: Date;
+  timezone: string;
+  turnId: string;
+  inputSequence: number;
+}): CapturedDeferredAvailabilityV2 {
+  const messages = input.inboundMessages?.length
+    ? input.inboundMessages
+    : [{ inboundId: 'batch', text: input.inboundText }];
+  const windows: DeferredAvailabilityWindowV2[] = [];
+  let hadConflict = false;
+  for (const message of messages) {
+    const dateResolution = input.inboundMessages?.length
+      ? resolveCurrentInboundDateV2({
+          currentInboundIds: [message.inboundId],
+          inboundTextsById: { [message.inboundId]: message.text },
+          now: input.now,
+          timezone: input.timezone,
+        })
+      : input.dateResolution;
+    const captured = captureDeferredAvailabilityConstraintV2({
+      inboundText: message.text,
+      dateResolution,
+      now: input.now,
+      turnId: input.turnId,
+      inputSequence: input.inputSequence,
+    });
+    if (captured.kind === 'conflict') {
+      hadConflict = true;
+      continue;
+    }
+    if (captured.kind === 'vague_period') {
+      const collected = collectOperatorWindows(
+        maskOrdinalOptionSpansV2(normalize(message.text))
+      );
+      const periodWindow = collected.windows.find((window) => window.kind === 'PERIOD');
+      const date = dateResolution.kind === 'resolved' ? dateResolution.date : undefined;
+      if (periodWindow && date) {
+        windows.push({ date, timeWindow: periodWindow });
+      }
+      continue;
+    }
+    if (captured.kind === 'captured') {
+      const entry: DeferredAvailabilityWindowV2 = {
+        ...(captured.constraint.date ? { date: captured.constraint.date } : {}),
+        ...(captured.constraint.timeWindow
+          ? { timeWindow: captured.constraint.timeWindow }
+          : {}),
+      };
+      if (entry.date || entry.timeWindow) {
+        if (!windows.some((other) => JSON.stringify(other) === JSON.stringify(entry))) {
+          windows.push(entry);
+        }
+      }
+    }
+  }
+  if (windows.length === 0) {
+    return hadConflict ? { kind: 'conflict' } : { kind: 'none' };
+  }
+  if (windows.length === 1) {
+    return {
+      kind: 'captured',
+      constraint: {
+        schemaVersion: 1,
+        capturedAt: input.now.toISOString(),
+        capturedTurnId: input.turnId,
+        capturedInputSequence: input.inputSequence,
+        ...(windows[0]!.date ? { date: windows[0]!.date } : {}),
+        ...(windows[0]!.timeWindow ? { timeWindow: windows[0]!.timeWindow } : {}),
+      },
+    };
+  }
+  return {
+    kind: 'captured',
+    constraint: {
+      schemaVersion: 2,
+      capturedAt: input.now.toISOString(),
+      capturedTurnId: input.turnId,
+      capturedInputSequence: input.inputSequence,
+      windows,
+    },
+  };
+}
+
 export function isDeferredAvailabilityConsumableV2(
   constraint: DeferredAvailabilityConstraintV2 | undefined,
   flowId: string,
   now: Date
 ): constraint is DeferredAvailabilityConstraintV2 {
-  if (!constraint || constraint.schemaVersion !== 1) return false;
+  if (
+    !constraint ||
+    (constraint.schemaVersion !== 1 && constraint.schemaVersion !== 2) ||
+    (constraint.schemaVersion === 2 &&
+      (!Array.isArray(constraint.windows) || constraint.windows.length < 2))
+  ) {
+    return false;
+  }
   if (constraint.capturedTurnId && flowId.length === 0) return false;
   const capturedAt = Date.parse(constraint.capturedAt);
   return (
@@ -321,6 +448,11 @@ export function withDeferredAvailabilityV2(
     return rest;
   }
   return { ...flowState, deferredAvailability: constraint };
+}
+
+export function withoutServiceResolverStateV2(flowState: FlowStateV2): FlowStateV2 {
+  if (!flowState.deferredAvailability?.windows?.length) return flowState;
+  return withDeferredAvailabilityV2(flowState, null);
 }
 
 export function applyServiceChangeToFlowStateV2(
@@ -390,6 +522,15 @@ function formatDeferredWindowPhraseV2(
   if (window.kind === 'BETWEEN_INCLUSIVE') {
     return `entre ${displayClockFromMinutesV2(window.startMinute)} e ${displayClockFromMinutesV2(window.endMinute)}`;
   }
+  if (window.kind === 'PERIOD') {
+    return window.period === 'morning'
+      ? 'de manhã'
+      : window.period === 'afternoon'
+        ? 'à tarde'
+        : window.period === 'evening'
+          ? 'à noite'
+          : 'de madrugada';
+  }
   const clock = displayClockFromMinutesV2(window.minuteOfDay);
   if (window.kind === 'AFTER_EXCLUSIVE') return `depois das ${clock}`;
   if (window.kind === 'AT_OR_AFTER') return `a partir das ${clock}`;
@@ -399,11 +540,33 @@ function formatDeferredWindowPhraseV2(
   return null;
 }
 
+function formatDeferredWindowEntryPhraseV2(
+  entry: DeferredAvailabilityWindowV2,
+  now: Date,
+  timezone: string
+): string {
+  const datePhrase = entry.date
+    ? formatDeferredDatePhraseV2(
+        { schemaVersion: 1, capturedAt: '', capturedTurnId: '', capturedInputSequence: 0, date: entry.date },
+        now,
+        timezone
+      )
+    : null;
+  const timePhrase = formatDeferredWindowPhraseV2(entry.timeWindow);
+  return [datePhrase, timePhrase].filter(Boolean).join(' ');
+}
+
 export function formatDeferredConstraintPhraseV2(
   constraint: DeferredAvailabilityConstraintV2,
   now: Date,
   timezone: string
 ): string {
+  if (constraint.windows && constraint.windows.length > 0) {
+    return constraint.windows
+      .map((entry) => formatDeferredWindowEntryPhraseV2(entry, now, timezone))
+      .filter(Boolean)
+      .join(' ou ');
+  }
   const parts: string[] = [];
   const datePhrase = formatDeferredDatePhraseV2(constraint, now, timezone);
   const windowPhrase = formatDeferredWindowPhraseV2(constraint.timeWindow);
@@ -465,6 +628,21 @@ export function buildPolarityAmbiguityCopyV2(canonicalName: string): string {
   return `Só para confirmar: você quer ${canonicalName} ou está dizendo que não é ${canonicalName}?`;
 }
 
+export function buildMultipleWindowClarificationCopyV2(
+  constraint: DeferredAvailabilityConstraintV2,
+  now: Date,
+  timezone: string
+): string {
+  const windows = constraint.windows ?? [];
+  const phrases = windows
+    .map((entry) => formatDeferredWindowEntryPhraseV2(entry, now, timezone))
+    .filter(Boolean);
+  if (phrases.length >= 2) {
+    return `Certo! Você quer que eu consulte primeiro ${phrases[0]} ou ${phrases[1]}?`;
+  }
+  return 'Certo! Qual janela você quer que eu consulte primeiro?';
+}
+
 export function slotMatchesDeferredTimeWindowV2(
   slot: string,
   window: DeferredAvailabilityTimeWindowV2
@@ -484,6 +662,11 @@ export function slotMatchesDeferredTimeWindowV2(
       return minutes <= window.minuteOfDay;
     case 'BETWEEN_INCLUSIVE':
       return minutes >= window.startMinute && minutes <= window.endMinute;
+    case 'PERIOD':
+      if (window.period === 'morning') return minutes >= 6 * 60 && minutes < 12 * 60;
+      if (window.period === 'afternoon') return minutes >= 12 * 60 && minutes < 18 * 60;
+      if (window.period === 'evening') return minutes >= 18 * 60 && minutes < 24 * 60;
+      return minutes < 6 * 60;
   }
 }
 
@@ -659,10 +842,69 @@ function receiptForDecision(
   }
 }
 
+function findSelectedDeferredWindowV2(input: {
+  constraint: DeferredAvailabilityConstraintV2;
+  inboundText: string;
+  dateResolution: CurrentDateResolutionV2;
+  now: Date;
+  timezone: string;
+  turnId: string;
+  inputSequence: number;
+}): DeferredAvailabilityConstraintV2 | null {
+  const windows = input.constraint.windows ?? [];
+  if (windows.length === 0) return null;
+  const captured = captureDeferredAvailabilityConstraintV2({
+    inboundText: input.inboundText,
+    dateResolution: input.dateResolution,
+    now: input.now,
+    turnId: input.turnId,
+    inputSequence: input.inputSequence,
+  });
+  if (captured.kind !== 'captured') return null;
+  const candidate: DeferredAvailabilityWindowV2 = {
+    ...(captured.constraint.date ? { date: captured.constraint.date } : {}),
+    ...(captured.constraint.timeWindow
+      ? { timeWindow: captured.constraint.timeWindow }
+      : {}),
+  };
+  const sameTimeWindowValue = (
+    left: DeferredAvailabilityTimeWindowV2 | undefined,
+    right: DeferredAvailabilityTimeWindowV2 | undefined
+  ): boolean => {
+    if (!left || !right) return left === right;
+    return sameTimeWindow(left, right);
+  };
+  const matches = windows.flatMap((entry, index) => {
+    if (candidate.date && entry.date !== candidate.date) return [];
+    if (
+      candidate.timeWindow &&
+      !sameTimeWindowValue(candidate.timeWindow, entry.timeWindow)
+    ) {
+      return [];
+    }
+    // A date-only/period-only answer is valid only when it identifies one
+    // stored window; never select by elimination when two windows share it.
+    return candidate.date || candidate.timeWindow ? [index] : [];
+  });
+  const index = matches.length === 1 ? matches[0]! : -1;
+  if (index < 0) return null;
+  const selected = windows[index]!;
+  return {
+    schemaVersion: 1,
+    capturedAt: input.now.toISOString(),
+    capturedTurnId: input.turnId,
+    capturedInputSequence: input.inputSequence,
+    ...(selected.date ? { date: selected.date } : {}),
+    ...(selected.timeWindow ? { timeWindow: selected.timeWindow } : {}),
+  };
+}
+
 export function planServiceContextV2(input: {
   enabled: boolean;
+  serviceResolverEnabled?: boolean;
   frame: TurnFrameV2;
   inboundText: string;
+  inboundMessages?: readonly { inboundId: string; text: string }[];
   catalog: ServicesResult;
   now: Date;
   dateResolution: CurrentDateResolutionV2;
@@ -683,6 +925,34 @@ export function planServiceContextV2(input: {
     ...input.frame,
     flowState: pruneDeferredAvailabilityV2(input.frame.flowState, input.now),
   };
+  const existingMultiWindow = frame.flowState.deferredAvailability;
+  if (existingMultiWindow?.windows?.length) {
+    const selectedWindow = findSelectedDeferredWindowV2({
+      constraint: existingMultiWindow,
+      inboundText: input.inboundText,
+      dateResolution: input.dateResolution,
+      now: input.now,
+      timezone: input.timezone,
+      turnId: input.turnId,
+      inputSequence: input.inputSequence,
+    });
+    if (selectedWindow) {
+      return {
+        decision: { kind: 'none' },
+        receipt: 'temporal_deferred',
+        vetoFamilyFastPath: true,
+        capturedConstraint: selectedWindow,
+        result: null,
+        nextFlowState: withDeferredAvailabilityV2(
+          frame.flowState,
+          selectedWindow
+        ),
+        ...(frame.flowState.fixedServiceId
+          ? { selectedServiceId: frame.flowState.fixedServiceId }
+          : {}),
+      };
+    }
+  }
   const correction = resolveServiceCorrectionDecisionV2({
     inboundText: input.inboundText,
     frame,
@@ -696,6 +966,143 @@ export function planServiceContextV2(input: {
   )
     ? frame.flowState.deferredAvailability
     : undefined;
+  const captured = captureDeferredAvailabilityBatchV2({
+    inboundText: input.inboundText,
+    inboundMessages: input.inboundMessages,
+    dateResolution: input.dateResolution,
+    now: input.now,
+    timezone: input.timezone,
+    turnId: input.turnId,
+    inputSequence: input.inputSequence,
+  });
+  const temporal = inboundHasOperationalTemporalComponentV2(input.inboundText);
+  const availabilityOrBooking =
+    hasExplicitAvailabilityReadRequestV2(input.inboundText) ||
+    hasPositiveExplicitBookingVerbV2(input.inboundText);
+  const capturedConstraint =
+    captured.kind === 'captured' ? captured.constraint : null;
+  const constraint = capturedConstraint
+    ? {
+        ...capturedConstraint,
+        ...(capturedConstraint.date
+          ? {}
+          : preservedConstraint?.date
+            ? { date: preservedConstraint.date }
+            : {}),
+        ...(capturedConstraint.timeWindow
+          ? {}
+          : preservedConstraint?.timeWindow
+            ? { timeWindow: preservedConstraint.timeWindow }
+            : {}),
+      }
+    : preservedConstraint ?? null;
+  const resolverDecision: ServiceResolverResult | null = input.serviceResolverEnabled
+    ? resolveServiceFromCatalog({ text: input.inboundText, catalog: input.catalog })
+    : null;
+  if (resolverDecision?.kind === 'negative_clarification') {
+    return {
+      decision: { kind: 'ambiguous_negation', mentionedServiceIds: resolverDecision.mentionedServiceIds },
+      receipt: 'negative_clarification',
+      vetoFamilyFastPath: true,
+      capturedConstraint: constraint,
+      result: modelResult({
+        reply: resolverDecision.clarification,
+        purpose: 'CLARIFICATION',
+        transition: frame.pending
+          ? { kind: 'invalidate', questionId: frame.pending.questionId, reason: 'service_polarity_ambiguity' }
+          : { kind: 'preserve' },
+      }),
+      nextFlowState: withDeferredAvailabilityV2(frame.flowState, constraint),
+    };
+  }
+  if (resolverDecision?.kind === 'ambiguous') {
+    const candidateIds = resolverDecision.serviceIds;
+    return {
+      decision: {
+        kind: 'clarify_positive_candidates',
+        serviceIds: candidateIds,
+      },
+      receipt: 'positive_reclarification',
+      vetoFamilyFastPath: true,
+      capturedConstraint: constraint,
+      result: modelResult({
+        reply: resolverDecision.clarification,
+        purpose: 'SERVICE_QUESTION',
+        transition: {
+          kind: 'open',
+          pendingKind: 'SERVICE',
+          flowId: frame.flowState.flowId,
+          optionEntityIds: candidateIds,
+        },
+      }),
+      nextFlowState: withDeferredAvailabilityV2(frame.flowState, constraint),
+    };
+  }
+  if (
+    resolverDecision?.kind === 'no_match' &&
+    resolverDecision.reason === 'inactive_only'
+  ) {
+    return {
+      decision: { kind: 'none' },
+      receipt: 'negative_clarification',
+      vetoFamilyFastPath: true,
+      capturedConstraint: constraint,
+      result: modelResult({
+        reply: SERVICE_CONTEXT_REJECTED_COPY_V2,
+        purpose: 'SERVICE_QUESTION',
+        transition: {
+          kind: 'open',
+          pendingKind: 'SERVICE',
+          flowId: frame.flowState.flowId,
+          optionEntityIds: [],
+        },
+      }),
+      nextFlowState: withDeferredAvailabilityV2(frame.flowState, constraint),
+    };
+  }
+  if (resolverDecision?.kind === 'resolved') {
+    const nextState = withDeferredAvailabilityV2(
+      applyServiceChangeToFlowStateV2(
+        frame.flowState,
+        resolverDecision.serviceId,
+        input.catalog
+      ),
+      constraint
+    );
+    if (constraint?.windows && constraint.windows.length > 1) {
+      return {
+        decision: { kind: 'none' },
+        receipt: 'temporal_deferred',
+        vetoFamilyFastPath: true,
+        capturedConstraint: constraint,
+        result: modelResult({
+          reply: buildMultipleWindowClarificationCopyV2(
+            constraint,
+            input.now,
+            input.timezone
+          ),
+          purpose: 'DATE_TIME_QUESTION',
+          transition: {
+            kind: 'open',
+            pendingKind: 'DATE',
+            flowId: frame.flowState.flowId,
+            optionEntityIds: constraint.windows.map((_entry, index) => `window:${index}`),
+          },
+        }),
+        nextFlowState: nextState,
+        selectedServiceId: resolverDecision.serviceId,
+      };
+    }
+    return {
+      decision: { kind: 'none' },
+      receipt: 'temporal_deferred',
+      vetoFamilyFastPath: Boolean(constraint && availabilityOrBooking),
+      capturedConstraint: constraint,
+      result: null,
+      nextFlowState: nextState,
+      selectedServiceId: resolverDecision.serviceId,
+    };
+  }
   if (correction.kind === 'ambiguous_negation') {
     const mentionedId = correction.mentionedServiceIds[0];
     const name =
@@ -793,17 +1200,6 @@ export function planServiceContextV2(input: {
     };
   }
 
-  const captured = captureDeferredAvailabilityConstraintV2({
-    inboundText: input.inboundText,
-    dateResolution: input.dateResolution,
-    now: input.now,
-    turnId: input.turnId,
-    inputSequence: input.inputSequence,
-  });
-  const temporal = inboundHasOperationalTemporalComponentV2(input.inboundText);
-  const availabilityOrBooking =
-    hasExplicitAvailabilityReadRequestV2(input.inboundText) ||
-    hasPositiveExplicitBookingVerbV2(input.inboundText);
   if (captured.kind === 'vague_period' || captured.kind === 'conflict') {
     return {
       ...empty,
@@ -811,23 +1207,6 @@ export function planServiceContextV2(input: {
       receipt: temporal ? 'temporal_deferred' : 'not_applicable',
     };
   }
-  const capturedConstraint =
-    captured.kind === 'captured' ? captured.constraint : null;
-  const constraint = capturedConstraint
-    ? {
-        ...capturedConstraint,
-        ...(capturedConstraint.date
-          ? {}
-          : preservedConstraint?.date
-            ? { date: preservedConstraint.date }
-            : {}),
-        ...(capturedConstraint.timeWindow
-          ? {}
-          : preservedConstraint?.timeWindow
-            ? { timeWindow: preservedConstraint.timeWindow }
-            : {}),
-      }
-    : preservedConstraint ?? null;
   if (!constraint || !availabilityOrBooking) {
     return {
       ...empty,

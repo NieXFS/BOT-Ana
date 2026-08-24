@@ -14,6 +14,7 @@ import { deliverPreparedReceptionistTurnV2 } from '../src/services/conversationa
 import { serializeTurnPlanReceiptV2 } from '../src/services/conversationalV2/receipts';
 import {
   isAnaV2ServiceContextEnabled,
+  isAnaV2ServiceResolverEnabled,
 } from '../src/services/conversationalV2/featureFlag';
 import { resolveCurrentInboundDateV2 } from '../src/services/conversationalV2/currentDateResolution';
 import {
@@ -58,7 +59,9 @@ const timezone = 'America/Sao_Paulo';
 let serial = 0;
 const nextId = () => `svc-ctx-${++serial}`;
 
-const fillers = Array.from({ length: 40 }, (_, index) => ({
+// Catálogo estruturalmente grande e inteiramente sintético: 7 itens-núcleo +
+// 100 serviços plausíveis, sem nomes, profissionais ou dados da cliente real.
+const fillers = Array.from({ length: 100 }, (_, index) => ({
   id: `svc-filler-${index + 1}`,
   name: `Preenchimento Estético ${index + 1}`,
   durationMinutes: 30,
@@ -93,6 +96,7 @@ const catalog: ServicesResult = {
       price: 40,
       priceFormatted: 'R$ 40,00',
       professionalIds: ['prof-ana'],
+      aliases: ['fazer a mao', 'so a mao', 'manicure normal'],
     },
     {
       id: 'svc-pedi',
@@ -101,6 +105,7 @@ const catalog: ServicesResult = {
       price: 45,
       priceFormatted: 'R$ 45,00',
       professionalIds: ['prof-ana', 'prof-bia'],
+      aliases: ['fazer o pe', 'so o pe'],
     },
     {
       id: 'svc-mani-pedi',
@@ -109,6 +114,7 @@ const catalog: ServicesResult = {
       price: 70,
       priceFormatted: 'R$ 70,00',
       professionalIds: ['prof-ana'],
+      aliases: ['pe e mao', 'mao e pe', 'fazer pe e mao', 'fazer mao e pe'],
     },
     {
       id: 'svc-mani-trad',
@@ -273,6 +279,7 @@ async function runTurn(input: {
   text: string;
   store: MemoryConversationalV2StateStore;
   enabled: boolean;
+  serviceResolverEnabled?: boolean;
   interpreterEnabled?: boolean;
   interpreterNenhuma?: boolean;
   regenerateServiceQuestion?: boolean;
@@ -289,6 +296,7 @@ async function runTurn(input: {
   paused?: boolean;
   allowModel?: boolean;
   catalogOverride?: ServicesResult;
+  configOverride?: TenantBotConfig;
   turnControl?: ReceptionistTurnControl;
   /** Literal multi-bubble batch used by the Laura fixture. */
   messages?: readonly string[];
@@ -307,9 +315,10 @@ async function runTurn(input: {
     phone: input.phone,
     userMessage: input.messages?.join(' ') ?? input.text,
     userName: 'Cliente',
-    config,
+    config: input.configOverride ?? config,
     interpreterEnabled: input.interpreterEnabled ?? false,
     serviceContextEnabled: input.enabled,
+    serviceResolverEnabled: input.serviceResolverEnabled ?? false,
     ...(input.turnControl ? { turnControl: input.turnControl } : {}),
     turnRuntime: turnRuntime(
       input.messages ?? input.text,
@@ -325,6 +334,7 @@ async function runTurn(input: {
       isPaused: async () => false,
       interpreterEnabled: input.interpreterEnabled ?? false,
       serviceContextEnabled: input.enabled,
+      serviceResolverEnabled: input.serviceResolverEnabled ?? false,
       executeProactiveDuplicateRead: async () =>
         JSON.stringify({ success: true, appointments: [] }),
       escalateSilent:
@@ -635,6 +645,16 @@ function assertNoSensitiveReceipt(
 async function main(): Promise<void> {
   assert.equal(isAnaV2ServiceContextEnabled('studio-viti', false), false);
   assert.equal(isAnaV2ServiceContextEnabled('studio-viti', true), true);
+  assert.equal(isAnaV2ServiceResolverEnabled('studio-viti', false, true), false);
+  assert.equal(isAnaV2ServiceResolverEnabled('studio-viti', true, true), true);
+  assert.equal(
+    isAnaV2ServiceResolverEnabled('studio-viti', undefined, true, '*'),
+    false
+  );
+  assert.equal(
+    isAnaV2ServiceResolverEnabled('studio-viti', undefined, false, 'studio-viti'),
+    false
+  );
   assert.equal(
     isAnaV2ServiceContextEnabled('studio-viti', undefined, '*'),
     false
@@ -671,19 +691,7 @@ async function main(): Promise<void> {
     '19:00',
   ] as const;
   const LAURA_ALLOWED_SLOTS = ['18:00', '18:30', '19:00'] as const;
-  const LAURA_CATALOG: ServicesResult = {
-    ...catalog,
-    services: catalog.services!.filter((service) =>
-      [
-        'svc-repo',
-        'svc-unha-inf',
-        'svc-mani',
-        'svc-pedi',
-        'svc-mani-pedi',
-        'svc-mani-trad',
-      ].includes(service.id)
-    ),
-  };
+  const LAURA_CATALOG: ServicesResult = catalog;
   const lauraCatalogNames = new Set(catalog.services!.map((service) => service.name));
   for (const requiredName of [
     'Manicure',
@@ -705,11 +713,7 @@ async function main(): Promise<void> {
     messages: LAURA_FIRST_BUBBLES,
     store: lauraStore,
     enabled: true,
-    interpreterEnabled: true,
-    interpreterNenhuma: true,
-    allowModel: true,
-    modelReply: 'Qual serviço ou categoria você quer consultar primeiro?',
-    modelNextPending: 'SERVICE',
+    serviceResolverEnabled: true,
     catalogOverride: LAURA_CATALOG,
     sequence: 1,
     now: LAURA_NOW,
@@ -734,32 +738,82 @@ async function main(): Promise<void> {
     'Laura T1 has no catalog mural'
   );
   assert.ok((lauraTurn1.prepared.payload ?? '').length < 500, 'Laura T1 remains compact');
-  if (lauraTurn1.prepared.transition.kind === 'open') {
-    const firstOptions = lauraTurn1.prepared.transition.frame.options.map((option) => option.entityId);
-    assert.notDeepEqual(firstOptions, ['svc-repo', 'svc-unha-inf']);
-    assert.ok(firstOptions.length >= 3, 'Laura T1 asks a real category/service choice');
-  }
+  assert.match(
+    lauraTurn1.prepared.payload ?? '',
+    /hoje depois das 17h30|amanh[ãa] de manh[ãa]/iu,
+    'Laura T1 names the two temporal windows'
+  );
+  assert.doesNotMatch(
+    lauraTurn1.prepared.payload ?? '',
+    /qual servi[cç]o|categoria|repetir/iu,
+    'Laura T1 never asks for a service already stated'
+  );
+  assert.doesNotMatch(
+    lauraTurn1.prepared.payload ?? '',
+    /Reposi[cç][ãa]o de unha|Unha infantil/u,
+    'Laura T1 never offers semantically wrong nail services'
+  );
+  assert.match(
+    lauraTurn1.prepared.payload ?? '',
+    /qual.*(janela|consultar primeiro)|hoje.*ou.*amanh[ãa]/iu,
+    'Laura T1 asks only which window to consult first'
+  );
+  assert.equal(
+    nextFlowState(lauraTurn1.prepared).fixedServiceId,
+    'svc-mani-pedi',
+    'Laura T1 resolves the combined service from the literal batch'
+  );
   await deliver(lauraTurn1.prepared, lauraStore, 1, () => LAURA_NOW);
+
+  // Kill-switch regression: the same conversation is re-entered with IA-24
+  // OFF while its IA-24 OPEN window question still exists. The baseline route
+  // must close that experimental row in the normal delivery CAS, then commit a
+  // normal PendingFrame without a CAS conflict or deferred-window leakage.
+  const flagOffLauraStore = reloadMemoryStore(lauraStore);
+  flagOffLauraStore.setInputSequence(lauraKey, 2);
+  const flagOffLaura = await runTurn({
+    phone: lauraPhone,
+    text: 'Quero agendar',
+    store: flagOffLauraStore,
+    enabled: true,
+    serviceResolverEnabled: false,
+    sequence: 2,
+    now: LAURA_NOW,
+    catalogOverride: LAURA_CATALOG,
+    allowModel: true,
+  });
+  const flagOffDelivery = await deliver(flagOffLaura.prepared, flagOffLauraStore, 2, () => LAURA_NOW);
+  assert.equal(flagOffDelivery.receipt.flowStateCommitOutcome, 'committed');
+  assert.notEqual(flagOffDelivery.receipt.pendingCommitOutcome, 'cas_conflict');
+  assert.equal(flagOffLauraStore.flowStateInvalidations.has(lauraKey), false);
+  const flagOffState = await flagOffLauraStore.loadLatestState(lauraKey, LAURA_NOW);
+  assert.notEqual(flagOffState.pending?.snapshot.kind, 'DATE');
+  assert.equal(flagOffState.flowState?.deferredAvailability, undefined);
 
   // Reload 1: a new Memory instance is the process-restart fixture boundary.
   lauraStore = reloadMemoryStore(lauraStore);
   lauraStore.setInputSequence(lauraKey, 2);
   const lauraTurn2 = await runTurn({
     phone: lauraPhone,
-    text: 'Manicure e pedicure',
+    text: 'Hoje',
     store: lauraStore,
     enabled: true,
-    interpreterEnabled: true,
+    serviceResolverEnabled: true,
     sequence: 2,
     now: LAURA_NOW,
+    slots: LAURA_SLOTS,
     catalogOverride: LAURA_CATALOG,
   });
-  assert.equal(lauraTurn2.toolNames.length, 0, 'Laura service choice asks the window first');
+  assert.deepEqual(
+    lauraTurn2.toolNames,
+    ['getAvailableSlots'],
+    'Laura T2 reads only the selected temporal window'
+  );
   assert.ok(lauraTurn2.prepared.payload);
-  assert.match(
+  assert.doesNotMatch(
     lauraTurn2.prepared.payload ?? '',
-    /qual (?:dia|per[ií]odo|janela)|qual .*consultar primeiro/iu,
-    'Laura T2 fixes the two-window clarification before a read'
+    /qual servi[cç]o|Reposi[cç][ãa]o de unha|Unha infantil/iu,
+    'Laura T2 does not reopen service selection'
   );
   assert.equal(lauraTurn2.prepared.hasCommittedWrite, false);
   assert.equal(
@@ -768,55 +822,143 @@ async function main(): Promise<void> {
   );
   await deliver(lauraTurn2.prepared, lauraStore, 2, () => LAURA_NOW);
 
-  // Reload 2: only the explicit temporal window can now authorize the read.
+  // Reload after the single read: the pending TIME and filtered evidence must
+  // survive a process boundary without reopening service selection.
   lauraStore = reloadMemoryStore(lauraStore);
   lauraStore.setInputSequence(lauraKey, 3);
-  const lauraTurn3 = await runTurn({
-    phone: lauraPhone,
-    text: 'Hoje depois das 17:30',
-    store: lauraStore,
-    enabled: true,
-    interpreterEnabled: true,
-    interpreterNenhuma: true,
-    sequence: 3,
-    now: LAURA_NOW,
-    slots: LAURA_SLOTS,
-    catalogOverride: LAURA_CATALOG,
-  });
-  assert.deepEqual(
-    lauraTurn3.toolNames,
-    ['getAvailableSlots'],
-    'Laura T3 performs exactly one read and no write'
-  );
-  assert.equal(lauraTurn3.prepared.hasCommittedWrite, false);
-  assert.equal(
-    lauraTurn3.prepared.planReceipt.toolEffects.some((effect) => effect.writeCommitted),
-    false
-  );
-  assert.equal(
-    lauraTurn3.prepared.planReceipt.toolEffects.some((effect) => effect.tool === 'bookAppointment'),
-    false
-  );
-  assert.equal(lauraTurn3.prepared.transition.kind, 'open');
-  if (lauraTurn3.prepared.transition.kind === 'open') {
-    assert.equal(lauraTurn3.prepared.transition.frame.kind, 'TIME');
-    assert.deepEqual(
-      lauraTurn3.prepared.transition.frame.options.map((option) => option.entityId),
-      LAURA_ALLOWED_SLOTS
-    );
-  }
-  assert.deepEqual(nextFlowState(lauraTurn3.prepared).slotEvidence?.slots, LAURA_ALLOWED_SLOTS);
-  assert.deepEqual(
-    lauraTurn3.prepared.planReceipt.toolEffects
-      .filter((effect) => effect.tool === 'getAvailableSlots')
-      .map((effect) => effect.class),
-    ['read']
-  );
-  await deliver(lauraTurn3.prepared, lauraStore, 3, () => LAURA_NOW);
-  lauraStore = reloadMemoryStore(lauraStore);
   const lauraAfterReload = await lauraStore.loadLatestState(lauraKey, LAURA_NOW);
   assert.equal(lauraAfterReload.pending?.snapshot.kind, 'TIME');
   assert.deepEqual(lauraAfterReload.pending?.snapshot.options.map((option) => option.entityId), LAURA_ALLOWED_SLOTS);
+  assert.deepEqual(lauraAfterReload.flowState.slotEvidence?.slots, LAURA_ALLOWED_SLOTS);
+  assert.equal(
+    [...lauraStore.outbox.values()].filter((record) =>
+      record.transition.kind === 'open' && record.transition.frame.kind === 'TIME'
+    ).length,
+    1,
+    'Laura has exactly one persisted TIME offer/read across restart'
+  );
+
+  // --- IA24_RUNTIME_DETERMINISTIC_MATRIX ---
+  // Todas as rotas abaixo usam o runModelLoop/interpreter throwing da fixture;
+  // uma aprovação só é válida se o planner resolver sem fabricar resposta do
+  // modelo.
+  async function deterministicServiceTurn(
+    text: string,
+    catalogOverride: ServicesResult = LAURA_CATALOG,
+    configOverride?: TenantBotConfig
+  ) {
+    const store = new MemoryConversationalV2StateStore();
+    const phone = `55110000006${String(serial).padStart(2, '0')}`;
+    const key = `${config.phoneNumberId}:${phone}`;
+    store.setInputSequence(key, 1);
+    const turn = await runTurn({
+      phone,
+      text,
+      store,
+      enabled: true,
+      serviceResolverEnabled: true,
+      catalogOverride,
+      configOverride,
+      sequence: 1,
+      now: LAURA_NOW,
+    });
+    assert.equal(turn.toolNames.length, 0, `${text}: no tool`);
+    assert.equal(turn.prepared.planReceipt.primaryModelRounds, 0, `${text}: no model rounds`);
+    assert.equal(turn.prepared.planReceipt.primaryProviderCalls, 0, `${text}: no provider calls`);
+    assert.equal(turn.prepared.hasCommittedWrite, false, `${text}: no write`);
+    return turn;
+  }
+
+  for (const [text, serviceId] of [
+    ['pé e mão', 'svc-mani-pedi'],
+    ['mão e pé', 'svc-mani-pedi'],
+    ['fazer pé e mão', 'svc-mani-pedi'],
+    ['fazer a mão', 'svc-mani'],
+    ['fazer o pé', 'svc-pedi'],
+    ['Manicure', 'svc-mani'],
+    ['Manicure normal', 'svc-mani'],
+    ['Manicure e pedicure', 'svc-mani-pedi'],
+    ['Reposição de unha', 'svc-repo'],
+    ['Unha infantil', 'svc-unha-inf'],
+  ] as const) {
+    const turn = await deterministicServiceTurn(text);
+    assert.equal(nextFlowState(turn.prepared).fixedServiceId, serviceId, `${text}: service`);
+  }
+  for (const text of ['fazer a unha', 'quero fazer unha', 'serviço de unha']) {
+    const turn = await deterministicServiceTurn(text);
+    assert.equal(nextFlowState(turn.prepared).fixedServiceId, undefined, `${text}: ambiguous`);
+    assert.match(turn.prepared.payload ?? '', /Manicure|Pedicure/u);
+    assert.doesNotMatch(turn.prepared.payload ?? '', /Reposição de unha|Unha infantil/u);
+    assert.equal(turn.prepared.transition.kind, 'open');
+    if (turn.prepared.transition.kind === 'open') {
+      assert.equal(turn.prepared.transition.frame.kind, 'SERVICE');
+      assert.deepEqual(
+        turn.prepared.transition.frame.options.map((option) => option.entityId),
+        ['svc-mani', 'svc-pedi', 'svc-mani-pedi']
+      );
+    }
+  }
+  for (const text of ['Não é manicure normal', 'Não é só manicure mesmo', 'Não é reposição']) {
+    const turn = await deterministicServiceTurn(text);
+    assert.equal(nextFlowState(turn.prepared).fixedServiceId, undefined, `${text}: negative`);
+    assert.match(turn.prepared.payload ?? '', /confirmar|serviço/iu);
+  }
+  const corrected = await deterministicServiceTurn('Não, quero pé e mão');
+  assert.equal(nextFlowState(corrected.prepared).fixedServiceId, 'svc-mani-pedi');
+
+  const duplicateAliasRuntimeCatalog: ServicesResult = {
+    success: true,
+    services: [
+      { ...catalog.services![0]!, id: 'dup-a', name: 'Serviço A', aliases: ['termo duplicado'] },
+      { ...catalog.services![1]!, id: 'dup-b', name: 'Serviço B', aliases: ['termo duplicado'] },
+    ],
+    professionals: catalog.professionals,
+  };
+  const duplicateRuntime = await deterministicServiceTurn(
+    'termo duplicado',
+    duplicateAliasRuntimeCatalog
+  );
+  assert.equal(nextFlowState(duplicateRuntime.prepared).fixedServiceId, undefined);
+  assert.match(duplicateRuntime.prepared.payload ?? '', /Serviço A|Serviço B/u);
+
+  const inactiveRuntimeCatalog: ServicesResult = {
+    success: true,
+    services: [{ ...catalog.services![0]!, id: 'inactive', name: 'Serviço inativo', aliases: ['termo inativo'], active: false } as ServicesResult['services'][number]],
+    professionals: catalog.professionals,
+  };
+  const inactiveRuntime = await deterministicServiceTurn('termo inativo', inactiveRuntimeCatalog);
+  assert.equal(nextFlowState(inactiveRuntime.prepared).fixedServiceId, undefined);
+  assert.equal(inactiveRuntime.prepared.planReceipt.primaryModelRounds, 0);
+
+  const noAliasesRuntime = await deterministicServiceTurn(
+    'Manicure',
+    { success: true, services: [{ ...catalog.services!.find((service) => service.id === 'svc-mani')!, aliases: [] }], professionals: catalog.professionals },
+    {
+      ...config,
+      authoritativeCatalog: {
+        ...config.authoritativeCatalog!,
+        services: [{ ...config.authoritativeCatalog!.services.find((service) => service.id === 'svc-mani')!, aliases: [] }],
+      },
+    }
+  );
+  assert.equal(nextFlowState(noAliasesRuntime.prepared).fixedServiceId, 'svc-mani');
+
+  const flagOffStore = new MemoryConversationalV2StateStore();
+  const flagOffPhone = '5511000000650';
+  flagOffStore.setInputSequence(`${config.phoneNumberId}:${flagOffPhone}`, 1);
+  const flagOff = await runTurn({
+    phone: flagOffPhone,
+    text: 'pé e mão',
+    store: flagOffStore,
+    enabled: true,
+    serviceResolverEnabled: false,
+    catalogOverride: LAURA_CATALOG,
+    sequence: 1,
+    now: LAURA_NOW,
+    allowModel: true,
+  });
+  assert.notEqual(nextFlowState(flagOff.prepared).fixedServiceId, 'svc-mani-pedi');
+  assert.equal(flagOff.prepared.planReceipt.primaryModelRounds > 0, true);
 
   async function runLauraNegativeBranch(
     phone: string,
@@ -848,6 +990,7 @@ async function main(): Promise<void> {
       text,
       store,
       enabled: true,
+      serviceResolverEnabled: true,
       interpreterEnabled: true,
       sequence: 1,
       now: LAURA_NOW,
@@ -1060,6 +1203,7 @@ async function main(): Promise<void> {
     text: FAMILY_INBOUND,
     store: familyOnStore,
     enabled: true,
+    serviceResolverEnabled: true,
     interpreterEnabled: true,
   });
   assert.equal(familyOn.prepared.planReceipt.route, 'fast_path');
@@ -1067,20 +1211,19 @@ async function main(): Promise<void> {
     familyOn.prepared.planReceipt.serviceContextDecision,
     'temporal_deferred'
   );
+  assert.deepEqual(familyOn.toolNames, ['getAvailableSlots']);
   assert.equal(familyOn.prepared.transition.kind, 'open');
   if (familyOn.prepared.transition.kind === 'open') {
-    assert.equal(familyOn.prepared.transition.frame.kind, 'SERVICE');
+    assert.equal(familyOn.prepared.transition.frame.kind, 'TIME');
     assert.deepEqual(
       familyOn.prepared.transition.frame.options.map((option) => option.entityId),
-      ['svc-repo', 'svc-unha-inf']
+      AFTER_EXCLUSIVE_SLOTS
     );
   }
-  assert.match(
-    familyOn.prepared.payload ?? '',
-    /Para eu verificar hoje depois das 17h30, qual destes serviços você quer: Reposição de unha ou Unha infantil\?/u
-  );
+  assert.match(familyOn.prepared.payload ?? '', /18:00/u);
+  assert.doesNotMatch(familyOn.prepared.payload ?? '', /Reposição de unha|Unha infantil/u);
   assert.doesNotMatch(familyOn.prepared.payload ?? '', /Preenchimento Estético/u);
-  assert.equal(familyOn.toolNames.length, 0);
+  assert.equal(familyOn.toolNames.length, 1);
   assert.equal(
     familyOn.prepared.planReceipt.toolEffects.some((entry) => entry.class === 'write'),
     false
@@ -1126,6 +1269,7 @@ async function main(): Promise<void> {
     text: 'Reposição de unha',
     store: familyOnStore,
     enabled: true,
+    serviceResolverEnabled: true,
     sequence: 2,
   });
   assert.equal(chosen.toolNames.filter((name) => name === 'getAvailableSlots').length, 1);
@@ -1677,6 +1821,7 @@ async function main(): Promise<void> {
     text: FAMILY_INBOUND,
     store: interpOffStore,
     enabled: true,
+    serviceResolverEnabled: true,
     interpreterEnabled: false,
   });
   assert.equal(interpOff.prepared.planReceipt.route, familyOn.prepared.planReceipt.route);

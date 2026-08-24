@@ -11,6 +11,7 @@ import {
   CUSTOMER_IDENTITY_AMBIGUOUS_HINT,
   CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
 } from './customerIdentitySafety';
+import { normalizeServiceAliases } from '../lib/services/service-aliases';
 
 export { CUSTOMER_IDENTITY_AMBIGUOUS_HINT } from './customerIdentitySafety';
 
@@ -88,6 +89,8 @@ interface ErpService {
   name: string;
   durationMinutes: number;
   price?: number | string | null;
+  /** Contrato aditivo ERP: aliases já normalizados no catálogo autoritativo. */
+  aliases?: unknown;
   // FIX 3: ids dos profissionais habilitados PARA ESTE serviço (vem do ERP novo).
   // Ausente no ERP antigo → tratamos como elegibilidade global (fallback).
   professionalIds?: (string | number)[];
@@ -151,6 +154,8 @@ export interface ServiceSummary {
   // FIX 3: ids (string) dos profissionais habilitados pra este serviço, quando o
   // ERP os informa. undefined = ERP antigo → fallback pra lista global.
   professionalIds?: string[];
+  /** Aliases tenant-scoped; ausente no ERP antigo equivale a []. */
+  aliases?: string[];
   /** Somente a rota v2 hidrata este campo do catálogo autoritativo da config. */
   licensedDescription?: LicensedServiceDescriptionV2 | null;
 }
@@ -467,6 +472,7 @@ function normalizeServices(services: ErpService[] = []): ServiceSummary[] {
                 currency: 'BRL',
               }).format(price),
         professionalIds,
+        aliases: normalizeServiceAliases(service.aliases),
       };
     });
 }
