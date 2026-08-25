@@ -31,6 +31,10 @@ import {
   normalizeLicensedServiceDescriptionV2,
   validDescriptionTermAcceptanceV2,
 } from './licensedServiceDescription';
+import {
+  classifyAvailabilityTimeClaims,
+  type AvailabilityTimeMentionV2,
+} from './availabilityClaimScope';
 
 export { CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE } from './customerIdentitySafety';
 
@@ -196,9 +200,6 @@ export interface ValidatedReceptionistOutbound {
 }
 
 const MONEY_RE = /(?:R\$\s*(?<prefixed>\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)|(?<worded>\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*reais?\b)/giu;
-const TIME_OFFER_RE = /\b(?:temos?|dispon[ií]ve(?:l|is)|hor[aá]rios?)\b[^.!?\n]{0,60}\b([01]?\d|2[0-3])(?:[:h]([0-5]\d))\b/giu;
-const NEGATIVE_AVAILABILITY_CLAUSE_RE =
-  /\b(?:n[aã]o\s+(?:encontrei|achei|localizei|consegui\s+(?:encontrar|localizar))|sem|n[aã]o\s+(?:tem|temos))\b[^.!?\n]{0,80}\b(?:hor[aá]rios?|vagas?|disponibilidades?)\b/iu;
 const HUMAN_DEADLINE_RE = /\b(?:equipe|atendente|profissional|respons[aá]vel)\b[^.!?\n]{0,80}\b(?:em|dentro de|at[eé])\s+\d+\s*(?:minutos?|horas?|dias?)\b/iu;
 const CPF_RE = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/u;
 const PHONE_RE = /(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?9?\d{4}[-\s]?\d{4}/u;
@@ -495,6 +496,12 @@ function offeredSlots(evidence?: ReceptionistOutboundEvidence): Set<string> {
   return slots;
 }
 
+export function classifyReceptionistOutboundAvailabilityClaims(
+  text: string
+): AvailabilityTimeMentionV2[] {
+  return classifyAvailabilityTimeClaims(text);
+}
+
 function emojiCount(text: string): number {
   return (text.match(/\p{Extended_Pictographic}/gu) ?? []).length;
 }
@@ -682,12 +689,16 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   ) {
     reasons.add('UNVERIFIED_APPOINTMENT_CONTEXT');
   }
+  const availabilityClaims = classifyReceptionistOutboundAvailabilityClaims(
+    factCheckedText
+  );
   const mentionedServices = catalog.services.filter((service) => normalizedText.includes(normalize(service.name)));
   const serviceOffer = factCheckedText.match(/\b(?:temos|oferecemos|fazemos|realizamos|trabalhamos\s+com)\s+(?:o\s+servi[cç]o\s+de\s+|a\s+)?([^.!?\n]+)/iu)?.[1];
   if (
     serviceOffer &&
     mentionedServices.length === 0 &&
     /\p{L}/u.test(serviceOffer) &&
+    availabilityClaims.length === 0 &&
     !/\b(?:hor[aá]rio|vaga|disponibilidade|dispon[ií]ve(?:l|is)|agenda)\b/iu.test(serviceOffer) &&
     !catalog.services.some((service) =>
       normalize(serviceOffer).includes(normalize(service.name))
@@ -708,23 +719,17 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   ) reasons.add('UNKNOWN_SERVICE');
 
   const slots = offeredSlots(envelope.evidence);
-  for (const match of factCheckedText.matchAll(TIME_OFFER_RE)) {
-    const matchIndex = match.index ?? 0;
-    const sentenceStart = Math.max(
-      factCheckedText.lastIndexOf('.', matchIndex - 1),
-      factCheckedText.lastIndexOf('!', matchIndex - 1),
-      factCheckedText.lastIndexOf('?', matchIndex - 1),
-      factCheckedText.lastIndexOf('\n', matchIndex - 1)
-    ) + 1;
-    const sentenceThroughMatch = factCheckedText.slice(
-      sentenceStart,
-      matchIndex + match[0].length
-    );
-    // "Não encontrei horários hoje depois das 17h30" reports a negative
-    // availability result. The clock is a constraint, not an offered slot.
-    if (NEGATIVE_AVAILABILITY_CLAUSE_RE.test(sentenceThroughMatch)) continue;
-    const slot = `${String(match[1]).padStart(2, '0')}:${match[2]}`;
-    if (!slots.has(slot)) reasons.add('UNVERIFIED_AVAILABILITY');
+  for (const claim of availabilityClaims) {
+    if (
+      claim.disposition !== 'positive_availability' &&
+      claim.disposition !== 'unknown'
+    ) {
+      continue;
+    }
+    if (!slots.has(claim.time)) {
+      // `unknown` é tratado como evidence_required, nunca como no_offer.
+      reasons.add('UNVERIFIED_AVAILABILITY');
+    }
   }
 
   const mentionedProfessionals = catalog.professionals.filter((professional) => normalizedText.includes(normalize(professional.name)));

@@ -1,5 +1,9 @@
 import type { ServicesResult } from './calendarService';
 import { buildCanonicalDuplicateAppointmentContextV2 } from './conversationalV2/duplicateAppointmentCopy';
+import {
+  classifyAvailabilityTimeClaims,
+  type AvailabilityTimeMentionV2,
+} from './availabilityClaimScope';
 
 export type CustomerReplyLeakReason =
   | 'internal_hint'
@@ -563,53 +567,29 @@ function isVerifiedAvailabilityConfirmation(
   return times.length > 0 && times.every((time) => verifiedSlots.has(time));
 }
 
-const AVAILABILITY_POSITIVE_CUE_RE =
-  /\b(?:tenho|temos|tem\s+(?:horarios?|vagas?|disponibilidade)\b|ha|existem|(?:encontrei|achei)\s+(?:(?:os|as|um|uma|uns|umas|alguns?|algumas?|est[ea]s?|ess[ea]s?|nov[oa]s?|\d+)\s+)?(?:horarios?|vagas?|disponibilidade|opcao|opcoes|alternativa|alternativas)\b|posso\s+(?:te\s+)?oferecer|disponiveis?|livres?|vagas?)\b/;
-const AVAILABILITY_NEGATIVE_CUE_RE =
-  /\b(?:nao\s+(?:tem(?:os)?|ha|encontrei|achei|localizei|consegui\s+(?:encontrar|localizar))|sem\s+(?:horarios?|vagas?|disponibilidade)|nao\s+horarios?|nao\s+vagas?|nao\s+disponibilidade)|\b(?:indisponiveis?|ocupad[oa]s?|esgotad[oa]s?)\b/;
-const OPERATING_HOURS_CUE_RE =
-  /\b(?:horario\s+de\s+funcionamento|horario\s+comercial|expediente|funcionamos|funciona|atendemos|atendimento|abrimos|fechamos|aberto)\b/;
-
 /**
- * Extrai apenas horários apresentados como oferta de disponibilidade. A regra
- * é deliberadamente estreita: duração, preço, horário de funcionamento,
- * pergunta ao cliente e negativa de disponibilidade não são ofertas e não
- * devem derrubar uma resposta correta.
+ * Expõe a classificação completa por horário. A fronteira abaixo decide quais
+ * disposições são oferta e quais foram excluídas positivamente; horário não
+ * compreendido permanece `unknown` e exige evidência.
  */
+export function classifyCustomerReplyAvailabilityClaims(
+  reply: string
+): AvailabilityTimeMentionV2[] {
+  return classifyAvailabilityTimeClaims(reply);
+}
+
 function offeredAvailabilitySlots(reply: string): string[] {
-  const normalized = normalizeClaimText(reply);
-  if (!normalized) return [];
-
   const offered = new Set<string>();
-  const sentences = normalized.match(/[^.!?\n]+[.!?\n]?/g) ?? [normalized];
-
-  for (const sentenceValue of sentences) {
-    const sentence = sentenceValue.trim();
-    if (!sentence || sentence.endsWith('?')) continue;
-
-    // Um contraste pode conter uma negativa legítima seguida de uma oferta
-    // válida: "não temos 09:00, mas temos 10:30". Cada lado é analisado
-    // sozinho para não licenciar nem bloquear o horário errado.
-    const segments = sentence.split(/\b(?:mas|porem|contudo|entretanto)\b/);
-    for (const rawSegment of segments) {
-      const segment = rawSegment.trim();
-      const times = mentionedTimes(segment);
-      if (times.length === 0) continue;
-      if (OPERATING_HOURS_CUE_RE.test(segment)) continue;
-      if (AVAILABILITY_NEGATIVE_CUE_RE.test(segment)) continue;
-      if (!AVAILABILITY_POSITIVE_CUE_RE.test(segment)) continue;
-
-      // "dura 60 min" nem entra em mentionedTimes; esta guarda adicional
-      // torna explícito que duração/preço não são disponibilidade mesmo se a
-      // frase contiver um horário em outro contexto.
-      if (/\b(?:dura(?:cao)?|duracao|preco|valor|r\$)\b/.test(segment)) {
-        continue;
-      }
-
-      for (const time of times) offered.add(time);
+  for (const claim of classifyCustomerReplyAvailabilityClaims(reply)) {
+    // Só uma exclusão tipada ou uma negativa local fica fora deste guard. Toda
+    // menção positiva ou ainda desconhecida exige prova autoritativa.
+    if (
+      claim.disposition === 'positive_availability' ||
+      claim.disposition === 'unknown'
+    ) {
+      offered.add(claim.time);
     }
   }
-
   return [...offered];
 }
 

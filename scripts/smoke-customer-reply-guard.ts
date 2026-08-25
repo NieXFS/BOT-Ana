@@ -3,11 +3,17 @@ import type { ServicesResult } from '../src/services/calendarService';
 import {
   buildSafeRecoveryReply,
   buildSafeWriteConfirmation,
+  classifyCustomerReplyAvailabilityClaims,
   hasFalseWriteClaim,
   hasUnverifiedAvailabilityClaim,
   inspectCustomerReply,
   normalizeCustomerReplyStyle,
 } from '../src/services/customerReplyGuard';
+import { splitAvailabilityClaimScopes } from '../src/services/availabilityClaimScope';
+import {
+  AVAILABILITY_CLAIM_MATRIX,
+  UNKNOWN_AVAILABILITY_CLAIM,
+} from './availability-claim-matrix';
 
 const services: ServicesResult = {
   success: true,
@@ -300,6 +306,316 @@ assert.equal(
   hasUnverifiedAvailabilityClaim('Não tem horários às 15h amanhã.', []),
   false,
   'não tem horários é negativa, não oferta de disponibilidade'
+);
+
+assert.deepEqual(
+  splitAvailabilityClaimScopes('Não encontrei horários hoje e tenho 10:00 amanhã.'),
+  ['nao encontrei horarios hoje', 'tenho 10:00 amanha.'],
+  'e abre somente a nova afirmação positiva'
+);
+assert.deepEqual(
+  splitAvailabilityClaimScopes('Temos 10:00 e 10:30.'),
+  ['temos 10:00 e 10:30.'],
+  'e não divide uma lista de horários do mesmo claim'
+);
+assert.equal(AVAILABILITY_CLAIM_MATRIX.length, 34, 'matriz IA-26b tem 34 casos');
+
+for (const [index, matrixCase] of AVAILABILITY_CLAIM_MATRIX.entries()) {
+  const claims = classifyCustomerReplyAvailabilityClaims(matrixCase.text);
+  assert.deepEqual(
+    claims,
+    matrixCase.claims,
+    `claims customerReplyGuard #${index + 1}: ${matrixCase.label}`
+  );
+  const requiresEvidence = hasUnverifiedAvailabilityClaim(matrixCase.text, []);
+  assert.equal(
+    requiresEvidence,
+    matrixCase.requiresEvidence,
+    `matriz customerReplyGuard #${index + 1}: ${matrixCase.label}`
+  );
+  const hasPositiveOrUnknownClaim = claims.some(
+    (claim) =>
+      claim.disposition === 'positive_availability' ||
+      claim.disposition === 'unknown'
+  );
+  assert.equal(
+    requiresEvidence,
+    hasPositiveOrUnknownClaim,
+    `E2E vazio customerReplyGuard #${index + 1}: claims positivos/unknown exigem prova: ${matrixCase.label}`
+  );
+  console.log(
+    `availability matrix customerReplyGuard #${index + 1}: ${requiresEvidence ? 'evidence_required' : 'no_offer'}`
+  );
+}
+
+for (const exclusion of [
+  {
+    text: 'depois das 17:30',
+    time: '17:30',
+    exclusionReason: 'customer_constraint' as const,
+  },
+  {
+    text: 'fechamos às 20h',
+    time: '20:00',
+    exclusionReason: 'business_hours' as const,
+  },
+]) {
+  const claims = classifyCustomerReplyAvailabilityClaims(exclusion.text);
+  assert.deepEqual(
+    claims,
+    [
+      {
+        time: exclusion.time,
+        span: {
+          start: exclusion.text.indexOf(
+            exclusion.text.includes('17:30') ? '17:30' : '20h'
+          ),
+          end:
+            exclusion.text.indexOf(
+              exclusion.text.includes('17:30') ? '17:30' : '20h'
+            ) + (exclusion.text.includes('17:30') ? 5 : 3),
+        },
+        disposition: 'non_availability_reference',
+        source: 'explicit_exclusion',
+        exclusionReason: exclusion.exclusionReason,
+      },
+    ],
+    `exclusão tipada preserva a menção: ${exclusion.text}`
+  );
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(exclusion.text, []),
+    false,
+    `exclusão tipada não entra no guard de disponibilidade: ${exclusion.text}`
+  );
+}
+
+const exclusionDoesNotInherit = 'Fechamos às 20:00 e 18:00.';
+assert.deepEqual(
+  classifyCustomerReplyAvailabilityClaims(exclusionDoesNotInherit),
+  [
+    {
+      time: '20:00',
+      span: { start: 12, end: 17 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'business_hours',
+    },
+    {
+      time: '18:00',
+      span: { start: 20, end: 25 },
+      disposition: 'unknown',
+      source: 'unclassified',
+    },
+  ],
+  'exclusão tipada nunca se propaga por coordenação'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim(exclusionDoesNotInherit, []),
+  true,
+  'horário coordenado sem governança própria continua evidence_required'
+);
+const constrainedRangeWithOffer = 'Entre 10:00 e 10:30 eu tenho 10:15';
+assert.deepEqual(
+  classifyCustomerReplyAvailabilityClaims(constrainedRangeWithOffer),
+  [
+    {
+      time: '10:00',
+      span: { start: 6, end: 11 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'customer_constraint',
+    },
+    {
+      time: '10:30',
+      span: { start: 14, end: 19 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'customer_constraint',
+    },
+    {
+      time: '10:15',
+      span: { start: 29, end: 34 },
+      disposition: 'positive_availability',
+      source: 'predicate_before',
+    },
+  ],
+  'faixa de restrição continua local e a oferta posterior permanece positiva'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim(constrainedRangeWithOffer, []),
+  true,
+  'oferta dentro de uma frase com faixa de restrição continua evidence_required'
+);
+for (const pureExclusion of [
+  {
+    text: 'Você pediu depois das 17:30.',
+    claim: {
+      time: '17:30',
+      span: { start: 22, end: 27 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'customer_constraint' as const,
+    },
+  },
+  {
+    text: 'Não encontrei nada depois das 17:30.',
+    claim: {
+      time: '17:30',
+      span: { start: 30, end: 35 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'customer_constraint' as const,
+    },
+  },
+  {
+    text: 'Funcionamos até 20:00.',
+    claim: {
+      time: '20:00',
+      span: { start: 16, end: 21 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'business_hours' as const,
+    },
+  },
+  {
+    text: 'Seu agendamento anterior era às 10:00.',
+    claim: {
+      time: '10:00',
+      span: { start: 32, end: 37 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'appointment_context' as const,
+    },
+  },
+] as const) {
+  assert.deepEqual(
+    classifyCustomerReplyAvailabilityClaims(pureExclusion.text),
+    [pureExclusion.claim],
+    `negativa pura tipada permanece visível: ${pureExclusion.text}`
+  );
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(pureExclusion.text, []),
+    false,
+    `negativa pura não exige prova: ${pureExclusion.text}`
+  );
+}
+
+for (const nucleus of ['está', 'fica', 'ficou', 'tá'] as const) {
+  const positiveEllipsis = `O 10:00 não está disponível e o 10:30 ${nucleus}.`;
+  assert.deepEqual(
+    classifyCustomerReplyAvailabilityClaims(positiveEllipsis),
+    [
+      {
+        time: '10:00',
+        span: { start: 2, end: 7 },
+        disposition: 'negative_availability',
+        source: 'status_after',
+      },
+      {
+        time: '10:30',
+        span: {
+          start: positiveEllipsis.indexOf('10:30'),
+          end: positiveEllipsis.indexOf('10:30') + 5,
+        },
+        disposition: 'positive_availability',
+        source: 'status_after',
+      },
+    ],
+    `elipse positiva derivada para o núcleo ${nucleus}`
+  );
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(positiveEllipsis, []),
+    true,
+    `elipse positiva sem leitura atual exige prova para ${nucleus}`
+  );
+
+  const negativeEllipsis = `O 10:00 não está disponível e o 10:30 não ${nucleus}.`;
+  assert.deepEqual(
+    classifyCustomerReplyAvailabilityClaims(negativeEllipsis),
+    [
+      {
+        time: '10:00',
+        span: { start: 2, end: 7 },
+        disposition: 'negative_availability',
+        source: 'status_after',
+      },
+      {
+        time: '10:30',
+        span: {
+          start: negativeEllipsis.indexOf('10:30'),
+          end: negativeEllipsis.indexOf('10:30') + 5,
+        },
+        disposition: 'negative_availability',
+        source: 'status_after',
+      },
+    ],
+    `elipse negativa preservada para o núcleo ${nucleus}`
+  );
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(negativeEllipsis, []),
+    false,
+    `claims somente negativos não exigem leitura de disponibilidade para ${nucleus}`
+  );
+}
+
+assert.deepEqual(
+  classifyCustomerReplyAvailabilityClaims('10:00 tem vaga.'),
+  [
+    {
+      time: '10:00',
+      span: { start: 0, end: 5 },
+      disposition: 'positive_availability',
+      source: 'status_after',
+    },
+  ],
+  'forma plena positiva tem vaga usa a mesma gramática de estado'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim('10:00 tem vaga.', []),
+  true,
+  'tem vaga sem leitura atual exige prova'
+);
+assert.deepEqual(
+  classifyCustomerReplyAvailabilityClaims('10:00 não tem vaga.'),
+  [
+    {
+      time: '10:00',
+      span: { start: 0, end: 5 },
+      disposition: 'negative_availability',
+      source: 'status_after',
+    },
+  ],
+  'forma negativa não tem vaga preserva a polaridade local'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim('10:00 não tem vaga.', []),
+  false,
+  'não tem vaga não é oferta positiva'
+);
+
+assert.deepEqual(
+  classifyCustomerReplyAvailabilityClaims(UNKNOWN_AVAILABILITY_CLAIM.text),
+  UNKNOWN_AVAILABILITY_CLAIM.claims,
+  'unknown availability claim remains visible in the shared classifier'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim(UNKNOWN_AVAILABILITY_CLAIM.text, []),
+  true,
+  'unknown availability claim falls to evidence_required'
+);
+const mixedNegativeLater = AVAILABILITY_CLAIM_MATRIX.find(
+  (matrixCase) => matrixCase.label === 'positive then negative result lead'
+)!;
+assert.equal(
+  hasUnverifiedAvailabilityClaim(mixedNegativeLater.text, [
+    {
+      userTurn: 3,
+      name: 'getAvailableSlots',
+      result: JSON.stringify({ success: true, slots: ['10:00'] }),
+    },
+  ]),
+  false,
+  'evidence for the positive earlier time is not suppressed by a later negative time'
 );
 
 assert.deepEqual(

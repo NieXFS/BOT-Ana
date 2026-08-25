@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import {
   buildReceptionistEnvelope,
+  classifyReceptionistOutboundAvailabilityClaims,
   CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
   outboundBlockHash,
   validateReceptionistOutbound,
 } from '../src/services/receptionistOutbound';
+import {
+  AVAILABILITY_CLAIM_MATRIX,
+  UNKNOWN_AVAILABILITY_CLAIM,
+} from './availability-claim-matrix';
 
 const catalog = {
   services: [
@@ -250,4 +255,206 @@ assert.equal(
   true,
   'pergunta pendente da Ana desliga só SOCIAL_CONTEXT_DRIFT'
 );
+
+assert.equal(AVAILABILITY_CLAIM_MATRIX.length, 34, 'matriz IA-26b tem 34 casos');
+
+for (const [index, matrixCase] of AVAILABILITY_CLAIM_MATRIX.entries()) {
+  assert.deepEqual(
+    classifyReceptionistOutboundAvailabilityClaims(matrixCase.text),
+    matrixCase.claims,
+    `claims receptionistOutbound #${index + 1}: ${matrixCase.label}`
+  );
+  const result = validate([{ source: 'GENERATED', text: matrixCase.text }]);
+  const requiresEvidence = !result.originalAccepted;
+  assert.equal(
+    requiresEvidence,
+    matrixCase.requiresEvidence,
+    `matriz receptionistOutbound #${index + 1}: ${matrixCase.label}`
+  );
+  console.log(
+    `availability matrix receptionistOutbound #${index + 1}: ${requiresEvidence ? 'evidence_required' : 'no_offer'}`
+  );
+}
+
+for (const exclusion of [
+  {
+    text: 'depois das 17:30',
+    time: '17:30',
+    rawToken: '17:30',
+    exclusionReason: 'customer_constraint' as const,
+  },
+  {
+    text: 'fechamos às 20h',
+    time: '20:00',
+    rawToken: '20h',
+    exclusionReason: 'business_hours' as const,
+  },
+]) {
+  const claims = classifyReceptionistOutboundAvailabilityClaims(exclusion.text);
+  assert.deepEqual(
+    claims,
+    [
+      {
+        time: exclusion.time,
+        span: {
+          start: exclusion.text.indexOf(exclusion.rawToken),
+          end:
+            exclusion.text.indexOf(exclusion.rawToken) +
+            exclusion.rawToken.length,
+        },
+        disposition: 'non_availability_reference',
+        source: 'explicit_exclusion',
+        exclusionReason: exclusion.exclusionReason,
+      },
+    ],
+    `exclusão tipada preserva a menção no outbound: ${exclusion.text}`
+  );
+  assert.equal(
+    validate([{ source: 'GENERATED', text: exclusion.text }]).originalAccepted,
+    true,
+    `exclusão tipada não gera UNVERIFIED_AVAILABILITY: ${exclusion.text}`
+  );
+}
+
+const exclusionDoesNotInherit = 'Fechamos às 20:00 e 18:00.';
+assert.deepEqual(
+  classifyReceptionistOutboundAvailabilityClaims(exclusionDoesNotInherit),
+  [
+    {
+      time: '20:00',
+      span: { start: 12, end: 17 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'business_hours',
+    },
+    {
+      time: '18:00',
+      span: { start: 20, end: 25 },
+      disposition: 'unknown',
+      source: 'unclassified',
+    },
+  ],
+  'exclusão tipada nunca se propaga por coordenação no outbound'
+);
+const exclusionDoesNotInheritResult = validate([
+  { source: 'GENERATED', text: exclusionDoesNotInherit },
+]);
+assert.ok(
+  exclusionDoesNotInheritResult.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  'horário coordenado sem governança própria continua evidence_required no outbound'
+);
+const constrainedRangeWithOffer = 'Entre 10:00 e 10:30 eu tenho 10:15';
+assert.deepEqual(
+  classifyReceptionistOutboundAvailabilityClaims(constrainedRangeWithOffer),
+  [
+    {
+      time: '10:00',
+      span: { start: 6, end: 11 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'customer_constraint',
+    },
+    {
+      time: '10:30',
+      span: { start: 14, end: 19 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'customer_constraint',
+    },
+    {
+      time: '10:15',
+      span: { start: 29, end: 34 },
+      disposition: 'positive_availability',
+      source: 'predicate_before',
+    },
+  ],
+  'faixa de restrição continua local e a oferta posterior permanece positiva no outbound'
+);
+assert.ok(
+  validate([{ source: 'GENERATED', text: constrainedRangeWithOffer }]).reasonCodes.includes(
+    'UNVERIFIED_AVAILABILITY'
+  ),
+  'oferta dentro de uma frase com faixa de restrição continua evidence_required no outbound'
+);
+for (const pureExclusion of [
+  {
+    text: 'Você pediu depois das 17:30.',
+    claim: {
+      time: '17:30',
+      span: { start: 22, end: 27 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'customer_constraint' as const,
+    },
+  },
+  {
+    text: 'Não encontrei nada depois das 17:30.',
+    claim: {
+      time: '17:30',
+      span: { start: 30, end: 35 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'customer_constraint' as const,
+    },
+  },
+  {
+    text: 'Funcionamos até 20:00.',
+    claim: {
+      time: '20:00',
+      span: { start: 16, end: 21 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'business_hours' as const,
+    },
+  },
+  {
+    text: 'Seu agendamento anterior era às 10:00.',
+    claim: {
+      time: '10:00',
+      span: { start: 32, end: 37 },
+      disposition: 'non_availability_reference' as const,
+      source: 'explicit_exclusion' as const,
+      exclusionReason: 'appointment_context' as const,
+    },
+  },
+] as const) {
+  assert.deepEqual(
+    classifyReceptionistOutboundAvailabilityClaims(pureExclusion.text),
+    [pureExclusion.claim],
+    `negativa pura tipada permanece visível no outbound: ${pureExclusion.text}`
+  );
+  const pureExclusionResult = validate([
+    { source: 'GENERATED', text: pureExclusion.text },
+  ]);
+  assert.equal(
+    pureExclusionResult.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+    false,
+    `negativa pura não exige prova de disponibilidade no outbound: ${pureExclusion.text}`
+  );
+}
+
+assert.deepEqual(
+  classifyReceptionistOutboundAvailabilityClaims(UNKNOWN_AVAILABILITY_CLAIM.text),
+  UNKNOWN_AVAILABILITY_CLAIM.claims,
+  'unknown availability claim remains visible in the shared classifier'
+);
+const unknownAvailabilityResult = validate([
+  { source: 'GENERATED', text: UNKNOWN_AVAILABILITY_CLAIM.text },
+]);
+assert.ok(
+  unknownAvailabilityResult.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  'unknown availability claim falls to evidence_required'
+);
+const mixedNegativeLater = AVAILABILITY_CLAIM_MATRIX.find(
+  (matrixCase) => matrixCase.label === 'positive then negative result lead'
+)!;
+assert.equal(
+  validate(
+    [{ source: 'GENERATED', text: mixedNegativeLater.text }],
+    { evidence: { verifiedAvailabilitySlots: ['10:00'] } }
+  ).originalAccepted,
+  true,
+  'evidence for the positive earlier time is not suppressed by a later negative time'
+);
+
 console.log('smoke receptionist final outbound: OK');
