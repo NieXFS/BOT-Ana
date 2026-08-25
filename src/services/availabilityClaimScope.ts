@@ -18,6 +18,22 @@ export const RESULT_LEADS = [
   'consegui localizar',
 ] as const;
 
+/**
+ * Superfícies lexicais que podem denotar disponibilidade. A existência do
+ * claim nasce desta superfície; `RESULT_LEADS` só fornece a polaridade quando
+ * um lead conhecido também governa o mesmo grupo local.
+ */
+export const AVAILABILITY_SURFACES = [
+  'horario',
+  'horarios',
+  'vaga',
+  'vagas',
+  'disponibilidade',
+  'disponibilidades',
+  'encaixe',
+  'encaixes',
+] as const;
+
 export type AvailabilityTimeMentionDisposition =
   | 'positive_availability'
   | 'negative_availability'
@@ -58,7 +74,7 @@ export type AvailabilityExistenceConstraintV2 =
  * este claim exige a existência de algum slot posterior no trace.
  */
 export type AvailabilityExistenceClaimV2 = {
-  polarity: 'positive' | 'negative';
+  polarity: 'positive' | 'negative' | 'unknown';
   constraint?: AvailabilityExistenceConstraintV2;
 };
 
@@ -110,6 +126,17 @@ const RESULT_LEAD_RE = new RegExp(
   'gu'
 );
 const RESULT_LEAD_TEST_RE = new RegExp(RESULT_LEAD_RE.source, 'u');
+const AVAILABILITY_SURFACE_PATTERN = AVAILABILITY_SURFACES
+  .slice()
+  .sort((left, right) => right.length - left.length)
+  .map((surface) => surface.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|');
+const AVAILABILITY_SURFACE_RE = new RegExp(
+  `(?<![\\p{L}])(?:${AVAILABILITY_SURFACE_PATTERN})(?![\\p{L}])`,
+  'gu'
+);
+const CUSTOMER_CONSTRAINT_REFERENCE_RE =
+  /\b(?:pediu|pediram|solicitou|solicitaram|prefere|prefiro|preferiu|quer|queria|gostaria|procura|procuro|busca|busco|escolheu|escolher|prioriza|priorizou)\b/iu;
 
 const APPOINTMENT_CONTEXT_BEFORE_RE =
   /\b(?:agendamentos?|agendad[oa]s?|agendei|agendamos|marcad[oa]s?|marquei|marcamos|confirmad[oa]s?|confirmei|confirmamos|cancelad[oa]s?|cancelei|cancelamos|remarcad[oa]s?|remarquei|remarcamos|reservad[oa]s?|reservei|reservamos|reservas?|consultas?|sess[aã]os?|procedimentos?)\b[^.!?\n]{0,50}(?:as?|para|em|no|na|e|:)\s*$/iu;
@@ -695,16 +722,16 @@ function singleExistenceConstraintKindV2(
 
 function locateAvailabilityExistenceConstraintV2(
   value: string,
-  leadEnd: number,
+  surfaceEnd: number,
   scopeEnd: number,
   tokens: TimeToken[]
 ): LocatedAvailabilityExistenceConstraintV2 | null {
   const scopedTokens = tokens.filter(
-    (token) => token.start >= leadEnd && token.end <= scopeEnd
+    (token) => token.start >= surfaceEnd && token.end <= scopeEnd
   );
   for (let index = 0; index < scopedTokens.length; index += 1) {
     const token = scopedTokens[index]!;
-    const beforeTime = value.slice(leadEnd, token.start);
+    const beforeTime = value.slice(surfaceEnd, token.start);
     if (/\bentre\s*$/u.test(beforeTime)) {
       const endToken = scopedTokens[index + 1];
       if (
@@ -733,10 +760,87 @@ function locateAvailabilityExistenceConstraintV2(
   return null;
 }
 
+function localExistenceReferenceGroupStart(
+  value: string,
+  start: number
+): number {
+  const bounds = sentenceBounds(value, start, start);
+  let groupStart = bounds.start;
+  const boundaryRe = /,|\b(?:e|mas|porem|contudo|entretanto)\b/gu;
+  for (const match of value
+    .slice(bounds.start, start)
+    .matchAll(boundaryRe)) {
+    groupStart = bounds.start + (match.index ?? 0) + match[0].length;
+  }
+  return groupStart;
+}
+
+type ExistenceResultLeadV2 = {
+  polarity: 'positive' | 'negative';
+};
+
+function findExistenceResultLeadV2(
+  value: string,
+  groupStart: number,
+  firstTimeStart: number,
+  tokens: TimeToken[]
+): ExistenceResultLeadV2 | null {
+  const matches = [...value.matchAll(RESULT_LEAD_RE)];
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const match = matches[index]!;
+    const relativeStart = match.index ?? 0;
+    const start = relativeStart;
+    const end = start + match[0].length;
+    if (start < groupStart || start >= firstTimeStart) continue;
+    if (hasTimeBefore(tokens, end, firstTimeStart)) continue;
+
+    const between = value.slice(end, firstTimeStart);
+    if (hasInterveningPredicate(between)) continue;
+
+    return {
+      polarity: match.groups?.negative ? 'negative' : 'positive',
+    };
+  }
+  return null;
+}
+
+function existenceReferenceExclusionReasonV2(
+  value: string,
+  token: TimeToken,
+  tokens: TimeToken[],
+  referenceStart: number,
+  bounds: { start: number; end: number }
+): AvailabilityTimeMentionExclusionReason | null {
+  const localReference = value.slice(referenceStart, token.start);
+  // These exclusions are deliberately checked before any result lead is
+  // allowed to determine the claim polarity. A request for a time is not a
+  // statement that the time exists.
+  if (CUSTOMER_CONSTRAINT_REFERENCE_RE.test(localReference)) {
+    return 'customer_constraint';
+  }
+  if (
+    OPERATING_HOURS_RE.test(localReference) ||
+    isOperatingHoursTime(value, token, tokens)
+  ) {
+    return 'business_hours';
+  }
+  if (
+    APPOINTMENT_CONTEXT_MARKER_RE.test(localReference) ||
+    isAppointmentTime(value, token, tokens)
+  ) {
+    return 'appointment_context';
+  }
+  if (value.slice(bounds.start, bounds.end).trim().endsWith('?')) {
+    return 'other_typed_reference';
+  }
+  return null;
+}
+
 /**
  * Extrai claims de existência cujo horário explícito é um limite, não um slot
- * ofertado. O escopo termina antes do próximo lead para que duas orações não
- * compartilhem polaridade por acidente.
+ * ofertado. A descoberta começa pela superfície de disponibilidade. Um lead
+ * conhecido pode classificar a polaridade, mas sua ausência nunca apaga o
+ * claim: nesse caso a polaridade é `unknown` e a evidência continua exigida.
  */
 export function classifyAvailabilityExistenceClaimsV2(
   value: string
@@ -744,41 +848,57 @@ export function classifyAvailabilityExistenceClaimsV2(
   const normalized = normalizeAvailabilityText(value);
   if (!normalized) return [];
   const tokens = extractTimeTokens(normalized);
-  const leads = [...normalized.matchAll(RESULT_LEAD_RE)];
+  const surfaces = [...normalized.matchAll(AVAILABILITY_SURFACE_RE)];
   const claims: AvailabilityExistenceClaimV2[] = [];
   const seen = new Set<string>();
 
-  for (let index = 0; index < leads.length; index += 1) {
-    const lead = leads[index]!;
-    const leadStart = lead.index ?? 0;
-    const leadEnd = leadStart + lead[0].length;
-    const bounds = sentenceBounds(normalized, leadStart, leadEnd);
-    const nextLeadStart = leads[index + 1]?.index;
+  for (let index = 0; index < surfaces.length; index += 1) {
+    const surface = surfaces[index]!;
+    const surfaceStart = surface.index ?? 0;
+    const surfaceEnd = surfaceStart + surface[0].length;
+    const bounds = sentenceBounds(normalized, surfaceStart, surfaceEnd);
+    const nextSurfaceStart = surfaces[index + 1]?.index;
     const scopeEnd =
-      nextLeadStart !== undefined && nextLeadStart < bounds.end
-        ? nextLeadStart
+      nextSurfaceStart !== undefined && nextSurfaceStart < bounds.end
+        ? nextSurfaceStart
         : bounds.end;
     const located = locateAvailabilityExistenceConstraintV2(
       normalized,
-      leadEnd,
+      surfaceEnd,
       scopeEnd,
       tokens
     );
     if (!located) continue;
+    const firstTimeToken = tokens.find(
+      (token) => token.start === located.firstTimeStart
+    );
+    if (!firstTimeToken) continue;
 
-    const subjectAndOperator = normalized.slice(
-      leadEnd,
-      located.firstTimeStart
+    const referenceStart = localExistenceReferenceGroupStart(
+      normalized,
+      surfaceStart
     );
     if (
-      APPOINTMENT_CONTEXT_MARKER_RE.test(subjectAndOperator) ||
-      OPERATING_HOURS_RE.test(subjectAndOperator)
+      existenceReferenceExclusionReasonV2(
+        normalized,
+        firstTimeToken,
+        tokens,
+        referenceStart,
+        bounds
+      )
     ) {
       continue;
     }
 
+    const lead = findExistenceResultLeadV2(
+      normalized,
+      localGroupStart(normalized, surfaceStart),
+      located.firstTimeStart,
+      tokens
+    );
+
     const claim: AvailabilityExistenceClaimV2 = {
-      polarity: lead.groups?.negative ? 'negative' : 'positive',
+      polarity: lead?.polarity ?? 'unknown',
       constraint: located.constraint,
     };
     const key = JSON.stringify(claim);
@@ -800,9 +920,15 @@ export function hasSlotSatisfyingAvailabilityExistenceClaimV2(
   claim: AvailabilityExistenceClaimV2,
   slots: Iterable<string>
 ): boolean {
-  // Claims negativos continuam sendo descrições seguras e não exigem prova de
-  // ausência; esta função é a licença positiva usada pela barreira.
-  if (claim.polarity !== 'positive') return true;
+  // Negative é a única polaridade que não exige prova. Positive e unknown
+  // percorrem exatamente a mesma verificação de existência autoritativa.
+  switch (claim.polarity) {
+    case 'negative':
+      return true;
+    case 'positive':
+    case 'unknown':
+      break;
+  }
   const slotMinutes = [...slots]
     .map(clockMinutesV2)
     .filter((minutes): minutes is number => minutes !== null);

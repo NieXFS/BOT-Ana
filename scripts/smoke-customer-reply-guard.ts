@@ -438,6 +438,118 @@ assert.equal(
 );
 console.log('bloqueante A customerReplyGuard: negativa after -> PASS sem slot ofertado');
 
+const surfaceFirstExistenceGate = [
+  {
+    label: 'Consigo after trace vazio',
+    text: 'Consigo horário depois das 17:30.',
+    trace: [],
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedBlocked: true,
+  },
+  {
+    label: 'Consigo after trace 18:00',
+    text: 'Consigo horário depois das 17:30.',
+    trace: constrainedAvailabilityTrace(['18:00']),
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedBlocked: false,
+  },
+  {
+    label: 'Consigo after trace 17:00',
+    text: 'Consigo horário depois das 17:30.',
+    trace: constrainedAvailabilityTrace(['17:00']),
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedBlocked: true,
+  },
+  {
+    label: 'Talvez role vaga after trace vazio',
+    text: 'Talvez role uma vaga depois das 17:30.',
+    trace: [],
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedBlocked: true,
+  },
+  {
+    label: 'Não consigo after trace vazio',
+    text: 'Não consigo horário depois das 17:30.',
+    trace: [],
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedBlocked: true,
+  },
+  {
+    label: 'pedido do cliente não cria existência',
+    text: 'Você pediu horário depois das 17:30.',
+    trace: [],
+    expectedClaims: [],
+    expectedBlocked: false,
+  },
+  {
+    label: 'pergunta de preferência não cria existência',
+    text: 'Prefere um horário depois das 17:30?',
+    trace: [],
+    expectedClaims: [],
+    expectedBlocked: false,
+  },
+  {
+    label: 'horário de funcionamento não cria existência',
+    text: 'Nosso horário de funcionamento vai até 20:00.',
+    trace: [],
+    expectedClaims: [],
+    expectedBlocked: false,
+  },
+  {
+    label: 'agendamento do cliente não cria existência',
+    text: 'Seu agendamento era às 17:30.',
+    trace: [],
+    expectedClaims: [],
+    expectedBlocked: false,
+  },
+  {
+    label: 'responder depois não cria existência',
+    text: 'Vou responder depois das 17:30.',
+    trace: [],
+    expectedClaims: [],
+    expectedBlocked: false,
+  },
+  {
+    label: 'preferir falar depois não cria existência',
+    text: 'Prefiro falar depois das 17:30.',
+    trace: [],
+    expectedClaims: [],
+    expectedBlocked: false,
+  },
+  {
+    label: 'procedimento terminar depois não cria existência',
+    text: 'O procedimento termina depois das 17:30.',
+    trace: [],
+    expectedClaims: [],
+    expectedBlocked: false,
+  },
+];
+for (const testCase of surfaceFirstExistenceGate) {
+  assert.deepEqual(
+    classifyAvailabilityExistenceClaimsV2(testCase.text),
+    testCase.expectedClaims,
+    `surface-first existence customerReplyGuard: ${testCase.label}`
+  );
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(testCase.text, [...testCase.trace]),
+    testCase.expectedBlocked,
+    `surface-first gate customerReplyGuard: ${testCase.label}`
+  );
+  console.log(
+    `surface-first customerReplyGuard: ${testCase.label} -> ${testCase.expectedBlocked ? 'BLOCK' : 'PASS'}`
+  );
+}
+
 for (const exclusion of [
   {
     text: 'depois das 17:30',

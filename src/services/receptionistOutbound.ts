@@ -768,11 +768,15 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
     }
   }
   for (const claim of availabilityExistenceClaims) {
-    if (
-      claim.polarity === 'positive' &&
-      !hasSlotSatisfyingAvailabilityExistenceClaimV2(claim, slots)
-    ) {
-      reasons.add('UNVERIFIED_AVAILABILITY');
+    switch (claim.polarity) {
+      case 'negative':
+        continue;
+      case 'positive':
+      case 'unknown':
+        if (!hasSlotSatisfyingAvailabilityExistenceClaimV2(claim, slots)) {
+          reasons.add('UNVERIFIED_AVAILABILITY');
+        }
+        break;
     }
   }
 

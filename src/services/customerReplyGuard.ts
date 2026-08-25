@@ -609,9 +609,7 @@ export function hasUnverifiedAvailabilityClaim(
   additionalVerifiedSlots: readonly string[] = []
 ): boolean {
   const offered = offeredAvailabilitySlots(reply);
-  const existenceClaims = classifyAvailabilityExistenceClaimsV2(reply).filter(
-    (claim) => claim.polarity === 'positive'
-  );
+  const existenceClaims = classifyAvailabilityExistenceClaimsV2(reply);
   if (offered.length === 0 && existenceClaims.length === 0) return false;
 
   const verified = currentTurnAuthoritativeAvailabilitySlots(toolTrace);

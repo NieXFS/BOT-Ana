@@ -335,6 +335,139 @@ assert.equal(
 );
 console.log('bloqueante A receptionistOutbound: negativa after -> PASS sem slot ofertado');
 
+const surfaceFirstExistenceGate = [
+  {
+    label: 'Consigo after trace vazio',
+    text: 'Consigo horário depois das 17:30.',
+    extra: {},
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedAccepted: false,
+    expectedAvailabilityBlocked: true,
+  },
+  {
+    label: 'Consigo after trace 18:00',
+    text: 'Consigo horário depois das 17:30.',
+    extra: availabilityEvidence(['18:00']),
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedAccepted: true,
+    expectedAvailabilityBlocked: false,
+  },
+  {
+    label: 'Consigo after trace 17:00',
+    text: 'Consigo horário depois das 17:30.',
+    extra: availabilityEvidence(['17:00']),
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedAccepted: false,
+    expectedAvailabilityBlocked: true,
+  },
+  {
+    label: 'Talvez role vaga after trace vazio',
+    text: 'Talvez role uma vaga depois das 17:30.',
+    extra: {},
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedAccepted: false,
+    expectedAvailabilityBlocked: true,
+  },
+  {
+    label: 'Não consigo after trace vazio',
+    text: 'Não consigo horário depois das 17:30.',
+    extra: {},
+    expectedClaims: [
+      { polarity: 'unknown', constraint: { kind: 'after', time: '17:30' } },
+    ],
+    expectedAccepted: false,
+    expectedAvailabilityBlocked: true,
+  },
+  {
+    label: 'pedido do cliente não cria existência',
+    text: 'Você pediu horário depois das 17:30.',
+    extra: {},
+    expectedClaims: [],
+    expectedAccepted: true,
+    expectedAvailabilityBlocked: false,
+  },
+  {
+    label: 'pergunta de preferência não cria existência',
+    text: 'Prefere um horário depois das 17:30?',
+    extra: {},
+    expectedClaims: [],
+    expectedAccepted: true,
+    expectedAvailabilityBlocked: false,
+  },
+  {
+    label: 'horário de funcionamento não cria existência',
+    text: 'Nosso horário de funcionamento vai até 20:00.',
+    extra: {},
+    expectedClaims: [],
+    expectedAccepted: true,
+    expectedAvailabilityBlocked: false,
+  },
+  {
+    label: 'agendamento do cliente não cria existência',
+    text: 'Seu agendamento era às 17:30.',
+    extra: {},
+    expectedClaims: [],
+    expectedAccepted: false,
+    expectedAvailabilityBlocked: false,
+  },
+  {
+    label: 'responder depois não cria existência',
+    text: 'Vou responder depois das 17:30.',
+    extra: {},
+    expectedClaims: [],
+    expectedAccepted: true,
+    expectedAvailabilityBlocked: false,
+  },
+  {
+    label: 'preferir falar depois não cria existência',
+    text: 'Prefiro falar depois das 17:30.',
+    extra: {},
+    expectedClaims: [],
+    expectedAccepted: true,
+    expectedAvailabilityBlocked: false,
+  },
+  {
+    label: 'procedimento terminar depois não cria existência',
+    text: 'O procedimento termina depois das 17:30.',
+    extra: {},
+    expectedClaims: [],
+    expectedAccepted: true,
+    expectedAvailabilityBlocked: false,
+  },
+];
+for (const testCase of surfaceFirstExistenceGate) {
+  assert.deepEqual(
+    classifyAvailabilityExistenceClaimsV2(testCase.text),
+    testCase.expectedClaims,
+    `surface-first existence receptionistOutbound: ${testCase.label}`
+  );
+  const result = validate(
+    [{ source: 'GENERATED', text: testCase.text }],
+    testCase.extra
+  );
+  assert.equal(
+    result.originalAccepted,
+    testCase.expectedAccepted,
+    `surface-first gate receptionistOutbound: ${testCase.label}`
+  );
+  assert.equal(
+    result.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+    testCase.expectedAvailabilityBlocked,
+    `surface-first reason receptionistOutbound: ${testCase.label}`
+  );
+  console.log(
+    `surface-first receptionistOutbound: ${testCase.label} -> ${testCase.expectedAvailabilityBlocked ? 'BLOCK' : testCase.expectedAccepted ? 'PASS' : 'OTHER-GUARD'}`
+  );
+}
+
 assert.equal(substantiveServiceOfferResidualV2('Botox às 10:00'), 'botox');
 assert.equal(substantiveServiceOfferResidualV2('hoje às 10:00'), '');
 assert.equal(substantiveServiceOfferResidualV2('10:00'), '');
