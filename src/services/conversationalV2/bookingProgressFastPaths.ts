@@ -53,6 +53,7 @@ import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 import {
   buildDeferredAvailabilityConstraintFromWindowsV2,
   buildDeferredAvailabilityExhaustedCopyV2,
+  buildDeferredAvailabilityPastDateCopyV2,
   buildEmptyDeferredAvailabilityCopyV2,
   captureDeferredAvailabilityConstraintV2,
   deferredAvailabilityPendingTransitionV2,
@@ -485,6 +486,14 @@ export async function resolveDateSlotsFastPathV2(input: {
         )
       : undefined;
   const selectionActive = Boolean(deferredWindowSelection && selectedConstraint);
+  const selectedWindow = deferredWindowSelection?.selected ?? null;
+  const remainingConstraint =
+    selectionActive && input.frame.flowState.deferredAvailability
+      ? buildDeferredAvailabilityConstraintFromWindowsV2(
+          input.frame.flowState.deferredAvailability,
+          deferredWindowSelection?.remaining ?? []
+        )
+      : null;
   const entitlement = dateSlotsEntitlementV2({
     frame: input.frame,
     inboundText: input.currentInboundText,
@@ -625,15 +634,33 @@ export async function resolveDateSlotsFastPathV2(input: {
     };
   }
   if (date < civilToday(input.now, input.config.timezone)) {
+    const selectedPastDate = selectionActive && selectedWindow;
+    const reply = selectedPastDate
+      ? buildDeferredAvailabilityPastDateCopyV2({
+          remaining: deferredWindowSelection?.remaining ?? [],
+          now: input.now,
+          timezone: input.config.timezone,
+        })
+      : 'Essa data já passou. Qual outra data você prefere?';
     return {
       kind: 'resolved',
-      result: dateQuestionResult(
-        input.frame,
-        'Essa data já passou. Qual outra data você prefere?'
-      ),
+      result: {
+        ...dateQuestionResult(input.frame, reply),
+        ...(selectedPastDate
+          ? {
+              pendingTransitionCandidate:
+                deferredAvailabilityPendingTransitionV2(
+                  input.frame.flowState.flowId,
+                  remainingConstraint
+                ),
+            }
+          : {}),
+      },
       loop: loopForReads([]),
       proof: null,
-      nextFlowState: baseState,
+      nextFlowState: selectedPastDate
+        ? withDeferredAvailabilityV2(baseState, remainingConstraint)
+        : baseState,
     };
   }
   const professionalGate = professionalSelectionGate({
@@ -763,14 +790,6 @@ export async function resolveDateSlotsFastPathV2(input: {
       };
     }
   }
-  const selectedWindow = deferredWindowSelection?.selected ?? null;
-  const remainingConstraint =
-    selectionActive && input.frame.flowState.deferredAvailability
-      ? buildDeferredAvailabilityConstraintFromWindowsV2(
-          input.frame.flowState.deferredAvailability,
-          deferredWindowSelection?.remaining ?? []
-        )
-      : null;
   const isValidEmptyResult = slots !== null && slots.length === 0;
   const reply = isValidEmptyResult
     ? selectionActive && selectedWindow

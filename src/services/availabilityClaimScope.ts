@@ -45,6 +45,23 @@ export type AvailabilityTimeMentionV2 = {
   exclusionReason?: AvailabilityTimeMentionExclusionReason;
 };
 
+export type AvailabilityExistenceConstraintV2 =
+  | { kind: 'after'; time: string }
+  | { kind: 'at_or_after'; time: string }
+  | { kind: 'before'; time: string }
+  | { kind: 'at_or_before'; time: string }
+  | { kind: 'between'; startTime: string; endTime: string };
+
+/**
+ * Claim de existência separado das menções de horário. Em “tenho horário
+ * depois das 17:30”, 17:30 continua sendo somente o limite da restrição;
+ * este claim exige a existência de algum slot posterior no trace.
+ */
+export type AvailabilityExistenceClaimV2 = {
+  polarity: 'positive' | 'negative';
+  constraint?: AvailabilityExistenceConstraintV2;
+};
+
 /** @deprecated Use the explicit mention contract above. */
 export type AvailabilityTimeClaimV2 = AvailabilityTimeMentionV2;
 
@@ -109,7 +126,7 @@ const OPERATING_PREDICATE_RE =
 const RESTRICTION_AFTER_RE =
   /^\s*(?:continua|segue|e)\s+(?:uma?\s+)?restri[cç][aã]o\b/iu;
 const TIME_CONSTRAINT_BEFORE_RE =
-  /\b(?:depois|ap[oó]s|antes|at[eé]|a\s+partir\s+de)\s+(?:d[aeo]s?|as?|o|a)\s*$/iu;
+  /\b(?:(?:depois|ap[oó]s|antes)\s+(?:de|das?|dos?|as?|a|o)|a\s+partir\s+(?:de|das?|dos?|as?|a|o)|at[eé](?:\s+(?:as?|das?|dos?))?)\s*$/iu;
 const RANGE_START_BEFORE_RE = /\b(?:entre|das?)\s*$/iu;
 const RANGE_CONTINUATION_BEFORE_RE =
   /\b(?:entre\s+[^.!?\n]{0,30}\s+e|das?\s+[^.!?\n]{0,30}\s+as?)\s*$/iu;
@@ -610,7 +627,12 @@ function directPredicateBefore(
     if (/(?:,|\b(?:e|mas|porem|contudo|entretanto)\b)\s*$/iu.test(complement)) {
       continue;
     }
-    if (TIME_CONSTRAINT_BEFORE_RE.test(complement)) continue;
+    if (
+      TIME_CONSTRAINT_BEFORE_RE.test(complement) ||
+      RANGE_START_BEFORE_RE.test(complement)
+    ) {
+      continue;
+    }
     if (leadStart < groupStart) continue;
 
     return {
@@ -646,6 +668,170 @@ function canInherit(
   return /^(?:\s|[,;]|e|nem|tamb[eé]m|tambem|hoje|amanh[aã]|depois|antes|para|pra|as?|os?|um|uma|uns|umas|dos?|das?)*$/iu.test(
     between
   );
+}
+
+type LocatedAvailabilityExistenceConstraintV2 = {
+  constraint: AvailabilityExistenceConstraintV2;
+  firstTimeStart: number;
+};
+
+function singleExistenceConstraintKindV2(
+  beforeTime: string
+): Exclude<AvailabilityExistenceConstraintV2['kind'], 'between'> | null {
+  if (/\ba\s+partir\s+(?:de|das?|dos?|as?|a|o)\s*$/u.test(beforeTime)) {
+    return 'at_or_after';
+  }
+  if (/\b(?:depois|apos)\s+(?:de|das?|dos?|as?|a|o)\s*$/u.test(beforeTime)) {
+    return 'after';
+  }
+  if (/\bantes\s+(?:de|das?|dos?|as?|a|o)\s*$/u.test(beforeTime)) {
+    return 'before';
+  }
+  if (/\bate\s+(?:(?:as?|das?|dos?)\s*)?$/u.test(beforeTime)) {
+    return 'at_or_before';
+  }
+  return null;
+}
+
+function locateAvailabilityExistenceConstraintV2(
+  value: string,
+  leadEnd: number,
+  scopeEnd: number,
+  tokens: TimeToken[]
+): LocatedAvailabilityExistenceConstraintV2 | null {
+  const scopedTokens = tokens.filter(
+    (token) => token.start >= leadEnd && token.end <= scopeEnd
+  );
+  for (let index = 0; index < scopedTokens.length; index += 1) {
+    const token = scopedTokens[index]!;
+    const beforeTime = value.slice(leadEnd, token.start);
+    if (/\bentre\s*$/u.test(beforeTime)) {
+      const endToken = scopedTokens[index + 1];
+      if (
+        endToken &&
+        /^\s*e\s*$/u.test(value.slice(token.end, endToken.start))
+      ) {
+        return {
+          constraint: {
+            kind: 'between',
+            startTime: token.time,
+            endTime: endToken.time,
+          },
+          firstTimeStart: token.start,
+        };
+      }
+    }
+
+    const kind = singleExistenceConstraintKindV2(beforeTime);
+    if (kind) {
+      return {
+        constraint: { kind, time: token.time },
+        firstTimeStart: token.start,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Extrai claims de existência cujo horário explícito é um limite, não um slot
+ * ofertado. O escopo termina antes do próximo lead para que duas orações não
+ * compartilhem polaridade por acidente.
+ */
+export function classifyAvailabilityExistenceClaimsV2(
+  value: string
+): AvailabilityExistenceClaimV2[] {
+  const normalized = normalizeAvailabilityText(value);
+  if (!normalized) return [];
+  const tokens = extractTimeTokens(normalized);
+  const leads = [...normalized.matchAll(RESULT_LEAD_RE)];
+  const claims: AvailabilityExistenceClaimV2[] = [];
+  const seen = new Set<string>();
+
+  for (let index = 0; index < leads.length; index += 1) {
+    const lead = leads[index]!;
+    const leadStart = lead.index ?? 0;
+    const leadEnd = leadStart + lead[0].length;
+    const bounds = sentenceBounds(normalized, leadStart, leadEnd);
+    const nextLeadStart = leads[index + 1]?.index;
+    const scopeEnd =
+      nextLeadStart !== undefined && nextLeadStart < bounds.end
+        ? nextLeadStart
+        : bounds.end;
+    const located = locateAvailabilityExistenceConstraintV2(
+      normalized,
+      leadEnd,
+      scopeEnd,
+      tokens
+    );
+    if (!located) continue;
+
+    const subjectAndOperator = normalized.slice(
+      leadEnd,
+      located.firstTimeStart
+    );
+    if (
+      APPOINTMENT_CONTEXT_MARKER_RE.test(subjectAndOperator) ||
+      OPERATING_HOURS_RE.test(subjectAndOperator)
+    ) {
+      continue;
+    }
+
+    const claim: AvailabilityExistenceClaimV2 = {
+      polarity: lead.groups?.negative ? 'negative' : 'positive',
+      constraint: located.constraint,
+    };
+    const key = JSON.stringify(claim);
+    if (!seen.has(key)) {
+      seen.add(key);
+      claims.push(claim);
+    }
+  }
+  return claims;
+}
+
+function clockMinutesV2(value: string): number | null {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/u.exec(value);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+export function hasSlotSatisfyingAvailabilityExistenceClaimV2(
+  claim: AvailabilityExistenceClaimV2,
+  slots: Iterable<string>
+): boolean {
+  // Claims negativos continuam sendo descrições seguras e não exigem prova de
+  // ausência; esta função é a licença positiva usada pela barreira.
+  if (claim.polarity !== 'positive') return true;
+  const slotMinutes = [...slots]
+    .map(clockMinutesV2)
+    .filter((minutes): minutes is number => minutes !== null);
+  const constraint = claim.constraint;
+  if (!constraint) return slotMinutes.length > 0;
+
+  if (constraint.kind === 'between') {
+    const start = clockMinutesV2(constraint.startTime);
+    const end = clockMinutesV2(constraint.endTime);
+    return (
+      start !== null &&
+      end !== null &&
+      start <= end &&
+      slotMinutes.some((minutes) => minutes >= start && minutes <= end)
+    );
+  }
+
+  const boundary = clockMinutesV2(constraint.time);
+  if (boundary === null) return false;
+  switch (constraint.kind) {
+    case 'after':
+      return slotMinutes.some((minutes) => minutes > boundary);
+    case 'at_or_after':
+      return slotMinutes.some((minutes) => minutes >= boundary);
+    case 'before':
+      return slotMinutes.some((minutes) => minutes < boundary);
+    case 'at_or_before':
+      return slotMinutes.some((minutes) => minutes <= boundary);
+  }
 }
 
 function classifyNormalizedAvailabilityTimeClaims(

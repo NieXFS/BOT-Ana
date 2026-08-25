@@ -1,7 +1,9 @@
 import type { ServicesResult } from './calendarService';
 import { buildCanonicalDuplicateAppointmentContextV2 } from './conversationalV2/duplicateAppointmentCopy';
 import {
+  classifyAvailabilityExistenceClaimsV2,
   classifyAvailabilityTimeClaims,
+  hasSlotSatisfyingAvailabilityExistenceClaimV2,
   type AvailabilityTimeMentionV2,
 } from './availabilityClaimScope';
 
@@ -607,13 +609,21 @@ export function hasUnverifiedAvailabilityClaim(
   additionalVerifiedSlots: readonly string[] = []
 ): boolean {
   const offered = offeredAvailabilitySlots(reply);
-  if (offered.length === 0) return false;
+  const existenceClaims = classifyAvailabilityExistenceClaimsV2(reply).filter(
+    (claim) => claim.polarity === 'positive'
+  );
+  if (offered.length === 0 && existenceClaims.length === 0) return false;
 
   const verified = currentTurnAuthoritativeAvailabilitySlots(toolTrace);
   for (const slot of additionalVerifiedSlots) {
     if (/^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(slot)) verified.add(slot);
   }
-  return offered.some((slot) => !verified.has(slot));
+  return (
+    offered.some((slot) => !verified.has(slot)) ||
+    existenceClaims.some(
+      (claim) => !hasSlotSatisfyingAvailabilityExistenceClaimV2(claim, verified)
+    )
+  );
 }
 
 function mentionedDates(

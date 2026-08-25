@@ -185,29 +185,174 @@ async function reloadCheck(conversationKey: string, now: Date): Promise<void> {
   const state = await import('../src/services/conversationalV2/stateStore');
   const loaded = await state.pgConversationalV2StateStore.loadLatestState(conversationKey, now);
   const expectedFlowId = process.env.ANA_IA25_FIELD_RELOAD_FLOW_ID?.trim();
+  const stage = process.env.ANA_IA25_FIELD_RELOAD_STAGE?.trim();
   if (!expectedFlowId) fail('reload flow id missing');
   assert.equal(loaded.flowState?.fixedServiceId, COMBO_ID);
   assert.equal(loaded.pending?.snapshot.kind, 'DATE');
   assert.equal(loaded.pending?.snapshot.flowId, expectedFlowId);
   assert.equal(loaded.flowState?.flowId, expectedFlowId);
-  assert.equal(loaded.flowState?.deferredAvailability?.schemaVersion, 2);
-  assert.equal(loaded.flowState?.deferredAvailability?.windows?.length, 2);
+  if (stage === 'remaining_morning') {
+    assert.equal(loaded.flowState?.deferredAvailability?.schemaVersion, 1);
+    assert.equal(loaded.flowState?.deferredAvailability?.date, '2026-08-25');
+    assert.deepEqual(loaded.flowState?.deferredAvailability?.timeWindow, {
+      kind: 'PERIOD',
+      period: 'morning',
+    });
+    assert.equal(loaded.flowState?.deferredAvailability?.windows, undefined);
+    assert.deepEqual(
+      loaded.pending?.snapshot.options.map((option) => option.entityId),
+      ['window:0']
+    );
+  } else if (stage === 'initial_two_windows') {
+    assert.equal(loaded.flowState?.deferredAvailability?.schemaVersion, 2);
+    assert.equal(loaded.flowState?.deferredAvailability?.windows?.length, 2);
+  } else {
+    fail('reload stage missing');
+  }
+  let morningRoute: Record<string, unknown> | undefined;
+  const contextManager = await import('../src/services/contextManager');
+  if (stage === 'remaining_morning') {
+    const reloadPhoneNumberId = process.env.ANA_IA25_FIELD_RELOAD_PHONE_NUMBER_ID?.trim();
+    const reloadCustomerPhone = process.env.ANA_IA25_FIELD_RELOAD_CUSTOMER_PHONE?.trim();
+    const reloadInboundId = process.env.ANA_IA25_FIELD_RELOAD_INBOUND_ID?.trim();
+    const reloadTurnId = process.env.ANA_IA25_FIELD_RELOAD_TURN_ID?.trim();
+    const reloadSequence = Number(process.env.ANA_IA25_FIELD_RELOAD_SEQUENCE);
+    if (
+      !reloadPhoneNumberId ||
+      !reloadCustomerPhone ||
+      !reloadInboundId ||
+      !reloadTurnId ||
+      !Number.isInteger(reloadSequence) ||
+      reloadSequence < 1
+    ) {
+      fail('fresh-process morning route inputs missing');
+    }
+    phoneNumberId = reloadPhoneNumberId;
+    const runtime = await import('../src/services/conversationalV2/runtime');
+    const delivery = await import('../src/services/conversationalV2/delivery');
+    const toolCalls: string[] = [];
+    let primaryCalls = 0;
+    let regenCalls = 0;
+    const prepared = await runtime.getReceptionistReplyV2({
+      phone: reloadCustomerPhone,
+      userMessage: 'amanhã de manhã',
+      userName: 'fixture',
+      config: config(),
+      serviceContextEnabled: true,
+      serviceResolverEnabled: true,
+      semanticServiceResolverEnabled: false,
+      turnRuntime: {
+        turnId: reloadTurnId,
+        inputSequence: reloadSequence,
+        currentInboundIds: [reloadInboundId],
+        currentInboundTextsById: { [reloadInboundId]: 'amanhã de manhã' },
+        checkpoint: async () => ({
+          paused: false,
+          latestInputSequence: reloadSequence,
+          successorInputSequence: null,
+          successorInboundMessageIds: [],
+        }),
+      },
+      deps: {
+        store: state.pgConversationalV2StateStore,
+        now: () => now,
+        id: () => `${reloadTurnId}:id`,
+        loadServices: async () => SERVICES,
+        loadHistory: async (key) => contextManager.getHistory(key),
+        isPaused: async () => false,
+        executeProactiveDuplicateRead: async () =>
+          JSON.stringify({ success: true, appointments: [] }),
+        escalate: async () => ({ matched: false }),
+        escalateSilent: async () => ({ kind: 'pending' as const }),
+        runModelLoop: async () => {
+          primaryCalls += 1;
+          throw new Error('fresh-process morning must not call general provider');
+        },
+        regenerate: async () => {
+          regenCalls += 1;
+          throw new Error('fresh-process morning must not regenerate');
+        },
+        executeTool: async (name) => {
+          toolCalls.push(name);
+          if (name === 'getAvailableSlots') {
+            return JSON.stringify({
+              success: true,
+              slots: ['08:00', '10:00', '12:00', '18:00'],
+            });
+          }
+          if (name === 'getUpcomingAppointments') {
+            return JSON.stringify({ success: true, appointments: [] });
+          }
+          throw new Error('unexpected fresh-process synthetic tool');
+        },
+      },
+    });
+    assert.equal(prepared.planReceipt.route, 'fast_path');
+    assert.equal(prepared.planReceipt.primaryProviderCalls, 0);
+    assert.equal(prepared.planReceipt.regenProviderCalls, 0);
+    assert.equal(primaryCalls, 0);
+    assert.equal(regenCalls, 0);
+    assert.deepEqual(toolCalls, ['getAvailableSlots']);
+    assert.equal(prepared.transition.kind, 'open');
+    if (prepared.transition.kind !== 'open') fail('fresh-process morning did not open');
+    assert.equal(prepared.transition.frame.kind, 'TIME');
+    assert.deepEqual(
+      prepared.transition.frame.options.map((option) => option.entityId),
+      ['08:00', '10:00']
+    );
+    assert.doesNotMatch(prepared.payload ?? '', /12h|18h/iu);
+    const delivered = await delivery.deliverPreparedReceptionistTurnV2(prepared, {
+      store: state.pgConversationalV2StateStore,
+      now: () => now,
+      id: () => `${reloadTurnId}:delivery`,
+      checkpoint: async () => ({
+        paused: false,
+        latestInputSequence: reloadSequence,
+        successorInputSequence: null,
+        successorInboundMessageIds: [],
+      }),
+      sendTransport: async () => ({
+        providerMessageId: `${reloadTurnId}:provider`,
+      }),
+    });
+    assert.equal(delivered.receipt.outboxState, 'accepted_by_provider');
+    assert.equal(delivered.receipt.flowStateCommitOutcome, 'committed');
+    morningRoute = {
+      morningRoute: prepared.planReceipt.route,
+      morningReadCalls: toolCalls.length,
+      morningSlots: ['08:00', '10:00'],
+      primaryProviderCalls: primaryCalls,
+      regenProviderCalls: regenCalls,
+      delivery: delivered.receipt.flowStateCommitOutcome,
+    };
+  }
   console.log(JSON.stringify({
     status: 'PASS',
     reload: 'fresh_process',
+    stage,
     serviceResolved: true,
     pendingKind: 'DATE',
-    deferredAvailabilitySchemaVersion: 2,
-    deferredAvailabilityWindows: 2,
+    deferredAvailabilitySchemaVersion:
+      loaded.flowState?.deferredAvailability?.schemaVersion,
+    deferredAvailabilityWindows:
+      loaded.flowState?.deferredAvailability?.windows?.length ?? 1,
+    ...(morningRoute ?? {}),
   }));
-  const contextManager = await import('../src/services/contextManager');
   await contextManager.pool.end();
 }
 
 function reloadCheckInNewProcess(
   conversationKey: string,
   now: Date,
-  flowId: string
+  flowId: string,
+  stage: 'initial_two_windows' | 'remaining_morning',
+  morning?: {
+    phoneNumberId: string;
+    customerPhone: string;
+    inboundId: string;
+    inputSequence: number;
+    turnId: string;
+  }
 ): void {
   const output = execFileSync(
     process.execPath,
@@ -218,12 +363,27 @@ function reloadCheckInNewProcess(
         ANA_IA25_FIELD_RELOAD_CONVERSATION: conversationKey,
         ANA_IA25_FIELD_RELOAD_NOW: now.toISOString(),
         ANA_IA25_FIELD_RELOAD_FLOW_ID: flowId,
+        ANA_IA25_FIELD_RELOAD_STAGE: stage,
+        ...(morning
+          ? {
+              ANA_IA25_FIELD_RELOAD_PHONE_NUMBER_ID: morning.phoneNumberId,
+              ANA_IA25_FIELD_RELOAD_CUSTOMER_PHONE: morning.customerPhone,
+              ANA_IA25_FIELD_RELOAD_INBOUND_ID: morning.inboundId,
+              ANA_IA25_FIELD_RELOAD_SEQUENCE: String(morning.inputSequence),
+              ANA_IA25_FIELD_RELOAD_TURN_ID: morning.turnId,
+            }
+          : {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
     }
   );
   assert.match(output, /"status":"PASS"/u);
+  if (stage === 'remaining_morning') {
+    assert.match(output, /"morningRoute":"fast_path"/u);
+    assert.match(output, /"morningReadCalls":1/u);
+    assert.match(output, /"morningSlots":\["08:00","10:00"\]/u);
+  }
 }
 
 async function main(): Promise<void> {
@@ -381,6 +541,7 @@ async function main(): Promise<void> {
       sequence: number;
       texts: readonly string[];
       semantic: boolean;
+      availabilitySlots?: readonly string[];
     }) => {
       const inboundIds = input.texts.map((_text, index) => `${namespace}:msg:${input.id}:${index + 1}`);
       for (const inboundId of inboundIds) messageIds.push(inboundId);
@@ -427,7 +588,12 @@ async function main(): Promise<void> {
           executeTool: async (name) => {
             ordinaryToolCalls.push(name);
             if (input.semantic) targetToolCalls.push(name);
-            if (name === 'getAvailableSlots') return JSON.stringify({ success: true, slots: ['18:00'] });
+            if (name === 'getAvailableSlots') {
+              return JSON.stringify({
+                success: true,
+                slots: input.availabilitySlots ?? ['18:00'],
+              });
+            }
             if (name === 'getUpcomingAppointments') return JSON.stringify({ success: true, appointments: [] });
             throw new Error('unexpected synthetic tool');
           },
@@ -542,7 +708,91 @@ async function main(): Promise<void> {
     const targetDelivery = await deliver(target, targetSequence, 'target');
     assert.equal(targetDelivery.receipt.outboxState, 'accepted_by_provider');
     assert.equal(targetDelivery.receipt.flowStateCommitOutcome, 'committed');
-    reloadCheckInNewProcess(targetConversationKey, baseNow, targetFlowId);
+    reloadCheckInNewProcess(
+      targetConversationKey,
+      baseNow,
+      targetFlowId,
+      'initial_two_windows'
+    );
+
+    // IA-26/26b PG lifecycle: a seleção de hoje faz uma leitura válida vazia,
+    // consome somente essa janela e persiste a manhã restante.
+    const selectTodayId = `${namespace}:msg:ia26-select-today:1`;
+    const selectTodayIntake = await persist(
+      selectTodayId,
+      targetPhone,
+      'hoje'
+    );
+    const selectToday = await runTurn({
+      id: 'ia26-select-today',
+      phone: targetPhone,
+      sequence: selectTodayIntake.sequence ?? targetSequence + 1,
+      texts: ['hoje'],
+      semantic: false,
+      availabilitySlots: [],
+    });
+    assert.equal(selectToday.planReceipt.route, 'fast_path');
+    assert.equal(selectToday.planReceipt.primaryProviderCalls, 0);
+    assert.equal(selectToday.planReceipt.regenProviderCalls, 0);
+    assert.deepEqual(
+      selectToday.planReceipt.toolEffects.map((effect) => effect.tool),
+      ['getAvailableSlots']
+    );
+    assert.equal(selectToday.transition.kind, 'open');
+    if (selectToday.transition.kind !== 'open') fail('IA-26 PG selection did not open pending');
+    assert.equal(selectToday.transition.frame.kind, 'DATE');
+    assert.deepEqual(
+      selectToday.transition.frame.options.map((option) => option.entityId),
+      ['window:0']
+    );
+    assert.equal(
+      selectToday.transition.nextFlowState.deferredAvailability?.schemaVersion,
+      1
+    );
+    assert.equal(
+      selectToday.transition.nextFlowState.deferredAvailability?.date,
+      '2026-08-25'
+    );
+    assert.deepEqual(
+      selectToday.transition.nextFlowState.deferredAvailability?.timeWindow,
+      { kind: 'PERIOD', period: 'morning' }
+    );
+    assert.equal(
+      selectToday.transition.nextFlowState.deferredAvailability?.windows,
+      undefined
+    );
+    assert.match(selectToday.payload ?? '', /amanh[ãa] de manh[ãa]/iu);
+    const selectTodayDelivery = await deliver(
+      selectToday,
+      selectTodayIntake.sequence ?? targetSequence + 1,
+      'ia26-select-today'
+    );
+    assert.equal(selectTodayDelivery.receipt.outboxState, 'accepted_by_provider');
+    assert.equal(selectTodayDelivery.receipt.flowStateCommitOutcome, 'committed');
+    // O processo novo recarrega o schema 1 e executa o turno seguinte; a
+    // seleção conhecida consulta uma vez e conserva somente a manhã.
+    const morningId = `${namespace}:msg:ia26-morning:1`;
+    const morningIntake = await persist(
+      morningId,
+      targetPhone,
+      'amanhã de manhã'
+    );
+    const morningSequence =
+      morningIntake.sequence ??
+      (selectTodayIntake.sequence ?? targetSequence + 1) + 1;
+    reloadCheckInNewProcess(
+      targetConversationKey,
+      baseNow,
+      targetFlowId,
+      'remaining_morning',
+      {
+        phoneNumberId,
+        customerPhone: targetPhone,
+        inboundId: morningId,
+        inputSequence: morningSequence,
+        turnId: `${turnPrefix}ia26-morning-fresh`,
+      }
+    );
 
     const beforeCleanup = await counts(db);
     assert.ok(beforeCleanup);
@@ -572,6 +822,14 @@ async function main(): Promise<void> {
         target: targetToolCalls,
       },
       reload: 'fresh_process',
+      ia26Lifecycle: {
+        initialWindows: 2,
+        selectedTodayReadSlots: 0,
+        remainingSchemaVersion: 1,
+        remainingWindow: 'morning',
+        morningReadCalls: 1,
+        morningSlots: ['08:00', '10:00'],
+      },
       cleanup: 'zero',
       beforeCleanupCounts: beforeCleanup,
     }));

@@ -9,7 +9,10 @@ import {
   inspectCustomerReply,
   normalizeCustomerReplyStyle,
 } from '../src/services/customerReplyGuard';
-import { splitAvailabilityClaimScopes } from '../src/services/availabilityClaimScope';
+import {
+  classifyAvailabilityExistenceClaimsV2,
+  splitAvailabilityClaimScopes,
+} from '../src/services/availabilityClaimScope';
 import {
   AVAILABILITY_CLAIM_MATRIX,
   UNKNOWN_AVAILABILITY_CLAIM,
@@ -347,6 +350,93 @@ for (const [index, matrixCase] of AVAILABILITY_CLAIM_MATRIX.entries()) {
     `availability matrix customerReplyGuard #${index + 1}: ${requiresEvidence ? 'evidence_required' : 'no_offer'}`
   );
 }
+
+const constrainedAvailabilityTrace = (slots: readonly string[]) => [
+  {
+    userTurn: 1,
+    name: 'getAvailableSlots',
+    result: JSON.stringify({ success: true, slots }),
+  },
+];
+const afterConstraintText = 'Tenho horário depois das 17:30.';
+assert.deepEqual(
+  classifyCustomerReplyAvailabilityClaims(afterConstraintText),
+  [
+    {
+      time: '17:30',
+      span: { start: afterConstraintText.indexOf('17:30'), end: afterConstraintText.indexOf('17:30') + 5 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'customer_constraint',
+    },
+  ],
+  'A: o threshold after continua sendo restrição, não slot ofertado'
+);
+assert.deepEqual(
+  classifyAvailabilityExistenceClaimsV2(afterConstraintText),
+  [{ polarity: 'positive', constraint: { kind: 'after', time: '17:30' } }],
+  'A: existência positiva sob after é um claim separado'
+);
+const betweenConstraintText = 'Tenho horários entre 10:00 e 12:00.';
+assert.deepEqual(
+  classifyCustomerReplyAvailabilityClaims(betweenConstraintText),
+  [
+    {
+      time: '10:00',
+      span: { start: betweenConstraintText.indexOf('10:00'), end: betweenConstraintText.indexOf('10:00') + 5 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'customer_constraint',
+    },
+    {
+      time: '12:00',
+      span: { start: betweenConstraintText.indexOf('12:00'), end: betweenConstraintText.indexOf('12:00') + 5 },
+      disposition: 'non_availability_reference',
+      source: 'explicit_exclusion',
+      exclusionReason: 'customer_constraint',
+    },
+  ],
+  'A: os dois limites de between continuam sendo restrições'
+);
+assert.deepEqual(
+  classifyAvailabilityExistenceClaimsV2(betweenConstraintText),
+  [
+    {
+      polarity: 'positive',
+      constraint: { kind: 'between', startTime: '10:00', endTime: '12:00' },
+    },
+  ],
+  'A: existência positiva sob between é um claim separado'
+);
+
+for (const testCase of [
+  { label: 'after trace vazio bloqueia', text: afterConstraintText, trace: [], expected: true },
+  { label: 'after 18:00 passa', text: afterConstraintText, trace: constrainedAvailabilityTrace(['18:00']), expected: false },
+  { label: 'after 17:00 bloqueia', text: afterConstraintText, trace: constrainedAvailabilityTrace(['17:00']), expected: true },
+  { label: 'encontrei after vazio bloqueia', text: 'Encontrei horários depois das 17:30.', trace: [], expected: true },
+  { label: 'between vazio bloqueia', text: betweenConstraintText, trace: [], expected: true },
+  { label: 'between 10:30 passa', text: betweenConstraintText, trace: constrainedAvailabilityTrace(['10:30']), expected: false },
+  { label: 'between 13:00 bloqueia', text: betweenConstraintText, trace: constrainedAvailabilityTrace(['13:00']), expected: true },
+] as const) {
+  assert.equal(
+    hasUnverifiedAvailabilityClaim(testCase.text, [...testCase.trace]),
+    testCase.expected,
+    `bloqueante A customerReplyGuard: ${testCase.label}`
+  );
+  console.log(`bloqueante A customerReplyGuard: ${testCase.label} -> ${testCase.expected ? 'BLOCK' : 'PASS'}`);
+}
+const negativeAfterConstraintText = 'Não encontrei horários depois das 17:30.';
+assert.deepEqual(
+  classifyAvailabilityExistenceClaimsV2(negativeAfterConstraintText),
+  [{ polarity: 'negative', constraint: { kind: 'after', time: '17:30' } }],
+  'A: existência negativa sob restrição permanece negativa'
+);
+assert.equal(
+  hasUnverifiedAvailabilityClaim(negativeAfterConstraintText, []),
+  false,
+  'A: negativa sob restrição não transforma threshold em oferta'
+);
+console.log('bloqueante A customerReplyGuard: negativa after -> PASS sem slot ofertado');
 
 for (const exclusion of [
   {

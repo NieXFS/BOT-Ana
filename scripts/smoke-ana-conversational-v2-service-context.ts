@@ -878,7 +878,8 @@ async function main(): Promise<void> {
 
   async function openIa26Batch(
     phone: string,
-    messages: readonly string[]
+    messages: readonly string[],
+    now: Date = IA26_NOW
   ): Promise<{
     store: MemoryConversationalV2StateStore;
     key: string;
@@ -896,7 +897,7 @@ async function main(): Promise<void> {
       serviceResolverEnabled: true,
       catalogOverride: catalog,
       sequence: 1,
-      now: IA26_NOW,
+      now,
     });
     assertIa26Deterministic(prepared.prepared, `${phone}: initial raw batch`);
     assert.equal(prepared.toolNames.length, 0, `${phone}: initial batch has no read`);
@@ -909,7 +910,7 @@ async function main(): Promise<void> {
       nextFlowState(prepared.prepared).deferredAvailability,
       `${phone}: deferred aggregate captured`
     );
-    await deliver(prepared.prepared, store, 1, () => IA26_NOW);
+    await deliver(prepared.prepared, store, 1, () => now);
     return {
       store: reloadMemoryStore(store),
       key,
@@ -979,6 +980,93 @@ async function main(): Promise<void> {
     'IA26 primary empty: no generic date-freeform while alternative is known'
   );
   await deliver(ia26FirstEmpty.prepared, ia26Primary.store, 2, () => IA26_NOW);
+
+  // Gate cross-midnight: a primeira janela vira passado dentro do TTL. O
+  // resultado determinístico consome só ela e preserva a manhã conhecida.
+  const IA26_CROSS_CAPTURE_NOW = new Date('2026-08-25T02:30:00.000Z');
+  const IA26_CROSS_SELECTION_NOW = new Date('2026-08-25T03:30:00.000Z');
+  const ia26CrossMidnight = await openIa26Batch(
+    '5511000000706',
+    IA26_FIRST_BUBBLES,
+    IA26_CROSS_CAPTURE_NOW
+  );
+  assertIa26TwoWindowAggregate(
+    nextFlowState(ia26CrossMidnight.prepared),
+    ['2026-08-24', '2026-08-25'],
+    'IA26 cross-midnight captured at 23:30'
+  );
+  ia26CrossMidnight.store.setInputSequence(ia26CrossMidnight.key, 2);
+  const ia26PastSelection = await runTurn({
+    phone: '5511000000706',
+    text: 'primeira janela',
+    store: ia26CrossMidnight.store,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 2,
+    now: IA26_CROSS_SELECTION_NOW,
+    slots: [],
+  });
+  assertIa26Deterministic(
+    ia26PastSelection.prepared,
+    'IA26 cross-midnight past_date'
+  );
+  assert.deepEqual(
+    ia26PastSelection.toolNames,
+    [],
+    'IA26 cross-midnight: zero getAvailableSlots para data passada'
+  );
+  assert.equal(ia26PastSelection.prepared.transition.kind, 'open');
+  if (ia26PastSelection.prepared.transition.kind === 'open') {
+    assert.equal(ia26PastSelection.prepared.transition.frame.kind, 'DATE');
+    assert.deepEqual(
+      ia26PastSelection.prepared.transition.frame.options.map(
+        (option) => option.entityId
+      ),
+      ['window:0'],
+      'IA26 cross-midnight: pending aponta só para a manhã restante'
+    );
+  }
+  const ia26AfterPastSelection = nextFlowState(ia26PastSelection.prepared);
+  assert.equal(ia26AfterPastSelection.deferredAvailability?.schemaVersion, 1);
+  assert.equal(ia26AfterPastSelection.deferredAvailability?.date, '2026-08-25');
+  assert.deepEqual(ia26AfterPastSelection.deferredAvailability?.timeWindow, {
+    kind: 'PERIOD',
+    period: 'morning',
+  });
+  assert.equal(ia26AfterPastSelection.deferredAvailability?.windows, undefined);
+  assert.match(
+    ia26PastSelection.prepared.payload ?? '',
+    /j[aá] passou[\s\S]*consultar[\s\S]*hoje de manh[ãa]/iu,
+    'IA26 cross-midnight: copy oferece a alternativa conhecida'
+  );
+  assert.doesNotMatch(
+    ia26PastSelection.prepared.payload ?? '',
+    /qual outra data|date-freeform|outro dia ou per[ií]odo/iu
+  );
+  await deliver(
+    ia26PastSelection.prepared,
+    ia26CrossMidnight.store,
+    2,
+    () => IA26_CROSS_SELECTION_NOW
+  );
+  const ia26CrossReloaded = reloadMemoryStore(ia26CrossMidnight.store);
+  const ia26CrossReloadedState = await ia26CrossReloaded.loadLatestState(
+    ia26CrossMidnight.key,
+    IA26_CROSS_SELECTION_NOW
+  );
+  assert.equal(
+    ia26CrossReloadedState.flowState?.deferredAvailability?.schemaVersion,
+    1
+  );
+  assert.equal(
+    ia26CrossReloadedState.flowState?.deferredAvailability?.date,
+    '2026-08-25'
+  );
+  console.log(
+    'bloqueante C cross-midnight: zero tools/providers, janela passada removida, manhã schemaVersion 1 preservada'
+  );
 
   // Gate mínimo, reload + passo 2: “amanhã de manhã” é uma seleção conhecida,
   // portanto não cai no modelo e não oferece tarde/noite.

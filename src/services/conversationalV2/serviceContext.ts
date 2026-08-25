@@ -795,6 +795,29 @@ export function buildDeferredAvailabilityExhaustedCopyV2(input: {
   return `Não encontrei horários ${selectedPhrase}. Qual outro dia ou período você prefere?`;
 }
 
+/**
+ * Lifecycle determinístico para uma janela selecionada que atravessou a
+ * meia-noite antes da resposta. Não afirma que houve consulta de agenda.
+ */
+export function buildDeferredAvailabilityPastDateCopyV2(input: {
+  remaining: readonly DeferredAvailabilityWindowV2[];
+  now: Date;
+  timezone: string;
+}): string {
+  const remainingPhrases = input.remaining
+    .map((entry) =>
+      formatDeferredWindowEntryPhraseV2(entry, input.now, input.timezone)
+    )
+    .filter(Boolean);
+  if (remainingPhrases.length === 1) {
+    return `Essa janela já passou. Posso consultar ${remainingPhrases[0]}?`;
+  }
+  if (remainingPhrases.length > 1) {
+    return `Essa janela já passou. Qual janela você quer que eu consulte agora: ${joinServiceNames(remainingPhrases)}?`;
+  }
+  return 'Essa data já passou. Qual outra data você prefere?';
+}
+
 export function deferredAvailabilityPendingTransitionV2(
   flowId: string,
   constraint: DeferredAvailabilityConstraintV2 | null | undefined

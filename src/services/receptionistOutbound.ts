@@ -32,7 +32,9 @@ import {
   validDescriptionTermAcceptanceV2,
 } from './licensedServiceDescription';
 import {
+  classifyAvailabilityExistenceClaimsV2,
   classifyAvailabilityTimeClaims,
+  hasSlotSatisfyingAvailabilityExistenceClaimV2,
   type AvailabilityTimeMentionV2,
 } from './availabilityClaimScope';
 
@@ -502,6 +504,36 @@ export function classifyReceptionistOutboundAvailabilityClaims(
   return classifyAvailabilityTimeClaims(text);
 }
 
+const SERVICE_OFFER_SCHEDULE_VOCABULARY_RE =
+  /\b(?:horarios?|horas?|vagas?|disponibilidades?|disponiv(?:el|eis)|agenda|livres?|temos?|tenho|ha|encontrei|achei|localizei|consegui|encontrar|localizar|nao|nunca|nada|esta|estao|ta|fica|ficou|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|feira|manha|tarde|noite|madrugada|depois|apos|antes|ate|partir|entre|as|a|das|da|de|dos|do|nas|na|nos|no|para|pra|e|ou)\b/gu;
+
+/**
+ * Remove somente menções temporais classificadas e o vocabulário fechado de
+ * agenda. Qualquer entidade substantiva restante continua sujeita ao catálogo.
+ */
+export function substantiveServiceOfferResidualV2(serviceOffer: string): string {
+  let remainder = serviceOffer;
+  const spans = classifyAvailabilityTimeClaims(serviceOffer)
+    .map((claim) => claim.span)
+    .filter(
+      (span) =>
+        Number.isInteger(span.start) &&
+        Number.isInteger(span.end) &&
+        span.start >= 0 &&
+        span.end > span.start &&
+        span.end <= serviceOffer.length
+    )
+    .sort((left, right) => right.start - left.start);
+  for (const span of spans) {
+    remainder = `${remainder.slice(0, span.start)} ${remainder.slice(span.end)}`;
+  }
+  return normalize(remainder)
+    .replace(SERVICE_OFFER_SCHEDULE_VOCABULARY_RE, ' ')
+    .replace(/[^a-z0-9]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
 function emojiCount(text: string): number {
   return (text.match(/\p{Extended_Pictographic}/gu) ?? []).length;
 }
@@ -692,14 +724,18 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
   const availabilityClaims = classifyReceptionistOutboundAvailabilityClaims(
     factCheckedText
   );
+  const availabilityExistenceClaims = classifyAvailabilityExistenceClaimsV2(
+    factCheckedText
+  );
   const mentionedServices = catalog.services.filter((service) => normalizedText.includes(normalize(service.name)));
   const serviceOffer = factCheckedText.match(/\b(?:temos|oferecemos|fazemos|realizamos|trabalhamos\s+com)\s+(?:o\s+servi[cç]o\s+de\s+|a\s+)?([^.!?\n]+)/iu)?.[1];
+  const serviceOfferResidual = serviceOffer
+    ? substantiveServiceOfferResidualV2(serviceOffer)
+    : '';
   if (
     serviceOffer &&
     mentionedServices.length === 0 &&
-    /\p{L}/u.test(serviceOffer) &&
-    availabilityClaims.length === 0 &&
-    !/\b(?:hor[aá]rio|vaga|disponibilidade|dispon[ií]ve(?:l|is)|agenda)\b/iu.test(serviceOffer) &&
+    /\p{L}/u.test(serviceOfferResidual) &&
     !catalog.services.some((service) =>
       normalize(serviceOffer).includes(normalize(service.name))
     )
@@ -728,6 +764,14 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
     }
     if (!slots.has(claim.time)) {
       // `unknown` é tratado como evidence_required, nunca como no_offer.
+      reasons.add('UNVERIFIED_AVAILABILITY');
+    }
+  }
+  for (const claim of availabilityExistenceClaims) {
+    if (
+      claim.polarity === 'positive' &&
+      !hasSlotSatisfyingAvailabilityExistenceClaimV2(claim, slots)
+    ) {
       reasons.add('UNVERIFIED_AVAILABILITY');
     }
   }

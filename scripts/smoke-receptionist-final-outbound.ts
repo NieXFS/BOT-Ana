@@ -4,8 +4,10 @@ import {
   classifyReceptionistOutboundAvailabilityClaims,
   CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
   outboundBlockHash,
+  substantiveServiceOfferResidualV2,
   validateReceptionistOutbound,
 } from '../src/services/receptionistOutbound';
+import { classifyAvailabilityExistenceClaimsV2 } from '../src/services/availabilityClaimScope';
 import {
   AVAILABILITY_CLAIM_MATRIX,
   UNKNOWN_AVAILABILITY_CLAIM,
@@ -274,6 +276,97 @@ for (const [index, matrixCase] of AVAILABILITY_CLAIM_MATRIX.entries()) {
   console.log(
     `availability matrix receptionistOutbound #${index + 1}: ${requiresEvidence ? 'evidence_required' : 'no_offer'}`
   );
+}
+
+const availabilityEvidence = (slots: readonly string[]) => ({
+  evidence: {
+    toolTrace: [
+      {
+        name: 'getAvailableSlots',
+        result: JSON.stringify({ success: true, slots }),
+      },
+    ],
+  },
+});
+const afterExistenceText = 'Tenho horário depois das 17:30.';
+assert.deepEqual(
+  classifyAvailabilityExistenceClaimsV2(afterExistenceText),
+  [{ polarity: 'positive', constraint: { kind: 'after', time: '17:30' } }]
+);
+for (const testCase of [
+  { label: 'Tenho after trace vazio', text: afterExistenceText, extra: {}, expectedAccepted: false },
+  { label: 'Tenho after trace 18:00', text: afterExistenceText, extra: availabilityEvidence(['18:00']), expectedAccepted: true },
+  { label: 'Tenho after trace 17:00', text: afterExistenceText, extra: availabilityEvidence(['17:00']), expectedAccepted: false },
+  { label: 'Encontrei after trace vazio', text: 'Encontrei horários depois das 17:30.', extra: {}, expectedAccepted: false },
+  { label: 'Tenho between trace vazio', text: 'Tenho horários entre 10:00 e 12:00.', extra: {}, expectedAccepted: false },
+  { label: 'Tenho between trace 10:30', text: 'Tenho horários entre 10:00 e 12:00.', extra: availabilityEvidence(['10:30']), expectedAccepted: true },
+  { label: 'Tenho between trace 13:00', text: 'Tenho horários entre 10:00 e 12:00.', extra: availabilityEvidence(['13:00']), expectedAccepted: false },
+] as const) {
+  const result = validate([{ source: 'GENERATED', text: testCase.text }], testCase.extra);
+  assert.equal(
+    result.originalAccepted,
+    testCase.expectedAccepted,
+    `bloqueante A receptionistOutbound: ${testCase.label}`
+  );
+  assert.equal(
+    result.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+    !testCase.expectedAccepted,
+    `bloqueante A reason receptionistOutbound: ${testCase.label}`
+  );
+  console.log(`bloqueante A receptionistOutbound: ${testCase.label} -> ${testCase.expectedAccepted ? 'PASS' : 'BLOCK'}`);
+}
+const negativeExistenceText = 'Não encontrei horários depois das 17:30.';
+assert.deepEqual(
+  classifyAvailabilityExistenceClaimsV2(negativeExistenceText),
+  [{ polarity: 'negative', constraint: { kind: 'after', time: '17:30' } }]
+);
+const negativeExistenceResult = validate([
+  { source: 'GENERATED', text: negativeExistenceText },
+]);
+assert.equal(negativeExistenceResult.originalAccepted, true);
+assert.equal(
+  negativeExistenceResult.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  false
+);
+assert.equal(
+  classifyReceptionistOutboundAvailabilityClaims(negativeExistenceText)[0]?.disposition,
+  'non_availability_reference',
+  'A: a negativa não transforma 17:30 em slot ofertado'
+);
+console.log('bloqueante A receptionistOutbound: negativa after -> PASS sem slot ofertado');
+
+assert.equal(substantiveServiceOfferResidualV2('Botox às 10:00'), 'botox');
+assert.equal(substantiveServiceOfferResidualV2('hoje às 10:00'), '');
+assert.equal(substantiveServiceOfferResidualV2('10:00'), '');
+const unknownServiceVerified = validate(
+  [{ source: 'GENERATED', text: 'Temos Botox às 10:00.' }],
+  availabilityEvidence(['10:00'])
+);
+assert.equal(unknownServiceVerified.originalAccepted, false);
+assert.equal(unknownServiceVerified.reasonCodes.includes('UNKNOWN_SERVICE'), true);
+assert.equal(
+  unknownServiceVerified.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  false
+);
+console.log('bloqueante B: Botox + 10:00 verificado -> UNKNOWN_SERVICE');
+const unknownServiceUnverified = validate([
+  { source: 'GENERATED', text: 'Temos Botox às 10:00.' },
+]);
+assert.equal(unknownServiceUnverified.originalAccepted, false);
+assert.equal(unknownServiceUnverified.reasonCodes.includes('UNKNOWN_SERVICE'), true);
+assert.equal(
+  unknownServiceUnverified.reasonCodes.includes('UNVERIFIED_AVAILABILITY'),
+  true
+);
+console.log('bloqueante B: Botox + trace vazio -> UNKNOWN_SERVICE + UNVERIFIED_AVAILABILITY');
+for (const temporalOnly of ['Temos hoje às 10:00.', 'Temos 10:00.'] as const) {
+  const result = validate(
+    [{ source: 'GENERATED', text: temporalOnly }],
+    availabilityEvidence(['10:00'])
+  );
+  assert.equal(result.originalAccepted, true, temporalOnly);
+  assert.equal(result.reasonCodes.includes('UNKNOWN_SERVICE'), false, temporalOnly);
+  console.log(`bloqueante B: ${temporalOnly} -> PASS sem UNKNOWN_SERVICE`);
 }
 
 for (const exclusion of [
