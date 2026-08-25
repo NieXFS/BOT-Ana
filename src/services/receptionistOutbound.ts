@@ -197,6 +197,8 @@ export interface ValidatedReceptionistOutbound {
 
 const MONEY_RE = /(?:R\$\s*(?<prefixed>\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)|(?<worded>\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*reais?\b)/giu;
 const TIME_OFFER_RE = /\b(?:temos?|dispon[ií]ve(?:l|is)|hor[aá]rios?)\b[^.!?\n]{0,60}\b([01]?\d|2[0-3])(?:[:h]([0-5]\d))\b/giu;
+const NEGATIVE_AVAILABILITY_CLAUSE_RE =
+  /\b(?:n[aã]o\s+(?:encontrei|achei|localizei|consegui\s+(?:encontrar|localizar))|sem|n[aã]o\s+(?:tem|temos))\b[^.!?\n]{0,80}\b(?:hor[aá]rios?|vagas?|disponibilidades?)\b/iu;
 const HUMAN_DEADLINE_RE = /\b(?:equipe|atendente|profissional|respons[aá]vel)\b[^.!?\n]{0,80}\b(?:em|dentro de|at[eé])\s+\d+\s*(?:minutos?|horas?|dias?)\b/iu;
 const CPF_RE = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/u;
 const PHONE_RE = /(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?9?\d{4}[-\s]?\d{4}/u;
@@ -707,6 +709,20 @@ export function validateReceptionistOutbound(envelope: ReceptionistOutboundEnvel
 
   const slots = offeredSlots(envelope.evidence);
   for (const match of factCheckedText.matchAll(TIME_OFFER_RE)) {
+    const matchIndex = match.index ?? 0;
+    const sentenceStart = Math.max(
+      factCheckedText.lastIndexOf('.', matchIndex - 1),
+      factCheckedText.lastIndexOf('!', matchIndex - 1),
+      factCheckedText.lastIndexOf('?', matchIndex - 1),
+      factCheckedText.lastIndexOf('\n', matchIndex - 1)
+    ) + 1;
+    const sentenceThroughMatch = factCheckedText.slice(
+      sentenceStart,
+      matchIndex + match[0].length
+    );
+    // "Não encontrei horários hoje depois das 17h30" reports a negative
+    // availability result. The clock is a constraint, not an offered slot.
+    if (NEGATIVE_AVAILABILITY_CLAUSE_RE.test(sentenceThroughMatch)) continue;
     const slot = `${String(match[1]).padStart(2, '0')}:${match[2]}`;
     if (!slots.has(slot)) reasons.add('UNVERIFIED_AVAILABILITY');
   }

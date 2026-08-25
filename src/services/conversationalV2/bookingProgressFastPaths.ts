@@ -51,12 +51,16 @@ import {
 import { buildCanonicalDuplicateAppointmentContextV2 } from './duplicateAppointmentCopy';
 import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 import {
+  buildDeferredAvailabilityConstraintFromWindowsV2,
+  buildDeferredAvailabilityExhaustedCopyV2,
   buildEmptyDeferredAvailabilityCopyV2,
   captureDeferredAvailabilityConstraintV2,
+  deferredAvailabilityPendingTransitionV2,
   filterSlotsByDeferredWindowV2,
   isDeferredAvailabilityConsumableV2,
   withDeferredAvailabilityV2,
 } from './serviceContext';
+import type { SelectedDeferredWindowV2 } from './serviceContext';
 
 export type BookingProgressFastPathV2 =
   | {
@@ -470,7 +474,17 @@ export async function resolveDateSlotsFastPathV2(input: {
   lastAcceptedDelivery?: AcceptedDeliveryEvidenceV2 | null;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
   serviceContextEnabled?: boolean;
+  deferredWindowSelection?: SelectedDeferredWindowV2;
 }): Promise<BookingProgressFastPathV2> {
+  const deferredWindowSelection = input.deferredWindowSelection;
+  const selectedConstraint =
+    deferredWindowSelection && input.frame.flowState.deferredAvailability
+      ? buildDeferredAvailabilityConstraintFromWindowsV2(
+          input.frame.flowState.deferredAvailability,
+          [deferredWindowSelection.selected]
+        )
+      : undefined;
+  const selectionActive = Boolean(deferredWindowSelection && selectedConstraint);
   const entitlement = dateSlotsEntitlementV2({
     frame: input.frame,
     inboundText: input.currentInboundText,
@@ -491,6 +505,7 @@ export async function resolveDateSlotsFastPathV2(input: {
     : { kind: 'none' as const };
   if (
     input.serviceContextEnabled &&
+    !selectionActive &&
     (capturedConstraint.kind === 'vague_period' ||
       capturedConstraint.kind === 'conflict')
   ) {
@@ -499,7 +514,15 @@ export async function resolveDateSlotsFastPathV2(input: {
       reason: 'deferred_availability_unresolved',
     };
   }
-  if (input.dateResolution.kind === 'ambiguous') {
+  const effectiveDateResolution: CurrentDateResolutionV2 =
+    selectionActive && deferredWindowSelection?.selected.date
+      ? {
+          kind: 'resolved',
+          date: deferredWindowSelection.selected.date,
+          mentions: [],
+        }
+      : input.dateResolution;
+  if (effectiveDateResolution.kind === 'ambiguous') {
     const clearedTemporal = clearTemporalState(input.frame.flowState);
     return {
       kind: 'resolved',
@@ -518,10 +541,10 @@ export async function resolveDateSlotsFastPathV2(input: {
       ),
     };
   }
-  if (input.dateResolution.kind !== 'resolved') {
+  if (effectiveDateResolution.kind !== 'resolved') {
     return { kind: 'continue_model', reason: 'current_date_absent' };
   }
-  const date = input.dateResolution.date;
+  const date = effectiveDateResolution.date;
   if (
     input.frame.pending?.kind === 'TIME' &&
     input.frame.flowState.slotEvidence?.date === date
@@ -529,21 +552,24 @@ export async function resolveDateSlotsFastPathV2(input: {
     return { kind: 'continue_model', reason: 'same_date_as_time_evidence' };
   }
   const serviceId = entitlement.serviceId;
-  const existingConstraint =
-    input.serviceContextEnabled === true &&
-    isDeferredAvailabilityConsumableV2(
-      input.frame.flowState.deferredAvailability,
-      input.frame.flowState.flowId,
-      input.now
-    )
+  const existingConstraint = selectionActive
+    ? selectedConstraint
+    : input.serviceContextEnabled === true &&
+        isDeferredAvailabilityConsumableV2(
+          input.frame.flowState.deferredAvailability,
+          input.frame.flowState.flowId,
+          input.now
+        )
       ? input.frame.flowState.deferredAvailability
       : undefined;
   const inboundConstraint =
-    capturedConstraint.kind === 'captured'
+    !selectionActive && capturedConstraint.kind === 'captured'
       ? capturedConstraint.constraint
       : undefined;
   const constraint =
-    input.serviceContextEnabled === true
+    selectionActive
+      ? selectedConstraint
+      : input.serviceContextEnabled === true
       ? inboundConstraint
         ? {
             ...inboundConstraint,
@@ -560,7 +586,10 @@ export async function resolveDateSlotsFastPathV2(input: {
           }
         : existingConstraint
       : undefined;
-  const clearedTemporal = clearTemporalState(input.frame.flowState);
+  const temporalSourceState = selectedConstraint
+    ? withDeferredAvailabilityV2(input.frame.flowState, selectedConstraint)
+    : input.frame.flowState;
+  const clearedTemporal = clearTemporalState(temporalSourceState);
   const rolledBackTemporal =
     input.serviceContextEnabled === true
       ? clearedTemporal
@@ -663,7 +692,9 @@ export async function resolveDateSlotsFastPathV2(input: {
       services: input.servicesResult,
       sourceInboundText: input.currentInboundText,
       preserveDeferredAvailability:
-        input.serviceContextEnabled === true && Boolean(constraint),
+        input.serviceContextEnabled === true &&
+        Boolean(constraint) &&
+        !selectionActive,
     });
     if (reducer?.kind === 'canonical_slots') {
       if (
@@ -732,19 +763,34 @@ export async function resolveDateSlotsFastPathV2(input: {
       };
     }
   }
-  const reply =
-    slots && slots.length === 0
-      ? constraintWindow && rawSlots && rawSlots.length > 0
+  const selectedWindow = deferredWindowSelection?.selected ?? null;
+  const remainingConstraint =
+    selectionActive && input.frame.flowState.deferredAvailability
+      ? buildDeferredAvailabilityConstraintFromWindowsV2(
+          input.frame.flowState.deferredAvailability,
+          deferredWindowSelection?.remaining ?? []
+        )
+      : null;
+  const isValidEmptyResult = slots !== null && slots.length === 0;
+  const reply = isValidEmptyResult
+    ? selectionActive && selectedWindow
+      ? buildDeferredAvailabilityExhaustedCopyV2({
+          selected: selectedWindow,
+          remaining: deferredWindowSelection?.remaining ?? [],
+          now: input.now,
+          timezone: input.config.timezone,
+        })
+      : constraintWindow && rawSlots && rawSlots.length > 0
         ? buildEmptyDeferredAvailabilityCopyV2(
             constraint!,
             input.now,
             input.config.timezone
           )
         : emptyAvailabilityDayCopyV2(date)
-      : canonicalReadFailureCopyV2(
-          'availability',
-          read.parsed?.success === true ? 'invalid_payload' : readReason(read.parsed)
-        );
+    : canonicalReadFailureCopyV2(
+        'availability',
+        read.parsed?.success === true ? 'invalid_payload' : readReason(read.parsed)
+      );
   const emptyFilterTrace: ReceptionistToolTraceEntry =
     constraintWindow && rawSlots && rawSlots.length > 0 && slots?.length === 0
       ? {
@@ -753,14 +799,33 @@ export async function resolveDateSlotsFastPathV2(input: {
             ...(read.parsed ?? {}),
             slots: [],
           }),
-        }
+      }
       : trace;
+  const nextFlowState = isValidEmptyResult
+    ? selectionActive
+      ? withDeferredAvailabilityV2(baseState, remainingConstraint)
+      : baseState
+    : selectionActive
+      ? input.frame.flowState
+      : baseState;
+  const transition =
+    selectionActive
+      ? deferredAvailabilityPendingTransitionV2(
+          input.frame.flowState.flowId,
+          isValidEmptyResult
+            ? remainingConstraint
+            : input.frame.flowState.deferredAvailability
+        )
+      : dateQuestionResult(input.frame, reply).pendingTransitionCandidate;
   return {
     kind: 'resolved',
-    result: dateQuestionResult(input.frame, reply),
+    result: {
+      ...dateQuestionResult(input.frame, reply),
+      pendingTransitionCandidate: transition,
+    },
     loop: loopForReads([emptyFilterTrace]),
     proof: null,
-    nextFlowState: baseState,
+    nextFlowState,
   };
 }
 

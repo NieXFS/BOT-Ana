@@ -2206,6 +2206,7 @@ export async function getReceptionistReplyV2(input: {
       config: input.config,
       now: startedAt,
       executeTool,
+      deferredWindowSelection: serviceContextPlan.deferredWindowSelection,
     });
     if (consumed.kind !== 'resolved') {
       return {
@@ -2256,6 +2257,7 @@ export async function getReceptionistReplyV2(input: {
         lastAcceptedDelivery: stored.lastAcceptedDelivery,
         executeTool,
         serviceContextEnabled,
+        deferredWindowSelection: serviceContextPlan.deferredWindowSelection,
       })
     : { kind: 'continue_model' as const, reason: 'booking_reentry_resolved' };
   const pendingReadProof = resolvePendingOptionProofV2({
@@ -2945,7 +2947,8 @@ export async function getReceptionistReplyV2(input: {
     });
     if (
       serviceContextEnabled &&
-      dateSlotsFastPath.nextFlowState.deferredAvailability
+      (dateSlotsFastPath.nextFlowState.deferredAvailability ||
+        serviceContextPlan.deferredWindowSelection)
     ) {
       serviceContextOwnedTurn = true;
     }

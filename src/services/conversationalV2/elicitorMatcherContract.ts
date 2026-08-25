@@ -11,6 +11,7 @@ import {
   cancelConfirmationGateV2,
 } from './cancellationFlowV2';
 import type {
+  DeferredAvailabilityConstraintV2,
   FlowStateV2,
   PendingFrameSnapshotV2,
   TurnFrameV2,
@@ -34,6 +35,10 @@ import {
 import { buildDuplicateResolutionQuestionV2 } from './bookingProgressFastPaths';
 import type { AcceptedDeliveryEvidenceV2 } from './stateStore';
 import { normalizeTemporalAssertionsV2 } from './temporalNormalizer';
+import {
+  buildDeferredAvailabilityExhaustedCopyV2,
+  findSelectedDeferredWindowV2,
+} from './serviceContext';
 
 export interface ElicitorMatcherContractRowV2 {
   readonly nome: string;
@@ -460,6 +465,29 @@ function dateQuestionMatcher(reply: string): boolean {
   );
 }
 
+function deferredWindowSelectionMatcher(
+  reply: string,
+  constraint: DeferredAvailabilityConstraintV2
+): boolean {
+  const dateResolution = resolveCurrentInboundDateV2({
+    currentInboundIds: ['in-deferred-window'],
+    inboundTextsById: { 'in-deferred-window': reply },
+    now: CONTRACT_NOW,
+    timezone: CONTRACT_TZ,
+  });
+  return Boolean(
+    findSelectedDeferredWindowV2({
+      constraint,
+      inboundText: reply,
+      dateResolution,
+      now: CONTRACT_NOW,
+      timezone: CONTRACT_TZ,
+      turnId: 'turn-deferred-window-contract',
+      inputSequence: 1,
+    })
+  );
+}
+
 function duplicateNaturalAnswers(): string[] {
   return DUPLICATE_RESOLUTION_OPTIONS_V2.flatMap((option) =>
     DUPLICATE_COURTESY_PREFIXES_V2.map(
@@ -511,6 +539,28 @@ export function elicitorMatcherContractRowsV2(): readonly ElicitorMatcherContrac
     slots: ['18:00', '18:30'],
   });
   const multiTimeOfferReplies = timeOfferRepliesFromCopy(multiTimeOfferElicitor);
+  const deferredRemainingConstraint: DeferredAvailabilityConstraintV2 = {
+    schemaVersion: 1,
+    capturedAt: CONTRACT_NOW.toISOString(),
+    capturedTurnId: 'turn-deferred-window-contract',
+    capturedInputSequence: 1,
+    date: '2026-08-17',
+    timeWindow: { kind: 'PERIOD', period: 'morning' },
+  };
+  const deferredWindowElicitor = buildDeferredAvailabilityExhaustedCopyV2({
+    selected: {
+      date: '2026-08-16',
+      timeWindow: { kind: 'AFTER_EXCLUSIVE', minuteOfDay: 17 * 60 + 30 },
+    },
+    remaining: [
+      {
+        date: '2026-08-17',
+        timeWindow: { kind: 'PERIOD', period: 'morning' },
+      },
+    ],
+    now: CONTRACT_NOW,
+    timezone: CONTRACT_TZ,
+  });
   const serviceOption = { entityId: 'svc-drenagem', displayName: 'Drenagem Linfática' };
   const professionalOption = { entityId: 'prof-carla', displayName: 'Carla Mendes' };
   const serviceElicitor = buildPendingQuestionV2({
@@ -649,6 +699,15 @@ export function elicitorMatcherContractRowsV2(): readonly ElicitorMatcherContrac
       negacoes: ['não sei', 'depois eu vejo', 'qualquer dia'],
       interrogativas: ['qual dia você prefere?', 'segunda ou terça?'],
       matcher: dateQuestionMatcher,
+    },
+    {
+      nome: 'janela deferida — alternativa conhecida após esgotamento',
+      elicitor: deferredWindowElicitor,
+      respostasNaturais: ['pode', 'sim', 'amanhã', 'de manhã', 'amanhã de manhã'],
+      negacoes: ['qualquer dia', 'não sei', 'não quero'],
+      interrogativas: ['qual janela?', 'posso escolher?'],
+      matcher: (reply) =>
+        deferredWindowSelectionMatcher(reply, deferredRemainingConstraint),
     },
     {
       nome: 'legado isExplicitBookingConfirmation × CONFIRMATION_HINT',

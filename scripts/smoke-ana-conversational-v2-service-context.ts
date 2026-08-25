@@ -838,6 +838,344 @@ async function main(): Promise<void> {
     'Laura has exactly one persisted TIME offer/read across restart'
   );
 
+  // --- IA26_DEFERRED_WINDOW_LIFECYCLE ---
+  // A fixture nasce do lote de inbound cru e só resolve o serviço pelo
+  // catálogo. Nenhuma FlowState/PendingFrame é semeada para o caso principal.
+  const IA26_NOW = new Date('2026-08-24T15:00:00.000Z');
+  const IA26_FIRST_BUBBLES = [
+    'Tem horário hoje após as 17:30?',
+    'ou amanhã de manhã pra fazer a unha?',
+    'pé e mão',
+  ] as const;
+  const IA26_THREE_WINDOW_BUBBLES = [
+    'Tem horário hoje após as 17:30?',
+    'ou amanhã de manhã pra fazer a unha?',
+    'depois de amanhã à tarde',
+    'pé e mão',
+  ] as const;
+  const IA26_MORNING_AND_LATER_SLOTS = [
+    '08:00',
+    '10:00',
+    '11:30',
+    '12:00',
+    '18:00',
+  ] as const;
+
+  function assertIa26Deterministic(
+    prepared: Awaited<ReturnType<typeof getReceptionistReplyV2>>,
+    label: string
+  ): void {
+    assert.equal(prepared.planReceipt.route, 'fast_path', `${label}: route`);
+    assert.equal(prepared.planReceipt.primaryProviderCalls, 0, `${label}: primary provider`);
+    assert.equal(prepared.planReceipt.regenProviderCalls, 0, `${label}: regeneration provider`);
+    assert.equal(prepared.hasCommittedWrite, false, `${label}: no committed write`);
+    assert.equal(
+      prepared.planReceipt.toolEffects.some((effect) => effect.class === 'write'),
+      false,
+      `${label}: no write effect`
+    );
+  }
+
+  async function openIa26Batch(
+    phone: string,
+    messages: readonly string[]
+  ): Promise<{
+    store: MemoryConversationalV2StateStore;
+    key: string;
+    prepared: Awaited<ReturnType<typeof getReceptionistReplyV2>>;
+  }> {
+    const store = new MemoryConversationalV2StateStore();
+    const key = `${config.phoneNumberId}:${phone}`;
+    store.setInputSequence(key, 1);
+    const prepared = await runTurn({
+      phone,
+      text: messages[0] ?? '',
+      messages,
+      store,
+      enabled: true,
+      serviceResolverEnabled: true,
+      catalogOverride: catalog,
+      sequence: 1,
+      now: IA26_NOW,
+    });
+    assertIa26Deterministic(prepared.prepared, `${phone}: initial raw batch`);
+    assert.equal(prepared.toolNames.length, 0, `${phone}: initial batch has no read`);
+    assert.equal(
+      nextFlowState(prepared.prepared).fixedServiceId,
+      'svc-mani-pedi',
+      `${phone}: service resolved from raw batch`
+    );
+    assert.ok(
+      nextFlowState(prepared.prepared).deferredAvailability,
+      `${phone}: deferred aggregate captured`
+    );
+    await deliver(prepared.prepared, store, 1, () => IA26_NOW);
+    return {
+      store: reloadMemoryStore(store),
+      key,
+      prepared: prepared.prepared,
+    };
+  }
+
+  function assertIa26TwoWindowAggregate(
+    state: FlowStateV2 | undefined,
+    expectedDates: readonly string[],
+    label: string
+  ): void {
+    assert.equal(state?.deferredAvailability?.schemaVersion, 2, `${label}: schemaVersion 2`);
+    assert.deepEqual(
+      state?.deferredAvailability?.windows?.map((window) => window.date),
+      expectedDates,
+      `${label}: remaining dates`
+    );
+  }
+
+  // Gate mínimo, passo 1: hoje fica vazio, só amanhã de manhã sobrevive.
+  const ia26Primary = await openIa26Batch('5511000000701', IA26_FIRST_BUBBLES);
+  ia26Primary.store.setInputSequence(ia26Primary.key, 2);
+  const ia26FirstEmpty = await runTurn({
+    phone: '5511000000701',
+    text: 'Pode conferir hoje primeiro',
+    store: ia26Primary.store,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 2,
+    now: IA26_NOW,
+    slots: [],
+  });
+  assertIa26Deterministic(ia26FirstEmpty.prepared, 'IA26 primary empty today');
+  assert.deepEqual(ia26FirstEmpty.toolNames, ['getAvailableSlots']);
+  assert.equal(
+    ia26FirstEmpty.prepared.planReceipt.toolEffects.filter(
+      (effect) => effect.tool === 'getAvailableSlots'
+    ).length,
+    1,
+    'IA26 primary empty: exactly one availability read'
+  );
+  assert.equal(ia26FirstEmpty.prepared.planReceipt.serviceContextDecision, 'temporal_deferred');
+  assert.equal(ia26FirstEmpty.prepared.transition.kind, 'open');
+  if (ia26FirstEmpty.prepared.transition.kind === 'open') {
+    assert.equal(ia26FirstEmpty.prepared.transition.frame.kind, 'DATE');
+    assert.deepEqual(
+      ia26FirstEmpty.prepared.transition.frame.options.map((option) => option.entityId),
+      ['window:0'],
+      'IA26 primary empty: next pending points to the known alternative'
+    );
+  }
+  const ia26AfterFirstEmpty = nextFlowState(ia26FirstEmpty.prepared);
+  assert.equal(ia26AfterFirstEmpty.deferredAvailability?.schemaVersion, 1);
+  assert.equal(ia26AfterFirstEmpty.deferredAvailability?.date, '2026-08-25');
+  assert.deepEqual(ia26AfterFirstEmpty.deferredAvailability?.timeWindow, {
+    kind: 'PERIOD',
+    period: 'morning',
+  });
+  assert.equal(ia26AfterFirstEmpty.deferredAvailability?.windows, undefined);
+  assert.match(ia26FirstEmpty.prepared.payload ?? '', /amanh[ãa] de manh[ãa]/iu);
+  assert.doesNotMatch(
+    ia26FirstEmpty.prepared.payload ?? '',
+    /qual outro dia|date-freeform|outro dia ou per[ií]odo/iu,
+    'IA26 primary empty: no generic date-freeform while alternative is known'
+  );
+  await deliver(ia26FirstEmpty.prepared, ia26Primary.store, 2, () => IA26_NOW);
+
+  // Gate mínimo, reload + passo 2: “amanhã de manhã” é uma seleção conhecida,
+  // portanto não cai no modelo e não oferece tarde/noite.
+  const ia26Reloaded = reloadMemoryStore(ia26Primary.store);
+  ia26Reloaded.setInputSequence(ia26Primary.key, 3);
+  const ia26Morning = await runTurn({
+    phone: '5511000000701',
+    text: 'amanhã de manhã',
+    store: ia26Reloaded,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 3,
+    now: IA26_NOW,
+    slots: IA26_MORNING_AND_LATER_SLOTS,
+  });
+  assertIa26Deterministic(ia26Morning.prepared, 'IA26 morning after reload');
+  assert.equal(ia26Morning.prepared.planReceipt.serviceContextDecision, 'temporal_deferred');
+  assert.deepEqual(ia26Morning.toolNames, ['getAvailableSlots']);
+  assert.equal(
+    ia26Morning.prepared.transition.kind,
+    'open',
+    'IA26 morning: TIME pending is visible'
+  );
+  if (ia26Morning.prepared.transition.kind === 'open') {
+    assert.equal(ia26Morning.prepared.transition.frame.kind, 'TIME');
+    assert.deepEqual(
+      ia26Morning.prepared.transition.frame.options.map((option) => option.entityId),
+      ['08:00', '10:00', '11:30'],
+      'IA26 morning: only morning slots survive the deferred filter'
+    );
+  }
+  assert.doesNotMatch(ia26Morning.prepared.payload ?? '', /12h|18h/iu);
+  assert.equal(nextFlowState(ia26Morning.prepared).deferredAvailability, undefined);
+
+  // Primeira janela com horários: a alternativa não interfere e o lifecycle
+  // avança diretamente para TIME.
+  const ia26WithSlots = await openIa26Batch('5511000000702', IA26_FIRST_BUBBLES);
+  ia26WithSlots.store.setInputSequence(ia26WithSlots.key, 2);
+  const ia26Available = await runTurn({
+    phone: '5511000000702',
+    text: 'Pode conferir hoje primeiro',
+    store: ia26WithSlots.store,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 2,
+    now: IA26_NOW,
+    slots: ['08:00', '18:00'],
+  });
+  assertIa26Deterministic(ia26Available.prepared, 'IA26 available first window');
+  assert.deepEqual(ia26Available.toolNames, ['getAvailableSlots']);
+  assert.equal(ia26Available.prepared.transition.kind, 'open');
+  if (ia26Available.prepared.transition.kind === 'open') {
+    assert.equal(ia26Available.prepared.transition.frame.kind, 'TIME');
+    assert.deepEqual(
+      ia26Available.prepared.transition.frame.options.map((option) => option.entityId),
+      ['18:00']
+    );
+  }
+  assert.equal(nextFlowState(ia26Available.prepared).deferredAvailability, undefined);
+
+  // Erro técnico: não é zero disponibilidade; o agregado original inteiro
+  // continua retryable e a pergunta não abre date-freeform.
+  const ia26ExecutorError = await openIa26Batch('5511000000703', IA26_FIRST_BUBBLES);
+  ia26ExecutorError.store.setInputSequence(ia26ExecutorError.key, 2);
+  const ia26Error = await runTurn({
+    phone: '5511000000703',
+    text: 'Pode conferir hoje primeiro',
+    store: ia26ExecutorError.store,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 2,
+    now: IA26_NOW,
+    toolResponse: JSON.stringify({ success: false, reason: 'executor_error' }),
+  });
+  assertIa26Deterministic(ia26Error.prepared, 'IA26 executor error');
+  assert.deepEqual(ia26Error.toolNames, ['getAvailableSlots']);
+  assert.match(ia26Error.prepared.payload ?? '', /n[aã]o consegui consultar/iu);
+  assert.doesNotMatch(ia26Error.prepared.payload ?? '', /n[aã]o encontrei/iu);
+  assertIa26TwoWindowAggregate(
+    nextFlowState(ia26Error.prepared),
+    ['2026-08-24', '2026-08-25'],
+    'IA26 executor error'
+  );
+  if (ia26Error.prepared.transition.kind === 'open') {
+    assert.deepEqual(
+      ia26Error.prepared.transition.frame.options.map((option) => option.entityId),
+      ['window:0', 'window:1']
+    );
+  }
+
+  // Três janelas: cada zero remove exatamente a escolhida, incluindo a
+  // transição schema 2 -> schema 1; nenhuma janela consumida reaparece.
+  const ia26Three = await openIa26Batch('5511000000704', IA26_THREE_WINDOW_BUBBLES);
+  assert.equal(
+    nextFlowState(ia26Three.prepared).deferredAvailability?.windows?.length,
+    3,
+    'IA26 three windows: raw batch captured all three'
+  );
+  ia26Three.store.setInputSequence(ia26Three.key, 2);
+  const ia26ThreeFirst = await runTurn({
+    phone: '5511000000704',
+    text: 'hoje',
+    store: ia26Three.store,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 2,
+    now: IA26_NOW,
+    slots: [],
+  });
+  assertIa26Deterministic(ia26ThreeFirst.prepared, 'IA26 three windows first empty');
+  assertIa26TwoWindowAggregate(
+    nextFlowState(ia26ThreeFirst.prepared),
+    ['2026-08-25', '2026-08-26'],
+    'IA26 three windows after first empty'
+  );
+  await deliver(ia26ThreeFirst.prepared, ia26Three.store, 2, () => IA26_NOW);
+  const ia26ThreeReloaded = reloadMemoryStore(ia26Three.store);
+  ia26ThreeReloaded.setInputSequence(ia26Three.key, 3);
+  const ia26ThreeSecond = await runTurn({
+    phone: '5511000000704',
+    text: 'amanhã de manhã',
+    store: ia26ThreeReloaded,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 3,
+    now: IA26_NOW,
+    slots: [],
+  });
+  assertIa26Deterministic(ia26ThreeSecond.prepared, 'IA26 three windows second empty');
+  assert.equal(nextFlowState(ia26ThreeSecond.prepared).deferredAvailability?.schemaVersion, 1);
+  assert.equal(nextFlowState(ia26ThreeSecond.prepared).deferredAvailability?.date, '2026-08-26');
+  assert.deepEqual(nextFlowState(ia26ThreeSecond.prepared).deferredAvailability?.timeWindow, {
+    kind: 'PERIOD',
+    period: 'afternoon',
+  });
+  assert.equal(nextFlowState(ia26ThreeSecond.prepared).deferredAvailability?.windows, undefined);
+  assert.doesNotMatch(ia26ThreeSecond.prepared.payload ?? '', /2026-08-24|hoje/iu);
+
+  // Takeover entre consultas: o cutoff durável vence pending/outbox antigos e
+  // impede que uma janela remanescente ressuscite no turno humano.
+  const ia26Takeover = await openIa26Batch('5511000000705', IA26_FIRST_BUBBLES);
+  ia26Takeover.store.setInputSequence(ia26Takeover.key, 2);
+  const ia26TakeoverFirst = await runTurn({
+    phone: '5511000000705',
+    text: 'Pode conferir hoje primeiro',
+    store: ia26Takeover.store,
+    enabled: true,
+    serviceResolverEnabled: true,
+    interpreterEnabled: true,
+    catalogOverride: catalog,
+    sequence: 2,
+    now: IA26_NOW,
+    slots: [],
+  });
+  await deliver(ia26TakeoverFirst.prepared, ia26Takeover.store, 2, () => IA26_NOW);
+  const takeoverAt = new Date('2026-08-24T15:01:00.000Z');
+  await ia26Takeover.store.recordFlowStateInvalidation({
+    conversationKey: ia26Takeover.key,
+    reason: 'HUMAN_OWNERSHIP',
+    now: takeoverAt,
+  });
+  ia26Takeover.store.setInputSequence(ia26Takeover.key, 3);
+  const ia26TakeoverTurn = await runTurn({
+    phone: '5511000000705',
+    text: 'amanhã de manhã',
+    store: ia26Takeover.store,
+    enabled: true,
+    serviceResolverEnabled: true,
+    catalogOverride: catalog,
+    sequence: 3,
+    now: takeoverAt,
+    turnControl: {
+      disposition: 'HUMAN_ACTIVE',
+      resumeDecision: 'KEEP_HUMAN',
+    },
+  });
+  assert.equal(ia26TakeoverTurn.prepared.preemption, 'HUMAN_ACTIVE');
+  assert.equal(ia26TakeoverTurn.prepared.payload, null);
+  assert.equal(ia26TakeoverTurn.toolNames.length, 0);
+  assert.equal(nextFlowState(ia26TakeoverTurn.prepared).deferredAvailability, undefined);
+  assert.equal(
+    (await ia26Takeover.store.loadLatestState(ia26Takeover.key, takeoverAt)).flowState
+      ?.deferredAvailability,
+    undefined,
+    'IA26 takeover cutoff: no deferred window resurrects'
+  );
+
   // --- IA24_RUNTIME_DETERMINISTIC_MATRIX ---
   // Todas as rotas abaixo usam o runModelLoop/interpreter throwing da fixture;
   // uma aprovação só é válida se o planner resolver sem fabricar resposta do

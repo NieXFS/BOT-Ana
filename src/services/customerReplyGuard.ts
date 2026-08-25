@@ -566,7 +566,7 @@ function isVerifiedAvailabilityConfirmation(
 const AVAILABILITY_POSITIVE_CUE_RE =
   /\b(?:tenho|temos|tem\s+(?:horarios?|vagas?|disponibilidade)\b|ha|existem|(?:encontrei|achei)\s+(?:(?:os|as|um|uma|uns|umas|alguns?|algumas?|est[ea]s?|ess[ea]s?|nov[oa]s?|\d+)\s+)?(?:horarios?|vagas?|disponibilidade|opcao|opcoes|alternativa|alternativas)\b|posso\s+(?:te\s+)?oferecer|disponiveis?|livres?|vagas?)\b/;
 const AVAILABILITY_NEGATIVE_CUE_RE =
-  /\b(?:nao|sem)\s+(?:tem(?:os)?|ha|horarios?|vagas?|disponibilidade)|\b(?:indisponiveis?|ocupad[oa]s?|esgotad[oa]s?)\b/;
+  /\b(?:nao\s+(?:tem(?:os)?|ha|encontrei|achei|localizei|consegui\s+(?:encontrar|localizar))|sem\s+(?:horarios?|vagas?|disponibilidade)|nao\s+horarios?|nao\s+vagas?|nao\s+disponibilidade)|\b(?:indisponiveis?|ocupad[oa]s?|esgotad[oa]s?)\b/;
 const OPERATING_HOURS_CUE_RE =
   /\b(?:horario\s+de\s+funcionamento|horario\s+comercial|expediente|funcionamos|funciona|atendemos|atendimento|abrimos|fechamos|aberto)\b/;
 

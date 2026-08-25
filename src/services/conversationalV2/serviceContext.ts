@@ -18,6 +18,7 @@ import type {
   DeferredAvailabilityWindowV2,
   FlowStateV2,
   ModelTurnResultV2,
+  PendingTransitionCandidate,
   ServiceContextReceiptDecisionV2,
   TurnFrameV2,
 } from './contracts';
@@ -56,6 +57,7 @@ import {
   resolveServiceFromCatalog,
   type ServiceResolverResult,
 } from './serviceResolver';
+import { isNaturalAffirmativeReplyV2 } from './naturalAffirmative';
 import type {
   SemanticServiceInvocationPolicyV2,
   SemanticServiceInvocationReasonV2,
@@ -92,6 +94,16 @@ export type CapturedDeferredAvailabilityV2 =
   | { kind: 'conflict' }
   | { kind: 'captured'; constraint: DeferredAvailabilityConstraintV2 };
 
+/**
+ * Seleção efêmera de uma janela já capturada. A seleção licencia a leitura do
+ * turno atual, mas não é, sozinha, uma nova autoridade persistível.
+ */
+export type SelectedDeferredWindowV2 = {
+  selectedIndex: number;
+  selected: DeferredAvailabilityWindowV2;
+  remaining: DeferredAvailabilityWindowV2[];
+};
+
 export type ServiceContextPlanV2 = {
   decision: ServiceContextDecisionV2;
   receipt: ServiceContextReceiptDecisionV2;
@@ -100,6 +112,7 @@ export type ServiceContextPlanV2 = {
   result: ModelTurnResultV2 | null;
   nextFlowState: FlowStateV2 | null;
   selectedServiceId?: string;
+  deferredWindowSelection?: SelectedDeferredWindowV2;
 };
 
 /**
@@ -433,6 +446,108 @@ export function captureDeferredAvailabilityBatchV2(input: {
   };
 }
 
+/**
+ * Materializa o agregado persistível a partir das janelas ainda não
+ * consumidas. A versão 1 representa exatamente uma janela; a versão 2 só é
+ * válida quando ainda há pelo menos duas.
+ */
+export function buildDeferredAvailabilityConstraintFromWindowsV2(
+  source: DeferredAvailabilityConstraintV2,
+  windows: readonly DeferredAvailabilityWindowV2[]
+): DeferredAvailabilityConstraintV2 | null {
+  if (windows.length === 0) return null;
+  const metadata = {
+    capturedAt: source.capturedAt,
+    capturedTurnId: source.capturedTurnId,
+    capturedInputSequence: source.capturedInputSequence,
+  };
+  if (windows.length === 1) {
+    const [window] = windows;
+    if (!window) return null;
+    return {
+      schemaVersion: 1,
+      ...metadata,
+      ...(window.date ? { date: window.date } : {}),
+      ...(window.timeWindow ? { timeWindow: window.timeWindow } : {}),
+    };
+  }
+  return {
+    schemaVersion: 2,
+    ...metadata,
+    windows: windows.map((window) => ({
+      ...(window.date ? { date: window.date } : {}),
+      ...(window.timeWindow ? { timeWindow: window.timeWindow } : {}),
+    })),
+  };
+}
+
+function deferredWindowFromConstraintV2(
+  constraint: DeferredAvailabilityConstraintV2
+): DeferredAvailabilityWindowV2 | null {
+  if (constraint.windows?.length) return null;
+  if (!constraint.date && !constraint.timeWindow) return null;
+  return {
+    ...(constraint.date ? { date: constraint.date } : {}),
+    ...(constraint.timeWindow ? { timeWindow: constraint.timeWindow } : {}),
+  };
+}
+
+function deferredWindowsFromConstraintV2(
+  constraint: DeferredAvailabilityConstraintV2
+): DeferredAvailabilityWindowV2[] {
+  return constraint.windows?.length
+    ? [...constraint.windows]
+    : [deferredWindowFromConstraintV2(constraint)].filter(
+        (window): window is DeferredAvailabilityWindowV2 => Boolean(window)
+      );
+}
+
+function canonicalDeferredSelectionReplyV2(value: string): string {
+  return normalize(value)
+    .replace(/^[.!?,;:\s]+|[.!?,;:\s]+$/gu, '')
+    .replace(/[^a-z0-9]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+/**
+ * Respostas curtas autorizadas para a pergunta "Posso consultar ...?". O
+ * matcher só é usado quando o agregado já contém uma única janela, portanto
+ * não escolhe entre alternativas por eliminação.
+ */
+export function isDeferredAvailabilitySelectionReplyV2(value: string): boolean {
+  if (/[?？]/u.test(value) || /\b(?:nao|nunca)\b/u.test(normalize(value))) {
+    return false;
+  }
+  const canonical = canonicalDeferredSelectionReplyV2(value);
+  return (
+    isNaturalAffirmativeReplyV2(value) ||
+    new Set([
+      'sim',
+      'pode',
+      'claro',
+      'pode consultar',
+      'pode conferir',
+      'sim pode',
+    ]).has(canonical)
+  );
+}
+
+function ordinalDeferredWindowIndexV2(value: string): number | null {
+  const normalized = normalize(value);
+  const match = /\b(primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa])\s+(?:janela|op[cç][aã]o)\b/u.exec(
+    normalized
+  );
+  if (!match) return null;
+  const ordinal = match[1];
+  if (ordinal?.startsWith('primeir')) return 0;
+  if (ordinal?.startsWith('segund')) return 1;
+  if (ordinal?.startsWith('terceir')) return 2;
+  if (ordinal?.startsWith('quart')) return 3;
+  if (ordinal?.startsWith('quint')) return 4;
+  return null;
+}
+
 export function isDeferredAvailabilityConsumableV2(
   constraint: DeferredAvailabilityConstraintV2 | undefined,
   flowId: string,
@@ -650,6 +765,52 @@ export function buildEmptyDeferredAvailabilityCopyV2(
   _timezone: string
 ): string {
   return 'Não encontrei horário dentro da restrição que você pediu. Qual outro dia ou período você prefere?';
+}
+
+/**
+ * Copy de lifecycle depois de uma leitura válida sem slots. A alternativa é
+ * derivada exclusivamente do agregado restante; ela nunca é recriada a partir
+ * de texto nem reduzida a uma pergunta genérica enquanto ainda existe.
+ */
+export function buildDeferredAvailabilityExhaustedCopyV2(input: {
+  selected: DeferredAvailabilityWindowV2;
+  remaining: readonly DeferredAvailabilityWindowV2[];
+  now: Date;
+  timezone: string;
+}): string {
+  const selectedPhrase =
+    formatDeferredWindowEntryPhraseV2(input.selected, input.now, input.timezone) ||
+    'nessa janela';
+  const remainingPhrases = input.remaining
+    .map((entry) =>
+      formatDeferredWindowEntryPhraseV2(entry, input.now, input.timezone)
+    )
+    .filter(Boolean);
+  if (remainingPhrases.length === 1) {
+    return `Não encontrei horários ${selectedPhrase}. Posso consultar ${remainingPhrases[0]}?`;
+  }
+  if (remainingPhrases.length > 1) {
+    return `Não encontrei horários ${selectedPhrase}. Qual janela você quer que eu consulte agora: ${joinServiceNames(remainingPhrases)}?`;
+  }
+  return `Não encontrei horários ${selectedPhrase}. Qual outro dia ou período você prefere?`;
+}
+
+export function deferredAvailabilityPendingTransitionV2(
+  flowId: string,
+  constraint: DeferredAvailabilityConstraintV2 | null | undefined
+): PendingTransitionCandidate {
+  const windowCount = constraint
+    ? deferredWindowsFromConstraintV2(constraint).length
+    : 0;
+  return {
+    kind: 'open',
+    pendingKind: 'DATE',
+    flowId,
+    optionEntityIds:
+      windowCount > 0
+        ? Array.from({ length: windowCount }, (_entry, index) => `window:${index}`)
+        : ['date-freeform'],
+  };
 }
 
 export function buildPolarityAmbiguityCopyV2(canonicalName: string): string {
@@ -1036,7 +1197,7 @@ export function deriveSemanticServiceInvocationV2(input: {
   };
 }
 
-function findSelectedDeferredWindowV2(input: {
+export function findSelectedDeferredWindowV2(input: {
   constraint: DeferredAvailabilityConstraintV2;
   inboundText: string;
   dateResolution: CurrentDateResolutionV2;
@@ -1044,23 +1205,30 @@ function findSelectedDeferredWindowV2(input: {
   timezone: string;
   turnId: string;
   inputSequence: number;
-}): DeferredAvailabilityConstraintV2 | null {
-  const windows = input.constraint.windows ?? [];
+}): SelectedDeferredWindowV2 | null {
+  const windows = deferredWindowsFromConstraintV2(input.constraint);
   if (windows.length === 0) return null;
-  const captured = captureDeferredAvailabilityConstraintV2({
+  const captured = captureDeferredAvailabilityBatchV2({
     inboundText: input.inboundText,
     dateResolution: input.dateResolution,
     now: input.now,
+    timezone: input.timezone,
     turnId: input.turnId,
     inputSequence: input.inputSequence,
   });
-  if (captured.kind !== 'captured') return null;
-  const candidate: DeferredAvailabilityWindowV2 = {
-    ...(captured.constraint.date ? { date: captured.constraint.date } : {}),
-    ...(captured.constraint.timeWindow
-      ? { timeWindow: captured.constraint.timeWindow }
-      : {}),
-  };
+  let candidate: DeferredAvailabilityWindowV2 | null = null;
+  if (captured.kind === 'captured' && !captured.constraint.windows?.length) {
+    candidate = deferredWindowFromConstraintV2(captured.constraint);
+  } else if (
+    captured.kind === 'vague_period' ||
+    inboundHasVaguePeriodV2(input.inboundText)
+  ) {
+    const collected = collectOperatorWindows(
+      maskOrdinalOptionSpansV2(normalize(input.inboundText))
+    );
+    const period = collected.windows.find((window) => window.kind === 'PERIOD');
+    candidate = period ? { timeWindow: period } : null;
+  }
   const sameTimeWindowValue = (
     left: DeferredAvailabilityTimeWindowV2 | undefined,
     right: DeferredAvailabilityTimeWindowV2 | undefined
@@ -1068,28 +1236,39 @@ function findSelectedDeferredWindowV2(input: {
     if (!left || !right) return left === right;
     return sameTimeWindow(left, right);
   };
-  const matches = windows.flatMap((entry, index) => {
-    if (candidate.date && entry.date !== candidate.date) return [];
-    if (
-      candidate.timeWindow &&
-      !sameTimeWindowValue(candidate.timeWindow, entry.timeWindow)
-    ) {
-      return [];
-    }
-    // A date-only/period-only answer is valid only when it identifies one
-    // stored window; never select by elimination when two windows share it.
-    return candidate.date || candidate.timeWindow ? [index] : [];
-  });
-  const index = matches.length === 1 ? matches[0]! : -1;
+  const matches = candidate
+    ? windows.flatMap((entry, index) => {
+        if (candidate?.date && entry.date !== candidate.date) return [];
+        if (
+          candidate?.timeWindow &&
+          !sameTimeWindowValue(candidate.timeWindow, entry.timeWindow)
+        ) {
+          return [];
+        }
+        // A date-only/period-only answer is valid only when it identifies one
+        // stored window; never select by elimination when two windows share it.
+        return candidate.date || candidate.timeWindow ? [index] : [];
+      })
+    : [];
+  const ordinalIndex = ordinalDeferredWindowIndexV2(input.inboundText);
+  const index =
+    matches.length === 1
+      ? matches[0]!
+      : matches.length === 0 &&
+          ordinalIndex !== null &&
+          ordinalIndex >= 0 &&
+          ordinalIndex < windows.length
+        ? ordinalIndex
+        : matches.length === 0 &&
+            windows.length === 1 &&
+            isDeferredAvailabilitySelectionReplyV2(input.inboundText)
+          ? 0
+          : -1;
   if (index < 0) return null;
-  const selected = windows[index]!;
   return {
-    schemaVersion: 1,
-    capturedAt: input.now.toISOString(),
-    capturedTurnId: input.turnId,
-    capturedInputSequence: input.inputSequence,
-    ...(selected.date ? { date: selected.date } : {}),
-    ...(selected.timeWindow ? { timeWindow: selected.timeWindow } : {}),
+    selectedIndex: index,
+    selected: windows[index]!,
+    remaining: windows.filter((_entry, entryIndex) => entryIndex !== index),
   };
 }
 
@@ -1121,10 +1300,17 @@ export function planServiceContextV2(input: {
     ...input.frame,
     flowState: pruneDeferredAvailabilityV2(input.frame.flowState, input.now),
   };
-  const existingMultiWindow = frame.flowState.deferredAvailability;
-  if (existingMultiWindow?.windows?.length) {
+  const existingDeferred = frame.flowState.deferredAvailability;
+  if (
+    existingDeferred &&
+    isDeferredAvailabilityConsumableV2(
+      existingDeferred,
+      frame.flowState.flowId,
+      input.now
+    )
+  ) {
     const selectedWindow = findSelectedDeferredWindowV2({
-      constraint: existingMultiWindow,
+      constraint: existingDeferred,
       inboundText: input.inboundText,
       dateResolution: input.dateResolution,
       now: input.now,
@@ -1133,19 +1319,23 @@ export function planServiceContextV2(input: {
       inputSequence: input.inputSequence,
     });
     if (selectedWindow) {
+      const selectedConstraint =
+        buildDeferredAvailabilityConstraintFromWindowsV2(existingDeferred, [
+          selectedWindow.selected,
+        ]);
       return {
         decision: { kind: 'none' },
         receipt: 'temporal_deferred',
         vetoFamilyFastPath: true,
-        capturedConstraint: selectedWindow,
+        capturedConstraint: selectedConstraint,
         result: null,
-        nextFlowState: withDeferredAvailabilityV2(
-          frame.flowState,
-          selectedWindow
-        ),
+        // The aggregate remains the authority until the availability result
+        // decides whether the selected window is consumed.
+        nextFlowState: frame.flowState,
         ...(frame.flowState.fixedServiceId
           ? { selectedServiceId: frame.flowState.fixedServiceId }
           : {}),
+        deferredWindowSelection: selectedWindow,
       };
     }
   }
@@ -1699,9 +1889,21 @@ export async function consumeDeferredAvailabilityV2(input: {
   config: TenantBotConfig;
   now: Date;
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>;
+  deferredWindowSelection?: SelectedDeferredWindowV2;
 }): Promise<DeferredAvailabilityConsumptionV2> {
   const flowState = pruneDeferredAvailabilityV2(input.flowState, input.now);
-  const constraint = flowState.deferredAvailability;
+  const deferredWindowSelection = input.deferredWindowSelection;
+  const selectedConstraint =
+    deferredWindowSelection && flowState.deferredAvailability
+      ? buildDeferredAvailabilityConstraintFromWindowsV2(
+          flowState.deferredAvailability,
+          [deferredWindowSelection.selected]
+        )
+      : undefined;
+  const selectionActive = Boolean(deferredWindowSelection && selectedConstraint);
+  const constraint = selectionActive
+    ? selectedConstraint
+    : flowState.deferredAvailability;
   if (
     !constraint ||
     !isDeferredAvailabilityConsumableV2(constraint, flowState.flowId, input.now)
@@ -1724,7 +1926,7 @@ export async function consumeDeferredAvailabilityV2(input: {
   }
   const date = constraint.date;
   const baseState = {
-    ...flowState,
+    ...withDeferredAvailabilityV2(flowState, selectedConstraint ?? constraint),
     ...(professionalId ? { fixedProfessionalId: professionalId } : {}),
   };
   const professionalGate = professionalSelectionGate({
@@ -1760,6 +1962,9 @@ export async function consumeDeferredAvailabilityV2(input: {
       ? validSlots(parsed, input.now, input.config.timezone, date)
       : null;
   if (!toolSlots) {
+    const failureConstraint = selectionActive
+      ? flowState.deferredAvailability
+      : null;
     return {
       kind: 'resolved',
       result: modelResult({
@@ -1768,39 +1973,60 @@ export async function consumeDeferredAvailabilityV2(input: {
           availabilityQueryFailureReason(parsed)
         ),
         purpose: 'DATE_TIME_QUESTION',
-        transition: {
-          kind: 'open',
-          pendingKind: 'DATE',
-          flowId: flowState.flowId,
-          optionEntityIds: ['date-freeform'],
-        },
+        transition: selectionActive
+          ? deferredAvailabilityPendingTransitionV2(
+              flowState.flowId,
+              failureConstraint
+            )
+          : { kind: 'open', pendingKind: 'DATE', flowId: flowState.flowId, optionEntityIds: ['date-freeform'] },
       }),
-      nextFlowState: baseState,
+      // An executor error is not evidence that the selected window is empty.
+      nextFlowState: selectionActive ? flowState : baseState,
       loop: loopForReads([trace]),
     };
   }
   const offered = filterSlotsByDeferredWindowV2(toolSlots, constraint.timeWindow);
   if (offered.length === 0) {
+    const remainingConstraint =
+      selectionActive && flowState.deferredAvailability
+        ? buildDeferredAvailabilityConstraintFromWindowsV2(
+            flowState.deferredAvailability,
+            deferredWindowSelection?.remaining ?? []
+          )
+        : null;
+    const emptyReply =
+      selectionActive && deferredWindowSelection
+        ? buildDeferredAvailabilityExhaustedCopyV2({
+            selected: deferredWindowSelection.selected,
+            remaining: deferredWindowSelection.remaining,
+            now: input.now,
+            timezone: input.config.timezone,
+          })
+        : buildEmptyDeferredAvailabilityCopyV2(
+            constraint,
+            input.now,
+            input.config.timezone
+          );
+    const { resolvedDate: _resolvedDate, ...stateWithoutResolvedDate } = baseState;
     return {
       kind: 'resolved',
       result: modelResult({
-        reply: buildEmptyDeferredAvailabilityCopyV2(
-          constraint,
-          input.now,
-          input.config.timezone
-        ),
+        reply: emptyReply,
         purpose: 'DATE_TIME_QUESTION',
-        transition: {
-          kind: 'open',
-          pendingKind: 'DATE',
-          flowId: flowState.flowId,
-          optionEntityIds: ['date-freeform'],
-        },
+        transition:
+          selectionActive
+            ? deferredAvailabilityPendingTransitionV2(
+                flowState.flowId,
+                remainingConstraint
+              )
+            : { kind: 'open', pendingKind: 'DATE', flowId: flowState.flowId, optionEntityIds: ['date-freeform'] },
       }),
-      nextFlowState: {
-        ...baseState,
-        resolvedDate: date,
-      },
+      nextFlowState: selectionActive
+        ? withDeferredAvailabilityV2(
+            stateWithoutResolvedDate,
+            remainingConstraint
+          )
+        : stateWithoutResolvedDate,
       loop: loopForReads([trace]),
     };
   }
@@ -1816,7 +2042,7 @@ export async function consumeDeferredAvailabilityV2(input: {
     toolTrace: [filteredTrace],
     services: input.catalog,
     sourceInboundText: input.inboundText,
-    preserveDeferredAvailability: true,
+    preserveDeferredAvailability: !selectionActive,
   });
   if (reducer?.kind === 'canonical_slots') {
     const exactMinute =
@@ -1904,7 +2130,9 @@ export async function consumeDeferredAvailabilityV2(input: {
         optionEntityIds: ['date-freeform'],
       },
     }),
-    nextFlowState: baseState,
+    nextFlowState: selectionActive
+      ? flowState
+      : baseState,
     loop: loopForReads([trace]),
   };
 }
