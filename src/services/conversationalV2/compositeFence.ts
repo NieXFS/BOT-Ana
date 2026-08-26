@@ -13,6 +13,8 @@ export const COMPOSITE_FENCE_REASONS_V2 = [
   'components_missing',
   'components_not_distinct',
   'component_not_literal',
+  'component_not_token_bounded',
+  'components_overlap',
   'component_negated',
   'disjunctive_relation',
   'conjunctive_relation_missing',
@@ -152,6 +154,29 @@ function literalOccurrences(
   return occurrences;
 }
 
+const UNICODE_TOKEN_CHARACTER_BEFORE = /[\p{L}\p{N}\p{M}]$/u;
+const UNICODE_TOKEN_CHARACTER_AFTER = /^[\p{L}\p{N}\p{M}]/u;
+
+function isTokenBoundedOccurrence(
+  currentBatch: string,
+  occurrence: LiteralOccurrenceV2
+): boolean {
+  const hasTokenCharacterBefore = UNICODE_TOKEN_CHARACTER_BEFORE.test(
+    currentBatch.slice(0, occurrence.start)
+  );
+  const hasTokenCharacterAfter = UNICODE_TOKEN_CHARACTER_AFTER.test(
+    currentBatch.slice(occurrence.end)
+  );
+  return !hasTokenCharacterBefore && !hasTokenCharacterAfter;
+}
+
+function spansOverlap(
+  left: LiteralOccurrenceV2,
+  right: LiteralOccurrenceV2
+): boolean {
+  return left.start < right.end && right.start < left.end;
+}
+
 function hasExplicitConjunction(value: string): boolean {
   const normalized = normalizedPrefix(value);
   return /(?:^|\s)(?:e|com|mais|junt(?:o|a|os|as)|ambos|ambas|os dois|as duas)(?:$|\s)/u.test(
@@ -217,7 +242,13 @@ export function licenseCompositeDecisionV2(input: {
     if (occurrences.length === 0) {
       return { ok: false, reason: 'component_not_literal' };
     }
-    const positive = occurrences.filter((occurrence) =>
+    const tokenBounded = occurrences.filter((occurrence) =>
+      isTokenBoundedOccurrence(input.currentBatch, occurrence)
+    );
+    if (tokenBounded.length === 0) {
+      return { ok: false, reason: 'component_not_token_bounded' };
+    }
+    const positive = tokenBounded.filter((occurrence) =>
       componentHasPositiveLocalPolarity(input.currentBatch, occurrence)
     );
     if (positive.length === 0) {
@@ -233,6 +264,11 @@ export function licenseCompositeDecisionV2(input: {
   // polarity checks above rather than guessed by the server.
   const chosen = positiveOccurrences.map((occurrences) => occurrences[0]!);
   const ordered = [...chosen].sort((left, right) => left.start - right.start);
+  for (let index = 1; index < ordered.length; index += 1) {
+    if (spansOverlap(ordered[index - 1]!, ordered[index]!)) {
+      return { ok: false, reason: 'components_overlap' };
+    }
+  }
   const relationStart = ordered[0]!.start;
   const relationEnd = ordered.at(-1)!.end;
   const interval = input.currentBatch.slice(relationStart, relationEnd);
@@ -256,5 +292,7 @@ export const __compositeFenceInternals = {
   normalizeComponent,
   componentHasPositiveLocalPolarity,
   literalOccurrences,
+  isTokenBoundedOccurrence,
+  spansOverlap,
   hasExplicitConjunction,
 };

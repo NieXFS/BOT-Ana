@@ -981,10 +981,19 @@ function evidenceIsPositive(
     /\b(?:quero|queria|gostaria|prefiro|preciso|desejo|vou|pode\s+ser|escolho|mas|na\s+verdade|melhor|trocar|troquei)\b/u.test(
       evidenceClause
     );
+  // A bare `não quero ...` is negative evidence even though it contains the
+  // positive verb `quero`. Only the explicit punctuation form `não, quero ...`
+  // opens a new positive clause inside the evidence span itself.
+  const evidenceStartsWithBareNegation = /^\s*(?:nao|nunca|sem)\b/u.test(
+    normalizedEvidence
+  );
+  const evidenceStartsWithExplicitCorrection =
+    /^\s*nao\s*[,.!?;:]\s*(?:quero|queria|gostaria|prefiro|preciso|desejo|vou|pode\s+ser|escolho)\b/u.test(
+      normalizedEvidence
+    );
   if (
-    (/^\s*(?:nao|nunca|sem)\b/u.test(normalizedEvidence) ||
-      priorClauseStartsNegative) &&
-    !positiveCorrectionCue
+    (evidenceStartsWithBareNegation && !evidenceStartsWithExplicitCorrection) ||
+    (priorClauseStartsNegative && !positiveCorrectionCue)
   ) {
     return { ok: false, reason: 'negated_evidence' };
   }
@@ -1160,11 +1169,7 @@ export function parseAndValidateSemanticServiceDecision(input: {
     };
   }
   const evidence = evidenceIsPositive(input.currentBatch, evidenceText);
-  const negativeAmbiguousEvidence =
-    decision === 'ambiguous' &&
-    !evidence.ok &&
-    evidence.reason === 'negated_evidence';
-  if (!evidence.ok && !negativeAmbiguousEvidence) return evidence;
+  if (!evidence.ok) return evidence;
 
   const canonicalPositiveIds = positiveCanonicalServiceIds(
     input.currentBatch,
@@ -1258,11 +1263,7 @@ export function parseAndValidateSemanticServiceDecision(input: {
         occurrence.positive &&
         (correctionOffset < 0 || occurrence.start >= correctionOffset)
     );
-    if (
-      occurrences.length > 0 &&
-      !hasPositiveOccurrence &&
-      !negativeAmbiguousEvidence
-    ) {
+    if (occurrences.length > 0 && !hasPositiveOccurrence) {
       return { ok: false, reason: 'candidate_negated' };
     }
   }

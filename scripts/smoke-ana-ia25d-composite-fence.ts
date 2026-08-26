@@ -593,6 +593,22 @@ async function main(): Promise<void> {
       expected: 'component_negated',
     },
     {
+      name: 'substring-token-cheat',
+      result: fence({
+        text: 'quero peeling e mão',
+        components: ['pe', 'mão'],
+      }),
+      expected: 'component_not_token_bounded',
+    },
+    {
+      name: 'spans-sobrepostos',
+      result: fence({
+        text: 'quero pacote facial premium',
+        components: ['pacote facial', 'facial premium'],
+      }),
+      expected: 'components_overlap',
+    },
+    {
       name: 'relacao-disjuntiva',
       result: fence({
         text: 'manicure ou pedicure',
@@ -722,6 +738,8 @@ async function main(): Promise<void> {
 
   for (const test of [
     { text: 'pé e mão', components: ['pé', 'mão'] },
+    { text: 'pe e mao', components: ['pe', 'mao'] },
+    { text: 'pés e mãos', components: ['pés', 'mãos'] },
     { text: 'as unhas dos pés e das mãos', components: ['pés', 'mãos'] },
     { text: 'não quero manicure, agora quero pé e mão', components: ['pé', 'mão'] },
     { text: 'não quero manicure agora quero pé e mão', components: ['pé', 'mão'] },
@@ -785,9 +803,12 @@ async function main(): Promise<void> {
   });
   assert.equal(
     negativeAmbiguous.ok,
-    true,
-    'ambiguous com evidência negada não licencia seleção e preserva A'
+    false,
+    'ambiguous com evidência negada é rejeitado'
   );
+  if (!negativeAmbiguous.ok) {
+    assert.equal(negativeAmbiguous.reason, 'negated_evidence');
+  }
 
   const noneDecision = parseAndValidateSemanticServiceDecision({
     raw: decision({
@@ -885,6 +906,56 @@ async function main(): Promise<void> {
   assert.equal(successful.decision?.resolutionBasis, 'composite');
   assert.deepEqual(successful.decision?.componentEvidenceTexts, ['pé', 'mão']);
   assert.equal(successfulCalls.value, 1);
+
+  const substringTokenCalls = { value: 0 };
+  const substringToken = await resolveDirectWith(
+    'quero peeling e mão',
+    compositeDecision('quero peeling e mão', ['pe', 'mão']),
+    substringTokenCalls
+  );
+  assert.equal(substringToken.receipt.status, 'composite_fence_rejected');
+  assert.equal(
+    substringToken.compositeFenceReason,
+    'component_not_token_bounded'
+  );
+  assert.equal(substringToken.decision, null);
+  assert.equal(substringToken.receipt.providerCallCount, 1);
+  assert.equal(substringTokenCalls.value, 1);
+
+  const overlappingSpansCalls = { value: 0 };
+  const overlappingSpans = await resolveDirectWith(
+    'quero pacote facial premium para unha',
+    compositeDecision('quero pacote facial premium para unha', [
+      'pacote facial',
+      'facial premium',
+    ]),
+    overlappingSpansCalls
+  );
+  assert.equal(overlappingSpans.receipt.status, 'composite_fence_rejected');
+  assert.equal(overlappingSpans.compositeFenceReason, 'components_overlap');
+  assert.equal(overlappingSpans.decision, null);
+  assert.equal(overlappingSpans.receipt.providerCallCount, 1);
+  assert.equal(overlappingSpansCalls.value, 1);
+
+  const negativeAmbiguousCalls = { value: 0 };
+  const negativeAmbiguousCompletion = await resolveDirectWith(
+    'não quero pé e mão',
+    decision({
+      decision: 'ambiguous',
+      serviceId: null,
+      candidateServiceIds: [...LAYER_A],
+      evidenceText: 'não quero pé e mão',
+    }),
+    negativeAmbiguousCalls
+  );
+  assert.equal(negativeAmbiguousCompletion.receipt.status, 'rejected_evidence');
+  assert.equal(
+    negativeAmbiguousCompletion.parseRejectionReason,
+    'negated_evidence'
+  );
+  assert.equal(negativeAmbiguousCompletion.decision, null);
+  assert.equal(negativeAmbiguousCompletion.receipt.providerCallCount, 1);
+  assert.equal(negativeAmbiguousCalls.value, 1);
 
   const rejectedEvidenceCalls = { value: 0 };
   const rejectedEvidence = await resolveWith(
@@ -1132,6 +1203,18 @@ async function main(): Promise<void> {
       },
       providerTruncated: truncated.receipt.status,
       protocolFailure: protocol.receipt.status,
+      adversarialServerFences: {
+        substringToken: {
+          status: substringToken.receipt.status,
+          reason: substringToken.compositeFenceReason,
+          providerCalls: substringToken.receipt.providerCallCount,
+        },
+        overlappingSpans: {
+          status: overlappingSpans.receipt.status,
+          reason: overlappingSpans.compositeFenceReason,
+          providerCalls: overlappingSpans.receipt.providerCallCount,
+        },
+      },
       negativeEnvelope: {
         none: {
           completion: 'none + evidenceText=""',
@@ -1155,6 +1238,13 @@ async function main(): Promise<void> {
           generalModel: 0,
           regeneration: 0,
           tools: 0,
+        },
+        ambiguousNegatedEvidence: {
+          completion: 'ambiguous + evidenceText="não quero pé e mão"',
+          status: negativeAmbiguousCompletion.receipt.status,
+          parserReason: negativeAmbiguousCompletion.parseRejectionReason,
+          decision: negativeAmbiguousCompletion.decision,
+          semanticCalls: negativeAmbiguousCompletion.receipt.providerCallCount,
         },
       },
       agoraQuero: agoraQueroMatrix.map((test) => ({
