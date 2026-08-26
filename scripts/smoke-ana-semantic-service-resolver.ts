@@ -112,6 +112,25 @@ const config = {
 } as TenantBotConfig;
 
 function completion(content: string, model = 'deepseek-v4-flash'): OpenAI.Chat.Completions.ChatCompletion {
+  let normalizedContent = content;
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      Object.prototype.hasOwnProperty.call(parsed, 'decision') &&
+      !Object.prototype.hasOwnProperty.call(parsed, 'resolutionBasis') &&
+      !Object.prototype.hasOwnProperty.call(parsed, 'componentEvidenceTexts')
+    ) {
+      normalizedContent = JSON.stringify({
+        ...parsed,
+        resolutionBasis: 'direct',
+        componentEvidenceTexts: [],
+      });
+    }
+  } catch {
+    // Non-JSON fixtures intentionally remain non-JSON protocol cases.
+  }
   return {
     id: 'completion-fixture',
     object: 'chat.completion',
@@ -121,9 +140,32 @@ function completion(content: string, model = 'deepseek-v4-flash'): OpenAI.Chat.C
       index: 0,
       finish_reason: 'stop',
       logprobs: null,
-      message: { role: 'assistant', content, refusal: null },
+      message: { role: 'assistant', content: normalizedContent, refusal: null },
     }],
   } as OpenAI.Chat.Completions.ChatCompletion;
+}
+
+function normalizeFixtureDecisionRaw(raw: unknown): unknown {
+  if (typeof raw !== 'string') return raw;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      Object.prototype.hasOwnProperty.call(parsed, 'decision') &&
+      !Object.prototype.hasOwnProperty.call(parsed, 'resolutionBasis') &&
+      !Object.prototype.hasOwnProperty.call(parsed, 'componentEvidenceTexts')
+    ) {
+      return JSON.stringify({
+        ...parsed,
+        resolutionBasis: 'direct',
+        componentEvidenceTexts: [],
+      });
+    }
+  } catch {
+    // Keep malformed fixtures intact.
+  }
+  return raw;
 }
 
 function factoryFor(
@@ -650,7 +692,7 @@ async function main(): Promise<void> {
   ];
   for (const test of invalidCases) {
     const parsed = parseAndValidateSemanticServiceDecision({
-      raw: test.raw,
+      raw: normalizeFixtureDecisionRaw(test.raw),
       currentBatch: test.text,
       catalog,
       deterministicResult: resolveServiceFromCatalog({ text: test.text, catalog }),
@@ -677,7 +719,7 @@ async function main(): Promise<void> {
   assert.equal(canonicalAmbiguous.receipt.status, 'ambiguous');
   assert.equal(canonicalAmbiguousCount.value, 1);
   const correction = parseAndValidateSemanticServiceDecision({
-    raw: JSON.stringify({ decision: 'resolved', serviceId: PEDICURE_ID, candidateServiceIds: [PEDICURE_ID], evidenceText: 'pedicure' }),
+    raw: normalizeFixtureDecisionRaw(JSON.stringify({ decision: 'resolved', serviceId: PEDICURE_ID, candidateServiceIds: [PEDICURE_ID], evidenceText: 'pedicure' })),
     currentBatch: 'quero manicure, não, quero pedicure',
     catalog,
   });
@@ -740,12 +782,12 @@ async function main(): Promise<void> {
   ];
   for (const test of shortEvidencePolarityMatrix) {
     const parsed = parseAndValidateSemanticServiceDecision({
-      raw: JSON.stringify({
+      raw: normalizeFixtureDecisionRaw(JSON.stringify({
         decision: 'resolved',
         serviceId: test.serviceId,
         candidateServiceIds: [test.serviceId],
         evidenceText: test.evidenceText,
-      }),
+      })),
       currentBatch: test.currentBatch,
       catalog,
     });
@@ -762,12 +804,12 @@ async function main(): Promise<void> {
     services: [service('cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'Serviço inativo', { active: false })],
   };
   const inactiveDecision = parseAndValidateSemanticServiceDecision({
-    raw: JSON.stringify({
+    raw: normalizeFixtureDecisionRaw(JSON.stringify({
       decision: 'resolved',
       serviceId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
       candidateServiceIds: ['cccccccc-cccc-4ccc-8ccc-cccccccccccc'],
       evidenceText: 'Serviço inativo',
-    }),
+    })),
     currentBatch: 'Serviço inativo',
     catalog: inactiveCatalog,
   });
@@ -888,7 +930,41 @@ async function main(): Promise<void> {
     completionFactory: factoryFor('{"decision":"resolved"}', invalidCount),
   });
   assert.equal(invalid.receipt.status, 'invalid_response');
+  assert.equal(invalid.parseRejectionReason, 'extra_or_missing_keys');
+  assert.deepEqual(invalid.shape, {
+    decision: 'resolved',
+    resolutionBasis: 'direct',
+    candidateCount: 0,
+    componentCount: 0,
+    evidenceEmpty: true,
+    serviceInsideFence: true,
+  });
   assert.equal(invalidCount.value, 1);
+
+  const invalidTypes = await resolveSemanticService({
+    tenantSlug: 'studio-viti',
+    currentBatch: 'pé e mão',
+    catalog,
+    config,
+    completionFactory: factoryFor(JSON.stringify({
+      decision: 'resolved',
+      serviceId: COMBO_ID,
+      candidateServiceIds: [COMBO_ID],
+      evidenceText: 'pé e mão',
+      resolutionBasis: 'composite',
+      componentEvidenceTexts: ['pé', 7],
+    }), { value: 0 }),
+  });
+  assert.equal(invalidTypes.receipt.status, 'invalid_response');
+  assert.equal(invalidTypes.parseRejectionReason, 'invalid_types_or_limits');
+  assert.deepEqual(invalidTypes.shape, {
+    decision: 'resolved',
+    resolutionBasis: 'composite',
+    candidateCount: 1,
+    componentCount: 2,
+    evidenceEmpty: false,
+    serviceInsideFence: true,
+  });
 
   const truncated = await resolveSemanticService({
     tenantSlug: 'studio-viti',
@@ -903,7 +979,20 @@ async function main(): Promise<void> {
       }],
     } as OpenAI.Chat.Completions.ChatCompletion),
   });
-  assert.equal(truncated.receipt.status, 'invalid_response');
+  assert.equal(truncated.receipt.status, 'provider_truncated');
+  assert.equal(truncated.receipt.providerFinishReason, 'length');
+  assert.equal(truncated.receipt.providerCallCount, 1);
+  assert.equal(truncated.receipt.cacheHit, false);
+  assert.equal(truncated.receipt.skipReason, null);
+  assert.equal(truncated.parseRejectionReason, undefined);
+  assert.deepEqual(truncated.shape, {
+    decision: 'unknown',
+    resolutionBasis: 'unknown',
+    candidateCount: 0,
+    componentCount: 0,
+    evidenceEmpty: true,
+    serviceInsideFence: true,
+  });
 
   // Cache is tenant/catalog/context scoped and the hit does not call provider.
   clearSemanticServiceResolverCache();

@@ -95,6 +95,7 @@ import {
 import {
   resolveSemanticService,
   deriveSemanticServiceEligibilityV2,
+  deriveSemanticCompositeAuthorityV2,
   semanticServiceResolverNotInvokedReceipt,
   semanticDecisionToServiceResolverResult,
   SEMANTIC_SERVICE_SAFE_CLARIFICATION_V2,
@@ -2066,7 +2067,12 @@ export async function getReceptionistReplyV2(input: {
           deps.semanticCatalogVersion,
           semanticInvocation.policy.attemptedInvocationReason,
           semanticEligibility.eligibility.skipReason,
-          semanticEligibility.diagnostics.candidateCount
+          semanticEligibility.diagnostics.candidateCount,
+          deriveSemanticCompositeAuthorityV2({
+            policy: semanticInvocation.policy,
+            deterministicResult: semanticInvocation.deterministicResult,
+            catalog: services,
+          })
         );
     } else {
       const semanticOutcome = await resolveSemanticService({
@@ -2120,9 +2126,12 @@ export async function getReceptionistReplyV2(input: {
       } else if (
         !semanticInvocation.policy.preservePlanOnFailure &&
         (semanticOutcome.reason === 'provider_error' ||
+          semanticOutcome.reason === 'provider_truncated' ||
+          semanticOutcome.reason === 'protocol_failure' ||
           semanticOutcome.reason === 'provider_incompatible' ||
           semanticOutcome.reason === 'invalid_response' ||
           semanticOutcome.reason === 'rejected_evidence' ||
+          semanticOutcome.reason === 'composite_fence_rejected' ||
           (semanticOutcome.decision !== null && semanticServiceResult === null) ||
           (semanticOutcome.reason === 'accepted' &&
             semanticOutcome.receipt.status === 'none'))

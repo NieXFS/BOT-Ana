@@ -64,6 +64,8 @@
     "smoke:ana-conversational-v2-service-context": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-conversational-v2-service-context.ts",
     "smoke:ana-service-resolver": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-service-resolver.ts",
     "smoke:ana-semantic-service-resolver": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid DEEPSEEK_API_KEY=sk-deepseek-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-semantic-service-resolver.ts",
+    "smoke:ana-ia25d-composite-fence": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-openai-smoke-invalid DEEPSEEK_API_KEY=sk-deepseek-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-ia25d-composite-fence.ts",
+    "probe:ana-semantic-provider-real": "ANA_SEMANTIC_PROBE=1 ts-node -T scripts/probe-semantic-provider-real.ts",
     "smoke:ana-ia25-field-route": "DATABASE_URL=postgresql://smoke:smoke@127.0.0.1:1/smoke OPENAI_API_KEY=sk-smoke-invalid DEEPSEEK_API_KEY=sk-deepseek-smoke-invalid ERP_API_TOKEN=smoke-invalid ts-node -T scripts/smoke-ana-ia25-field-route.ts",
     "smoke:ana-ia24-deepseek-real": "ts-node -T scripts/smoke-ana-ia24-deepseek-real.ts",
     "smoke:ana-ia24-pg-real": "ts-node -T scripts/smoke-ana-ia24-pg-real.ts",

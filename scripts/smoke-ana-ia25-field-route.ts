@@ -112,6 +112,8 @@ function resolvedComboCompletion(): string {
     serviceId: COMBO_ID,
     candidateServiceIds: [COMBO_ID],
     evidenceText: 'pé e mão',
+    resolutionBasis: 'composite',
+    componentEvidenceTexts: ['pé', 'mão'],
   });
 }
 

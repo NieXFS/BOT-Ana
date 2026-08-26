@@ -161,6 +161,21 @@ export function assertReceiptRedactedV2(
       'Receipt semântico contém attemptedInvocationReason divergente de invocationReason.'
     );
   }
+  if (
+    semantic.compositeAuthoritySource !== null &&
+    semantic.compositeAuthoritySource !== 'planner_candidates' &&
+    semantic.compositeAuthoritySource !== 'direct_active_catalog'
+  ) {
+    throw new Error('Receipt semântico contém compositeAuthoritySource inválida.');
+  }
+  if (
+    !Number.isInteger(semantic.compositeAuthorityCount) ||
+    semantic.compositeAuthorityCount < 0 ||
+    (semantic.compositeAuthoritySource === null &&
+      semantic.compositeAuthorityCount !== 0)
+  ) {
+    throw new Error('Receipt semântico contém compositeAuthorityCount incompatível.');
+  }
   if (semantic.status === 'not_invoked') {
     if (semantic.providerCallCount !== 0 || semantic.cacheHit) {
       throw new Error('Receipt semântico not_invoked contém chamada/cache incompatível.');
@@ -193,6 +208,32 @@ export function assertReceiptRedactedV2(
   }
   if (semantic.providerCallCount === 1 && semantic.skipReason !== null) {
     throw new Error('Receipt semântico chamado não pode conter skipReason.');
+  }
+  if (semantic.status === 'provider_truncated') {
+    if (
+      semantic.providerCallCount !== 1 ||
+      semantic.cacheHit ||
+      semantic.skipReason !== null ||
+      semantic.providerFinishReason !== 'length'
+    ) {
+      throw new Error(
+        'Receipt semântico provider_truncated contém contagem/cache/finish incompatível.'
+      );
+    }
+  }
+  if (
+    semantic.status === 'protocol_failure' ||
+    semantic.status === 'composite_fence_rejected'
+  ) {
+    if (
+      semantic.providerCallCount !== 1 ||
+      semantic.cacheHit ||
+      semantic.skipReason !== null
+    ) {
+      throw new Error(
+        'Receipt semântico de falha tipada contém contagem/cache/skip incompatível.'
+      );
+    }
   }
   if (semantic.providerCallCount === 0 && semantic.status === 'provider_error' && !semantic.skipReason) {
     throw new Error('Erro de provider sem chamada exige skipReason factual.');
