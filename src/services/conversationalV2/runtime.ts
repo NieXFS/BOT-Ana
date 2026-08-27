@@ -57,6 +57,7 @@ import {
   type ModelTurnResultV2,
   type PendingFrameSnapshotV2,
   type PendingTransitionCandidate,
+  type PlanningIntentReceiptV2,
   type ResolutionProof,
   type TurnFrameV2,
   type TurnPlanReceiptV2,
@@ -89,6 +90,7 @@ import {
 } from './serviceResolver';
 import {
   isAnaV2ServiceContextEnabled,
+  isAnaV2PlanningIntentShadowEnabled,
   isAnaV2SemanticServiceResolverEnabled,
   isAnaV2ServiceResolverEnabled,
 } from './featureFlag';
@@ -171,6 +173,9 @@ import {
 import { coordinateRecoveryV2 } from './recoveryCoordinator';
 import { buildUnderstandingFailureDivergenceV2 } from './divergence';
 import { classifyRecoveryFallbackIntentV2 } from './recoveryFallbackIntent';
+import {
+  buildPlanningIntentReceiptV2,
+} from './planningIntentV2';
 import {
   composeProcedureInfoComponentV2,
   decideProcedureInfoV2,
@@ -295,6 +300,8 @@ export interface ReceptionistV2RuntimeDeps {
   serviceResolverEnabled?: boolean;
   /** IA-25: rollout estreito da Camada B; produção omite e fica OFF. */
   semanticServiceResolverEnabled?: boolean;
+  /** IA-27A1: receipt-only shadow; não participa do planner. */
+  planningIntentShadowEnabled?: boolean;
   /** Fixture-only completion; produção usa o adapter DeepSeek fixo. */
   semanticServiceCompletionFactory?: SemanticServiceCompletionFactory;
   /** Versão aditiva do catálogo, quando o contrato externo a fornecer. */
@@ -990,6 +997,8 @@ export async function getReceptionistReplyV2(input: {
   serviceResolverEnabled?: boolean;
   /** IA-25: rollout da Camada B; default vazio/off. */
   semanticServiceResolverEnabled?: boolean;
+  /** IA-27A1: rollout receipt-only; default OFF. */
+  planningIntentShadowEnabled?: boolean;
   deps?: ReceptionistV2RuntimeDeps;
 }): Promise<PreparedReceptionistTurnV2> {
   const deps = input.deps ?? {};
@@ -1024,6 +1033,10 @@ export async function getReceptionistReplyV2(input: {
       serviceContextEnabled,
       serviceResolverEnabled
     );
+  const planningIntentShadowEnabled = isAnaV2PlanningIntentShadowEnabled(
+    input.config.tenantSlug,
+    input.planningIntentShadowEnabled ?? deps.planningIntentShadowEnabled
+  );
   const elicitationVariant = resolveElicitationVariantV2(
     input.elicitationVariant
   );
@@ -1172,6 +1185,14 @@ export async function getReceptionistReplyV2(input: {
     pending: pendingRecord?.snapshot ?? null,
     flowState,
   };
+  const planningIntentReceipt: PlanningIntentReceiptV2 | undefined =
+    planningIntentShadowEnabled
+      ? buildPlanningIntentReceiptV2({
+          inboundText: currentInboundBatchText,
+          frame,
+          services,
+        })
+      : undefined;
   let procedureInfoPlan = decideProcedureInfoV2({
     inboundText: currentInboundBatchText,
     frame,
@@ -1264,6 +1285,11 @@ export async function getReceptionistReplyV2(input: {
       : {}),
     ...(semanticServiceResolutionReceipt
       ? { semanticServiceResolution: semanticServiceResolutionReceipt }
+      : {}),
+    // IA-27A1 é deliberadamente observacional: makePlan apenas transporta o
+    // sub-recibo; nenhum planner/fast-path/gate lê este valor.
+    ...(planningIntentReceipt
+      ? { planningIntent: planningIntentReceipt }
       : {}),
     result: 'accepted_for_delivery',
   });

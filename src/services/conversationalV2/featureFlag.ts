@@ -11,6 +11,10 @@ export const ANA_V2_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS_ENV =
 export const ANA_V2_SEMANTIC_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS_ENV =
   'ANA_V2_SEMANTIC_SERVICE_RESOLVER_ROLLOUT_TENANT_SLUGS';
 
+/** IA-27A1: observação apenas; nunca altera a rota ou o planner. */
+export const ANA_V2_PLANNING_INTENT_SHADOW_ROLLOUT_TENANT_SLUGS_ENV =
+  'ANA_V2_PLANNING_INTENT_SHADOW_ROLLOUT_TENANT_SLUGS';
+
 /**
  * Allowlist deliberadamente fechada. O contrato v2 proíbe `*`; vazio, ausente
  * ou uma entrada inválida mantêm o tenant integralmente na rota v1.
@@ -103,6 +107,28 @@ export function isAnaV2SemanticServiceResolverEnabled(
   if (serviceContextEnabled !== true || serviceResolverEnabled !== true) {
     return false;
   }
+  const slug = tenantSlug.trim();
+  if (!slug || !rawAllowlist?.trim()) return false;
+  const entries = rawAllowlist
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (entries.includes('*')) return false;
+  return entries.includes(slug);
+}
+
+/**
+ * IA-27A1 fica desligado por padrão e só pode ser ligado por tenant explícito.
+ * O booleano injetado é destinado aos fixtures; `*` continua proibido.
+ */
+export function isAnaV2PlanningIntentShadowEnabled(
+  tenantSlug: string,
+  explicit?: boolean,
+  rawAllowlist =
+    process.env[ANA_V2_PLANNING_INTENT_SHADOW_ROLLOUT_TENANT_SLUGS_ENV]
+): boolean {
+  if (typeof explicit === 'boolean') return explicit;
+  if (!isAnaConversationalV2Enabled(tenantSlug)) return false;
   const slug = tenantSlug.trim();
   if (!slug || !rawAllowlist?.trim()) return false;
   const entries = rawAllowlist

@@ -1,5 +1,9 @@
 import { createHash } from 'crypto';
-import { FLOW_STATE_COMMIT_OUTCOMES_V2 } from './contracts';
+import {
+  FLOW_STATE_COMMIT_OUTCOMES_V2,
+  PLANNING_INFORMATION_FAMILIES_V2,
+  PLANNING_TRANSACTIONS_V2,
+} from './contracts';
 import type {
   PendingTransitionCandidate,
   RedactedPendingTransitionCandidateV2,
@@ -66,6 +70,81 @@ const WAMID_VALUE_RE = /\bwamid\b|wamid\./iu;
  */
 const RFC4122_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function assertPlanningIntentReceiptV2(value: unknown): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Receipt de intenção de planejamento inválido.');
+  }
+  const planning = value as Record<string, unknown>;
+  const expectedKeys = [
+    'version',
+    'mode',
+    'hasPendingAnswerSignal',
+    'informationFamilies',
+    'transactionSignal',
+    'arbitrationCandidate',
+    'subjectSource',
+  ];
+  const actualKeys = Object.keys(planning).sort();
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key, index) => key !== [...expectedKeys].sort()[index])
+  ) {
+    throw new Error('Receipt de intenção de planejamento contém campo extra ou ausente.');
+  }
+  if (planning.version !== 1 || planning.mode !== 'shadow') {
+    throw new Error('Receipt de intenção de planejamento exige versão 1 em shadow.');
+  }
+  if (typeof planning.hasPendingAnswerSignal !== 'boolean') {
+    throw new Error('Receipt de intenção de planejamento exige booleano pending.');
+  }
+  if (
+    !Array.isArray(planning.informationFamilies) ||
+    new Set(planning.informationFamilies).size !== planning.informationFamilies.length ||
+    planning.informationFamilies.some(
+      (family) =>
+        !(PLANNING_INFORMATION_FAMILIES_V2 as readonly unknown[]).includes(family)
+    )
+  ) {
+    throw new Error('Receipt de intenção de planejamento contém família inválida.');
+  }
+  if (
+    planning.transactionSignal !== null &&
+    !(PLANNING_TRANSACTIONS_V2 as readonly unknown[]).includes(
+      planning.transactionSignal
+    )
+  ) {
+    throw new Error('Receipt de intenção de planejamento contém transação inválida.');
+  }
+  if (
+    ![
+      'information_first',
+      'pending_answer',
+      'transaction',
+      'general',
+    ].includes(String(planning.arbitrationCandidate))
+  ) {
+    throw new Error('Receipt de intenção de planejamento contém arbitragem inválida.');
+  }
+  if (
+    !['current_inbound', 'fixed_service', 'none'].includes(
+      String(planning.subjectSource)
+    )
+  ) {
+    throw new Error('Receipt de intenção de planejamento contém subjectSource inválido.');
+  }
+  const expectedArbitration =
+    planning.informationFamilies.length > 0
+      ? 'information_first'
+      : planning.hasPendingAnswerSignal
+        ? 'pending_answer'
+        : planning.transactionSignal !== null
+          ? 'transaction'
+          : 'general';
+  if (planning.arbitrationCandidate !== expectedArbitration) {
+    throw new Error('Receipt de intenção de planejamento contém arbitragem incoerente.');
+  }
+}
 
 function assertRedactedValue(
   value: unknown,
@@ -154,7 +233,10 @@ export function assertReceiptRedactedV2(
   context: ReceiptRedactionContextV2 = {}
 ): void {
   assertRedactedValue(receipt, '$', context, new Set<object>());
-  const semantic = (receipt as TurnPlanReceiptV2).semanticServiceResolution;
+  const plan = receipt as TurnPlanReceiptV2;
+  const planning = plan.planningIntent;
+  if (planning !== undefined) assertPlanningIntentReceiptV2(planning);
+  const semantic = plan.semanticServiceResolution;
   if (!semantic) return;
   if (semantic.attemptedInvocationReason !== semantic.invocationReason) {
     throw new Error(

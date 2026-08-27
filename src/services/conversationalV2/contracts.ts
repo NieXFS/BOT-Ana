@@ -3,6 +3,71 @@ import type { CopyVariantIdV2 } from './copyVariants';
 import type { VoiceReceiptV2 } from './voice/types';
 import type { SemanticServiceResolverReceipt } from './semanticServiceResolver';
 
+/** IA-27A1: facetas independentes observadas pelo classificador shadow. */
+export const PLANNING_INFORMATION_FAMILIES_V2 = [
+  'PRICE',
+  'DURATION',
+  'SERVICE_NAME',
+  'SERVICE_EXISTENCE',
+  'PROFESSIONAL_EXISTENCE',
+  'ADDRESS',
+  'PROCEDURE_INFO',
+  'GENERIC_INFORMATION',
+] as const;
+
+export type PlanningInformationFamilyV2 =
+  (typeof PLANNING_INFORMATION_FAMILIES_V2)[number];
+
+export const PLANNING_TRANSACTIONS_V2 = [
+  'BOOKING',
+  'CANCELLATION',
+  'RESCHEDULE',
+  'CONFIRMATION',
+] as const;
+
+export type PlanningTransactionV2 =
+  (typeof PLANNING_TRANSACTIONS_V2)[number] | null;
+
+export type PlanningIntentArbitrationV2 =
+  | 'INFORMATION_FIRST'
+  | 'PENDING_ANSWER'
+  | 'TRANSACTION'
+  | 'GENERAL';
+
+export type PlanningIntentArbitrationCandidateV2 =
+  | 'information_first'
+  | 'pending_answer'
+  | 'transaction'
+  | 'general';
+
+export type PlanningSubjectSourceV2 =
+  | 'current_inbound'
+  | 'fixed_service'
+  | 'none';
+
+export interface PlanningIntentSignalsV2 {
+  answersPending: boolean;
+  informationFamilies: PlanningInformationFamilyV2[];
+  transaction: PlanningTransactionV2;
+}
+
+export interface PlanningIntentClassificationV2 {
+  signals: PlanningIntentSignalsV2;
+  arbitration: PlanningIntentArbitrationV2;
+  subjectSource: PlanningSubjectSourceV2;
+}
+
+/** Sub-recibo IA-27A1: somente enums/booleanos, sem conteúdo ou identidade. */
+export interface PlanningIntentReceiptV2 {
+  version: 1;
+  mode: 'shadow';
+  hasPendingAnswerSignal: boolean;
+  informationFamilies: PlanningInformationFamilyV2[];
+  transactionSignal: PlanningTransactionV2;
+  arbitrationCandidate: PlanningIntentArbitrationCandidateV2;
+  subjectSource: PlanningSubjectSourceV2;
+}
+
 export const MODEL_REPLY_PURPOSES_V2 = [
   'SOCIAL',
   'SERVICE_QUESTION',
@@ -508,6 +573,8 @@ export interface TurnPlanReceiptV2 {
   serviceContextDecision?: ServiceContextReceiptDecisionV2;
   /** IA-25: subrecibo fechado da Camada B, sem evidência/PII/catálogo. */
   semanticServiceResolution?: SemanticServiceResolverReceipt;
+  /** IA-27A1: intenção de planejamento observada, sem autoridade. */
+  planningIntent?: PlanningIntentReceiptV2;
   result: 'accepted_for_delivery';
 }
 
