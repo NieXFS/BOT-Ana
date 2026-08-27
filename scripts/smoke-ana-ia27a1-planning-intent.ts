@@ -675,6 +675,297 @@ function runAdversarialMatrix(): void {
   console.log('ia27a1 adversarial matrix: PASS');
 }
 
+function runTransactionPolarityMatrix(): void {
+  // Os sete casos abaixo já eram verdes antes da correção e permanecem como
+  // contrato explícito da precedência/pending existente.
+  assertSignals(
+    'preserved confirmation plus Sim',
+    classify('Sim.', { pending: pending('CONFIRMATION') }),
+    {
+      answersPending: true,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'PENDING_ANSWER',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'preserved cancel confirmation plus Sim',
+    classify('Sim.', { pending: pending('CANCEL_CONFIRMATION') }),
+    {
+      answersPending: true,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'PENDING_ANSWER',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'preserved draft plus Pode marcar',
+    classify('Pode marcar', { flowState: COMPLETE_BOOKING_FLOW }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'fixed_service',
+    }
+  );
+  assertSignals(
+    'preserved confirmation plus pode cancelar',
+    classify('pode cancelar', { pending: pending('CONFIRMATION') }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CANCELLATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'preserved cancel confirmation plus pode marcar',
+    classify('pode marcar', { pending: pending('CANCEL_CONFIRMATION') }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'preserved draft plus new booking details',
+    classify('Pode marcar uma limpeza amanhã?', {
+      flowState: COMPLETE_BOOKING_FLOW,
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'preserved draft plus reschedule',
+    classify('quero remarcar para amanhã', {
+      flowState: COMPLETE_BOOKING_FLOW,
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'RESCHEDULE',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'fixed_service',
+    }
+  );
+
+  // Os sete adversariais exigem que cada cue vencedor tenha polaridade
+  // positiva na própria oração. As quatro primeiras também provam que não
+  // aparece GENERIC_INFORMATION por efeito colateral.
+  assertSignals(
+    'negative cancellation is general and not generic information',
+    classify('não quero cancelar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negative reschedule is general and not generic information',
+    classify('não quero remarcar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negative booking is general and not generic information',
+    classify('não quero marcar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negative confirmation is general and not generic information',
+    classify('não quero confirmar meu agendamento'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negative cancellation plus positive reschedule',
+    classify('não quero cancelar, quero remarcar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'RESCHEDULE',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negative reschedule plus positive cancellation',
+    classify('não quero remarcar, quero cancelar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CANCELLATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negative today plus positive tomorrow booking',
+    classify('não quero marcar hoje, mas quero marcar amanhã'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negated booking compound stays general',
+    classify('não pode ser hoje'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'positive adversative booking compound wins',
+    classify('não pode ser hoje, mas pode ser amanhã'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'negative cancellation plus positive referential confirmation',
+    classify('não quero cancelar, quero confirmar meu agendamento'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+
+  // Positive controls and the productive cancellation vocabulary make the
+  // intended widening visible in the deterministic output.
+  assertSignals(
+    'positive cancellation control',
+    classify('quero cancelar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CANCELLATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'positive reschedule control',
+    classify('quero remarcar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'RESCHEDULE',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'positive booking control',
+    classify('quero marcar'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'positive referential confirmation control',
+    classify('quero confirmar meu agendamento'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  for (const verb of ['cancela', 'cancelem', 'desmarca', 'desmarquem']) {
+    assertSignals(
+      `productive cancellation widening ${verb}`,
+      classify(verb),
+      {
+        answersPending: false,
+        informationFamilies: [],
+        transaction: 'CANCELLATION',
+        arbitration: 'TRANSACTION',
+        subjectSource: 'none',
+      }
+    );
+  }
+
+  // The legacy topical cue remains polarity-insensitive: a negated scheduling
+  // mention still suppresses the generic-information fallback.
+  assertSignals(
+    'negated scheduling mention remains topical',
+    classify('não quero marcar, qual?'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+
+  // The referential matcher is now clause-local. This is intentionally a
+  // narrowing: the comma-separated form is no longer CONFIRMATION; the
+  // legacy standalone `agendamento` booking cue can still yield BOOKING.
+  assertSignals(
+    'comma-separated referential confirmation narrows',
+    classify('confirmar, por favor, meu agendamento'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+
+  console.log('ia27a1 transaction polarity matrix: PASS');
+}
+
 const CONFIG = {
   tenantSlug: 'ia27a1-fixture',
   botName: 'Ana',
@@ -851,6 +1142,7 @@ async function runShadowGate(): Promise<void> {
 async function main(): Promise<void> {
   runClassificationMatrix();
   runAdversarialMatrix();
+  runTransactionPolarityMatrix();
   await runShadowGate();
   console.log('smoke ana ia27a1 planning intent: OK');
 }

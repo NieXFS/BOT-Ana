@@ -1,4 +1,5 @@
 import type { ServicesResult } from '../calendarService';
+import { detectPositiveCancellationIntentV2 } from './cancellationFlowV2';
 import { resolveServiceFromCatalog } from './serviceResolver';
 import { PENDING_FAST_PATH_MAX_AGE_MS } from './modelResultParser';
 import type {
@@ -13,6 +14,10 @@ import type {
   PlanningTransactionV2,
   TurnFrameV2,
 } from './contracts';
+import {
+  hasPositiveClauseMatchV2,
+  splitClausesV2,
+} from './polarity';
 
 /**
  * IA-27A1 — detector determinístico de intenção de planejamento.
@@ -216,6 +221,79 @@ function hasTimeExpression(rawText: string, normalized: string): boolean {
   );
 }
 
+/**
+ * A normalização usada pelos cues legados remove pontuação e, com isso,
+ * destruiria as fronteiras que `hasPositiveClauseMatchV2` precisa observar.
+ * Mantemos pontuação/adversativas e removemos apenas acentos para que os
+ * matchers históricos continuem aceitando pt-BR acentuado.
+ */
+function normalizeClausePolarityWitness(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+const BOOKING_CAPACITY_RE =
+  /\b(?:tem|tenho|ha|existe)\s+(?:vaga|horario|horarios|encaixe)\b/u;
+const BOOKING_AVAILABILITY_RE =
+  /\b(?:vaga|encaixe|disponibilidade|horario disponivel|horarios disponiveis)\b/u;
+const BOOKING_ACTION_RE =
+  /\b(?:agendar|agende|agendamento|marcar|marque|marcacao|reservar|reserve|reserva)\b/u;
+const BOOKING_READ_RE =
+  /\b(?:consultar|conferir|verificar)\s+(?:horario|horarios|disponibilidade)\b/u;
+const BOOKING_HORARIO_DATE_RE =
+  /\b(?:horario|horarios)\b.*\b(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia)\b/u;
+const BOOKING_ACCEPTANCE_RE =
+  /\b(?:pode ser|pode ficar|fica para|fica pra|serve)\b/u;
+const BOOKING_DATE_RE =
+  /\b(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia)\b/u;
+
+const RESCHEDULE_RE =
+  /\b(?:remarcar|remarque|remarcacao|reagendar|reagende|reagendamento)\b/u;
+const RESCHEDULE_TIME_CHANGE_RE =
+  /\b(?:mudar|trocar|alterar|passar)\s+(?:o\s+)?(?:horario|dia|data)\b/u;
+
+const REFERENTIAL_CONFIRMATION_RE =
+  /\b(?:confirmar|confirma|confirmo|confirmado|confirmada)\b(?:\s+\w+){0,3}\s+(?:agendamento|marcacao|reserva|consulta|horario)\b/u;
+
+/**
+ * Compostas exigem que os dois cues estejam na MESMA oração e que cada um
+ * tenha testemunho positivo. Isso evita combinar um match positivo de A com
+ * um teste cru de B através de uma vírgula ou de uma adversativa.
+ */
+function hasPositiveClauseCompositeMatchV2(
+  value: string,
+  matchers: readonly RegExp[]
+): boolean {
+  return splitClausesV2(value).some((clause) =>
+    matchers.every((matcher) => hasPositiveClauseMatchV2(clause, matcher))
+  );
+}
+
+function hasPositiveBookingCue(rawText: string): boolean {
+  const witnessed = normalizeClausePolarityWitness(rawText);
+  return (
+    hasPositiveClauseMatchV2(witnessed, BOOKING_CAPACITY_RE) ||
+    hasPositiveClauseMatchV2(witnessed, BOOKING_AVAILABILITY_RE) ||
+    hasPositiveClauseMatchV2(witnessed, BOOKING_ACTION_RE) ||
+    hasPositiveClauseMatchV2(witnessed, BOOKING_READ_RE) ||
+    hasPositiveClauseMatchV2(witnessed, BOOKING_HORARIO_DATE_RE) ||
+    hasPositiveClauseCompositeMatchV2(witnessed, [
+      BOOKING_ACCEPTANCE_RE,
+      BOOKING_DATE_RE,
+    ])
+  );
+}
+
+function hasPositiveRescheduleCue(rawText: string): boolean {
+  const witnessed = normalizeClausePolarityWitness(rawText);
+  return (
+    hasPositiveClauseMatchV2(witnessed, RESCHEDULE_RE) ||
+    hasPositiveClauseMatchV2(witnessed, RESCHEDULE_TIME_CHANGE_RE)
+  );
+}
+
 function hasBookingCue(normalized: string): boolean {
   return (
     /\b(?:tem|tenho|ha|existe)\s+(?:vaga|horario|horarios|encaixe)\b/u.test(
@@ -237,23 +315,6 @@ function hasBookingCue(normalized: string): boolean {
       /\b(?:hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia)\b/u.test(
         normalized
       )
-  );
-}
-
-function hasCancellationCue(normalized: string): boolean {
-  return /\b(?:cancelar|cancele|cancelamento|desmarcar|desmarque|desmarcacao)\b/u.test(
-    normalized
-  );
-}
-
-function hasRescheduleCue(normalized: string): boolean {
-  return (
-    /\b(?:remarcar|remarque|remarcacao|reagendar|reagende|reagendamento)\b/u.test(
-      normalized
-    ) ||
-    /\b(?:mudar|trocar|alterar|passar)\s+(?:o\s+)?(?:horario|dia|data)\b/u.test(
-      normalized
-    )
   );
 }
 
@@ -436,9 +497,10 @@ function hasCompleteBookingDraft(
   );
 }
 
-function hasExplicitReferentialConfirmation(normalized: string): boolean {
-  return /\b(?:confirmar|confirma|confirmo|confirmado|confirmada)\b(?:\s+\w+){0,3}\s+(?:agendamento|marcacao|reserva|consulta|horario)\b/u.test(
-    normalized
+function hasExplicitReferentialConfirmation(rawText: string): boolean {
+  return hasPositiveClauseMatchV2(
+    normalizeClausePolarityWitness(rawText),
+    REFERENTIAL_CONFIRMATION_RE
   );
 }
 
@@ -449,20 +511,22 @@ function transactionSignal(input: {
   answersPending: boolean;
   flowState: PlanningIntentDetectorInputV2['flowState'];
 }): PlanningTransactionV2 {
-  if (hasRescheduleCue(input.normalized)) return 'RESCHEDULE';
-  if (hasCancellationCue(input.normalized)) return 'CANCELLATION';
+  if (hasPositiveRescheduleCue(input.rawText)) return 'RESCHEDULE';
+  if (detectPositiveCancellationIntentV2(input.rawText)) {
+    return 'CANCELLATION';
+  }
 
   const confirmation = isClosedActionConfirmation(
     input.rawText,
     input.normalized,
     'booking'
   );
-  const booking = hasBookingCue(input.normalized);
+  const booking = hasPositiveBookingCue(input.rawText);
   const confirmableContext =
     (input.answersPending && input.pending?.kind === 'CONFIRMATION') ||
     (!input.pending && hasCompleteBookingDraft(input.flowState));
   if (
-    hasExplicitReferentialConfirmation(input.normalized) ||
+    hasExplicitReferentialConfirmation(input.rawText) ||
     (confirmableContext &&
       (confirmation || isCompactAffirmative(input.rawText)))
   ) {
