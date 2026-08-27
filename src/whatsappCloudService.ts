@@ -1,6 +1,9 @@
 import axios, { type AxiosRequestConfig } from 'axios';
 import type { TenantBotConfig } from './configProvider';
-import { labPhoneNumberAllowed } from './runtimePolicy';
+import {
+  labCustomerPhoneAllowed,
+  labPhoneNumberAllowed,
+} from './runtimePolicy';
 
 export type WhatsAppTenantConfig = Pick<
   TenantBotConfig,
@@ -14,6 +17,12 @@ function buildApiUrl(waConfig: WhatsAppTenantConfig) {
 function assertWhatsAppTenantAllowed(waConfig: WhatsAppTenantConfig): void {
   if (!labPhoneNumberAllowed(waConfig.phoneNumberId)) {
     throw new Error('WhatsApp tenant bloqueado pela cerca do LAB.');
+  }
+}
+
+function assertWhatsAppRecipientAllowed(to: string): void {
+  if (!labCustomerPhoneAllowed(to)) {
+    throw new Error('WhatsApp destinatário bloqueado pela cerca do LAB.');
   }
 }
 
@@ -32,6 +41,7 @@ export async function sendFreeformMessage(
   waConfig: WhatsAppTenantConfig
 ): Promise<void> {
   assertWhatsAppTenantAllowed(waConfig);
+  assertWhatsAppRecipientAllowed(to);
   await axios.post(
     buildApiUrl(waConfig),
     {
@@ -63,6 +73,7 @@ export async function sendFreeformMessageWithReceipt(
   waConfig: WhatsAppTenantConfig
 ): Promise<{ providerMessageId: string }> {
   assertWhatsAppTenantAllowed(waConfig);
+  assertWhatsAppRecipientAllowed(to);
   const response = await axios.post<{
     messages?: Array<{ id?: unknown }>;
   }>(
@@ -259,6 +270,7 @@ export async function sendAudioMessage(
   post: WhatsAppHttpPost = defaultHttpPost
 ): Promise<void> {
   assertWhatsAppTenantAllowed(waConfig);
+  assertWhatsAppRecipientAllowed(to);
   await post(buildApiUrl(waConfig), buildAudioMessagePayload(to, mediaId), {
     headers: headers(waConfig),
     timeout: 20_000,
@@ -274,6 +286,7 @@ export async function sendVideoMessage(
   caption?: string
 ): Promise<void> {
   assertWhatsAppTenantAllowed(waConfig);
+  assertWhatsAppRecipientAllowed(to);
   await post(
     buildApiUrl(waConfig),
     buildVideoMessagePayload(to, mediaId, caption),

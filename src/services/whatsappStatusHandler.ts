@@ -1,5 +1,8 @@
 import axios from 'axios';
-import { assertExternalWriteAllowed } from '../runtimePolicy';
+import {
+  assertExternalWriteAllowed,
+  isAnaLabRuntime,
+} from '../runtimePolicy';
 import { ERP_API_TOKEN } from '../erpApiToken';
 import { Sentry } from '../observability/sentry';
 import {
@@ -140,6 +143,12 @@ export interface WhatsAppStatusStore {
     attempts: number,
     nextAttemptAt: Date,
     failureCode: string
+  ) => Promise<boolean>;
+  markCallbackDismissed: (
+    providerMessageId: string,
+    statusEvent: WhatsAppStatusEventName,
+    version: number,
+    failureCode: 'LAB_WRITE_DISABLED'
   ) => Promise<boolean>;
   listPendingCallbacks: (limit: number) => Promise<StatusCallbackObligation[]>;
 }
@@ -284,6 +293,27 @@ export const pgWhatsAppStatusStore: WhatsAppStatusStore = {
     );
     return result.rowCount === 1;
   },
+  async markCallbackDismissed(
+    providerMessageId,
+    statusEvent,
+    version,
+    failureCode
+  ) {
+    const result = await pool.query(
+      `UPDATE sent_question_replies
+       SET callback_pending = false,
+           callback_next_attempt_at = NULL,
+           callback_ack_at = NULL,
+           callback_failure_code = $4,
+           updated_at = now()
+       WHERE provider_message_id = $1
+         AND provider_status = $2
+         AND provider_status_version = $3
+         AND callback_pending = true`,
+      [providerMessageId, statusEvent, version, failureCode]
+    );
+    return result.rowCount === 1;
+  },
   async listPendingCallbacks(limit) {
     const result = await pool.query<RawStatusObligationRow>(
       `SELECT phone_number_id, provider_message_id, provider_status,
@@ -360,6 +390,17 @@ async function attemptStatusCallbackOnce(
   deps: WhatsAppStatusDeps,
   attempts: number
 ): Promise<{ delivered: boolean; stillCurrent: boolean }> {
+  if (isAnaLabRuntime()) {
+    await deps.store.markCallbackDismissed(
+      obligation.providerMessageId,
+      obligation.statusEvent,
+      obligation.version,
+      'LAB_WRITE_DISABLED'
+    );
+    // `stillCurrent:false` encerra o fast-retry local. CAS falso significa que
+    // um status mais novo já assumiu a obrigação; ele será tratado à parte.
+    return { delivered: false, stillCurrent: false };
+  }
   try {
     await deps.postCallback({
       phoneNumberId: obligation.phoneNumberId,
@@ -496,6 +537,7 @@ export async function handleWhatsAppStatuses(
   let persistenceError = false;
   const awaitCallbacks = options.awaitCallbacks ?? true;
   const throwOnPersistenceFailure = options.throwOnPersistenceFailure ?? false;
+  const labRuntime = isAnaLabRuntime();
   let resolvedAllowV2Fallback: boolean | undefined;
   let allowV2FallbackResolved = false;
   const resolveAllowV2Fallback = async (): Promise<boolean> => {
@@ -570,7 +612,9 @@ export async function handleWhatsAppStatuses(
         applied += 1;
       }
 
-      if (awaitCallbacks) {
+      if (awaitCallbacks || labRuntime) {
+        // No LAB, a dispensa terminal local faz parte do ingest durável e
+        // precisa terminar antes do HTTP 200; não existe sweeper externo.
         await postCallbackWithRetries(local.obligation, deps);
       } else {
         // Fast attempt opcional: iniciado somente depois de apply() ter
@@ -578,7 +622,7 @@ export async function handleWhatsAppStatuses(
         void postCallbackWithRetries(local.obligation, deps).catch(() => undefined);
       }
     } catch (error) {
-      if (!localPersisted) persistenceError = true;
+      if (!localPersisted || labRuntime) persistenceError = true;
       Sentry.captureException(new Error('whatsapp status processing failed'), {
         level: 'warning',
         tags: {

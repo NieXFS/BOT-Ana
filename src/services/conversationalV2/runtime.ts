@@ -168,7 +168,10 @@ import {
   opaqueReceiptHashV2,
   redactPendingTransitionCandidateV2,
 } from './receipts';
-import { coordinateRecoveryV2 } from './recoveryCoordinator';
+import {
+  coordinateRecoveryV2,
+  OTHER_FALLBACK_V2,
+} from './recoveryCoordinator';
 import { buildUnderstandingFailureDivergenceV2 } from './divergence';
 import { classifyRecoveryFallbackIntentV2 } from './recoveryFallbackIntent';
 import {
@@ -3489,6 +3492,86 @@ export async function getReceptionistReplyV2(input: {
     return preparedPreemption(recovery.preemption, successorTurnId, loop);
   }
 
+  const prepareLabEscalationFallback = (
+    regenCalls: 0 | 1,
+    boundaryAttempts: Array<{
+      index: number;
+      candidateHash: string;
+      reasonCodes: BoundaryReasonCodeV2[];
+    }>
+  ) => {
+    const candidate = { kind: 'preserve' } as const;
+    const planReceipt = makePlan({
+      route: 'fallback',
+      loop,
+      candidate,
+      recoveryKind: 'direct_fallback',
+      regenCalls,
+      boundaryAttempts,
+    });
+    const recoveredCandidate = enforceCanonicalTimeSummaryTransitionV2({
+      frame,
+      flowState: nextFlowState,
+      services,
+      payload: OTHER_FALLBACK_V2,
+      candidate,
+      writeCommitted,
+    });
+    let fallbackCandidate = adjustTransitionForFlowResetV2(
+      coerceEquivalentOpenTransitionV2(
+        recoveredCandidate,
+        frame,
+        nextFlowState
+      ),
+      frame.pending,
+      flowResetReason
+    );
+    fallbackCandidate = applyCancellationAbandonmentTransitionV2(
+      fallbackCandidate,
+      cancellationAbandonment
+    );
+    const skipOperationalStamp =
+      cancellationFastPath.kind === 'resolved' &&
+      cancellationFastPath.refreshOperationalAt === false;
+    const committedFlowState = skipOperationalStamp
+      ? nextFlowState
+      : stampFlowOperationalActivityV2(nextFlowState, startedAt);
+    const transition = materializeTransition(
+      fallbackCandidate,
+      frame,
+      committedFlowState,
+      services,
+      nowFn(),
+      id,
+      hasDuplicateResolutionReadEvidence(loop)
+    );
+    emitRouteComparisonShadow({
+      legacyRoute: legacyShadowRoute,
+      v2Route: 'fallback',
+    });
+    return {
+      kind: ANA_CONVERSATIONAL_V2_PREPARED_KIND,
+      frame: { ...frame, flowState: committedFlowState },
+      conversationKey,
+      phoneNumberId: input.config.phoneNumberId,
+      customerPhone: input.phone,
+      config: input.config,
+      payload: OTHER_FALLBACK_V2,
+      transition,
+      planReceipt,
+      preemption: null,
+      successorTurnId,
+      hasCommittedWrite: writeCommitted,
+      canonicalPendingQuestion: canonicalPendingQuestion(
+        { ...frame, flowState: committedFlowState },
+        services,
+        shouldReanchorPendingQuestion
+      ),
+      elicitationVariant,
+      copyVariant: 'canonical' as const,
+    };
+  };
+
   if (recovery.status === 'silent_escalation') {
     const candidate = recovery.pendingTransitionCandidate;
     const boundaryAttempts = recovery.boundaryAttempts.map((entry) => ({
@@ -3522,6 +3605,12 @@ export async function getReceptionistReplyV2(input: {
       },
       deps.escalateSilentDeps
     );
+    if (silentOutcome.kind === 'lab_write_disabled') {
+      return prepareLabEscalationFallback(
+        recovery.regenCount,
+        boundaryAttempts
+      );
+    }
     if (!isAuthoritativeSilentEscalationOutcome(silentOutcome)) {
       throw new SilentEscalationHoldPersistenceError(
         'silent escalation missing durable hold or authoritative concurrent state'
@@ -3633,6 +3722,12 @@ export async function getReceptionistReplyV2(input: {
       },
       deps.escalateSilentDeps
     );
+    if (silentOutcome.kind === 'lab_write_disabled') {
+      return prepareLabEscalationFallback(
+        recovery.regenCount,
+        boundaryAttempts
+      );
+    }
     if (!isAuthoritativeSilentEscalationOutcome(silentOutcome)) {
       throw new SilentEscalationHoldPersistenceError(
         'visible escalation missing durable hold or authoritative concurrent state'

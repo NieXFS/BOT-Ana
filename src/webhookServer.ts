@@ -79,6 +79,8 @@ import {
   startAnaRetentionScheduler,
 } from './services/anaRetention';
 import {
+  canonicalLabCustomerPhone,
+  labV2RecoveryJobsEnabled,
   labBlockedWriteEffect,
   resolveAnaRuntimeConfig,
   type AnaLabRuntimeConfig,
@@ -94,6 +96,7 @@ export interface CloudWebhookValue {
   metadata?: CloudWebhookMetadata;
   contacts?: CloudContact[];
   messages?: CloudMessage[];
+  message_echoes?: unknown[];
   statuses?: unknown[];
 }
 
@@ -196,7 +199,9 @@ export type LabWebhookFenceReason =
   | 'tenant_inactive'
   | 'tenant_role_not_allowed'
   | 'tenant_slug_not_allowed'
-  | 'tenant_phone_mismatch';
+  | 'tenant_phone_mismatch'
+  | 'missing_customer_phone'
+  | 'customer_phone_not_allowed';
 
 export class LabWebhookRejectedError extends Error {
   constructor(readonly reason: LabWebhookFenceReason) {
@@ -233,6 +238,40 @@ export function authorizeLabWebhookValue(
     throw new LabWebhookRejectedError('tenant_phone_mismatch');
   }
   return config;
+}
+
+function authorizeLabWebhookCustomers(
+  change: WebhookChange,
+  runtime: AnaLabRuntimeConfig
+): void {
+  const value = change.value;
+  if (!value) return;
+  const candidates: unknown[] = isEchoChange(change.field)
+    ? (value.message_echoes ?? []).map((echo) =>
+        echo && typeof echo === 'object'
+          ? (echo as { to?: unknown }).to
+          : undefined
+      )
+    : (value.messages ?? []).map((message) => message.from);
+
+  if (
+    (isEchoChange(change.field) || Boolean(value.messages?.length)) &&
+    candidates.length === 0
+  ) {
+    throw new LabWebhookRejectedError('missing_customer_phone');
+  }
+  for (const candidate of candidates) {
+    const customerPhone =
+      typeof candidate === 'string'
+        ? canonicalLabCustomerPhone(candidate)
+        : '';
+    if (!customerPhone) {
+      throw new LabWebhookRejectedError('missing_customer_phone');
+    }
+    if (!runtime.allowedCustomerPhones.has(customerPhone)) {
+      throw new LabWebhookRejectedError('customer_phone_not_allowed');
+    }
+  }
 }
 
 interface WebhookChange {
@@ -275,6 +314,9 @@ async function preflightLabWebhook(
     if (!runtime.allowedPhoneNumberIds.has(phoneNumberId)) {
       throw new LabWebhookRejectedError('phone_number_not_allowed');
     }
+    // A cerca do cliente precede config/state/model/tool/handler. Em especial,
+    // um remetente estranho não provoca nem a leitura de configuração do tenant.
+    authorizeLabWebhookCustomers(change, runtime);
     let pending = configByPhone.get(phoneNumberId);
     if (!pending) {
       pending = webhookStatusConfigLoader(phoneNumberId);
@@ -646,7 +688,8 @@ app.get('/health', (_req: Request, res: Response) => {
       status: 'ok',
       runtimeMode: 'lab',
       writePolicy: runtime.writePolicy,
-      backgroundJobs: runtime.backgroundJobs,
+      globalBackgroundJobs: runtime.globalBackgroundJobs,
+      v2RecoveryJobs: runtime.v2RecoveryJobs,
       ts: new Date().toISOString(),
     });
     return;
@@ -1113,9 +1156,15 @@ export async function initializeRuntimeServices(
   rawV2Allowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
 ): Promise<void> {
   if (runtime.mode === 'lab') {
-    // Boot normal LAB é estritamente read-only sobre schema: sem DDL, retenção,
-    // probe global ou consumer. O bootstrap é um comando manual separado.
+    // Boot normal LAB nunca faz DDL. Só os dois recoveries da V2 operam sobre
+    // o storage dedicado; workers de negócio externo permanecem desligados.
     await operations.validateLabSchema(runtime.databaseFingerprint);
+    if (
+      labV2RecoveryJobsEnabled(runtime.allowedTenantSlugs, rawV2Allowlist)
+    ) {
+      await operations.startConversationalV2();
+      await operations.startConversationalV2Successor();
+    }
     return;
   }
 

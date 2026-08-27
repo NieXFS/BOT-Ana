@@ -27,6 +27,7 @@ import { Sentry } from '../observability/sentry';
 import { runtimeErrorKind, technicalHash } from '../observability/safeRuntime';
 import {
   assertExternalWriteAllowed,
+  isAnaLabRuntime,
   labBlockedWriteEffect,
 } from '../runtimePolicy';
 
@@ -481,7 +482,8 @@ export type SilentUnderstandingFailureOutcome =
   | { kind: 'deduplicated'; questionId: string }
   | { kind: 'active_elsewhere' }
   | { kind: 'pending' }
-  | { kind: 'released' };
+  | { kind: 'released' }
+  | { kind: 'lab_write_disabled'; reason: 'lab_write_disabled' };
 
 export interface SilentUnderstandingFailureDeps {
   post?: EscalationDeps['post'];
@@ -579,6 +581,25 @@ export async function escalateSilentUnderstandingFailure(
   },
   deps: SilentUnderstandingFailureDeps = {}
 ): Promise<SilentUnderstandingFailureOutcome> {
+  if (isAnaLabRuntime()) {
+    // O LAB não cria ownership humano externo e, sem sweeper de negócio, não
+    // pode materializar um hold pending. O diagnóstico só carrega tipos e
+    // hashes técnicos; nunca a allowlist, telefone, mensagem ou divergência.
+    Sentry.captureMessage('silent escalation external write blocked', {
+      level: 'warning',
+      tags: {
+        service: 'silent_escalation',
+        operation: 'external_escalation',
+        runtime_mode: 'lab',
+        outcome: 'blocked',
+        reason: 'lab_write_disabled',
+        phoneNumberHash: technicalHash(input.phoneNumberId),
+        messageIdHash: technicalHash(input.messageId),
+      },
+    });
+    return { kind: 'lab_write_disabled', reason: 'lab_write_disabled' };
+  }
+
   const holdStore = deps.holdStore ?? pgSilentEscalationHoldStore;
   const post = deps.post ?? defaultDeps.post;
   const wait = deps.wait ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));

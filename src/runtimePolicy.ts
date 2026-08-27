@@ -14,10 +14,12 @@ export interface AnaProductionRuntimeConfig {
 export interface AnaLabRuntimeConfig {
   mode: 'lab';
   writePolicy: 'disabled';
-  backgroundJobs: false;
+  globalBackgroundJobs: false;
+  v2RecoveryJobs: boolean;
   bindHost: '127.0.0.1';
   allowedTenantSlugs: ReadonlySet<string>;
   allowedPhoneNumberIds: ReadonlySet<string>;
+  allowedCustomerPhones: ReadonlySet<string>;
   databaseFingerprint: string;
 }
 
@@ -76,7 +78,11 @@ export function safeAnaRuntimeModeTag(
 
 function parseRequiredAllowlist(
   env: RuntimeEnvironment,
-  name: 'ANA_LAB_ALLOWED_TENANT_SLUGS' | 'ANA_LAB_ALLOWED_PHONE_NUMBER_IDS'
+  name:
+    | 'ANA_LAB_ALLOWED_TENANT_SLUGS'
+    | 'ANA_LAB_ALLOWED_PHONE_NUMBER_IDS'
+    | 'ANA_LAB_ALLOWED_CUSTOMER_PHONES',
+  normalize: (entry: string) => string = (entry) => entry
 ): ReadonlySet<string> {
   const raw = trimmed(env[name]);
   if (!raw) throw new Error(`${name} é obrigatória no LAB.`);
@@ -86,7 +92,33 @@ function parseRequiredAllowlist(
     .filter(Boolean);
   if (entries.length === 0) throw new Error(`${name} não pode ser vazia.`);
   if (entries.includes('*')) throw new Error(`${name} não aceita wildcard.`);
-  return new Set(entries);
+  const normalized = entries.map(normalize).filter(Boolean);
+  if (normalized.length === 0) throw new Error(`${name} não pode ser vazia.`);
+  return new Set(normalized);
+}
+
+/**
+ * Mesma forma estável usada nas chaves de conversa: números formatados viram
+ * somente dígitos; valores sintéticos de smoke continuam comparáveis sem serem
+ * confundidos com telefone real.
+ */
+export function canonicalLabCustomerPhone(customerPhone: string): string {
+  const value = customerPhone.trim();
+  if (!/^[+\d\s().-]+$/.test(value)) return value;
+  const digits = value.replace(/\D/g, '');
+  return digits || value;
+}
+
+export function labV2RecoveryJobsEnabled(
+  allowedTenantSlugs: ReadonlySet<string>,
+  rawV2Allowlist: string | undefined
+): boolean {
+  const entries = rawV2Allowlist
+    ?.split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean) ?? [];
+  if (entries.includes('*')) return false;
+  return entries.some((entry) => allowedTenantSlugs.has(entry));
 }
 
 /**
@@ -150,6 +182,12 @@ export function resolveAnaRuntimeConfig(
   if (trimmed(env.HOST) !== '127.0.0.1') {
     throw new Error('HOST precisa ser 127.0.0.1 no LAB.');
   }
+  if (
+    trimmed(env.RECEPS_IA_DIRECT_DATABASE_URL) ||
+    trimmed(env.ANA_DIRECT_DATABASE_URL)
+  ) {
+    throw new Error('O LAB usa exclusivamente DATABASE_URL para storage local.');
+  }
 
   const databaseUrl = trimmed(env.DATABASE_URL);
   const expectedFingerprint = trimmed(env.ANA_LAB_DATABASE_FINGERPRINT);
@@ -161,18 +199,29 @@ export function resolveAnaRuntimeConfig(
     throw new Error('Fingerprint do storage LAB não confere.');
   }
 
+  const allowedTenantSlugs = parseRequiredAllowlist(
+    env,
+    'ANA_LAB_ALLOWED_TENANT_SLUGS'
+  );
+
   return {
     mode,
     writePolicy: rawWritePolicy,
-    backgroundJobs: false,
-    bindHost: '127.0.0.1',
-    allowedTenantSlugs: parseRequiredAllowlist(
-      env,
-      'ANA_LAB_ALLOWED_TENANT_SLUGS'
+    globalBackgroundJobs: false,
+    v2RecoveryJobs: labV2RecoveryJobsEnabled(
+      allowedTenantSlugs,
+      env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
     ),
+    bindHost: '127.0.0.1',
+    allowedTenantSlugs,
     allowedPhoneNumberIds: parseRequiredAllowlist(
       env,
       'ANA_LAB_ALLOWED_PHONE_NUMBER_IDS'
+    ),
+    allowedCustomerPhones: parseRequiredAllowlist(
+      env,
+      'ANA_LAB_ALLOWED_CUSTOMER_PHONES',
+      canonicalLabCustomerPhone
     ),
     databaseFingerprint: actualFingerprint,
   };
@@ -213,5 +262,16 @@ export function labPhoneNumberAllowed(
   return (
     config.mode === 'production' ||
     config.allowedPhoneNumberIds.has(phoneNumberId.trim())
+  );
+}
+
+export function labCustomerPhoneAllowed(
+  customerPhone: string,
+  env: RuntimeEnvironment = process.env
+): boolean {
+  const config = resolveAnaRuntimeConfig(env);
+  return (
+    config.mode === 'production' ||
+    config.allowedCustomerPhones.has(canonicalLabCustomerPhone(customerPhone))
   );
 }
