@@ -8,6 +8,7 @@
     "start": "node dist/webhookServer.js",
     "dev": "ts-node-dev --respawn --transpile-only src/webhookServer.ts",
     "lab:bootstrap-schema": "ts-node -T scripts/bootstrap-ana-lab-schema.ts",
+    "gate:ana-lab-pg-real": "ts-node -T scripts/gate-ana-lab-pg-real.ts",
     "benchmark:ana-models": "ts-node scripts/benchmarks/ana-models/runner.ts",
     "benchmark:ana-models:p0": "ts-node scripts/benchmarks/ana-models/runner.ts --providers openai,deepseek",
     "behavioral:clinical-honesty": "ts-node scripts/behavioral-clinical-honesty.ts",
