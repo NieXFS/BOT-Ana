@@ -603,6 +603,54 @@ function runAdversarialMatrix(): void {
     }
   );
   assertSignals(
+    'booking confirmation pending yields to cancellation',
+    classify('pode cancelar', { pending: pending('CONFIRMATION') }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CANCELLATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'cancel confirmation pending yields to booking',
+    classify('pode marcar', { pending: pending('CANCEL_CONFIRMATION') }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'complete booking draft yields to new booking details',
+    classify('Pode marcar uma limpeza amanhã?', {
+      flowState: COMPLETE_BOOKING_FLOW,
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'complete booking draft yields to reschedule',
+    classify('quero remarcar para amanhã', {
+      flowState: COMPLETE_BOOKING_FLOW,
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'RESCHEDULE',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'fixed_service',
+    }
+  );
+  assertSignals(
     'explicit referential confirmation without pending',
     classify('Quero confirmar meu agendamento'),
     {

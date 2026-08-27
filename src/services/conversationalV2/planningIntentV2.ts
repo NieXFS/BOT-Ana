@@ -257,10 +257,23 @@ function hasRescheduleCue(normalized: string): boolean {
   );
 }
 
-function hasConfirmationCue(normalized: string): boolean {
-  return /\b(?:confirmar|confirma|confirmo|confirmado|fechado|combinado)\b/u.test(
-    normalized
-  ) || /\b(?:pode marcar|pode agendar)\b/u.test(normalized);
+const CLOSED_BOOKING_CONFIRMATION_RE =
+  /^(?:(?:sim|isso|certo|tudo certo|claro|pode ser) )?(?:pode marcar|pode agendar)(?: (?:sim|por favor|entao))?$/u;
+const CLOSED_CANCELLATION_CONFIRMATION_RE =
+  /^(?:(?:sim|isso|certo|tudo certo|claro|pode ser) )?pode cancelar(?: (?:sim|por favor|entao))?$/u;
+
+function isClosedActionConfirmation(
+  rawText: string,
+  normalized: string,
+  action: 'booking' | 'cancellation'
+): boolean {
+  if (/[?？]/u.test(rawText)) return false;
+  if (isCompactAffirmative(rawText)) return true;
+
+  const matcher = action === 'booking'
+    ? CLOSED_BOOKING_CONFIRMATION_RE
+    : CLOSED_CANCELLATION_CONFIRMATION_RE;
+  return matcher.test(normalized);
 }
 
 function isOptionMentioned(
@@ -379,12 +392,18 @@ function hasPendingAnswerSignal(input: {
     return false;
   }
 
-  if (pending.kind === 'CONFIRMATION' || pending.kind === 'CANCEL_CONFIRMATION') {
-    return (
-      isCompactAffirmative(input.rawText) ||
-      /\b(?:confirmo|confirmado|pode marcar|pode agendar|pode cancelar|fechado)\b/u.test(
-        input.normalized
-      )
+  if (pending.kind === 'CONFIRMATION') {
+    return isClosedActionConfirmation(
+      input.rawText,
+      input.normalized,
+      'booking'
+    );
+  }
+  if (pending.kind === 'CANCEL_CONFIRMATION') {
+    return isClosedActionConfirmation(
+      input.rawText,
+      input.normalized,
+      'cancellation'
     );
   }
 
@@ -433,11 +452,15 @@ function transactionSignal(input: {
   if (hasRescheduleCue(input.normalized)) return 'RESCHEDULE';
   if (hasCancellationCue(input.normalized)) return 'CANCELLATION';
 
-  const confirmation = hasConfirmationCue(input.normalized);
+  const confirmation = isClosedActionConfirmation(
+    input.rawText,
+    input.normalized,
+    'booking'
+  );
   const booking = hasBookingCue(input.normalized);
   const confirmableContext =
     (input.answersPending && input.pending?.kind === 'CONFIRMATION') ||
-    hasCompleteBookingDraft(input.flowState);
+    (!input.pending && hasCompleteBookingDraft(input.flowState));
   if (
     hasExplicitReferentialConfirmation(input.normalized) ||
     (confirmableContext &&
