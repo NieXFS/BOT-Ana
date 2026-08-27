@@ -26,6 +26,11 @@ process.env.OPENAI_API_KEY ??= 'fixture-key-not-used';
 process.env.ERP_API_TOKEN ??= 'fixture-token-not-used';
 
 const FLOW_ID = 'ia27-flow';
+const NOW = new Date('2026-08-26T15:00:00.000Z');
+const FRESH_PENDING_ASKED_AT = '2026-08-26T12:00:00.000Z';
+const STALE_PENDING_ASKED_AT = new Date(
+  NOW.getTime() - 5 * 60 * 60 * 1_000
+).toISOString();
 
 const CATALOG: ServicesResult = {
   success: true,
@@ -64,13 +69,24 @@ const FIXED_FLOW: FlowStateV2 = {
   fixedByProofVersion: { fixedServiceId: 1 },
 };
 
+const COMPLETE_BOOKING_FLOW: FlowStateV2 = {
+  ...FIXED_FLOW,
+  bookingDraft: {
+    serviceId: 'ia27-service-peeling',
+    date: '2026-08-27',
+    time: '10:00',
+    slotEvidenceTurnId: 'ia27-slot-evidence',
+  },
+};
+
 function pending(
   kind: PendingKindV2,
-  options: readonly { entityId: string; displayName: string }[] = []
+  options: readonly { entityId: string; displayName: string }[] = [],
+  askedAt = FRESH_PENDING_ASKED_AT
 ): PendingFrameSnapshotV2 {
   return {
     questionId: 'ia27-question',
-    askedAt: '2026-08-26T12:00:00.000Z',
+    askedAt,
     kind,
     flowId: FLOW_ID,
     version: 1,
@@ -87,6 +103,7 @@ function classify(
 ): PlanningIntentClassificationV2 {
   return classifyPlanningIntentV2({
     inboundText,
+    now: NOW,
     services: CATALOG,
     ...input,
   });
@@ -112,6 +129,12 @@ function assertSignals(
     arbitration: expected.arbitration,
     subjectSource: expected.subjectSource,
   }, label);
+  console.log(
+    `ia27a1 ${label}: pending=${String(actual.signals.answersPending)} ` +
+      `families=${actual.signals.informationFamilies.join('|') || '-'} ` +
+      `transaction=${actual.signals.transaction ?? '-'} ` +
+      `arbitration=${actual.arbitration} subject=${actual.subjectSource}`
+  );
 }
 
 function runClassificationMatrix(): void {
@@ -238,12 +261,80 @@ function runClassificationMatrix(): void {
     }
   );
   assertSignals(
-    'affirmative pending answer',
+    'professional compact affirmative is not a slot answer',
     classify('Sim.', {
       pending: pending('PROFESSIONAL', [
         { entityId: 'ia27-professional-carla', displayName: 'Carla' },
+        { entityId: 'ia27-professional-julia', displayName: 'Júlia' },
       ]),
     }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'date compact affirmative is not a slot answer',
+    classify('sim', {
+      pending: pending('DATE', [
+        { entityId: 'date-tomorrow', displayName: 'amanhã' },
+      ]),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'service compact affirmative is not a slot answer',
+    classify('sim', {
+      pending: pending('SERVICE', [
+        { entityId: 'ia27-service-peeling', displayName: 'Peeling' },
+      ]),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'time compact affirmative is not a slot answer',
+    classify('sim', {
+      pending: pending('TIME', [
+        { entityId: '10:00', displayName: '10h' },
+      ]),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'confirmation compact affirmative is allowed',
+    classify('Sim.', { pending: pending('CONFIRMATION') }),
+    {
+      answersPending: true,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'PENDING_ANSWER',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'cancel confirmation compact affirmative is allowed',
+    classify('Sim.', { pending: pending('CANCEL_CONFIRMATION') }),
     {
       answersPending: true,
       informationFamilies: [],
@@ -266,6 +357,7 @@ function runClassificationMatrix(): void {
 
   const receipt = buildPlanningIntentReceiptV2({
     inboundText: 'Qual o valor e tem horário amanhã?',
+    now: NOW,
     services: CATALOG,
   });
   const expectedReceipt: PlanningIntentReceiptV2 = {
@@ -281,6 +373,258 @@ function runClassificationMatrix(): void {
   const receiptJson = JSON.stringify(receipt);
   assert.doesNotMatch(receiptJson, /drenagem|carla|ia27|amanha|horario/iu);
   console.log('ia27a1 classification matrix: PASS');
+}
+
+const AMBIGUOUS_NAIL_CATALOG: ServicesResult = {
+  success: true,
+  services: [
+    {
+      id: 'ia27-nail-manicure',
+      name: 'Manicure',
+      aliases: ['unha'],
+      durationMinutes: 45,
+      price: 80,
+      priceFormatted: 'R$ 80,00',
+    },
+    {
+      id: 'ia27-nail-pedicure',
+      name: 'Pedicure',
+      aliases: ['unha'],
+      durationMinutes: 45,
+      price: 80,
+      priceFormatted: 'R$ 80,00',
+    },
+    {
+      id: 'ia27-nail-combo',
+      name: 'Manicure e pedicure',
+      aliases: ['unha'],
+      durationMinutes: 90,
+      price: 140,
+      priceFormatted: 'R$ 140,00',
+    },
+  ],
+  professionals: [],
+};
+
+function runAdversarialMatrix(): void {
+  const professionalOptions = [
+    { entityId: 'ia27-professional-carla', displayName: 'Carla' },
+    { entityId: 'ia27-professional-julia', displayName: 'Júlia' },
+  ];
+
+  assertSignals(
+    'fresh pending date plus amanhã',
+    classify('amanhã', {
+      pending: pending('DATE', [
+        { entityId: 'date-tomorrow', displayName: 'amanhã' },
+      ]),
+    }),
+    {
+      answersPending: true,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'PENDING_ANSWER',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'stale pending professional plus nome',
+    classify('Carla', {
+      pending: pending('PROFESSIONAL', [professionalOptions[0]!], STALE_PENDING_ASKED_AT),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'stale pending date plus amanhã',
+    classify('amanhã', {
+      pending: pending(
+        'DATE',
+        [{ entityId: 'date-tomorrow', displayName: 'amanhã' }],
+        STALE_PENDING_ASKED_AT
+      ),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'professional two options plus sim',
+    classify('sim', {
+      pending: pending('PROFESSIONAL', professionalOptions),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'professional first option exists',
+    classify('primeira opção', {
+      pending: pending('PROFESSIONAL', professionalOptions),
+    }),
+    {
+      answersPending: true,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'PENDING_ANSWER',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'professional option 2 exists',
+    classify('opção 2', {
+      pending: pending('PROFESSIONAL', professionalOptions),
+    }),
+    {
+      answersPending: true,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'PENDING_ANSWER',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'professional third option out of range',
+    classify('terceira opção', {
+      pending: pending('PROFESSIONAL', professionalOptions),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'professional segunda-feira is not an ordinal',
+    classify('segunda-feira pode?', {
+      pending: pending('PROFESSIONAL', professionalOptions),
+    }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'question mark alone is general',
+    classify('?'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: null,
+      arbitration: 'GENERAL',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'fixed subject without current mention',
+    classify('Valor', { flowState: FIXED_FLOW }),
+    {
+      answersPending: false,
+      informationFamilies: ['PRICE'],
+      transaction: null,
+      arbitration: 'INFORMATION_FIRST',
+      subjectSource: 'fixed_service',
+    }
+  );
+  assertSignals(
+    'resolved current Peeling supersedes fixed subject',
+    classify('Qual valor do Peeling?', { flowState: FIXED_FLOW }),
+    {
+      answersPending: false,
+      informationFamilies: ['PRICE'],
+      transaction: null,
+      arbitration: 'INFORMATION_FIRST',
+      subjectSource: 'current_inbound',
+    }
+  );
+  assertSignals(
+    'ambiguous current unha blocks fixed fallback',
+    classify('Qual valor da unha?', {
+      flowState: FIXED_FLOW,
+      services: AMBIGUOUS_NAIL_CATALOG,
+    }),
+    {
+      answersPending: false,
+      informationFamilies: ['PRICE'],
+      transaction: null,
+      arbitration: 'INFORMATION_FIRST',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'new booking is not confirmation without context',
+    classify('Pode marcar uma limpeza amanhã?'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'BOOKING',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'pending confirmation makes pode marcar confirmable',
+    classify('Pode marcar', { pending: pending('CONFIRMATION') }),
+    {
+      answersPending: true,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'PENDING_ANSWER',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'complete booking draft makes pode marcar confirmable',
+    classify('Pode marcar', { flowState: COMPLETE_BOOKING_FLOW }),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'fixed_service',
+    }
+  );
+  assertSignals(
+    'explicit referential confirmation without pending',
+    classify('Quero confirmar meu agendamento'),
+    {
+      answersPending: false,
+      informationFamilies: [],
+      transaction: 'CONFIRMATION',
+      arbitration: 'TRANSACTION',
+      subjectSource: 'none',
+    }
+  );
+  assertSignals(
+    'mixed information and booking keeps both facets',
+    classify('Qual o valor e tem horário amanhã?'),
+    {
+      answersPending: false,
+      informationFamilies: ['PRICE'],
+      transaction: 'BOOKING',
+      arbitration: 'INFORMATION_FIRST',
+      subjectSource: 'none',
+    }
+  );
+  console.log('ia27a1 adversarial matrix: PASS');
 }
 
 const CONFIG = {
@@ -447,6 +791,7 @@ async function runShadowGate(): Promise<void> {
     on.prepared.planReceipt.planningIntent,
     buildPlanningIntentReceiptV2({
       inboundText: SHADOW_TEXT,
+      now: NOW,
       services: CATALOG,
     })
   );
@@ -457,6 +802,7 @@ async function runShadowGate(): Promise<void> {
 
 async function main(): Promise<void> {
   runClassificationMatrix();
+  runAdversarialMatrix();
   await runShadowGate();
   console.log('smoke ana ia27a1 planning intent: OK');
 }

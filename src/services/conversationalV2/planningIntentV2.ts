@@ -1,4 +1,6 @@
 import type { ServicesResult } from '../calendarService';
+import { resolveServiceFromCatalog } from './serviceResolver';
+import { PENDING_FAST_PATH_MAX_AGE_MS } from './modelResultParser';
 import type {
   FlowStateV2,
   PendingFrameSnapshotV2,
@@ -23,6 +25,8 @@ import type {
 
 export interface PlanningIntentDetectorInputV2 {
   inboundText: string;
+  /** Relógio do turno; obrigatório para não transformar o shadow em wall-clock. */
+  now: Date;
   pending?: PendingFrameSnapshotV2 | null;
   flowState?: Pick<
     FlowStateV2,
@@ -76,7 +80,11 @@ function catalogTerms(catalog: ServicesResult | null | undefined): string[] {
 const SERVICE_SUBJECT_RE =
   /\b(?:servico|servicos|procedimento|procedimentos|tratamento|tratamentos|sessao|sessoes|peeling|drenagem|unha|unhas|manutencao|massagem|depilacao|sobrancelha|corte|limpeza|botox)\b/u;
 
-function hasCurrentServiceSubject(
+/**
+ * Sinal lexical apenas. Isto deliberadamente não licencia um serviço: termos
+ * guarda-chuva como "unha" podem cobrir várias entidades do catálogo.
+ */
+function hasCurrentServiceMention(
   normalized: string,
   catalog: ServicesResult | null | undefined
 ): boolean {
@@ -84,6 +92,20 @@ function hasCurrentServiceSubject(
     SERVICE_SUBJECT_RE.test(normalized) ||
     catalogTerms(catalog).some((term) => containsNormalizedTerm(normalized, term))
   );
+}
+
+/**
+ * Única licença para `subjectSource: current_inbound`: a menção atual precisa
+ * resolver para uma entidade ativa e única no catálogo tenant-scoped. O
+ * resultado `ambiguous`/`no_match` permanece sem sujeito para impedir que o
+ * fixedServiceId anterior seja reutilizado depois de uma mudança de assunto.
+ */
+function hasResolvedCurrentServiceSubject(
+  rawText: string,
+  catalog: ServicesResult | null | undefined
+): boolean {
+  if (!catalog) return false;
+  return resolveServiceFromCatalog({ text: rawText, catalog }).kind === 'resolved';
 }
 
 const PRICE_RE =
@@ -117,7 +139,7 @@ function detectInformationFamilies(
   normalized: string,
   catalog: ServicesResult | null | undefined
 ): PlanningInformationFamilyV2[] {
-  const serviceSubject = hasCurrentServiceSubject(normalized, catalog);
+  const serviceSubject = hasCurrentServiceMention(normalized, catalog);
   const serviceExistence =
     hasAny(normalized, SERVICE_EXISTENCE_RE) && serviceSubject;
   const professionalExistence = hasAny(
@@ -277,10 +299,51 @@ function isOptionMentioned(
   });
 }
 
-function hasOrdinalSelection(normalized: string): boolean {
-  return /\b(?:primeiro|primeira|segundo|segunda|terceiro|terceira|quarto|quarta|quinto|quinta|ultima|ultimo)\b/u.test(
-    normalized
+const OPTION_ORDINAL_POSITIONS: Readonly<Record<string, number>> = {
+  primeira: 1,
+  primeiro: 1,
+  segunda: 2,
+  segundo: 2,
+  terceira: 3,
+  terceiro: 3,
+  quarta: 4,
+  quarto: 4,
+  quinta: 5,
+  quinto: 5,
+};
+
+/**
+ * Parser fechado e allow-only para ordinais de opção. A palavra ordinal não
+ * basta sozinha: exigir "opção" evita transformar dias da semana (por
+ * exemplo, "segunda-feira") em seleção. A posição é conferida contra o
+ * snapshot, não contra `options.length`, porque o snapshot é a autoridade.
+ */
+function optionOrdinalPosition(
+  normalized: string,
+  pending: PendingFrameSnapshotV2
+): number | null {
+  const match = normalized.match(
+    /^(?:e )?(?:a |o )?(?:(primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa]|ultim[oa]) opcao|opcao (?:numero )?([1-9]\d*|primeir[oa]|segund[oa]|terceir[oa]|quart[oa]|quint[oa]|ultim[oa]))(?: por favor)?$/u
   );
+  const token = match?.[1] ?? match?.[2];
+  if (!token) return null;
+
+  const position = /^\d+$/u.test(token)
+    ? Number(token)
+    : token === 'ultima' || token === 'ultimo'
+      ? pending.options.at(-1)?.position ?? null
+      : OPTION_ORDINAL_POSITIONS[token] ?? null;
+  if (!position) return null;
+  return pending.options.some((option) => option.position === position)
+    ? position
+    : null;
+}
+
+function hasOrdinalSelection(
+  normalized: string,
+  pending: PendingFrameSnapshotV2
+): boolean {
+  return optionOrdinalPosition(normalized, pending) !== null;
 }
 
 function hasProfessionalNeutralSelection(normalized: string): boolean {
@@ -301,10 +364,20 @@ function hasPendingAnswerSignal(input: {
   pending: PendingFrameSnapshotV2 | null;
   flowState: PlanningIntentDetectorInputV2['flowState'];
   catalog: ServicesResult | null | undefined;
+  now: Date;
 }): boolean {
   const pending = input.pending;
   if (!pending) return false;
-  if (input.flowState && pending.flowId !== input.flowState.flowId) return false;
+  const askedAt = Date.parse(pending.askedAt);
+  const nowMs = input.now.getTime();
+  if (
+    (input.flowState && pending.flowId !== input.flowState.flowId) ||
+    !Number.isFinite(askedAt) ||
+    !Number.isFinite(nowMs) ||
+    nowMs - askedAt > PENDING_FAST_PATH_MAX_AGE_MS
+  ) {
+    return false;
+  }
 
   if (pending.kind === 'CONFIRMATION' || pending.kind === 'CANCEL_CONFIRMATION') {
     return (
@@ -319,9 +392,8 @@ function hasPendingAnswerSignal(input: {
     return true;
   }
 
-  if (isCompactAffirmative(input.rawText)) return true;
   if (isOptionMentioned(input.normalized, pending)) return true;
-  if (pending.options.length > 0 && hasOrdinalSelection(input.normalized)) return true;
+  if (hasOrdinalSelection(input.normalized, pending)) return true;
 
   if (pending.kind === 'DATE') {
     return hasDateExpression(input.rawText, input.normalized);
@@ -330,9 +402,25 @@ function hasPendingAnswerSignal(input: {
     return hasTimeExpression(input.rawText, input.normalized);
   }
   if (pending.kind === 'SERVICE') {
-    return hasCurrentServiceSubject(input.normalized, input.catalog);
+    return hasResolvedCurrentServiceSubject(input.rawText, input.catalog);
   }
   return false;
+}
+
+function hasCompleteBookingDraft(
+  flowState: PlanningIntentDetectorInputV2['flowState']
+): boolean {
+  const draft = flowState?.bookingDraft;
+  if (!draft) return false;
+  return [draft.serviceId, draft.date, draft.time, draft.slotEvidenceTurnId].every(
+    (value) => typeof value === 'string' && value.trim().length > 0
+  );
+}
+
+function hasExplicitReferentialConfirmation(normalized: string): boolean {
+  return /\b(?:confirmar|confirma|confirmo|confirmado|confirmada)\b(?:\s+\w+){0,3}\s+(?:agendamento|marcacao|reserva|consulta|horario)\b/u.test(
+    normalized
+  );
 }
 
 function transactionSignal(input: {
@@ -340,13 +428,23 @@ function transactionSignal(input: {
   normalized: string;
   pending: PendingFrameSnapshotV2 | null;
   answersPending: boolean;
+  flowState: PlanningIntentDetectorInputV2['flowState'];
 }): PlanningTransactionV2 {
   if (hasRescheduleCue(input.normalized)) return 'RESCHEDULE';
   if (hasCancellationCue(input.normalized)) return 'CANCELLATION';
 
   const confirmation = hasConfirmationCue(input.normalized);
   const booking = hasBookingCue(input.normalized);
-  if (confirmation) return 'CONFIRMATION';
+  const confirmableContext =
+    (input.answersPending && input.pending?.kind === 'CONFIRMATION') ||
+    hasCompleteBookingDraft(input.flowState);
+  if (
+    hasExplicitReferentialConfirmation(input.normalized) ||
+    (confirmableContext &&
+      (confirmation || isCompactAffirmative(input.rawText)))
+  ) {
+    return 'CONFIRMATION';
+  }
   if (booking) return 'BOOKING';
 
   if (
@@ -356,13 +454,6 @@ function transactionSignal(input: {
       hasTimeExpression(input.rawText, input.normalized))
   ) {
     return 'BOOKING';
-  }
-  if (
-    input.answersPending &&
-    input.pending?.kind === 'CONFIRMATION' &&
-    isCompactAffirmative(input.rawText)
-  ) {
-    return 'CONFIRMATION';
   }
   return null;
 }
@@ -377,17 +468,24 @@ function deriveArbitration(
 }
 
 function deriveSubjectSource(input: {
+  rawText: string;
   normalized: string;
   flowState: PlanningIntentDetectorInputV2['flowState'];
   catalog: ServicesResult | null | undefined;
 }): PlanningSubjectSourceV2 {
-  if (hasCurrentServiceSubject(input.normalized, input.catalog)) {
-    return 'current_inbound';
+  const currentMention = hasCurrentServiceMention(
+    input.normalized,
+    input.catalog
+  );
+  if (!currentMention) {
+    if (input.flowState?.fixedServiceId || input.flowState?.bookingDraft?.serviceId) {
+      return 'fixed_service';
+    }
+    return 'none';
   }
-  if (input.flowState?.fixedServiceId || input.flowState?.bookingDraft?.serviceId) {
-    return 'fixed_service';
-  }
-  return 'none';
+  return hasResolvedCurrentServiceSubject(input.rawText, input.catalog)
+    ? 'current_inbound'
+    : 'none';
 }
 
 function resolvedInput(input: PlanningIntentDetectorInputV2): {
@@ -414,6 +512,7 @@ export function classifyPlanningIntentV2(
     pending: resolved.pending,
     flowState: resolved.flowState,
     catalog: resolved.catalog,
+    now: input.now,
   });
   const signals: PlanningIntentSignalsV2 = {
     answersPending,
@@ -427,12 +526,14 @@ export function classifyPlanningIntentV2(
       normalized,
       pending: resolved.pending,
       answersPending,
+      flowState: resolved.flowState,
     }),
   };
   return {
     signals,
     arbitration: deriveArbitration(signals),
     subjectSource: deriveSubjectSource({
+      rawText,
       normalized,
       flowState: resolved.flowState,
       catalog: resolved.catalog,

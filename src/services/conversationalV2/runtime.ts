@@ -1189,6 +1189,7 @@ export async function getReceptionistReplyV2(input: {
     planningIntentShadowEnabled
       ? buildPlanningIntentReceiptV2({
           inboundText: currentInboundBatchText,
+          now: startedAt,
           frame,
           services,
         })
