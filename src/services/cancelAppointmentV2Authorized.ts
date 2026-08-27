@@ -23,6 +23,12 @@ import {
   safeHttpStatus,
 } from '../observability/safeRuntime';
 import { ERP_API_TOKEN } from '../erpApiToken';
+import {
+  LAB_WRITE_DISABLED_REASON,
+  assertExternalWriteAllowed,
+  labBlockedWriteEffect,
+  type LabBlockedWriteEffect,
+} from '../runtimePolicy';
 
 const ERP_BASE_URL = process.env.ERP_BASE_URL ?? 'http://localhost:3000';
 
@@ -42,6 +48,9 @@ export type CancelAppointmentV2AuthorizedResult = {
   success: boolean;
   message: string;
   posted: boolean;
+  class?: LabBlockedWriteEffect['class'];
+  outcome?: LabBlockedWriteEffect['outcome'];
+  writeCommitted?: false;
   reason?:
     | 'customer_identity_ambiguous'
     | 'pending_invalid'
@@ -50,7 +59,8 @@ export type CancelAppointmentV2AuthorizedResult = {
     | 'fingerprint_mismatch'
     | 'disposition_denied'
     | 'executor_error'
-    | 'preempted';
+    | 'preempted'
+    | typeof LAB_WRITE_DISABLED_REASON;
   preemption?: DeliveryPreemptionV2;
 };
 
@@ -63,6 +73,7 @@ function normalizeCustomerPhone(phone: string): string {
 const defaultDeps: CancelAppointmentV2AuthorizedDeps = {
   getUpcomingAppointments: getCustomerUpcomingAppointmentsV2,
   postCancel: async (payload) => {
+    assertExternalWriteAllowed();
     await axios.post(`${ERP_BASE_URL}/api/v1/agenda/cancel`, payload, {
       headers: {
         Authorization: `Bearer ${ERP_API_TOKEN}`,
@@ -133,6 +144,11 @@ export async function cancelAppointmentV2Authorized(input: {
   /** Recheck de corrida imediatamente antes do POST, após releitura autoritativa. */
   beforeCancelPost?: () => Promise<DeliveryPreemptionV2 | null>;
 }): Promise<CancelAppointmentV2AuthorizedResult> {
+  const labBlock = labBlockedWriteEffect('cancelAppointment');
+  if (labBlock) {
+    return { ...labBlock, posted: false };
+  }
+
   const deps: CancelAppointmentV2AuthorizedDeps = {
     ...defaultDeps,
     ...input.deps,

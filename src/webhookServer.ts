@@ -78,12 +78,19 @@ import {
   runAnaRetention,
   startAnaRetentionScheduler,
 } from './services/anaRetention';
+import {
+  labBlockedWriteEffect,
+  resolveAnaRuntimeConfig,
+  type AnaLabRuntimeConfig,
+  type AnaRuntimeConfig,
+} from './runtimePolicy';
+import { validateLabSchema } from './services/labSchema';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
 }
 
-interface CloudWebhookValue {
+export interface CloudWebhookValue {
   metadata?: CloudWebhookMetadata;
   contacts?: CloudContact[];
   messages?: CloudMessage[];
@@ -110,6 +117,27 @@ const VERIFY_TOKEN =
   process.env.WA_GLOBAL_VERIFY_TOKEN ?? process.env.WA_VERIFY_TOKEN ?? '';
 const LEGACY_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID ?? '';
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
+let activeRuntimeConfig: AnaRuntimeConfig | null = null;
+
+function currentRuntimeConfig(): AnaRuntimeConfig {
+  return activeRuntimeConfig ?? resolveAnaRuntimeConfig(process.env);
+}
+
+function rejectLabAdministrativeWrite(
+  res: Response,
+  operation: string
+): boolean {
+  const blocked = labBlockedWriteEffect(operation);
+  if (!blocked) return false;
+  res.status(423).json({
+    success: blocked.success,
+    class: blocked.class,
+    outcome: blocked.outcome,
+    writeCommitted: blocked.writeCommitted,
+    reason: blocked.reason,
+  });
+  return true;
+}
 
 type WebhookEchoHandler = typeof handleSmbMessageEchoes;
 let webhookEchoHandler: WebhookEchoHandler = handleSmbMessageEchoes;
@@ -119,6 +147,8 @@ type WebhookStatusConfigLoader = (
   phoneNumberId: string
 ) => Promise<TenantBotConfig | null>;
 let webhookStatusConfigLoader: WebhookStatusConfigLoader = getTenantConfig;
+type WebhookMessageHandler = typeof handleIncomingMessage;
+let webhookMessageHandler: WebhookMessageHandler = handleIncomingMessage;
 
 /** Seam exclusivo de smoke HTTP; `undefined` restaura o handler produtivo. */
 export function __setWebhookEchoHandlerForTest(
@@ -141,6 +171,13 @@ export function __setWebhookStatusConfigLoaderForTest(
   webhookStatusConfigLoader = loader ?? getTenantConfig;
 }
 
+/** Seam exclusivo de smoke HTTP; `undefined` restaura o handler produtivo. */
+export function __setWebhookMessageHandlerForTest(
+  handler?: WebhookMessageHandler
+): void {
+  webhookMessageHandler = handler ?? handleIncomingMessage;
+}
+
 export function isAnaV2ProviderStatusEligible(
   config: Pick<TenantBotConfig, 'botRole' | 'tenantSlug'> | null,
   rawAllowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
@@ -152,16 +189,123 @@ export function isAnaV2ProviderStatusEligible(
   );
 }
 
-async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
+export type LabWebhookFenceReason =
+  | 'missing_phone_number_id'
+  | 'phone_number_not_allowed'
+  | 'tenant_config_unavailable'
+  | 'tenant_inactive'
+  | 'tenant_role_not_allowed'
+  | 'tenant_slug_not_allowed'
+  | 'tenant_phone_mismatch';
+
+export class LabWebhookRejectedError extends Error {
+  constructor(readonly reason: LabWebhookFenceReason) {
+    super('LAB webhook callback rejected');
+    this.name = 'LabWebhookRejectedError';
+  }
+}
+
+export function authorizeLabWebhookValue(
+  value: CloudWebhookValue,
+  config: TenantBotConfig | null,
+  runtime: AnaLabRuntimeConfig
+): TenantBotConfig {
+  const phoneNumberId = value.metadata?.phone_number_id?.trim();
+  if (!phoneNumberId) {
+    throw new LabWebhookRejectedError('missing_phone_number_id');
+  }
+  if (!runtime.allowedPhoneNumberIds.has(phoneNumberId)) {
+    throw new LabWebhookRejectedError('phone_number_not_allowed');
+  }
+  if (!config) {
+    throw new LabWebhookRejectedError('tenant_config_unavailable');
+  }
+  if (!config.isActive) {
+    throw new LabWebhookRejectedError('tenant_inactive');
+  }
+  if (config.botRole !== 'receptionist') {
+    throw new LabWebhookRejectedError('tenant_role_not_allowed');
+  }
+  if (!runtime.allowedTenantSlugs.has(config.tenantSlug)) {
+    throw new LabWebhookRejectedError('tenant_slug_not_allowed');
+  }
+  if (config.phoneNumberId !== phoneNumberId) {
+    throw new LabWebhookRejectedError('tenant_phone_mismatch');
+  }
+  return config;
+}
+
+interface WebhookChange {
+  field?: unknown;
+  value?: CloudWebhookValue;
+}
+
+function webhookChanges(body: unknown): WebhookChange[] {
+  const source = body as { entry?: unknown } | null | undefined;
+  const entries = Array.isArray(source?.entry) ? source.entry : [];
+  return entries.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const changes = (entry as { changes?: unknown }).changes;
+    return Array.isArray(changes) ? (changes as WebhookChange[]) : [];
+  });
+}
+
+function actionableWebhookValue(change: WebhookChange): boolean {
+  const value = change.value;
+  return Boolean(
+    value &&
+      (isEchoChange(change.field) ||
+        value.statuses?.length ||
+        value.messages?.length)
+  );
+}
+
+async function preflightLabWebhook(
+  changes: readonly WebhookChange[],
+  runtime: AnaLabRuntimeConfig
+): Promise<Map<CloudWebhookValue, TenantBotConfig>> {
+  const configByPhone = new Map<string, Promise<TenantBotConfig | null>>();
+  const authorized = new Map<CloudWebhookValue, TenantBotConfig>();
+  for (const change of changes) {
+    if (!actionableWebhookValue(change) || !change.value) continue;
+    const phoneNumberId = change.value.metadata?.phone_number_id?.trim();
+    if (!phoneNumberId) {
+      throw new LabWebhookRejectedError('missing_phone_number_id');
+    }
+    if (!runtime.allowedPhoneNumberIds.has(phoneNumberId)) {
+      throw new LabWebhookRejectedError('phone_number_not_allowed');
+    }
+    let pending = configByPhone.get(phoneNumberId);
+    if (!pending) {
+      pending = webhookStatusConfigLoader(phoneNumberId);
+      configByPhone.set(phoneNumberId, pending);
+    }
+    const config = authorizeLabWebhookValue(
+      change.value,
+      await pending,
+      runtime
+    );
+    authorized.set(change.value, config);
+  }
+  return authorized;
+}
+
+async function processWebhookValue(
+  value: CloudWebhookValue,
+  prevalidatedConfig?: TenantBotConfig,
+  runtime: AnaRuntimeConfig = currentRuntimeConfig()
+): Promise<void> {
   const phoneNumberId =
-    value.metadata?.phone_number_id?.trim() || LEGACY_PHONE_NUMBER_ID;
+    value.metadata?.phone_number_id?.trim() ||
+    (runtime.mode === 'production' ? LEGACY_PHONE_NUMBER_ID : '');
 
   if (!phoneNumberId) {
     console.warn('⚠️ Webhook recebido sem phone_number_id.');
     return;
   }
 
-  const config = await getTenantConfig(phoneNumberId);
+  const config =
+    prevalidatedConfig ?? (await webhookStatusConfigLoader(phoneNumberId));
 
   if (!config || !config.isActive) {
     console.warn(`⚠️ Nenhuma configuração ativa encontrada para ${phoneNumberId}.`);
@@ -200,7 +344,7 @@ async function processWebhookValue(value: CloudWebhookValue): Promise<void> {
         type: message.type,
       });
 
-      return handleIncomingMessage(message, contact, config).catch((err) => {
+      return webhookMessageHandler(message, contact, config).catch((err) => {
         if (config.botRole === 'sales') {
           Sentry.captureException(
             new Error('webhook_server sales message processing failed')
@@ -244,79 +388,106 @@ app.get('/webhook', (req: Request, res: Response) => {
 
 app.post('/webhook', botSignatureMiddleware, async (req: Request, res: Response) => {
   try {
-    const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+    const runtime = currentRuntimeConfig();
+    const changes = webhookChanges(req.body);
+    // LAB valida o payload INTEIRO antes do primeiro handler. Assim, uma change
+    // inesperada posterior não pode chegar depois que uma anterior já gravou
+    // state e também não pode ser escondida por um 200 antecipado.
+    const labAuthorized =
+      runtime.mode === 'lab'
+        ? await preflightLabWebhook(changes, runtime)
+        : new Map<CloudWebhookValue, TenantBotConfig>();
     const allowV2ByPhoneNumberId = new Map<string, Promise<boolean>>();
 
-    for (const entry of entries) {
-      const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+    for (const change of changes) {
+      const value = change.value;
+      if (!value) {
+        continue;
+      }
 
-      for (const change of changes) {
-        const value = change?.value as CloudWebhookValue | undefined;
-        if (!value) {
-          continue;
-        }
+      // Coexistence: o dono respondeu PELO app do WhatsApp (echo) → pausa a
+      // conversa pra Ana não falar por cima do humano. O 200 só sai DEPOIS
+      // da persistência durável; falha retorna 500 para a Meta retransmitir.
+      if (isEchoChange(change.field)) {
+        await webhookEchoHandler(
+          value,
+          runtime.mode === 'production' ? LEGACY_PHONE_NUMBER_ID : undefined
+        );
+        continue;
+      }
 
-        // Coexistence: o dono respondeu PELO app do WhatsApp (echo) → pausa a
-        // conversa pra Ana não falar por cima do humano. O 200 só sai DEPOIS
-        // da persistência durável; falha retorna 500 para a Meta retransmitir.
-        if (isEchoChange(change?.field)) {
-          await webhookEchoHandler(value, LEGACY_PHONE_NUMBER_ID);
-          continue;
-        }
-
-        // Status Meta (sent/delivered/read/failed) é um fato separado de inbound:
-        // não passa pelo dedup por message.id e não é mais descartado. O
-        // durable ingest termina antes do 200; callbacks ERP continuam fora
-        // da resposta HTTP como obrigações retomáveis.
-        if (value.statuses?.length) {
-          const statusPhoneNumberId =
-            value.metadata?.phone_number_id?.trim() || LEGACY_PHONE_NUMBER_ID;
-          await webhookStatusHandler(value, undefined, {
-            awaitCallbacks: false,
-            throwOnPersistenceFailure: true,
-            resolveAllowV2Fallback: async () => {
-              if (!statusPhoneNumberId) return false;
-              let pending = allowV2ByPhoneNumberId.get(statusPhoneNumberId);
-              if (!pending) {
-                pending = webhookStatusConfigLoader(statusPhoneNumberId).then(
-                  (statusConfig) => {
-                    if (!statusConfig) {
-                      // Unknown legacy status + absent config is inconclusive,
-                      // never evidence of v1/sales. Force Meta replay without
-                      // exposing phone/config details.
-                      throw new Error('status tenant config unavailable');
-                    }
-                    return isAnaV2ProviderStatusEligible(statusConfig);
+      // Status Meta (sent/delivered/read/failed) é um fato separado de inbound:
+      // não passa pelo dedup por message.id e não é mais descartado. O
+      // durable ingest termina antes do 200; callbacks ERP continuam fora
+      // da resposta HTTP como obrigações retomáveis.
+      if (value.statuses?.length) {
+        const statusPhoneNumberId =
+          value.metadata?.phone_number_id?.trim() ||
+          (runtime.mode === 'production' ? LEGACY_PHONE_NUMBER_ID : '');
+        await webhookStatusHandler(value, undefined, {
+          awaitCallbacks: false,
+          throwOnPersistenceFailure: true,
+          resolveAllowV2Fallback: async () => {
+            if (!statusPhoneNumberId) return false;
+            const prevalidated = labAuthorized.get(value);
+            if (prevalidated) {
+              return isAnaV2ProviderStatusEligible(prevalidated);
+            }
+            let pending = allowV2ByPhoneNumberId.get(statusPhoneNumberId);
+            if (!pending) {
+              pending = webhookStatusConfigLoader(statusPhoneNumberId).then(
+                (statusConfig) => {
+                  if (!statusConfig) {
+                    // Unknown legacy status + absent config is inconclusive,
+                    // never evidence of v1/sales. Force Meta replay without
+                    // exposing phone/config details.
+                    throw new Error('status tenant config unavailable');
                   }
-                );
-                allowV2ByPhoneNumberId.set(statusPhoneNumberId, pending);
-              }
-              return pending;
-            },
-          });
-        }
-
-        if (!value.messages?.length) {
-          continue;
-        }
-
-        processWebhookValue(value).catch((err) => {
-          Sentry.captureException(new Error('webhook payload processing failed'), {
-            tags: {
-              service: 'webhook_server',
-              operation: 'process_payload',
-              error_kind: runtimeErrorKind(err),
-            },
-          });
-          console.error(
-            `❌ Erro ao processar payload do webhook | error=${runtimeErrorKind(err)}`
-          );
+                  return isAnaV2ProviderStatusEligible(statusConfig);
+                }
+              );
+              allowV2ByPhoneNumberId.set(statusPhoneNumberId, pending);
+            }
+            return pending;
+          },
         });
       }
+
+      if (!value.messages?.length) {
+        continue;
+      }
+
+      processWebhookValue(value, labAuthorized.get(value), runtime).catch((err) => {
+        Sentry.captureException(new Error('webhook payload processing failed'), {
+          tags: {
+            service: 'webhook_server',
+            operation: 'process_payload',
+            error_kind: runtimeErrorKind(err),
+          },
+        });
+        console.error(
+          `❌ Erro ao processar payload do webhook | error=${runtimeErrorKind(err)}`
+        );
+      });
     }
 
     res.sendStatus(200);
   } catch (err) {
+    if (err instanceof LabWebhookRejectedError) {
+      Sentry.captureMessage('lab webhook callback rejected', {
+        level: 'warning',
+        tags: {
+          service: 'webhook_server',
+          operation: 'lab_preflight',
+          runtime_mode: 'lab',
+          reason: err.reason,
+        },
+      });
+      // A Meta recebe non-2xx e mantém a entrega elegível para retry. O corpo não
+      // revela phoneNumberId, tenant ou configuração.
+      res.status(503).json({ error: 'lab_callback_rejected' });
+      return;
+    }
     Sentry.captureException(new Error('webhook durable processing failed'), {
       tags: {
         service: 'webhook_server',
@@ -343,6 +514,7 @@ app.post('/webhook', botSignatureMiddleware, async (req: Request, res: Response)
  * `{ customerPhone, event: "trial_started", onboarding?: boolean }`.
  */
 app.post('/sales-notify', botSignatureMiddleware, (req: Request, res: Response) => {
+  if (rejectLabAdministrativeWrite(res, 'salesNotify')) return;
   res.sendStatus(200);
 
   const customerPhone =
@@ -378,6 +550,7 @@ app.post(
   '/admin/reset-conversation',
   botSignatureMiddleware,
   async (req: Request, res: Response) => {
+    if (rejectLabAdministrativeWrite(res, 'adminResetConversation')) return;
     const phoneNumberId =
       typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId.trim() : '';
     const customerPhone =
@@ -424,6 +597,7 @@ app.post(
   '/admin/reprocess-response',
   botSignatureMiddleware,
   async (req: Request, res: Response) => {
+    if (rejectLabAdministrativeWrite(res, 'adminReprocessResponse')) return;
     if (!isValidAdminReprocessInput(req.body)) {
       res.status(400).json({
         error: 'phoneNumberId e customerPhone são obrigatórios.',
@@ -466,6 +640,17 @@ app.post(
 );
 
 app.get('/health', (_req: Request, res: Response) => {
+  const runtime = currentRuntimeConfig();
+  if (runtime.mode === 'lab') {
+    res.json({
+      status: 'ok',
+      runtimeMode: 'lab',
+      writePolicy: runtime.writePolicy,
+      backgroundJobs: runtime.backgroundJobs,
+      ts: new Date().toISOString(),
+    });
+    return;
+  }
   res.json({ status: 'ok', ts: new Date().toISOString() });
 });
 
@@ -478,6 +663,7 @@ app.post('/internal/question-replies/send', async (req: Request, res: Response) 
     res.sendStatus(401);
     return;
   }
+  if (rejectLabAdministrativeWrite(res, 'sendQuestionReply')) return;
 
   const phoneNumberId =
     typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId.trim() : '';
@@ -592,6 +778,7 @@ app.post(
       res.sendStatus(401);
       return;
     }
+    if (rejectLabAdministrativeWrite(res, 'reprocessInboundOutbox')) return;
     const messageId =
       typeof req.body?.messageId === 'string' ? req.body.messageId.trim() : '';
     if (!messageId) {
@@ -635,6 +822,7 @@ app.post(
       res.sendStatus(401);
       return;
     }
+    if (rejectLabAdministrativeWrite(res, 'privacyPurgeConversation')) return;
     const phoneNumberId =
       typeof req.body?.phoneNumberId === 'string'
         ? req.body.phoneNumberId.trim()
@@ -824,30 +1012,50 @@ app.get('/internal/conversation-messages', (req: Request, res: Response) => {
     });
 });
 
-async function boot(): Promise<void> {
-  // Garante a tabela de idempotência e o schema da Onda 2 antes do tráfego.
-  await ensureProcessedMessagesTable();
-  await ensureAnaWave2Tables();
-  await ensureSilentEscalationHoldTable();
-  startSilentEscalationHoldSweep(async () => {
-    const { sweepSilentEscalationHolds } = await import(
-      './services/questionEscalation'
+export interface RuntimeBootOperations {
+  validateLabSchema: (databaseFingerprint: string) => Promise<void>;
+  ensureProcessedMessages: () => Promise<void>;
+  ensureAnaWave2: () => Promise<void>;
+  ensureSilentEscalationHold: () => Promise<void>;
+  startSilentEscalationHold: () => Promise<void>;
+  ensureConversationalV2: () => Promise<void>;
+  startConversationalV2: () => Promise<void>;
+  startConversationalV2Successor: () => Promise<void>;
+  runRetentionOnce: () => Promise<void>;
+  startRetentionScheduler: () => Promise<void>;
+  startInboundOutbox: () => Promise<void>;
+  startWhatsAppStatusCallback: () => Promise<void>;
+  ensureSalesFollowups: () => Promise<void>;
+  startSalesFollowup: () => Promise<void>;
+  initializeVoiceStorageAndProbe: () => Promise<void>;
+}
+
+const defaultRuntimeBootOperations: RuntimeBootOperations = {
+  validateLabSchema,
+  ensureProcessedMessages: ensureProcessedMessagesTable,
+  ensureAnaWave2: ensureAnaWave2Tables,
+  ensureSilentEscalationHold: ensureSilentEscalationHoldTable,
+  startSilentEscalationHold: async () => {
+    startSilentEscalationHoldSweep(async () => {
+      const { sweepSilentEscalationHolds } = await import(
+        './services/questionEscalation'
+      );
+      return sweepSilentEscalationHolds();
+    });
+  },
+  ensureConversationalV2: async () => {
+    const { ensureConversationalV2Tables } = await import(
+      './services/conversationalV2/stateStore'
     );
-    return sweepSilentEscalationHolds();
-  });
-  // O schema/worker v2 só é carregado quando existe allowlist configurada.
-  // Flag vazia mantém o boot e a rota v1 sem importar o runtime v2 pesado.
-  const v2Allowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
-    ?.split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry && entry !== '*') ?? [];
-  if (v2Allowlist.length > 0) {
-    const {
-      ensureConversationalV2Tables,
-      startConversationalV2Sweep,
-    } = await import('./services/conversationalV2/stateStore');
     await ensureConversationalV2Tables();
+  },
+  startConversationalV2: async () => {
+    const { startConversationalV2Sweep } = await import(
+      './services/conversationalV2/stateStore'
+    );
     startConversationalV2Sweep();
+  },
+  startConversationalV2Successor: async () => {
     const { startConversationalV2SuccessorSweep } = await import(
       './services/conversationalV2/successorProcessor'
     );
@@ -855,47 +1063,105 @@ async function boot(): Promise<void> {
       process: reprocessDurableSuccessorBatchV2,
       fallback: deliverDurableSuccessorFallbackV2,
     });
+  },
+  runRetentionOnce: async () => {
+    // Falha de retenção é observada/sanitizada no serviço e nunca impede o boot.
+    await runAnaRetention().catch(() => undefined);
+  },
+  startRetentionScheduler: async () => {
+    startAnaRetentionScheduler();
+  },
+  startInboundOutbox: async () => {
+    startInboundOutboxSweep();
+  },
+  startWhatsAppStatusCallback: async () => {
+    startWhatsAppStatusCallbackSweep();
+  },
+  ensureSalesFollowups: ensureSalesFollowupsTable,
+  startSalesFollowup: async () => {
+    startFollowupPoller();
+  },
+  initializeVoiceStorageAndProbe: async () => {
+    await ensureTtsCacheTable();
+    await ensureTtsUsageTable();
+    await ensureChannelPrefsTable();
+    await ensureMediaCacheTable();
+    const ffmpegReady = await checkFfmpegAvailable();
+    const voiceConfig = getVoiceEnvConfig();
+
+    if (!ffmpegReady && process.env.NODE_ENV === 'production') {
+      Sentry.captureMessage('renata_voice: ffmpeg missing', {
+        level: 'warning',
+        tags: { service: 'renata_voice', reason: 'ffmpeg_missing' },
+      });
+    }
+
+    const voiceState = !voiceConfig.enabled
+      ? 'disabled (flag_off)'
+      : !providerApiKey(voiceConfig, voiceConfig.provider)
+        ? `disabled (api_key_missing provider=${voiceConfig.provider})`
+        : !ffmpegReady
+          ? 'disabled (ffmpeg_missing)'
+          : `enabled (ready provider=${voiceConfig.provider})`;
+    console.log(`🔊 Renata voice: ${voiceState}`);
+  },
+};
+
+export async function initializeRuntimeServices(
+  runtime: AnaRuntimeConfig,
+  operations: RuntimeBootOperations = defaultRuntimeBootOperations,
+  rawV2Allowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
+): Promise<void> {
+  if (runtime.mode === 'lab') {
+    // Boot normal LAB é estritamente read-only sobre schema: sem DDL, retenção,
+    // probe global ou consumer. O bootstrap é um comando manual separado.
+    await operations.validateLabSchema(runtime.databaseFingerprint);
+    return;
   }
-  // Falha de retenção é observada/sanitizada no serviço e nunca impede o boot.
-  await runAnaRetention().catch(() => undefined);
-  startAnaRetentionScheduler();
-  startInboundOutboxSweep();
-  startWhatsAppStatusCallbackSweep();
 
-  // Workstream B (Renata): régua de follow-up. Garante a tabela e liga o poller
-  // de 30min por default (só VENDA — o receptionist não escreve na tabela).
-  await ensureSalesFollowupsTable();
-  startFollowupPoller();
+  // Ordem idêntica ao boot histórico de produção.
+  await operations.ensureProcessedMessages();
+  await operations.ensureAnaWave2();
+  await operations.ensureSilentEscalationHold();
+  await operations.startSilentEscalationHold();
 
-  // Voz da Renata: tabelas raw pg + checagem do ffmpeg antes de aceitar
-  // tráfego. A flag continua OFF por default; sem chave/ffmpeg o gate mantém
-  // texto, sem degradar a recepção nem deixar a Renata em silêncio.
-  await ensureTtsCacheTable();
-  await ensureTtsUsageTable();
-  await ensureChannelPrefsTable();
-  await ensureMediaCacheTable();
-  const ffmpegReady = await checkFfmpegAvailable();
-  const voiceConfig = getVoiceEnvConfig();
-
-  if (!ffmpegReady && process.env.NODE_ENV === 'production') {
-    Sentry.captureMessage('renata_voice: ffmpeg missing', {
-      level: 'warning',
-      tags: { service: 'renata_voice', reason: 'ffmpeg_missing' },
-    });
+  const v2Allowlist =
+    rawV2Allowlist
+      ?.split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry && entry !== '*') ?? [];
+  if (v2Allowlist.length > 0) {
+    await operations.ensureConversationalV2();
+    await operations.startConversationalV2();
+    await operations.startConversationalV2Successor();
   }
 
-  const voiceState = !voiceConfig.enabled
-    ? 'disabled (flag_off)'
-    : !providerApiKey(voiceConfig, voiceConfig.provider)
-      ? `disabled (api_key_missing provider=${voiceConfig.provider})`
-      : !ffmpegReady
-        ? 'disabled (ffmpeg_missing)'
-        : `enabled (ready provider=${voiceConfig.provider})`;
-  console.log(`🔊 Renata voice: ${voiceState}`);
+  await operations.runRetentionOnce();
+  await operations.startRetentionScheduler();
+  await operations.startInboundOutbox();
+  await operations.startWhatsAppStatusCallback();
+  await operations.ensureSalesFollowups();
+  await operations.startSalesFollowup();
+  await operations.initializeVoiceStorageAndProbe();
+}
 
-  app.listen(PORT, () => {
-    console.log(`🚀 Receps-IA runtime rodando na porta ${PORT} | personas=Ana,Renata`);
-  });
+export async function boot(): Promise<void> {
+  const runtime = resolveAnaRuntimeConfig(process.env);
+  activeRuntimeConfig = runtime;
+  await initializeRuntimeServices(runtime);
+
+  const onListening = () => {
+    console.log(
+      runtime.mode === 'lab'
+        ? `🚀 Receps-IA runtime rodando na porta ${PORT} | personas=Ana,Renata | runtimeMode=lab`
+        : `🚀 Receps-IA runtime rodando na porta ${PORT} | personas=Ana,Renata`
+    );
+  };
+  if (runtime.bindHost) {
+    app.listen(PORT, runtime.bindHost, onListening);
+    return;
+  }
+  app.listen(PORT, onListening);
 }
 
 if (process.env.RECEPS_IA_SKIP_BOOT !== '1') {

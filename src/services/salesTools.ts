@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import axios from 'axios';
+import { assertExternalWriteAllowed } from '../runtimePolicy';
 import { Sentry } from '../observability/sentry';
 import { ERP_API_TOKEN } from '../erpApiToken';
 import type { SalesConfig } from '../salesConfigProvider';
@@ -216,6 +217,7 @@ export async function createPrefilledSignupLink(
   }
 
   try {
+    assertExternalWriteAllowed();
     const { data } = await axios.post<{ url?: string }>(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/signup-prefill`,
       {
@@ -299,6 +301,7 @@ export async function registerQualifiedLead(
   const status = payload.status ?? 'qualificado';
   const { interest, ...payloadWithoutInterest } = payload;
   try {
+    assertExternalWriteAllowed();
     await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
       {
@@ -344,6 +347,7 @@ export async function handoffToHuman(
   let conversationPaused = false;
 
   try {
+    assertExternalWriteAllowed();
     await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
       { ...payload, status: 'handoff', reason, customerPhone: phone },
@@ -361,6 +365,7 @@ export async function handoffToHuman(
   }
 
   try {
+    assertExternalWriteAllowed();
     await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/pause-conversation`,
       { phoneNumberId, customerPhone: phone, source: 'handoff' },

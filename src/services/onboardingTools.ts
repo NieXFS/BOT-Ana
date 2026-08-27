@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { assertExternalWriteAllowed } from '../runtimePolicy';
 import { ERP_API_TOKEN } from '../erpApiToken';
 import { Sentry } from '../observability/sentry';
 import {
@@ -171,6 +172,7 @@ async function postOnboarding(
   operation: string
 ): Promise<OnboardingToolResult> {
   try {
+    assertExternalWriteAllowed();
     const { data } = await axios.post<Record<string, unknown>>(
       `${recepsBaseUrl()}${path}`,
       {
@@ -352,4 +354,3 @@ export function __setOnboardingCaptureSinkForTest(
 ): void {
   captureSink = sink ?? defaultCaptureSink;
 }
-

@@ -352,6 +352,11 @@ export async function resolveCancellationPlannerV2(input: {
           success: write.success,
           message: write.message,
           ...(write.reason ? { reason: write.reason } : {}),
+          ...(write.class ? { class: write.class } : {}),
+          ...(write.outcome ? { outcome: write.outcome } : {}),
+          ...(write.writeCommitted === false
+            ? { writeCommitted: false }
+            : {}),
         })
       )
     );

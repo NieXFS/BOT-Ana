@@ -12,6 +12,12 @@ import {
   CUSTOMER_IDENTITY_SAFE_CUSTOMER_MESSAGE,
 } from './customerIdentitySafety';
 import { normalizeServiceAliases } from '../lib/services/service-aliases';
+import {
+  LAB_WRITE_DISABLED_REASON,
+  assertExternalWriteAllowed,
+  labBlockedWriteEffect,
+  type LabBlockedWriteEffect,
+} from '../runtimePolicy';
 
 export { CUSTOMER_IDENTITY_AMBIGUOUS_HINT } from './customerIdentitySafety';
 
@@ -189,6 +195,7 @@ export type BookFailureReason =
   | 'outside_hours'
   | 'package_exhausted'
   | CustomerIdentityFailureReason
+  | typeof LAB_WRITE_DISABLED_REASON
   | 'other';
 
 export type BookAppointmentResult = {
@@ -205,6 +212,9 @@ export type BookAppointmentResult = {
   // reais aqui — a Ana só repassa, sem chutar horários vizinhos (mata Falha 2 em
   // código, não dependendo do modelo seguir a regra B em prosa).
   availableSlots?: string[];
+  class?: LabBlockedWriteEffect['class'];
+  outcome?: LabBlockedWriteEffect['outcome'];
+  writeCommitted?: false;
 };
 
 // Empurra a Ana a SEMPRE consultar a disponibilidade real antes de oferecer
@@ -988,6 +998,7 @@ export interface CancelAppointmentDeps {
 const defaultCancelAppointmentDeps: CancelAppointmentDeps = {
   getUpcomingAppointments: getCustomerUpcomingAppointments,
   postCancel: async (payload) => {
+    assertExternalWriteAllowed();
     await erpApi.post('/api/v1/agenda/cancel', payload);
   },
 };
@@ -1001,8 +1012,14 @@ export async function cancelAppointment(
 ): Promise<{
   success: boolean;
   message: string;
-  reason?: CustomerIdentityFailureReason;
+  reason?: CustomerIdentityFailureReason | typeof LAB_WRITE_DISABLED_REASON;
+  class?: LabBlockedWriteEffect['class'];
+  outcome?: LabBlockedWriteEffect['outcome'];
+  writeCommitted?: false;
 }> {
+  const labBlock = labBlockedWriteEffect('cancelAppointment');
+  if (labBlock) return labBlock;
+
   const requestedAppointmentId = appointmentId?.trim();
 
   if (!requestedAppointmentId) {
@@ -1107,6 +1124,9 @@ export async function bookAppointment(
   professionalId?: string,
   confirmedDuplicate = false
 ): Promise<BookAppointmentResult> {
+  const labBlock = labBlockedWriteEffect('bookAppointment');
+  if (labBlock) return labBlock;
+
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return { success: false, reason: 'other', message: 'Formato de data inválido. Use AAAA-MM-DD.' };
   }
@@ -1281,6 +1301,7 @@ export async function bookAppointment(
 
     // professionalId undefined é OMITIDO do JSON pelo axios → o servidor resolve
     // automaticamente um profissional livre.
+    assertExternalWriteAllowed();
     const bookResponse = await erpApi.post<{
       professional?: { id: string; name?: string };
     }>('/api/v1/agenda/book', {

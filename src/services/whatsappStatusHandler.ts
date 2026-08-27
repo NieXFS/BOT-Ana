@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { assertExternalWriteAllowed } from '../runtimePolicy';
 import { ERP_API_TOKEN } from '../erpApiToken';
 import { Sentry } from '../observability/sentry';
 import {
@@ -305,6 +306,7 @@ export const pgWhatsAppStatusStore: WhatsAppStatusStore = {
 async function postStatusCallback(
   payload: QuestionReplyStatusCallbackPayload
 ): Promise<void> {
+  assertExternalWriteAllowed();
   await axios.post(
     `${RECEPS_INTERNAL_API_URL}/api/v1/bot/question-replies/status-callback`,
     payload,

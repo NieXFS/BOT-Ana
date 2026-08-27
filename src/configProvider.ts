@@ -22,6 +22,7 @@ import {
   observeTechnicalMaintenance,
   parseTechnicalMaintenanceSnapshot,
 } from './services/technicalMaintenanceCache';
+import { isAnaLabRuntime } from './runtimePolicy';
 
 export type {
   BookingMenuItem,
@@ -382,6 +383,10 @@ export async function getTenantConfig(
   if (authoritativelyRejectedConfigs.has(cacheKey)) {
     return null;
   }
+
+  // O LAB exige config autoritativa resolvida pelo ERP. Copiar variáveis
+  // legadas de produção não pode ressuscitar tenant/token localmente.
+  if (isAnaLabRuntime()) return null;
 
   const legacyConfig = getLegacyConfig(phoneNumberId);
 

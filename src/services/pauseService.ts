@@ -31,6 +31,10 @@ import {
   canonicalConversationKey,
   canonicalCustomerPhone,
 } from './conversationOrder';
+import {
+  assertExternalWriteAllowed,
+  isAnaLabRuntime,
+} from '../runtimePolicy';
 
 // Base + auth no MESMO padrão do optOutService (Bearer ERP_API_TOKEN).
 const RECEPS_INTERNAL_API_URL =
@@ -89,6 +93,7 @@ async function persistPauseInReceps(
   phoneNumberId: string,
   customerPhone: string
 ): Promise<string | null> {
+  assertExternalWriteAllowed();
   const { data } = await axios.post<{ pausedUntil: string }>(
     `${RECEPS_INTERNAL_API_URL}/api/v1/bot/pause-conversation`,
     { phoneNumberId, customerPhone, source: 'echo' },
@@ -263,6 +268,10 @@ export async function pauseConversationByEcho(
     startedAt
   );
   writeEchoLatch(phoneNumberId, canonicalPhone, localUntilMs);
+
+  // LAB não escreve pause/resume no ERP. O latch local continua soberano e o
+  // echo/histórico ficam duráveis exclusivamente no storage isolado do LAB.
+  if (isAnaLabRuntime()) return;
 
   try {
     const pausedUntilMs = toMs(await deps.persistPause(phoneNumberId, canonicalPhone));

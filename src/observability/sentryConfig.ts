@@ -3,6 +3,7 @@ import {
   recepsIaEnvValuesConflict,
   resolveRecepsIaEnvValue,
 } from '../runtimeIdentity';
+import { safeAnaRuntimeModeTag } from '../runtimePolicy';
 
 type SentryEnvironment = Record<string, string | undefined>;
 
@@ -20,7 +21,10 @@ const CONFIG_PAIRS = [
 ] as const;
 
 export const RECEPS_IA_SENTRY_SCOPE = {
-  tags: { runtime: RECEPS_IA_RUNTIME_TAG },
+  tags: {
+    runtime: RECEPS_IA_RUNTIME_TAG,
+    runtime_mode: safeAnaRuntimeModeTag(process.env),
+  },
 } as const;
 
 /** Resolve a configuração do SDK sem inicializar rede nem expor valores. */

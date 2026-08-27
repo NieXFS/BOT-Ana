@@ -438,6 +438,7 @@ export interface TurnPlanToolEffectV2 {
   class: ToolEffectClassV2;
   outcome: ToolEffectOutcomeV2;
   writeCommitted: boolean;
+  reason?: 'lab_write_disabled';
 }
 
 export interface TurnPlanBoundaryAttemptV2 {

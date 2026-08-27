@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { assertExternalWriteAllowed } from '../runtimePolicy';
 import { ERP_API_TOKEN } from '../erpApiToken';
 import { Sentry } from '../observability/sentry';
 import { normalizeForMatch } from './salesOpeners';
@@ -270,6 +271,7 @@ export async function claimOnboardingSession(
   code: string
 ): Promise<OnboardingClaimResult> {
   try {
+    assertExternalWriteAllowed();
     const { data } = await axios.post<OnboardingState>(
       `${recepsBaseUrl()}/api/v1/bot/onboarding/claim`,
       { customerPhone, code },
@@ -299,4 +301,3 @@ export async function claimOnboardingSession(
 export function __resetOnboardingSessionCacheForTest(): void {
   sessionCache.clear();
 }
-

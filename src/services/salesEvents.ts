@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { assertExternalWriteAllowed } from '../runtimePolicy';
 import { Sentry } from '../observability/sentry';
 import { ERP_API_TOKEN } from '../erpApiToken';
 
@@ -65,6 +66,7 @@ export async function captureReferral(
   if (!referral.ctwa_clid) return;
 
   try {
+    assertExternalWriteAllowed();
     await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
       {
@@ -96,6 +98,7 @@ export async function capturePartnerAttribution(
   partnerSlug: string
 ): Promise<'attributed' | 'not-attributed' | 'failed'> {
   try {
+    assertExternalWriteAllowed();
     const response = await axios.post<{ partnerSlug?: unknown }>(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-lead`,
       { customerPhone, partnerSlug },
@@ -125,6 +128,7 @@ export async function emitSalesEvent(
   metadata?: SalesEventMetadata
 ): Promise<void> {
   try {
+    assertExternalWriteAllowed();
     await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/sales-event`,
       { customerPhone, type, metadata },

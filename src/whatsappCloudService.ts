@@ -1,5 +1,6 @@
 import axios, { type AxiosRequestConfig } from 'axios';
 import type { TenantBotConfig } from './configProvider';
+import { labPhoneNumberAllowed } from './runtimePolicy';
 
 export type WhatsAppTenantConfig = Pick<
   TenantBotConfig,
@@ -8,6 +9,12 @@ export type WhatsAppTenantConfig = Pick<
 
 function buildApiUrl(waConfig: WhatsAppTenantConfig) {
   return `https://graph.facebook.com/${waConfig.waApiVersion}/${waConfig.phoneNumberId}/messages`;
+}
+
+function assertWhatsAppTenantAllowed(waConfig: WhatsAppTenantConfig): void {
+  if (!labPhoneNumberAllowed(waConfig.phoneNumberId)) {
+    throw new Error('WhatsApp tenant bloqueado pela cerca do LAB.');
+  }
 }
 
 /** Limite cancelável do POST; evita segurar a lock da conversa indefinidamente. */
@@ -24,6 +31,7 @@ export async function sendFreeformMessage(
   text: string,
   waConfig: WhatsAppTenantConfig
 ): Promise<void> {
+  assertWhatsAppTenantAllowed(waConfig);
   await axios.post(
     buildApiUrl(waConfig),
     {
@@ -54,6 +62,7 @@ export async function sendFreeformMessageWithReceipt(
   text: string,
   waConfig: WhatsAppTenantConfig
 ): Promise<{ providerMessageId: string }> {
+  assertWhatsAppTenantAllowed(waConfig);
   const response = await axios.post<{
     messages?: Array<{ id?: unknown }>;
   }>(
@@ -120,6 +129,7 @@ export async function downloadMedia(
   mediaId: string,
   waConfig: WhatsAppTenantConfig
 ): Promise<Buffer> {
+  assertWhatsAppTenantAllowed(waConfig);
   // Passo 1: Resolve a URL do CDN a partir do media ID
   const urlResponse = await axios.get<{ url: string }>(
     `https://graph.facebook.com/${waConfig.waApiVersion}/${mediaId}`,
@@ -181,6 +191,7 @@ export async function uploadMedia(
   waConfig: WhatsAppTenantConfig,
   post: WhatsAppHttpPost = defaultHttpPost
 ): Promise<string> {
+  assertWhatsAppTenantAllowed(waConfig);
   const form = new FormData();
   form.append('messaging_product', 'whatsapp');
   form.append(
@@ -213,6 +224,7 @@ export async function uploadVideoMedia(
   waConfig: WhatsAppTenantConfig,
   post: WhatsAppHttpPost = defaultHttpPost
 ): Promise<string> {
+  assertWhatsAppTenantAllowed(waConfig);
   const form = new FormData();
   form.append('messaging_product', 'whatsapp');
   form.append(
@@ -246,6 +258,7 @@ export async function sendAudioMessage(
   waConfig: WhatsAppTenantConfig,
   post: WhatsAppHttpPost = defaultHttpPost
 ): Promise<void> {
+  assertWhatsAppTenantAllowed(waConfig);
   await post(buildApiUrl(waConfig), buildAudioMessagePayload(to, mediaId), {
     headers: headers(waConfig),
     timeout: 20_000,
@@ -260,6 +273,7 @@ export async function sendVideoMessage(
   post: WhatsAppHttpPost = defaultHttpPost,
   caption?: string
 ): Promise<void> {
+  assertWhatsAppTenantAllowed(waConfig);
   await post(
     buildApiUrl(waConfig),
     buildVideoMessagePayload(to, mediaId, caption),

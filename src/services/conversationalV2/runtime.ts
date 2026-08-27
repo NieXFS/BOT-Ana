@@ -786,7 +786,7 @@ function hasDuplicateResolutionReadEvidence(
   });
 }
 
-function toolEffects(
+export function toolEffects(
   loop: ReceptionistModelLoopResult
 ): TurnPlanReceiptV2['toolEffects'] {
   return loop.toolTrace.map((entry, index) => {
@@ -796,8 +796,23 @@ function toolEffects(
     let outcome: 'success' | 'failure' | 'blocked' | 'error' = success
       ? 'success'
       : 'failure';
+    let reason: 'lab_write_disabled' | undefined;
     try {
-      const parsed = JSON.parse(entry.result) as { message?: unknown };
+      const parsed = JSON.parse(entry.result) as {
+        message?: unknown;
+        reason?: unknown;
+        outcome?: unknown;
+        writeCommitted?: unknown;
+      };
+      if (
+        isWrite &&
+        parsed.reason === 'lab_write_disabled' &&
+        parsed.outcome === 'blocked' &&
+        parsed.writeCommitted === false
+      ) {
+        outcome = 'blocked';
+        reason = 'lab_write_disabled';
+      }
       if (
         parsed.message &&
         String(parsed.message).startsWith('INTERNAL_HINT:')
@@ -817,6 +832,7 @@ function toolEffects(
       class: isWrite ? 'write' : 'read',
       outcome,
       writeCommitted: isWrite && success,
+      ...(reason ? { reason } : {}),
     };
   });
 }

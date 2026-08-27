@@ -11,6 +11,11 @@ import {
 import { isAnaConversationalV2Enabled } from './conversationalV2/featureFlag';
 import { getHistoryWithTimestamps } from './contextManager';
 import { releaseLocalEchoPauseAfterAnaResume } from './pauseService';
+import { HUMAN_ECHO_PREFIX } from './humanConversationContext';
+import {
+  assertExternalWriteAllowed,
+  isAnaLabRuntime,
+} from '../runtimePolicy';
 import type {
   HumanControlDisposition,
   ReceptionistTurnControl,
@@ -129,6 +134,7 @@ export function parseAnaResumeGateFinalizeResponse(
 }
 
 async function callResumeGate<T>(body: unknown): Promise<T> {
+  assertExternalWriteAllowed();
   const { data } = await axios.post<T>(
     `${RECEPS_INTERNAL_API_URL}/api/v1/bot/resume-gate`,
     body,
@@ -242,6 +248,63 @@ export async function evaluateAnaResumeForInbound(
   const explicitAnaResumeRequest = isExplicitAnaResumeRequest(
     input.inboundText ?? ''
   );
+
+  // O resume-gate produtivo é um POST mutável no ERP. No LAB-1, a autoridade
+  // mínima vem do histórico isolado: sem echo humano, prossegue; depois de echo,
+  // permanece silenciosa até pedido explícito pela Ana. Não há HTTP nem promessa
+  // de alterar a pausa produtiva.
+  if (isAnaLabRuntime()) {
+    let history: Awaited<ReturnType<typeof getHistoryWithTimestamps>>;
+    try {
+      history = await resolved.loadHistory(
+        input.config.phoneNumberId,
+        input.customerPhone
+      );
+    } catch (error) {
+      capture(error, input.config, 'lab_load_history');
+      return silentHuman('KEEP_SILENT');
+    }
+    const lastHumanIndex = history.reduce(
+      (last, entry, index) =>
+        entry.role === 'assistant' && entry.content.startsWith(HUMAN_ECHO_PREFIX)
+          ? index
+          : last,
+      -1
+    );
+    if (lastHumanIndex < 0) {
+      return {
+        allowed: true,
+        disposition: 'NO_ACTIVE_TAKEOVER',
+        resumeDecision: 'PROCEED',
+      };
+    }
+    const anaAnsweredAfterHuman = history
+      .slice(lastHumanIndex + 1)
+      .some(
+        (entry) =>
+          entry.role === 'assistant' &&
+          !entry.content.startsWith(HUMAN_ECHO_PREFIX)
+      );
+    if (anaAnsweredAfterHuman) {
+      return {
+        allowed: true,
+        disposition: 'NO_ACTIVE_TAKEOVER',
+        resumeDecision: 'PROCEED',
+      };
+    }
+    if (explicitAnaResumeRequest) {
+      resolved.onAnaResumeApplied?.(
+        input.config.phoneNumberId,
+        input.customerPhone
+      );
+      return {
+        allowed: true,
+        disposition: 'RESUME_APPROVED',
+        resumeDecision: 'RESUME_ANA',
+      };
+    }
+    return silentHuman('KEEP_SILENT');
+  }
 
   let beginRaw: unknown;
   try {

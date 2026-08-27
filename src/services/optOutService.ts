@@ -12,6 +12,10 @@ import {
   runtimeErrorKind,
   safeHttpStatus,
 } from '../observability/safeRuntime';
+import {
+  assertExternalWriteAllowed,
+  labBlockedWriteEffect,
+} from '../runtimePolicy';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -124,6 +128,7 @@ async function callReceps(
   customerPhone: string
 ): Promise<OptOutResponse | null> {
   try {
+    assertExternalWriteAllowed();
     const { data } = await axios.post<OptOutResponse>(
       `${RECEPS_INTERNAL_API_URL}/api/internal/opt-out`,
       { phoneNumberId, customerPhone },
@@ -169,7 +174,10 @@ export async function tryHandleOptOut(
     `🚫 [optOut] detectado | phoneNumberId=${config.phoneNumberId} | convHash=${convHash} | chars=${text.length}`
   );
 
-  const result = await callReceps(config.phoneNumberId, from);
+  const labBlock = labBlockedWriteEffect('optOut');
+  const result = labBlock
+    ? null
+    : await callReceps(config.phoneNumberId, from);
 
   if (result) {
     if (result.customerFound) {
@@ -184,7 +192,9 @@ export async function tryHandleOptOut(
   }
 
   const botName = config.botName || 'nossa atendente';
-  const reply = `Entendi! A partir de agora você não receberá mais mensagens automáticas da ${botName}. Se precisar de algo, é só nos chamar aqui.`;
+  const reply = labBlock
+    ? 'Não consegui atualizar sua preferência por este atendimento. Por favor, peça à equipe do estabelecimento para interromper as mensagens.'
+    : `Entendi! A partir de agora você não receberá mais mensagens automáticas da ${botName}. Se precisar de algo, é só nos chamar aqui.`;
 
   try {
     if (config.botRole !== 'sales') {

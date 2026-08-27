@@ -25,6 +25,10 @@ import {
 } from './silentEscalationHold';
 import { Sentry } from '../observability/sentry';
 import { runtimeErrorKind, technicalHash } from '../observability/safeRuntime';
+import {
+  assertExternalWriteAllowed,
+  labBlockedWriteEffect,
+} from '../runtimePolicy';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -113,6 +117,13 @@ export type EscalationOutcome =
   | { kind: 'created'; questionId: string }
   | { kind: 'active_question_different_source' }
   | { kind: 'echo_human_active' }
+  | {
+      kind: 'blocked';
+      class: 'write';
+      outcome: 'blocked';
+      writeCommitted: false;
+      reason: 'lab_write_disabled';
+    }
   | { kind: 'failed' };
 
 export interface EscalationDeps {
@@ -121,6 +132,7 @@ export interface EscalationDeps {
 
 const defaultDeps: EscalationDeps = {
   async post(input) {
+    assertExternalWriteAllowed();
     const { data } = await axios.post(
       `${RECEPS_INTERNAL_API_URL}/api/v1/bot/questions/escalate`,
       {
@@ -230,6 +242,16 @@ export async function escalateQuestion(
   deps: EscalationDeps = defaultDeps
 ): Promise<EscalationOutcome> {
   if (!isEscalationReasonCode(input.reasonCode)) return { kind: 'failed' };
+  const labBlock = labBlockedWriteEffect('createEscalation');
+  if (labBlock) {
+    return {
+      kind: 'blocked',
+      class: labBlock.class,
+      outcome: labBlock.outcome,
+      writeCommitted: labBlock.writeCommitted,
+      reason: labBlock.reason,
+    };
+  }
   try {
     const raw = await postEscalationWithTopicCompatibility(input, deps);
     const outcome = escalationOutcomeFromPayload(raw);

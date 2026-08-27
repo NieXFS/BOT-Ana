@@ -22,6 +22,11 @@ import type {
   InboundMessageType,
 } from './anaWave2Store';
 import { truncateForW1 } from './inboundContent';
+import {
+  assertExternalWriteAllowed,
+  labBlockedWriteEffect,
+  type LabBlockedWriteEffect,
+} from '../runtimePolicy';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -278,6 +283,7 @@ function retryDelayMs(attempts: number): number {
 async function postInboundToReceps(
   payload: InboundDeliveryPayload
 ): Promise<InboundDeliveryResponse> {
+  assertExternalWriteAllowed();
   const { data } = await axios.post<InboundDeliveryResponse>(
     `${RECEPS_INTERNAL_API_URL}/api/v1/bot/conversations/inbound`,
     payload,
@@ -313,6 +319,10 @@ export interface InboundDeliveryResult {
   attempts: number;
   terminal: boolean;
   fastRetryAllowed: boolean;
+  class?: LabBlockedWriteEffect['class'];
+  outcome?: LabBlockedWriteEffect['outcome'];
+  writeCommitted?: false;
+  reason?: 'lab_write_disabled';
 }
 
 export interface InboundOutboxFailure {
@@ -384,6 +394,21 @@ export async function attemptInboundDeliveryOnce(
       attempts: row.attempts,
       terminal: false,
       fastRetryAllowed: false,
+    };
+  }
+
+  const labBlock = labBlockedWriteEffect('deliverInboundToErp');
+  if (labBlock) {
+    await deps.store.markTerminal(messageId, row.attempts, 'LAB_WRITE_DISABLED');
+    return {
+      delivered: false,
+      attempts: row.attempts,
+      terminal: true,
+      fastRetryAllowed: false,
+      class: labBlock.class,
+      outcome: labBlock.outcome,
+      writeCommitted: labBlock.writeCommitted,
+      reason: labBlock.reason,
     };
   }
 
@@ -505,6 +530,7 @@ export async function shouldSuspendForPendingInbound(
   customerPhone: string,
   store: InboundOutboxStore = pgInboundOutboxStore
 ): Promise<boolean> {
+  if (labBlockedWriteEffect('deliverInboundToErp')) return false;
   if (!isEscalationKnownActive(phoneNumberId, customerPhone)) return false;
   return store.hasPending(canonicalConversationKey(phoneNumberId, customerPhone));
 }
