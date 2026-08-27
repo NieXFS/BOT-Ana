@@ -17,6 +17,7 @@ import type {
 export const PROVIDER_STATUS_MATCH_HORIZON_MS_V2 = 24 * 60 * 60 * 1_000;
 export const PROVIDER_STATUS_INITIAL_BACKOFF_MS_V2 = 1_000;
 export const PROVIDER_STATUS_MAX_BACKOFF_MS_V2 = 10 * 60_000;
+export const PROVIDER_STATUS_RECOVERY_INTERVAL_MS_V2 = 60_000;
 
 export const PROVIDER_STATUS_EVENTS_V2 = [
   'sent',
@@ -859,6 +860,60 @@ export const pgProviderStatusStoreV2: ProviderStatusStoreV2 = {
     return result.rows.map(rowToEvent);
   },
 };
+
+/**
+ * Recovery estritamente local para status v2 que chegou antes do outbox.
+ * A única dependência executada é o store local; não há callback ERP, reparo
+ * de histórico, transporte WhatsApp ou observabilidade remota neste caminho.
+ */
+export async function sweepProviderStatusRecoveryV2(
+  store: ProviderStatusStoreV2 = pgProviderStatusStoreV2,
+  now = new Date()
+): Promise<ProviderStatusSweepResultV2> {
+  return store.sweep(now);
+}
+
+interface ProviderStatusRecoveryRuntimeV2 {
+  timer: NodeJS.Timeout | null;
+  running: boolean;
+}
+
+const PROVIDER_STATUS_RECOVERY_RUNTIME_KEY_V2 = Symbol.for(
+  'ana.provider-status-v2-recovery.runtime.v1'
+);
+
+function providerStatusRecoveryRuntimeV2(): ProviderStatusRecoveryRuntimeV2 {
+  const globals = globalThis as unknown as Record<PropertyKey, unknown>;
+  const existing = globals[PROVIDER_STATUS_RECOVERY_RUNTIME_KEY_V2] as
+    | ProviderStatusRecoveryRuntimeV2
+    | undefined;
+  if (existing) return existing;
+  const created = { timer: null, running: false };
+  globals[PROVIDER_STATUS_RECOVERY_RUNTIME_KEY_V2] = created;
+  return created;
+}
+
+export function startProviderStatusRecoverySweepV2(
+  store: ProviderStatusStoreV2 = pgProviderStatusStoreV2,
+  intervalMs = PROVIDER_STATUS_RECOVERY_INTERVAL_MS_V2
+): boolean {
+  const runtime = providerStatusRecoveryRuntimeV2();
+  if (runtime.timer) return false;
+  runtime.timer = setInterval(() => {
+    if (runtime.running) return;
+    runtime.running = true;
+    void sweepProviderStatusRecoveryV2(store)
+      .catch(() => {
+        // Mensagem constante e local: não inclui driver, URL, WAMID ou PII.
+        console.warn('[provider-status-v2] recovery local falhou');
+      })
+      .finally(() => {
+        runtime.running = false;
+      });
+  }, intervalMs);
+  runtime.timer.unref();
+  return true;
+}
 
 /** Pure digest projection shared by the daily digest and deterministic smoke. */
 export function buildProviderStatusDigestV2(

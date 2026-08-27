@@ -245,6 +245,10 @@ async function main(): Promise<void> {
   const resume = await import('../src/services/anaResumeGate');
   const inboundOutbox = await import('../src/services/inboundOutbox');
   const whatsappStatus = await import('../src/services/whatsappStatusHandler');
+  const providerStatus = await import(
+    '../src/services/conversationalV2/providerStatus'
+  );
+  const labSchema = await import('../src/services/labSchema');
   const sentryConfig = await import('../src/observability/sentryConfig');
   assert.equal(
     sentryConfig.RECEPS_IA_SENTRY_SCOPE.tags.runtime_mode,
@@ -335,6 +339,96 @@ async function main(): Promise<void> {
       error.reason === 'tenant_inactive'
   );
 
+  const schemaDeps = (
+    query: (
+      sql: string,
+      params?: readonly unknown[]
+    ) => Promise<{ rows: Record<string, unknown>[] }>
+  ): labSchema.LabSchemaQuery => ({
+    query: query as unknown as import('pg').Pool['query'],
+  });
+  let productionCatalogReads = 0;
+  await labSchema.assertProductionStorageIsNotLab(
+    schemaDeps(async (sql, params = []) => {
+      productionCatalogReads += 1;
+      assert.match(sql, /to_regclass/i);
+      assert.deepEqual(params, [labSchema.ANA_LAB_SCHEMA_MARKER_TABLE]);
+      return { rows: [{ relation: null }] };
+    })
+  );
+  assert.equal(productionCatalogReads, 1);
+  await assert.rejects(
+    () =>
+      labSchema.assertProductionStorageIsNotLab(
+        schemaDeps(async () => ({
+          rows: [{ relation: labSchema.ANA_LAB_SCHEMA_MARKER_TABLE }],
+        }))
+      ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message === labSchema.PRODUCTION_STORAGE_IS_LAB_ERROR
+  );
+
+  const completeLabSchema = schemaDeps(async (sql, params = []) => {
+    if (/to_regclass/i.test(sql)) {
+      return { rows: [{ relation: String(params[0]) }] };
+    }
+    if (sql.includes(`FROM ${labSchema.ANA_LAB_SCHEMA_MARKER_TABLE}`)) {
+      return {
+        rows: [
+          {
+            schema_version: labSchema.ANA_LAB_SCHEMA_VERSION,
+            database_fingerprint: expectedFingerprint,
+          },
+        ],
+      };
+    }
+    throw new Error('unexpected LAB schema smoke query');
+  });
+  await labSchema.validateLabSchema(expectedFingerprint, completeLabSchema);
+  await assert.rejects(
+    () =>
+      labSchema.validateLabSchema(
+        expectedFingerprint,
+        schemaDeps(async (sql, params = []) => {
+          if (/to_regclass/i.test(sql)) {
+            return {
+              rows: [
+                {
+                  relation:
+                    params[0] === labSchema.ANA_LAB_SCHEMA_MARKER_TABLE
+                      ? null
+                      : String(params[0]),
+                },
+              ],
+            };
+          }
+          throw new Error('marker ausente não deve ler rows operacionais');
+        })
+      ),
+    /Schema LAB ausente ou incompleto/
+  );
+  await assert.rejects(
+    () =>
+      labSchema.validateLabSchema(
+        expectedFingerprint,
+        schemaDeps(async (sql, params = []) => {
+          if (/to_regclass/i.test(sql)) {
+            return { rows: [{ relation: String(params[0]) }] };
+          }
+          return {
+            rows: [
+              {
+                schema_version: labSchema.ANA_LAB_SCHEMA_VERSION,
+                database_fingerprint: '0'.repeat(64),
+              },
+            ],
+          };
+        })
+      ),
+    /Identidade\/versão do schema LAB não confere/
+  );
+
   // Use operations inline so completion order is observed deterministically.
   const labBootEvents: string[] = [];
   const productionBootEvents: string[] = [];
@@ -345,6 +439,9 @@ async function main(): Promise<void> {
       events.push(name);
     };
     return {
+      assertProductionStorageIsNotLab: push(
+        'assertProductionStorageIsNotLab'
+      ),
       validateLabSchema: async () => events.push('validateLabSchema'),
       ensureProcessedMessages: push('ensureProcessedMessages'),
       ensureAnaWave2: push('ensureAnaWave2'),
@@ -354,6 +451,9 @@ async function main(): Promise<void> {
       startConversationalV2: push('startConversationalV2Sweep'),
       startConversationalV2Successor: push(
         'startConversationalV2SuccessorSweep'
+      ),
+      startProviderStatusV2Recovery: push(
+        'startProviderStatusV2RecoverySweep'
       ),
       runRetentionOnce: push('runAnaRetention'),
       startRetentionScheduler: push('startAnaRetentionScheduler'),
@@ -375,6 +475,7 @@ async function main(): Promise<void> {
     'validateLabSchema',
     'startConversationalV2Sweep',
     'startConversationalV2SuccessorSweep',
+    'startProviderStatusV2RecoverySweep',
   ]);
   const labV2Disabled = policy.resolveAnaRuntimeConfig(
     labEnv(expectedFingerprint, {
@@ -396,6 +497,7 @@ async function main(): Promise<void> {
     'studio-viti'
   );
   assert.deepEqual(productionBootEvents, [
+    'assertProductionStorageIsNotLab',
     'ensureProcessedMessages',
     'ensureAnaWave2',
     'ensureSilentEscalationHold',
@@ -410,6 +512,26 @@ async function main(): Promise<void> {
     'ensureSalesFollowups',
     'startFollowupPoller',
     'initializeVoiceStorageAndProbe',
+  ]);
+  const reverseFenceBootEvents: string[] = [];
+  const reverseFenceOperations = makeOperations(reverseFenceBootEvents);
+  reverseFenceOperations.assertProductionStorageIsNotLab = async () => {
+    reverseFenceBootEvents.push('assertProductionStorageIsNotLab');
+    throw new Error(labSchema.PRODUCTION_STORAGE_IS_LAB_ERROR);
+  };
+  await assert.rejects(
+    () =>
+      serverModule.initializeRuntimeServices(
+        productionDefault,
+        reverseFenceOperations,
+        'studio-viti'
+      ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message === labSchema.PRODUCTION_STORAGE_IS_LAB_ERROR
+  );
+  assert.deepEqual(reverseFenceBootEvents, [
+    'assertProductionStorageIsNotLab',
   ]);
   const explicitProductionBootEvents: string[] = [];
   await serverModule.initializeRuntimeServices(
@@ -1038,6 +1160,73 @@ async function main(): Promise<void> {
   assert.equal(statusCallbackDismissals, 1);
   assert.equal(statusCallbackDismissReason, 'LAB_WRITE_DISABLED');
 
+  const pendingProviderStatusStore =
+    new providerStatus.MemoryProviderStatusStoreV2();
+  let providerRecoveryCallbackPosts = 0;
+  let providerRecoveryHistoryRepairs = 0;
+  const pendingProviderApplied = await whatsappStatus.handleWhatsAppStatuses(
+    {
+      statuses: [
+        {
+          id: 'wamid-provider-before-outbox-smoke',
+          status: 'delivered',
+          timestamp: '1787832000',
+        },
+      ],
+    },
+    {
+      store: {
+        apply: async () => ({ kind: 'unknown' }),
+        markCallbackAck: async () => true,
+        markCallbackFailure: async () => true,
+        markCallbackDismissed: async () => true,
+        listPendingCallbacks: async () => [],
+      },
+      providerStatusStore: pendingProviderStatusStore,
+      postCallback: async () => {
+        providerRecoveryCallbackPosts += 1;
+      },
+      repairHumanHistory: async () => {
+        providerRecoveryHistoryRepairs += 1;
+      },
+      wait: async () => undefined,
+      now: () => Date.parse('2026-08-27T12:00:00.000Z'),
+    },
+    { awaitCallbacks: false, allowV2Fallback: true }
+  );
+  assert.equal(pendingProviderApplied, 0);
+  assert.equal(pendingProviderStatusStore.getEvents()[0]?.state, 'pending');
+  const pendingProviderMessageHash = providerStatus.hashProviderMessageIdV2(
+    'wamid-provider-before-outbox-smoke'
+  );
+  pendingProviderStatusStore.registerOutbox({
+    deliveryAttemptId: 'delivery-attempt-provider-recovery-smoke',
+    turnId: 'turn-provider-recovery-smoke',
+    deliveryReceiptId: 'delivery-receipt-provider-recovery-smoke',
+    providerMessageIdHash: pendingProviderMessageHash,
+    providerStatus: null,
+    providerStatusAt: null,
+    providerFailureCode: null,
+    providerStatusVersion: 0,
+    outboxState: 'accepted_by_provider',
+  });
+  const providerRecoveryResult =
+    await providerStatus.sweepProviderStatusRecoveryV2(
+      pendingProviderStatusStore,
+      new Date('2026-08-27T12:00:02.000Z')
+    );
+  assert.equal(providerRecoveryResult.attempted, 1);
+  assert.equal(providerRecoveryResult.applied, 1);
+  assert.equal(providerRecoveryResult.unmatched, 0);
+  assert.equal(pendingProviderStatusStore.getEvents()[0]?.state, 'applied');
+  assert.equal(
+    pendingProviderStatusStore.getOutbox(pendingProviderMessageHash)
+      ?.providerStatus,
+    'delivered'
+  );
+  assert.equal(providerRecoveryCallbackPosts, 0);
+  assert.equal(providerRecoveryHistoryRepairs, 0);
+
   const blockedResult = JSON.stringify(booking);
   const effect = v2Runtime.toolEffects({
     rawReply: null,
@@ -1361,6 +1550,11 @@ async function main(): Promise<void> {
     assert.equal(healthBody.writePolicy, 'disabled');
     assert.equal(healthBody.globalBackgroundJobs, false);
     assert.equal(healthBody.v2RecoveryJobs, true);
+    assert.deepEqual(healthBody.localRecoveryJobs, {
+      conversationalV2State: true,
+      conversationalV2Successor: true,
+      providerStatusV2: true,
+    });
     for (const forbidden of [
       process.env.DATABASE_URL!,
       expectedFingerprint,

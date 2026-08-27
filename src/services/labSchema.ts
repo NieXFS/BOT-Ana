@@ -3,6 +3,8 @@ import { pool } from './contextManager';
 
 export const ANA_LAB_SCHEMA_VERSION = 1;
 export const ANA_LAB_SCHEMA_MARKER_TABLE = 'ana_lab_schema_metadata';
+export const PRODUCTION_STORAGE_IS_LAB_ERROR =
+  'Storage de produção aponta para um schema reservado do LAB.';
 
 /**
  * Schema completo criado pelo bootstrap explícito. A lista inclui superfícies
@@ -31,6 +33,23 @@ export const ANA_LAB_REQUIRED_TABLES = [
 
 export interface LabSchemaQuery {
   query: Pool['query'];
+}
+
+/**
+ * Cerca reversa de identidade do storage. Produção só faz esta leitura de
+ * catálogo antes do boot histórico: não lê rows operacionais, não executa DDL
+ * e nunca tenta corrigir um banco marcado como LAB.
+ */
+export async function assertProductionStorageIsNotLab(
+  deps: LabSchemaQuery = pool
+): Promise<void> {
+  const existing = await deps.query<{ relation: string | null }>(
+    'SELECT to_regclass($1)::text AS relation',
+    [ANA_LAB_SCHEMA_MARKER_TABLE]
+  );
+  if (existing.rows[0]?.relation) {
+    throw new Error(PRODUCTION_STORAGE_IS_LAB_ERROR);
+  }
 }
 
 export async function assertLabStorageEmpty(

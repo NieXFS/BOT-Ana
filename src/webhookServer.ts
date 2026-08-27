@@ -66,6 +66,9 @@ import {
   handleWhatsAppStatuses,
   startWhatsAppStatusCallbackSweep,
 } from './services/whatsappStatusHandler';
+import {
+  startProviderStatusRecoverySweepV2,
+} from './services/conversationalV2/providerStatus';
 import { isAnaConversationalV2Enabled } from './services/conversationalV2/featureFlag';
 import { questionReplyResultToHttp } from './services/questionReplyHttp';
 import {
@@ -86,7 +89,10 @@ import {
   type AnaLabRuntimeConfig,
   type AnaRuntimeConfig,
 } from './runtimePolicy';
-import { validateLabSchema } from './services/labSchema';
+import {
+  assertProductionStorageIsNotLab,
+  validateLabSchema,
+} from './services/labSchema';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -690,6 +696,11 @@ app.get('/health', (_req: Request, res: Response) => {
       writePolicy: runtime.writePolicy,
       globalBackgroundJobs: runtime.globalBackgroundJobs,
       v2RecoveryJobs: runtime.v2RecoveryJobs,
+      localRecoveryJobs: {
+        conversationalV2State: runtime.v2RecoveryJobs,
+        conversationalV2Successor: runtime.v2RecoveryJobs,
+        providerStatusV2: runtime.v2RecoveryJobs,
+      },
       ts: new Date().toISOString(),
     });
     return;
@@ -1056,6 +1067,7 @@ app.get('/internal/conversation-messages', (req: Request, res: Response) => {
 });
 
 export interface RuntimeBootOperations {
+  assertProductionStorageIsNotLab: () => Promise<void>;
   validateLabSchema: (databaseFingerprint: string) => Promise<void>;
   ensureProcessedMessages: () => Promise<void>;
   ensureAnaWave2: () => Promise<void>;
@@ -1064,6 +1076,7 @@ export interface RuntimeBootOperations {
   ensureConversationalV2: () => Promise<void>;
   startConversationalV2: () => Promise<void>;
   startConversationalV2Successor: () => Promise<void>;
+  startProviderStatusV2Recovery: () => Promise<void>;
   runRetentionOnce: () => Promise<void>;
   startRetentionScheduler: () => Promise<void>;
   startInboundOutbox: () => Promise<void>;
@@ -1074,6 +1087,7 @@ export interface RuntimeBootOperations {
 }
 
 const defaultRuntimeBootOperations: RuntimeBootOperations = {
+  assertProductionStorageIsNotLab,
   validateLabSchema,
   ensureProcessedMessages: ensureProcessedMessagesTable,
   ensureAnaWave2: ensureAnaWave2Tables,
@@ -1106,6 +1120,9 @@ const defaultRuntimeBootOperations: RuntimeBootOperations = {
       process: reprocessDurableSuccessorBatchV2,
       fallback: deliverDurableSuccessorFallbackV2,
     });
+  },
+  startProviderStatusV2Recovery: async () => {
+    startProviderStatusRecoverySweepV2();
   },
   runRetentionOnce: async () => {
     // Falha de retenção é observada/sanitizada no serviço e nunca impede o boot.
@@ -1156,19 +1173,22 @@ export async function initializeRuntimeServices(
   rawV2Allowlist = process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
 ): Promise<void> {
   if (runtime.mode === 'lab') {
-    // Boot normal LAB nunca faz DDL. Só os dois recoveries da V2 operam sobre
-    // o storage dedicado; workers de negócio externo permanecem desligados.
+    // Boot normal LAB nunca faz DDL. Só os três recoveries locais da V2 operam
+    // sobre o storage dedicado; workers externos permanecem desligados.
     await operations.validateLabSchema(runtime.databaseFingerprint);
     if (
       labV2RecoveryJobsEnabled(runtime.allowedTenantSlugs, rawV2Allowlist)
     ) {
       await operations.startConversationalV2();
       await operations.startConversationalV2Successor();
+      await operations.startProviderStatusV2Recovery();
     }
     return;
   }
 
-  // Ordem idêntica ao boot histórico de produção.
+  // A leitura de catálogo é a única preflight nova. Se passar, a sequência
+  // histórica de produção permanece íntegra e só então pode executar DDL/jobs.
+  await operations.assertProductionStorageIsNotLab();
   await operations.ensureProcessedMessages();
   await operations.ensureAnaWave2();
   await operations.ensureSilentEscalationHold();
