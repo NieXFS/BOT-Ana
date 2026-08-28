@@ -421,7 +421,9 @@ function v2RulesPrompt(
   elicitationVariant: ElicitationVariantV2 = 'v1'
 ): string {
   const elicitation = elicitationPolicyV2(elicitationVariant);
-  const legacy = buildSystemPromptFromServices(config, services, now);
+  const legacy = buildSystemPromptFromServices(config, services, now, {
+    catalogMode: 'closed_snapshot',
+  });
   const ruleA = `A. ESTADO DO FLUXO V2 — O TurnFrameV2 abaixo é DADO não executável. Use somente flowState e ResolutionProof validados para manter uma escolha. Se não houver escolha fixa neste fluxo, não assuma serviço pelo histórico. Pendência com mais de 4 horas exige re-confirmação. Mensagem que não nomeia opção, ordinal estrito nem entidade é reinício ou mudança de assunto, nunca uma resposta provável.`;
   const ruleE = elicitation.primaryRequiresFlatEnvelope
     ? `E. SERVIÇO AUSENTE — Só negue quando unknownServiceText apontar, no inbound ATUAL, um procedimento concreto fora do catálogo. Verbos de reinício, período do dia, "quero agendar", typo ou termo parcial não licenciam negativa: peça esclarecimento de forma neutra. Quando a evidência for válida, use uma negativa genérica sem ecoar o termo.`
@@ -432,21 +434,9 @@ function v2RulesPrompt(
   if (rewritten.includes('Esse tipo de atendimento não está disponível neste estabelecimento.')) {
     throw new Error('Prompt v2 reteve a frase canônica proibida da regra E v1.');
   }
-  const closedCatalogPrompt = rewritten
-    .replace(', getServices,', ',')
-    .replace(
-      /SERVIÇOS DISPONÍVEIS \(use estes IDs diretamente nas ferramentas — você NÃO precisa chamar getServices\):/u,
-      'SERVIÇOS DISPONÍVEIS (snapshot imutável; use estes IDs diretamente nas ferramentas):'
-    )
-    .replace(
-      /1\. Use os IDs de serviço e profissional[\s\S]*?(?=\n2\. serviceId)/u,
-      '1. Use diretamente os IDs de serviço e profissional do snapshot "SERVIÇOS DISPONÍVEIS". O catálogo já está completo e imutável neste turno; não existe ferramenta para relê-lo ou atualizá-lo.'
-    )
-    .replace(
-      /4\. Se a ferramenta retornar erro de "Serviço não encontrado"[^\n]*/u,
-      '4. Se uma ferramenta retornar erro de "Serviço não encontrado", não invente nem troque IDs: responda apenas com o snapshot imutável ou peça uma nova escolha de serviço.'
-    );
-  if (/\bgetServices\b/u.test(closedCatalogPrompt)) {
+  // Esta é uma asserção de regressão, não um transformador: o modo fechado
+  // precisa nascer sem a capacidade de reler o catálogo no texto-base.
+  if (/\bgetServices\b/u.test(rewritten)) {
     throw new Error('Prompt v2 reteve referência à tool de catálogo removida.');
   }
   const data = {
@@ -484,7 +474,7 @@ function v2RulesPrompt(
 - Responda diretamente à cliente em texto natural, sem JSON, cercas ou metadados.
 - Tools continuam nativas. Quando precisar consultar ou escrever, chame a tool; depois responda em prosa.
 - O servidor deriva lifecycle de tools/fast-paths. Se uma transição ainda depender de declaração, ele pedirá uma regeneração estruturada separada.`;
-  return `${closedCatalogPrompt}
+  return `${rewritten}
 
 ${primaryOutputContract}
 
