@@ -2,7 +2,7 @@ import 'dotenv/config';
 // Init do Sentry o mais cedo possível (depois do dotenv, antes do express e
 // dos services) pra instrumentar erros e auto-instrumentar http/express.
 import { Sentry } from './observability/sentry';
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import { getTenantConfig, type TenantBotConfig } from './configProvider';
 import {
   deliverDurableSuccessorFallbackV2,
@@ -13,6 +13,7 @@ import {
 } from './messageHandler';
 import {
   botSignatureMiddleware,
+  strictBotSignatureMiddleware,
   webhookRateLimitMiddleware,
   isValidBearerToken,
 } from './security';
@@ -78,6 +79,10 @@ import {
   runAnaRetention,
   startAnaRetentionScheduler,
 } from './services/anaRetention';
+import {
+  authOtpEndpoint,
+  onboardingWelcomeEndpoint,
+} from './services/transactionalOnboardingMessages';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -463,6 +468,37 @@ app.post(
       res.status(500).json({ error: 'internal error' });
     }
   }
+);
+
+function requireErpInternalBearer(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  if (!isValidBearerToken(req.get('authorization'), ERP_API_TOKEN)) {
+    res.sendStatus(401);
+    return;
+  }
+  next();
+}
+
+/**
+ * Transporte transacional do onboarding. As duas rotas exigem o Bearer interno
+ * E o HMAC dos bytes exatos. Nenhuma delas passa pelo brain, histórico, lead,
+ * follow-up ou estado de pausa da Renata.
+ */
+app.post(
+  '/internal/auth/otp',
+  requireErpInternalBearer,
+  strictBotSignatureMiddleware,
+  authOtpEndpoint
+);
+
+app.post(
+  '/internal/onboarding/welcome',
+  requireErpInternalBearer,
+  strictBotSignatureMiddleware,
+  onboardingWelcomeEndpoint
 );
 
 app.get('/health', (_req: Request, res: Response) => {

@@ -27,6 +27,12 @@ ssh root@46.62.134.25 "cd ~/Receps-IA && git pull && npm install --no-audit --no
 ## Assets binários
 `assets/renata-demo.mp4` (10,7MB) é o vídeo da escada de demonstração da Renata, **commitado de propósito**: o `video/` do repo Receps é gitignored, então o `git pull` é o único caminho que leva o arquivo pra VPS. O `boot()` não lê o asset; ele só é carregado no 1º `sendDemoVideo` (e aí fica ~11MB memoizado no processo). Env opcional `RENATA_DEMO_VIDEO_PATH` sobrepõe o caminho.
 
+## OTP transacional + assento de onboarding (2026-08-28, código local; sem deploy)
+
+O assento de onboarding já existente continua sendo `onboardingBrain` dentro do ramo `botRole:"sales"`/tenant `receps-vendas`; não existe segundo `botRole`, brain, número ou conversa. A precedência por telefone é: recepcionista fora da ponte → pausa/takeover → claim → sessão ERP `open` (onboarding/trial) → vendas; estado ERP `blocked|unavailable` falha fechado e nunca cai em Renata sales. `resolveConversationBrainRole` é o predicado puro usado pelo dispatcher real. Contrato e mapeamento: `docs/otp-onboarding.md`. Smoke: `smoke:onboarding-routing`.
+
+`POST /internal/auth/otp` recebe `{ phone: "+55…", code }` já gerado pelo ERP; `POST /internal/onboarding/welcome` recebe somente `{ phone }`. Ambos exigem Bearer `ERP_API_TOKEN` **e** HMAC estrito `X-Bot-Signature` sobre os bytes exatos com `RECEPS_BOT_WEBHOOK_SECRET`. O transporte resolve exclusivamente a config ativa `receps-vendas` pelo `RECEPS_TRANSACTIONAL_PHONE_NUMBER_ID`, envia template e não toca brain, histórico, `SalesLead`, follow-up ou pause/resume. Rate limit local: OTP 5/10min por telefone; welcome 3/24h. Respostas nunca devolvem telefone, código ou wamid; outcome Meta ambíguo é `202` e não autoriza retry automático. Templates default `receps_auth_otp_v1` (`AUTHENTICATION`) e `receps_onboarding_welcome_v1` (`UTILITY`), ambos `pt_BR`; submissão idempotente em `scripts/create-otp-templates.ts`. Smokes: `smoke:auth-transactional-guardrails`, `smoke:transactional-endpoint`, grupo `smoke:otp-onboarding`.
+
 ## Smokes (determinísticos, sem rede/OpenAI/DB)
 Rodados com `npx tsx`. Padrão pós-ESM: setar `process.env.DATABASE_URL`/`OPENAI_API_KEY` dummy ANTES de carregar o módulo (o `contextManager` LANÇA no load sem `DATABASE_URL`; o `Pool` do pg é lazy, não conecta), usar `import type` pros tipos e `await import()` dinâmico pro módulo real. Lista em `package.json` (`smoke:*`).
 

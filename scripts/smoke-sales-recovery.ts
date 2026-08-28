@@ -141,9 +141,8 @@ async function main(): Promise<void> {
         recoveredRole = brainRegistry.resolveConversationBrainRole({
           baseRole: 'sales',
           paused: false,
-          claimMatched: false,
-          claimSucceeded: false,
-          hasOpenOnboardingSession: true,
+          claimStatus: 'none',
+          onboardingState: 'open',
         });
         return `resposta-${recoveredRole}`;
       },

@@ -35,9 +35,8 @@ async function main(): Promise<void> {
     brain.resolveConversationBrainRole({
       baseRole: 'receptionist',
       paused: false,
-      claimMatched: true,
-      claimSucceeded: true,
-      hasOpenOnboardingSession: true,
+      claimStatus: 'accepted',
+      onboardingState: 'open',
     }) === 'receptionist'
   );
   check(
@@ -45,9 +44,8 @@ async function main(): Promise<void> {
     brain.resolveConversationBrainRole({
       baseRole: 'sales',
       paused: true,
-      claimMatched: true,
-      claimSucceeded: true,
-      hasOpenOnboardingSession: true,
+      claimStatus: 'accepted',
+      onboardingState: 'open',
     }) === 'paused'
   );
   check(
@@ -55,9 +53,8 @@ async function main(): Promise<void> {
     brain.resolveConversationBrainRole({
       baseRole: 'sales',
       paused: false,
-      claimMatched: true,
-      claimSucceeded: true,
-      hasOpenOnboardingSession: false,
+      claimStatus: 'accepted',
+      onboardingState: 'none',
     }) === 'onboarding'
   );
   check(
@@ -65,9 +62,8 @@ async function main(): Promise<void> {
     brain.resolveConversationBrainRole({
       baseRole: 'sales',
       paused: false,
-      claimMatched: true,
-      claimSucceeded: false,
-      hasOpenOnboardingSession: false,
+      claimStatus: 'rejected',
+      onboardingState: 'none',
     }) === 'claim'
   );
   check(
@@ -75,9 +71,8 @@ async function main(): Promise<void> {
     brain.resolveConversationBrainRole({
       baseRole: 'sales',
       paused: false,
-      claimMatched: false,
-      claimSucceeded: false,
-      hasOpenOnboardingSession: true,
+      claimStatus: 'none',
+      onboardingState: 'open',
     }) === 'onboarding'
   );
   check(
@@ -85,10 +80,21 @@ async function main(): Promise<void> {
     brain.resolveConversationBrainRole({
       baseRole: 'sales',
       paused: false,
-      claimMatched: false,
-      claimSucceeded: false,
-      hasOpenOnboardingSession: false,
+      claimStatus: 'none',
+      onboardingState: 'none',
     }) === 'sales'
+  );
+  check(
+    'estado ERP ambíguo/indisponível nunca cai em vendas',
+    ['blocked', 'unavailable'].every(
+      (onboardingState) =>
+        brain.resolveConversationBrainRole({
+          baseRole: 'sales',
+          paused: false,
+          claimStatus: 'none',
+          onboardingState: onboardingState as 'blocked' | 'unavailable',
+        }) === 'blocked'
+    )
   );
   check(
     'claim reconhece prefixo e separadores',

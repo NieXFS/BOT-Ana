@@ -74,6 +74,60 @@ export async function sendFreeformMessageWithReceipt(
   return { providerMessageId: providerMessageId.trim() };
 }
 
+export interface WhatsAppTemplateMessage {
+  name: string;
+  languageCode: string;
+  components?: ReadonlyArray<Record<string, unknown>>;
+}
+
+/** Payload puro do transporte de template; não persiste nem classifica conversa. */
+export function buildTemplateMessagePayload(
+  to: string,
+  template: WhatsAppTemplateMessage
+) {
+  return {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'template',
+    template: {
+      name: template.name,
+      language: { code: template.languageCode },
+      ...(template.components?.length
+        ? { components: template.components }
+        : {}),
+    },
+  } as const;
+}
+
+/**
+ * Envia um template aprovado e só confirma aceite quando a Meta devolve recibo.
+ * O chamador decide categoria/variáveis; este helper não toca histórico, lead,
+ * follow-up nem estado de pausa.
+ */
+export async function sendTemplateMessageWithReceipt(
+  to: string,
+  template: WhatsAppTemplateMessage,
+  waConfig: WhatsAppTenantConfig,
+  post: WhatsAppHttpPost = defaultHttpPost
+): Promise<{ providerMessageId: string }> {
+  const response = await post(
+    buildApiUrl(waConfig),
+    buildTemplateMessagePayload(to, template),
+    {
+      headers: headers(waConfig),
+      timeout: WHATSAPP_TEXT_TIMEOUT_MS,
+    }
+  );
+
+  const providerMessageId = (
+    response.data as { messages?: Array<{ id?: unknown }> } | undefined
+  )?.messages?.[0]?.id;
+  if (typeof providerMessageId !== 'string' || !providerMessageId.trim()) {
+    throw new WhatsAppReceiptMissingError();
+  }
+  return { providerMessageId: providerMessageId.trim() };
+}
+
 /**
  * Sem resposta HTTP, o POST pode ter sido aceito pela Meta e só o recibo ter se
  * perdido. Essa condição nunca autoriza retry nem outra mensagem automática.

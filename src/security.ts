@@ -97,6 +97,32 @@ export function botSignatureMiddleware(
   next();
 }
 
+/**
+ * Variante estrita para comandos internos com efeito externo (ex.: OTP).
+ * Diferente do webhook legado, o HMAC é obrigatório também em desenvolvimento:
+ * sem segredo não existe modo degradado que possa disparar mensagem.
+ */
+export function strictBotSignatureMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const secret = process.env.RECEPS_BOT_WEBHOOK_SECRET ?? '';
+  if (!secret) {
+    res.status(503).json({ error: 'internal signature not configured' });
+    return;
+  }
+
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+  const signature = req.get('x-bot-signature') ?? undefined;
+  if (!isValidMetaSignature(rawBody, signature, secret)) {
+    res.sendStatus(401);
+    return;
+  }
+
+  next();
+}
+
 // ---------------------------------------------------------------------------
 // Auth de API interna (Bearer) — endpoints lidos pelo Receps (ex.:
 // /internal/conversation-activity). Espelha o segredo compartilhado ERP_API_TOKEN

@@ -1632,7 +1632,14 @@ export type ConversationBrainRole =
   | 'paused'
   | 'claim'
   | 'onboarding'
+  | 'blocked'
   | 'sales';
+
+export type ErpOnboardingPhoneState =
+  | 'open'
+  | 'none'
+  | 'blocked'
+  | 'unavailable';
 
 export type RecoverableSalesConversationRole =
   | 'sales'
@@ -1676,17 +1683,17 @@ export function clearResolvedSalesConversationRoles(
 export function resolveConversationBrainRole(input: {
   baseRole: 'sales' | 'receptionist';
   paused: boolean;
-  claimMatched: boolean;
-  claimSucceeded: boolean;
-  hasOpenOnboardingSession: boolean;
+  claimStatus: 'none' | 'accepted' | 'rejected';
+  onboardingState: ErpOnboardingPhoneState;
 }): ConversationBrainRole {
   if (input.baseRole === 'receptionist') return 'receptionist';
   if (input.paused) return 'paused';
-  if (input.claimMatched) {
-    return input.claimSucceeded ? 'onboarding' : 'claim';
+  if (input.claimStatus !== 'none') {
+    return input.claimStatus === 'accepted' ? 'onboarding' : 'claim';
   }
-  if (input.hasOpenOnboardingSession) return 'onboarding';
-  return 'sales';
+  if (input.onboardingState === 'open') return 'onboarding';
+  if (input.onboardingState === 'none') return 'sales';
+  return 'blocked';
 }
 
 export function resolveHistoryRecoveryRole(input: {
@@ -1739,23 +1746,42 @@ export async function getReply(
   if (baseRole === 'sales') {
     // A checagem duplicada fecha a corrida entre o pre-flush e o claim: uma
     // pausa que entrou nesse intervalo impede inclusive reivindicar o código.
-    if (await isConversationPaused(config.phoneNumberId, phone)) {
+    const paused = await isConversationPaused(config.phoneNumberId, phone);
+    const preDispatchRole = resolveConversationBrainRole({
+      baseRole,
+      paused,
+      claimStatus: 'none',
+      onboardingState: 'none',
+    });
+    if (preDispatchRole === 'paused') {
       throw new ConversationPausedBeforeDispatch();
     }
 
     const claimCode = matchOnboardingClaimCode(userMessage);
     if (claimCode) {
       const claim = await claimOnboardingSession(phone, claimCode);
+      const claimRole = resolveConversationBrainRole({
+        baseRole,
+        paused: false,
+        claimStatus: claim.success ? 'accepted' : 'rejected',
+        onboardingState: 'none',
+      });
       const storedMessage = claim.success
         ? '[código de onboarding confirmado]'
         : '[código de onboarding informado]';
       if (!claim.success) {
+        if (claimRole !== 'claim') {
+          throw new Error('Estado impossível na resolução do claim de onboarding.');
+        }
         return recordDirectSalesReply(
           phone,
           storedMessage,
           claim.message,
           config
         );
+      }
+      if (claimRole !== 'onboarding') {
+        throw new Error('Claim aceito não resolveu o assento de onboarding.');
       }
       rememberResolvedSalesRole(phone, config, 'onboarding');
       return getOnboardingReply(
@@ -1768,7 +1794,13 @@ export async function getReply(
     }
 
     const onboarding = await getOnboardingSessionResult(phone);
-    if (onboarding.kind === 'open') {
+    const conversationRole = resolveConversationBrainRole({
+      baseRole,
+      paused: false,
+      claimStatus: 'none',
+      onboardingState: onboarding.kind,
+    });
+    if (conversationRole === 'onboarding' && onboarding.kind === 'open') {
       rememberResolvedSalesRole(phone, config, 'onboarding');
       return getOnboardingReply(
         phone,
@@ -1778,8 +1810,8 @@ export async function getReply(
       );
     }
     if (
-      onboarding.kind === 'blocked' ||
-      onboarding.kind === 'unavailable'
+      conversationRole === 'blocked' &&
+      (onboarding.kind === 'blocked' || onboarding.kind === 'unavailable')
     ) {
       return recordDirectSalesReply(
         phone,
