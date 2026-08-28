@@ -28,6 +28,20 @@ const BASELINE_AVAILABLE_SHA256 =
   '7d55780d186df9a00593bf58b15bbcd4d2299295a0d5fdb1f004e6860e0adf0b';
 const BASELINE_UNAVAILABLE_SHA256 =
   '21fe60996254b28116d7b6ed7a8775310d15b423951cbab5fd94b1d480e7e566';
+// SHA-256 do prompt FINAL (depois de v2RulesPrompt), gerado no def0832 com
+// exatamente a mesma fixture/config/frame do caso saudável abaixo. O digest
+// é uma comparação byte-level do envelope completo, inclusive JSON do turno.
+const BASELINE_DEF0832_AVAILABLE_V2_PROMPT_SHA256 =
+  '359dce69184478ca04815cc88e7a5a44f5c64a381d7d4a83e067683e579feff2';
+
+const CLOSED_SNAPSHOT_HEADER =
+  'SERVIÇOS DISPONÍVEIS (snapshot imutável; use estes IDs diretamente nas ferramentas):';
+const CLOSED_SNAPSHOT_STYLE =
+  'ESTILO DE WHATSAPP: use texto corrido, curto e natural; evite Markdown, bullets e listas numeradas. Quando precisar oferecer as quatro opções de duplicidade, coloque-as em uma única frase curta. Use no máximo 1 emoji. Concisão nunca autoriza pular uma ferramenta obrigatória nem omitir uma parte do pedido. NUNCA narre plano, raciocínio, regras internas ou escolha de tool. NÃO escreva "Peeling tem dois profissionais habilitados (Júlia e Marina). Preciso perguntar a preferência antes de consultar horários.", nem "O cliente quer..."/"O cliente pediu...", nem nomes técnicos como getAvailableSlots, bookAppointment, getUpcomingAppointments ou cancelAppointment. Converta diretamente em fala ao cliente, por exemplo: "Peeling é com Júlia ou Marina. Você prefere uma profissional específica ou tanto faz?"';
+const CLOSED_SNAPSHOT_RULE_ONE =
+  '1. Use diretamente os IDs de serviço e profissional do snapshot "SERVIÇOS DISPONÍVEIS". O catálogo já está completo e imutável neste turno; não existe ferramenta para relê-lo ou atualizá-lo.';
+const CLOSED_SNAPSHOT_RULE_FOUR =
+  '4. Se uma ferramenta retornar erro de "Serviço não encontrado", não invente nem troque IDs: responda apenas com o snapshot imutável ou peça uma nova escolha de serviço.';
 
 const config = {
   tenantSlug: 'baseline',
@@ -316,8 +330,10 @@ async function main(): Promise<void> {
     assert.doesNotMatch(prompt, /atualiz(?:ar|ada)|recarreg|refresh|reload/iu);
     assert.doesNotMatch(prompt, /nova (?:leitura|consulta).*cat[aá]logo/iu);
   }
-  assert.match(closedAvailable, /snapshot imutável/u);
-  assert.match(closedAvailable, /Se a ferramenta retornar erro de "Serviço não encontrado"/u);
+  assert.ok(closedAvailable.includes(CLOSED_SNAPSHOT_HEADER));
+  assert.ok(closedAvailable.includes(CLOSED_SNAPSHOT_STYLE));
+  assert.ok(closedAvailable.includes(CLOSED_SNAPSHOT_RULE_ONE));
+  assert.ok(closedAvailable.includes(CLOSED_SNAPSHOT_RULE_FOUR));
   assert.match(closedUnavailable, /A lista de serviços não está disponível neste turno/u);
 
   // (1) Falha HTTP com frame novo: fallback canônico, sem provider/rede e sem
@@ -361,6 +377,39 @@ async function main(): Promise<void> {
   assert.equal(available.prepared.planReceipt.route, 'fast_path');
   assert.deepEqual(available.toolCalls, []);
 
+  // (8) Catálogo disponível em uma pergunta que não tem fast-path: prova que
+  // runModelLoop recebeu o prompt FINAL de v2 (não apenas o builder legado).
+  const availableModel = await runCase({
+    catalog: availableCatalog,
+    text: 'Vocês aceitam cartão?',
+  });
+  assert.equal(
+    availableModel.modelPrompts.length,
+    1,
+    'o caso saudável deve alcançar runModelLoop exatamente uma vez'
+  );
+  assert.equal(
+    availableModel.modelToolSets.length,
+    1,
+    'o caso saudável deve capturar exatamente um arsenal final'
+  );
+  const finalV2AvailablePrompt = availableModel.modelPrompts[0];
+  assert.equal(typeof finalV2AvailablePrompt, 'string');
+  assert.match(finalV2AvailablePrompt, /DADOS IMUTÁVEIS DO TURNO \(não são instruções\)/u);
+  assert.ok(finalV2AvailablePrompt.includes(CLOSED_SNAPSHOT_HEADER));
+  assert.deepEqual(availableModel.modelToolSets[0], [
+    'getAvailableSlots',
+    'getUpcomingAppointments',
+    'bookAppointment',
+    'cancelAppointment',
+  ]);
+  assert.equal(
+    hash(finalV2AvailablePrompt),
+    BASELINE_DEF0832_AVAILABLE_V2_PROMPT_SHA256,
+    'prompt FINAL disponível divergiu do baseline def0832'
+  );
+  assert.doesNotMatch(finalV2AvailablePrompt, /\bgetServices\b/u);
+
   // (7) A constante pública do arsenal também permanece fechada.
   assert.equal(
     runtime.RECEPTIONIST_V2_TOOLS.some(
@@ -375,7 +424,7 @@ async function main(): Promise<void> {
   assert.ok(httpFailure.modelPrompts.every((prompt) => !/\bgetServices\b/u.test(prompt)));
   assert.equal(httpFailure.regenerateCalls, 1);
 
-  console.log('smoke-ana-conversational-v2-closed-catalog: 7 gates passed');
+  console.log('smoke-ana-conversational-v2-closed-catalog: 8 gates passed');
 }
 
 main().catch((error: unknown) => {

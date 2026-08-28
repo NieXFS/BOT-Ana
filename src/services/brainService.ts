@@ -292,11 +292,11 @@ export function buildSystemPromptFromServices(
       : `E. SERVIÇO AUSENTE — Se o serviço pedido não aparece em "SERVIÇOS DISPONÍVEIS", diga explicitamente que esse serviço não está disponível neste estabelecimento antes de oferecer qualquer alternativa, mas não repita nem ecoe o termo ausente; use a frase canônica: "Esse tipo de atendimento não está disponível neste estabelecimento." Nunca trate uma alternativa como se fosse o serviço pedido. Só chame getServices uma vez se houver indício real de que a lista atual está desatualizada; se continuar ausente, mantenha a negativa explícita e ofereça apenas serviços cadastrados.`;
   const criticalToolRuleOne =
     catalogMode === 'closed_snapshot'
-      ? '1. Use os IDs de serviço e profissional listados no snapshot imutável "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Opere somente com os dados deste turno e não invente IDs ou dados de catálogo.'
+      ? '1. Use diretamente os IDs de serviço e profissional do snapshot "SERVIÇOS DISPONÍVEIS". O catálogo já está completo e imutável neste turno; não existe ferramenta para relê-lo ou atualizá-lo.'
       : '1. Use os IDs de serviço e profissional listados em "SERVIÇOS DISPONÍVEIS" acima diretamente nas ferramentas (getAvailableSlots, bookAppointment). Você normalmente NÃO precisa chamar getServices porque a lista atualizada já está disponível. Só chame getServices se suspeitar que a lista mudou (ex: cliente mencionou um serviço/profissional que não aparece na lista acima).';
   const criticalToolRuleFour =
     catalogMode === 'closed_snapshot'
-      ? '4. Se a ferramenta retornar erro de "Serviço não encontrado", não invente nem troque IDs: responda apenas com os dados confirmados no snapshot imutável ou peça uma nova escolha de serviço.'
+      ? '4. Se uma ferramenta retornar erro de "Serviço não encontrado", não invente nem troque IDs: responda apenas com o snapshot imutável ou peça uma nova escolha de serviço.'
       : '4. Se a ferramenta retornar erro de "Serviço não encontrado", chame getServices uma vez pra atualizar e use o ID exato retornado.';
 
   return `CONTEXTO TEMPORAL (OBRIGATÓRIO): Hoje é ${today}, são ${currentTime}. O ano atual é ${currentYear}. Quando o cliente mencionar datas relativas (amanhã, semana que vem, segunda, etc.), calcule a data correta a partir de HOJE. Quando o cliente mencionar apenas dia/mês (ex: "01/04"), SEMPRE assuma o ano ${currentYear}. NUNCA use anos anteriores.
