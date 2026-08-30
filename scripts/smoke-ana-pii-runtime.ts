@@ -51,10 +51,21 @@ function sourceSweep(): string[] {
     /response\??\.(?:body|data)/,
     /JSON\.stringify\s*\(\s*(?:payload|callbackPayload)/,
   ];
+  // Este gate é deliberadamente mais estreito que o scrub: `message.id` é
+  // autoridade no intake, mas nunca pode ser projetado em console, tags,
+  // contexts ou receipts serializados. O scrub não torna uma tag crua aceitável
+  // — a captura deve nascer higienizada.
+  const rawMessageIdTelemetry = [
+    /\$\{\s*(?:message\.id|messageId|input\.messageId|row\.messageId|event\.providerMessageId|obligation\.providerMessageId)\s*\}/,
+    /(?:messageId|message_id)\s*:\s*(?:message\.id|messageId|input\.messageId|row\.messageId|event\.providerMessageId|obligation\.providerMessageId)\b/,
+    /(?:setTag|setContext|setExtra|setExtras)\s*\(\s*['"](?:messageId|message_id)['"]\s*,\s*(?:message\.id|messageId|input\.messageId|row\.messageId|event\.providerMessageId|obligation\.providerMessageId)\b/,
+  ];
 
-  const extractCalls = (source: string): Array<{ body: string; line: number }> => {
+  const extractCalls = (
+    source: string,
+    startPattern: RegExp
+  ): Array<{ body: string; line: number }> => {
     const calls: Array<{ body: string; line: number }> = [];
-    const startPattern = /(?:console\.(?:log|info|warn|error)|Sentry\.(?:captureException|captureMessage))\s*\(/g;
     for (const match of source.matchAll(startPattern)) {
       const start = match.index ?? 0;
       const open = source.indexOf('(', start);
@@ -97,7 +108,11 @@ function sourceSweep(): string[] {
 
   for (const relative of SOURCE_PATHS) {
     const source = fs.readFileSync(path.resolve(relative), 'utf8');
-    for (const call of extractCalls(source)) {
+    const telemetryCalls = extractCalls(
+      source,
+      /(?:console\.(?:log|info|warn|error)|Sentry\.(?:captureException|captureMessage|withIsolationScope)|(?:scope|Sentry)\.(?:setTag|setContext|setExtra|setExtras))\s*\(/g
+    );
+    for (const call of telemetryCalls) {
       const statusSurfacePatterns = relative.endsWith(
         'services/whatsappStatusHandler.ts'
       )
@@ -114,17 +129,80 @@ function sourceSweep(): string[] {
           break;
         }
       }
+      for (const pattern of rawMessageIdTelemetry) {
+        if (pattern.test(call.body)) {
+          findings.push(`raw-message-id-telemetry:${relative}:${call.line}`);
+          break;
+        }
+      }
+    }
+    // Receipts and other serialized envelopes are a separate surface. They
+    // are not passed through the log-call checks above, but may still leak an
+    // ID if a raw field is added to one.
+    for (const call of extractCalls(source, /JSON\.stringify\s*\(/g)) {
+      for (const pattern of rawMessageIdTelemetry) {
+        if (pattern.test(call.body)) {
+          findings.push(`raw-message-id-receipt:${relative}:${call.line}`);
+          break;
+        }
+      }
     }
   }
   return [...new Set(findings)];
 }
 
+function countTechnicalMessageIdSinks(): number {
+  const sources = {
+    messageHandler: fs.readFileSync(
+      path.resolve('src/messageHandler.ts'),
+      'utf8'
+    ),
+    webhookServer: fs.readFileSync(
+      path.resolve('src/webhookServer.ts'),
+      'utf8'
+    ),
+  };
+  const expectedSinks: Array<[keyof typeof sources, RegExp]> = [
+    [
+      'messageHandler',
+      /operation:\s*'inbound_outbox_immediate'[\s\S]{0,180}messageIdHash:\s*technicalHash\(\s*message\.id\s*\)/,
+    ],
+    [
+      'messageHandler',
+      /Inbound repetida[\s\S]{0,180}messageIdHash=\$\{\s*technicalHash\(\s*message\.id\s*\)\s*\}/,
+    ],
+    [
+      'messageHandler',
+      /operation:\s*'audio_transcription'[\s\S]{0,180}messageIdHash:\s*technicalHash\(\s*message\.id\s*\)/,
+    ],
+    [
+      'messageHandler',
+      /operation:\s*'finalize_audio_failure'[\s\S]{0,180}messageIdHash:\s*technicalHash\(\s*message\.id\s*\)/,
+    ],
+    [
+      'messageHandler',
+      /\[escalation\] inbound pendente[\s\S]{0,180}messageIdHash=\$\{\s*technicalHash\(\s*message\.id\s*\)\s*\}/,
+    ],
+    [
+      'webhookServer',
+      /Mensagem já processada[\s\S]{0,180}messageIdHash=\$\{\s*technicalHash\(\s*message\.id\s*\)\s*\}/,
+    ],
+  ];
+  return expectedSinks.filter(([file, pattern]) => pattern.test(sources[file])).length;
+}
+
 async function main(): Promise<void> {
   const findings = sourceSweep();
+  const hashSinkCount = countTechnicalMessageIdSinks();
   check(
-    'sweep de fonte não encontra PII/raw Error em chamadas de log',
+    'sweep de fonte não encontra PII/raw Error em telemetria',
     findings.length === 0,
     findings.join(', ') || undefined
+  );
+  check(
+    'seis sinks de message id projetam somente hash técnico',
+    hashSinkCount === 6,
+    `encontrados=${hashSinkCount}`
   );
 
   const messageHandler = await import('../src/messageHandler');
@@ -139,6 +217,7 @@ async function main(): Promise<void> {
   const secretReply = 'Rascunho clínico secreto para a cliente';
   const secretName = 'Maria Segredo da Silva';
   const secretError = `request body ${secretPhone} ${secretInbound}`;
+  const secretInboundMessageId = 'wamid-inbound-PII-CRU-NAO-LOGAR';
   const secretProviderMessageId = 'wamid-PII-CRU-NAO-LOGAR';
   const secretPhoneNumberId = 'PNID-PII-CRU-NAO-LOGAR';
   const captured: string[] = [];
@@ -179,10 +258,11 @@ async function main(): Promise<void> {
   console.warn = capture;
   console.error = capture;
   try {
+    const persistedInboundIds = new Set<string>();
     await messageHandler.handleIncomingMessage(
       {
         from: secretPhone,
-        id: 'wamid-pii-intake',
+        id: secretInboundMessageId,
         timestamp: '1722470400',
         type: 'text',
         text: { body: secretInbound },
@@ -190,11 +270,52 @@ async function main(): Promise<void> {
       { profile: { name: secretName }, wa_id: secretPhone },
       config,
       {
-        persistInbound: async (input) => ({
-          fresh: input.content === secretInbound,
-          conversationKey: `${input.phoneNumberId}:${secretPhone}`,
-          sequence: 1,
+        persistInbound: async (input) => {
+          const fresh = !persistedInboundIds.has(input.messageId);
+          if (fresh) persistedInboundIds.add(input.messageId);
+          return {
+            fresh,
+            conversationKey: `${input.phoneNumberId}:${secretPhone}`,
+            sequence: fresh ? 1 : null,
+          };
+        },
+        deliverInbound: async () => ({
+          delivered: true,
+          attempts: 1,
+          terminal: false,
+          fastRetryAllowed: false,
         }),
+        updateInboundContent: async () => undefined,
+        markTranscriptionFailed: async () => undefined,
+        downloadAudio: async () => Buffer.alloc(0),
+        transcribeAudio: async () => 'transcrição secreta',
+        handleOptOut: async () => false,
+        shouldSuspend: async () => false,
+        isPaused: async () => true,
+      }
+    );
+    // A retransmissão precisa atravessar o mesmo sink de console que o replay
+    // de cutover exercita. O ID permanece sintético e nunca deve ser emitido.
+    await messageHandler.handleIncomingMessage(
+      {
+        from: secretPhone,
+        id: secretInboundMessageId,
+        timestamp: '1722470400',
+        type: 'text',
+        text: { body: `${secretInbound} retransmitida` },
+      },
+      { profile: { name: secretName }, wa_id: secretPhone },
+      config,
+      {
+        persistInbound: async (input) => {
+          const fresh = !persistedInboundIds.has(input.messageId);
+          if (fresh) persistedInboundIds.add(input.messageId);
+          return {
+            fresh,
+            conversationKey: `${input.phoneNumberId}:${secretPhone}`,
+            sequence: fresh ? 1 : null,
+          };
+        },
         deliverInbound: async () => ({
           delivered: true,
           attempts: 1,
@@ -304,6 +425,7 @@ async function main(): Promise<void> {
     secretError,
     '123.456.789-00',
     'transcrição secreta',
+    secretInboundMessageId,
     secretProviderMessageId,
     secretPhoneNumberId,
     'response body callback payload',
@@ -314,6 +436,11 @@ async function main(): Promise<void> {
   );
   check('captura preserva convHash técnico', joined.includes('convHash='));
   check('captura preserva apenas contagens de conteúdo', joined.includes('chars='));
+  check(
+    'replay capturado não emite ID cru e emite hash técnico',
+    !joined.includes(secretInboundMessageId) &&
+      joined.includes(`messageIdHash=${technicalHash(secretInboundMessageId)}`)
+  );
   check(
     'status usa hashes técnicos consistentes para provider e phoneNumberId',
     joined.includes(`providerMessageHash=${technicalHash(secretProviderMessageId)}`) &&

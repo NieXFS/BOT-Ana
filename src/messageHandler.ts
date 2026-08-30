@@ -73,6 +73,7 @@ import {
 } from './services/inboundOutbox';
 import {
   conversationHash,
+  technicalHash,
   runtimeErrorDetail,
   runtimeErrorKind,
 } from './observability/safeRuntime';
@@ -1558,7 +1559,7 @@ export async function handleIncomingMessage(
           service: 'message_handler',
           operation: 'inbound_outbox_immediate',
           phoneNumberId: config.phoneNumberId,
-          messageId: message.id,
+          messageIdHash: technicalHash(message.id),
           error_kind: runtimeErrorKind(error),
         },
       });
@@ -1579,7 +1580,11 @@ export async function handleIncomingMessage(
       receivedAt: inboundReceivedAt(message),
     });
     if (!intake.fresh) {
-      console.info(`↩️ Inbound ${message.id} repetida — intake atômico em noop.`);
+      console.info(
+        `↩️ Inbound repetida — intake atômico em noop | messageIdHash=${technicalHash(
+          message.id
+        )}`
+      );
       return;
     }
     conversationKey = intake.conversationKey;
@@ -1631,7 +1636,7 @@ export async function handleIncomingMessage(
             operation: 'audio_transcription',
             phoneNumberId: config.phoneNumberId,
             tenantSlug: config.tenantSlug,
-            messageId: message.id,
+            messageIdHash: technicalHash(message.id),
             error_kind: runtimeErrorKind(err),
           },
         }
@@ -1651,7 +1656,7 @@ export async function handleIncomingMessage(
                 service: 'message_handler',
                 operation: 'finalize_audio_failure',
                 phoneNumberId: config.phoneNumberId,
-                messageId: message.id,
+                messageIdHash: technicalHash(message.id),
                 error_kind: runtimeErrorKind(finalizeError),
               },
             }
@@ -1727,7 +1732,9 @@ export async function handleIncomingMessage(
     (await deps.shouldSuspend(config.phoneNumberId, from))
   ) {
     console.info(
-      `⏸️ [escalation] inbound ${message.id} pendente; conversa mantida suspensa.`
+      `⏸️ [escalation] inbound pendente; conversa mantida suspensa. | messageIdHash=${technicalHash(
+        message.id
+      )}`
     );
     return;
   }
