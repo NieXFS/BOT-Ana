@@ -369,7 +369,9 @@ async function processWebhookValue(
       const fresh = await markMessageProcessed(message.id, phoneNumberId);
       if (!fresh) {
         console.log(
-          `↩️ Mensagem ${message.id} já processada — ignorando retransmissão da Meta.`
+          `↩️ Mensagem já processada — ignorando retransmissão da Meta. | messageIdHash=${technicalHash(
+            message.id
+          )}`
         );
         continue;
       }
