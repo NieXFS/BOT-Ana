@@ -91,6 +91,7 @@
     "smoke:conversation-activity": "npx tsx scripts/smoke-conversation-activity.ts",
     "smoke:conversations-endpoint": "npx tsx scripts/smoke-conversations-endpoint.ts",
     "smoke:ana-intake-atomicity": "npx tsx scripts/smoke-ana-intake-atomicity.ts",
+    "smoke:ana-lab-cross-storage-dedupe": "npx tsx scripts/smoke-ana-lab-cross-storage-dedupe.ts",
     "smoke:ana-outbox": "ts-node -T scripts/smoke-ana-outbox.ts",
     "smoke:ana-w1-truncation": "ts-node -T scripts/smoke-ana-w1-truncation.ts",
     "smoke:ana-outbox-quarantine": "ts-node -T scripts/smoke-ana-outbox-quarantine.ts",
