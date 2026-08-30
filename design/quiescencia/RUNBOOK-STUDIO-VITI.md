@@ -1223,15 +1223,17 @@ O conjunto candidato é escopado ao `conversation_key` alvo e ao
 `inbound_event_outbox.received_at < T_HOLD`; não usar `now()`, `processed_at`
 isolado ou `ana_inbound_messages` para ampliar a seleção. A presença em
 `processed_messages` deve ser lida no snapshot PROD feito em `T_SEED`, ainda
-durante o hold. A consulta de reconciliação abaixo não imprime IDs. Ela exige
-uma relação um-para-um entre as duas fontes, chaves iguais e uma linha
-final/estabilizada antes de qualquer extração protegida:
+durante o hold. A consulta de reconciliação abaixo não imprime IDs. Ela deriva
+a interseção pelo `message_id`, registra as chaves/estado do par e produz a
+cardinalidade e o digest técnico que serão comparados entre a leitura final e
+a leitura imediatamente anterior ao seed. A igualdade das contagens das
+fontes não é exigida: o que não tiver par fica fora da interseção.
 
 ```sql
 -- PROD local; passar -v hold_at="$T_HOLD_UTC" e nunca assumir now().
 WITH p AS (
   -- Presença no snapshot T_SEED; não filtrar por processed_at.
-  SELECT message_id, phone_number_id, conversation_key
+  SELECT message_id, phone_number_id, conversation_key, processed_at
   FROM processed_messages
   WHERE phone_number_id = :'phone_number_id'
     AND conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
@@ -1259,6 +1261,12 @@ WITH p AS (
     (SELECT count(*) FROM p) AS processed_source_rows,
     (SELECT count(*) FROM o) AS outbox_source_rows,
     (SELECT count(*) FROM j) AS intersection_rows,
+    (SELECT count(DISTINCT message_id) FROM j) AS candidate_count,
+    (SELECT md5(coalesce(
+       (SELECT string_agg(message_id, E'\n' ORDER BY message_id)
+          FROM (SELECT DISTINCT message_id FROM j) AS ids),
+       ''
+    ))) AS candidate_set_digest,
     (SELECT count(*) FROM j WHERE
        processed_phone_number_id IS DISTINCT FROM outbox_phone_number_id
        OR processed_conversation_key IS DISTINCT FROM outbox_conversation_key
@@ -1276,23 +1284,60 @@ WITH p AS (
 )
 SELECT *,
   (
-    processed_source_rows = outbox_source_rows
-    AND outbox_source_rows = intersection_rows
-    AND key_mismatch_rows = 0
+    key_mismatch_rows = 0
     AND unstable_rows = 0
-  ) AS one_to_one_stable
+    AND intersection_rows = stable_rows
+  ) AS candidate_set_valid
 FROM metrics;
 ```
 
-Para este par, a cardinalidade esperada de `processed_source_rows`,
-`outbox_source_rows`, `intersection_rows` e `stable_rows` é exatamente `1`.
-Qualquer diferença, linha sem par, `content_status = 'pending'`, outbox sem
-entrega final ou `terminal_at` sem disposição autoritativa aborta a extração;
-não se “completa” o conjunto lendo `ana_inbound_messages`. Uma linha de
-`processed_messages` pode ter `processed_at` posterior a `T_HOLD` quando o
-inbound foi recebido antes do hold e concluiu a transação durante a drenagem;
-ela continua sendo candidata se estiver presente no snapshot `T_SEED` e o
-outbox satisfizer o corte. O `processed_at` não é filtro nem prova de chegada.
+Para este par, a cardinalidade esperada de `candidate_count` e `stable_rows` é
+exatamente `1`. `processed_source_rows` e `outbox_source_rows` são métricas de
+diagnóstico, não uma exigência de igualdade: uma linha sem par é
+**EXCLUÍDA pela derivação da interseção**, assim como uma linha na fronteira ou
+pós-hold. Não se “completa” o conjunto lendo `ana_inbound_messages`. Já uma
+linha pareada com `content_status = 'pending'`, outbox sem entrega final ou
+`terminal_at` preenchido é **ABORTA pela validação fail-closed**; instabilidade
+não pode desaparecer como exclusão silenciosa. `key_mismatch_rows` também
+aborta. A coluna `candidate_set_digest` é um digest técnico do conjunto
+ordenado e não contém IDs em claro na saída compartilhada.
+
+Uma linha de `processed_messages` pode ter `processed_at` posterior a
+`T_HOLD` quando o inbound foi recebido antes do hold e concluiu a transação
+durante a drenagem; ela continua sendo candidata se estiver presente no
+snapshot `T_SEED` e o outbox satisfizer o corte. O `processed_at` não é filtro
+nem prova de chegada.
+
+##### Gate local da seleção (somente memória)
+
+Antes de qualquer leitura/seed autorizado, executar
+`npm run gate:ana-lab-seed-selection`. O script não importa `src/`, não lê
+`DATABASE_URL`, não faz HTTP e não abre Postgres: usa apenas fixtures em
+memória. Ele imprime uma linha sanitizada para cada caso da matriz abaixo,
+com `expected`, `actual`, cardinalidade, digest técnico e motivo; qualquer
+divergência encerra com exit não-zero. O gate também verifica separadamente
+que a cerca aborta quando o digest muda com a mesma cardinalidade e quando a
+cardinalidade muda.
+
+| Caso | Resultado exigido |
+|---|---|
+| `processed_messages` + outbox estável, `received_at < T_HOLD` | `INCLUI` |
+| `processed_messages` sem outbox | `EXCLUI` |
+| outbox sem `processed_messages` | `EXCLUI` |
+| `received_at = T_HOLD` | `EXCLUI` |
+| `received_at > T_HOLD` | `EXCLUI` |
+| recebido pre-hold, `processed_at` pós-hold | `INCLUI` |
+| `content_status = pending` | `ABORTA` |
+| `delivered_at IS NULL` | `ABORTA` |
+| `terminal_at IS NOT NULL` | `ABORTA` |
+| conjunto muda entre leitura final e seed | `ABORTA` |
+
+`deriveSeedCandidateSet()` é deliberadamente local ao script e espelha o SQL
+da seção: somente o outbox corta por `received_at < T_HOLD`; a interseção é
+derivada antes da validação fail-closed. O resultado do gate não é prova de
+estado real; a seleção PROD/LAB continua exigindo as leituras read-only e o
+preflight deste runbook.
+
 O único corte obrigatório é `received_at < T_HOLD` estrito: essa coluna é da
 fonte que representa a chegada do inbound, não a hora de uma tentativa de
 processamento posterior. A10/E7 pode reiniciar a quiet window ao observar o
@@ -1308,34 +1353,181 @@ essa PK/coluna, abortar o cutover; qualquer fence alternativa seria
 LAB-only e precisaria de desenho separado, nunca uma tabela nova no ERP.
 
 O seed é uma operação futura, em hold, imediatamente antes de `T_LAB`, depois
-de uma seleção PROD repetível e da reconciliação acima. O `message_id` cru só
-deve atravessar o canal de bind/`psql` do operador; não deve aparecer no
-runbook, em saída compartilhada ou em log. O valor escolhido para
-`processed_at` é `T_SEED_UTC` (a hora da semeadura, não a hora histórica do
-PROD), para que a limpeza de retenção de 90 dias não remova a linha durante a
-janela de cutover:
+de uma seleção PROD repetível e da reconciliação acima. Antes do `INSERT`, o
+LAB deve passar o preflight transacional abaixo. Ele não verifica ausência de
+tabelas nem regride o marker: a existência do schema e da tabela
+`ana_lab_schema_metadata` é pré-condição. O que precisa ser zero é o estado
+operacional.
+
+As superfícies com `conversation_key` (e o histórico, que usa
+`"conversationKey"`) são consultadas para a conversa canária e também no
+total global do LAB dedicado; assim um resíduo de outra conversa ou um órfão
+não passa despercebido. `media_cache` só tem `phone_number_id`, então recebe
+uma contagem específica do número e uma contagem global. `ana_v2_turn_receipts`,
+`ana_v2_provider_status_events`, `tts_cache` e `tts_daily_usage` não têm chave
+de conversa (receipts/status também não são tecnicamente atribuíveis ao
+canário); como o storage LAB é dedicado, a verificação global zero é segura e
+fail-closed. Uma linha em qualquer escopo aborta, sem alegar que ela pertence
+à conversa.
 
 ```sql
--- LAB; seeded_message_id e seed_at vêm de binds externos e não são impressos.
+-- LAB; transação futura, antes de qualquer INSERT do tombstone.
+-- O marker e as tabelas devem existir; somente as linhas operacionais abaixo
+-- precisam ser zero. Não imprimir conteúdos nem IDs.
+\set ON_ERROR_STOP on
+BEGIN;
+CREATE TEMP TABLE lab_seed_preflight AS
+WITH canary_scoped AS (
+  SELECT 'processed_messages'::text AS surface, 'canary'::text AS scope,
+         count(*)::bigint AS rows
+    FROM processed_messages
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'ana_conversation_history', 'canary', count(*)::bigint
+    FROM ana_conversation_history
+   WHERE "conversationKey" = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'ana_conversation_seq', 'canary', count(*)::bigint
+    FROM ana_conversation_seq
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'inbound_event_outbox', 'canary', count(*)::bigint
+    FROM inbound_event_outbox
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'sent_question_replies', 'canary', count(*)::bigint
+    FROM sent_question_replies
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'ana_v2_pending_frames', 'canary', count(*)::bigint
+    FROM ana_v2_pending_frames
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'ana_v2_flow_state_invalidations', 'canary', count(*)::bigint
+    FROM ana_v2_flow_state_invalidations
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'ana_v2_outbound_outbox', 'canary', count(*)::bigint
+    FROM ana_v2_outbound_outbox
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'ana_v2_silent_escalation_holds', 'canary', count(*)::bigint
+    FROM ana_v2_silent_escalation_holds
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'ana_v2_successor_batches', 'canary', count(*)::bigint
+    FROM ana_v2_successor_batches
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'sales_followups', 'canary', count(*)::bigint
+    FROM sales_followups
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'renata_channel_prefs', 'canary', count(*)::bigint
+    FROM renata_channel_prefs
+   WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+  UNION ALL
+  SELECT 'media_cache', 'phone_number_id-only', count(*)::bigint
+    FROM media_cache
+   WHERE phone_number_id = :'phone_number_id'
+), lab_global AS (
+  SELECT 'processed_messages', 'lab-global', count(*)::bigint
+    FROM processed_messages
+  UNION ALL SELECT 'ana_conversation_history', 'lab-global', count(*)::bigint
+    FROM ana_conversation_history
+  UNION ALL SELECT 'ana_conversation_seq', 'lab-global', count(*)::bigint
+    FROM ana_conversation_seq
+  UNION ALL SELECT 'inbound_event_outbox', 'lab-global', count(*)::bigint
+    FROM inbound_event_outbox
+  UNION ALL SELECT 'sent_question_replies', 'lab-global', count(*)::bigint
+    FROM sent_question_replies
+  UNION ALL SELECT 'ana_v2_pending_frames', 'lab-global', count(*)::bigint
+    FROM ana_v2_pending_frames
+  UNION ALL SELECT 'ana_v2_flow_state_invalidations', 'lab-global', count(*)::bigint
+    FROM ana_v2_flow_state_invalidations
+  UNION ALL SELECT 'ana_v2_outbound_outbox', 'lab-global', count(*)::bigint
+    FROM ana_v2_outbound_outbox
+  UNION ALL SELECT 'ana_v2_silent_escalation_holds', 'lab-global', count(*)::bigint
+    FROM ana_v2_silent_escalation_holds
+  UNION ALL SELECT 'ana_v2_successor_batches', 'lab-global', count(*)::bigint
+    FROM ana_v2_successor_batches
+  UNION ALL SELECT 'sales_followups', 'lab-global', count(*)::bigint
+    FROM sales_followups
+  UNION ALL SELECT 'renata_channel_prefs', 'lab-global', count(*)::bigint
+    FROM renata_channel_prefs
+  UNION ALL SELECT 'media_cache', 'lab-global', count(*)::bigint
+    FROM media_cache
+  -- Sem conversation_key próprio: não atribuir; no LAB dedicado, qualquer
+  -- linha é resíduo/órfão e deve abortar.
+  UNION ALL SELECT 'ana_v2_turn_receipts', 'lab-global-unscoped', count(*)::bigint
+    FROM ana_v2_turn_receipts
+  UNION ALL SELECT 'ana_v2_provider_status_events', 'lab-global-unscoped', count(*)::bigint
+    FROM ana_v2_provider_status_events
+  UNION ALL SELECT 'tts_cache', 'lab-global-unscoped', count(*)::bigint
+    FROM tts_cache
+  UNION ALL SELECT 'tts_daily_usage', 'lab-global-unscoped', count(*)::bigint
+    FROM tts_daily_usage
+), preflight AS (
+  SELECT * FROM canary_scoped
+  UNION ALL
+  SELECT * FROM lab_global
+)
+SELECT surface, scope, rows
+  FROM preflight;
+
+SELECT surface, scope, rows
+  FROM lab_seed_preflight
+ ORDER BY surface, scope;
+
+-- Divisão por zero é o fail-closed: qualquer estado operacional aborta.
+SELECT 1 / CASE WHEN bool_and(rows = 0) THEN 1 ELSE 0 END
+  AS lab_operational_state_empty
+  FROM lab_seed_preflight;
+ROLLBACK;
+```
+
+O primeiro `SELECT` é um relatório sanitizado de contagens. O segundo só
+prossegue com zero em todos os escopos; se o storage dedicado contiver uma
+linha de outra conversa, um `processed_messages.conversation_key IS NULL`, um
+receipt/status órfão ou cache sem atribuição, o preflight aborta. `COMMIT` não
+deve ocorrer no preflight; a sessão termina em `ROLLBACK` e somente depois se
+abre a transação de seed. O `message_id` cru só deve existir no arquivo
+temporário `0600` ou no pipe protegido descrito abaixo; não deve aparecer em
+bind `-v`, argv, terminal, saída compartilhada ou log. O valor escolhido para
+`processed_at` é `T_SEED_UTC`
+(a hora da semeadura, não a hora histórica do PROD), para que a limpeza de
+retenção de 90 dias não remova a linha durante a janela de cutover:
+
+```sql
+-- O preflight acima terminou em ROLLBACK; abrir a transação de seed somente
+-- depois do resultado zero. seed_input é preenchida pelo procedimento de
+-- transporte protegido da
+-- subseção seguinte. O message_id nunca é variável -v nem argumento de psql.
 -- T_SEED_UTC precisa ser registrado e T_SEED < T_LAB.
 \set ON_ERROR_STOP on
 BEGIN;
--- Falha fechado se houver qualquer linha prévia para a conversa.
-SELECT 1 / CASE WHEN count(*) = 0 THEN 1 ELSE 0 END AS lab_conversation_empty
-FROM processed_messages
-WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits');
+
+CREATE TEMP TABLE seed_input (
+  message_id text PRIMARY KEY
+);
+-- COPY FROM STDIN é alimentado pelo arquivo 0600, sem valor no argv.
+COPY seed_input (message_id) FROM STDIN;
+\.
+
+SELECT 1 / CASE WHEN (SELECT count(*) FROM seed_input) = 1 THEN 1 ELSE 0 END
+  AS seed_input_exactly_one;
 
 -- RETURNING expõe somente a constante 1. Conflito global de message_id faz
 -- count(*) = 0 e aborta a transação; o ID cru nunca aparece na saída.
 WITH inserted AS (
   INSERT INTO processed_messages (
     message_id, phone_number_id, conversation_key, processed_at
-  ) VALUES (
-    :'seeded_message_id',
-    :'phone_number_id',
-    concat(:'phone_number_id', ':', :'customer_phone_digits'),
-    :'seed_at'::timestamptz
   )
+  SELECT seed_input.message_id,
+         :'phone_number_id',
+         concat(:'phone_number_id', ':', :'customer_phone_digits'),
+         :'seed_at'::timestamptz
+    FROM seed_input
   ON CONFLICT (message_id) DO NOTHING
   RETURNING 1
 )
@@ -1349,15 +1541,353 @@ WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits
 COMMIT;
 ```
 
+##### Transporte protegido do `message_id` cru — procedimento futuro
+
+O `message_id` é inevitável na operação de seed, mas não pode ser carregado
+numa variável shell nem passado como `-v`, `-c`, argumento de processo ou
+parâmetro de `psql`. O procedimento abaixo é somente futuro e executável: roda
+como script **não interativo**, com `umask 077`, diretório temporário `0700` e
+arquivos `0600`. O shell tracing e o verbose ficam desligados antes de abrir o
+arquivo; a seleção redireciona o único valor cru diretamente para o arquivo
+protegido, sem terminal, histórico, `ps` ou log. Use os bindings externos já
+definidos no cabeçalho do runbook para os seletores da conversa; nunca inclua o
+ID cru neles.
+
+Primeiro execute o bloco de preflight acima numa sessão `psql` LAB separada,
+com o processo `receps-ia-lab` parado. Exija exit `0` e a linha
+`lab_operational_state_empty = 1`; ele termina em `ROLLBACK`. Só então execute
+o script abaixo, que abre a transação de seed. Se o preflight falhar ou se o
+processo LAB voltar a escrever entre as duas sessões, abortar e repetir ambos
+os passos sob o hold.
+
+```sh
+#!/usr/bin/env bash
+# SOMENTE PROCEDIMENTO FUTURO — nenhum ID, segredo ou DSN é mostrado aqui.
+set -euo pipefail
+set +x
+set +v
+umask 077
+export HISTFILE=/dev/null
+
+SEED_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ana-seed.XXXXXX")"
+SEED_SELECT_SQL="$SEED_TMP_DIR/select.sql"
+SEED_LAB_SELECT_SQL="$SEED_TMP_DIR/lab-select.sql"
+SEED_METRICS_SQL="$SEED_TMP_DIR/metrics.sql"
+SEED_FINAL_METRICS_FILE="$SEED_TMP_DIR/final-metrics"
+SEED_T_SEED_METRICS_FILE="$SEED_TMP_DIR/t-seed-metrics"
+SEED_ID_FILE="$SEED_TMP_DIR/message-id"
+SEED_LAB_ID_FILE="$SEED_TMP_DIR/lab-message-id"
+CLEANUP_RUNNING=0
+
+cleanup() {
+  if [ "$CLEANUP_RUNNING" -ne 0 ]; then return 0; fi
+  CLEANUP_RUNNING=1
+  cleanup_status=0
+  if ! rm -f -- "$SEED_SELECT_SQL" "$SEED_LAB_SELECT_SQL" "$SEED_METRICS_SQL" \
+    "$SEED_FINAL_METRICS_FILE" "$SEED_T_SEED_METRICS_FILE" \
+    "$SEED_ID_FILE" "$SEED_LAB_ID_FILE"; then
+    cleanup_status=1
+  fi
+  if ! rmdir -- "$SEED_TMP_DIR"; then cleanup_status=1; fi
+  return "$cleanup_status"
+}
+abort_on_signal() {
+  cleanup || true
+  exit 1
+}
+on_exit() {
+  cleanup || true
+}
+trap on_exit EXIT
+trap abort_on_signal HUP INT TERM
+
+# mktemp já cria o diretório privado; reafirmar 0700 com os traps ativos.
+chmod 700 "$SEED_TMP_DIR"
+# Os traps já estão ativos antes de criar qualquer arquivo, inclusive os que
+# poderão conter o valor cru.
+(umask 077; : > "$SEED_SELECT_SQL"; : > "$SEED_LAB_SELECT_SQL"; : > "$SEED_METRICS_SQL"; : > "$SEED_FINAL_METRICS_FILE"; : > "$SEED_T_SEED_METRICS_FILE"; : > "$SEED_ID_FILE"; : > "$SEED_LAB_ID_FILE")
+chmod 600 "$SEED_SELECT_SQL" "$SEED_LAB_SELECT_SQL" "$SEED_METRICS_SQL" \
+  "$SEED_FINAL_METRICS_FILE" "$SEED_T_SEED_METRICS_FILE" \
+  "$SEED_ID_FILE" "$SEED_LAB_ID_FILE"
+
+# As métricas abaixo são a mesma canonicalização SQL da seleção da seção 6 e
+# devolvem somente candidate_count|candidate_set_digest|candidate_set_valid.
+# Os arquivos de métricas são 0600 e nunca contêm o ID cru.
+(cat > "$SEED_METRICS_SQL" <<'SQL'
+\set ON_ERROR_STOP on
+WITH p AS (
+  SELECT message_id, phone_number_id, conversation_key
+    FROM processed_messages
+   WHERE phone_number_id = :'phone_number_id'
+     AND conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+), o AS (
+  SELECT message_id, phone_number_id, conversation_key,
+         content_status, delivered_at, terminal_at
+    FROM inbound_event_outbox
+   WHERE phone_number_id = :'phone_number_id'
+     AND conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+     AND received_at < :'hold_at'::timestamptz
+), j AS (
+  SELECT p.message_id,
+         p.phone_number_id AS processed_phone_number_id,
+         o.phone_number_id AS outbox_phone_number_id,
+         p.conversation_key AS processed_conversation_key,
+         o.conversation_key AS outbox_conversation_key,
+         o.content_status, o.delivered_at, o.terminal_at
+    FROM p
+    JOIN o ON o.message_id = p.message_id
+), metrics AS (
+  SELECT count(DISTINCT message_id) AS candidate_count,
+         count(*) AS intersection_rows,
+         count(*) FILTER (WHERE
+           processed_phone_number_id IS DISTINCT FROM outbox_phone_number_id
+           OR processed_conversation_key IS DISTINCT FROM outbox_conversation_key
+         ) AS key_mismatch_rows,
+         count(*) FILTER (WHERE
+           content_status = 'pending'
+           OR delivered_at IS NULL
+           OR terminal_at IS NOT NULL
+         ) AS unstable_rows,
+         count(*) FILTER (WHERE
+           content_status <> 'pending'
+           AND delivered_at IS NOT NULL
+           AND terminal_at IS NULL
+         ) AS stable_rows,
+         (SELECT md5(coalesce(
+            (SELECT string_agg(message_id, E'\n' ORDER BY message_id)
+               FROM (SELECT DISTINCT message_id FROM j) AS ids),
+            ''
+         ))) AS candidate_set_digest
+    FROM j
+)
+SELECT candidate_count, candidate_set_digest,
+       CASE WHEN key_mismatch_rows = 0
+                  AND unstable_rows = 0
+                  AND intersection_rows = stable_rows
+            THEN 'true' ELSE 'false' END AS candidate_set_valid
+  FROM metrics;
+SQL
+)
+
+# Leitura final: somente valores sanitizados (count, digest e booleano).
+PGSERVICE=ana-prod psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+  -v phone_number_id="$VITI_PHONE_NUMBER_ID" \
+  -v customer_phone_digits="$VITI_CUSTOMER_PHONE_DIGITS" \
+  -v hold_at="$T_HOLD_UTC" \
+  -f "$SEED_METRICS_SQL" > "$SEED_FINAL_METRICS_FILE"
+test "$(wc -l < "$SEED_FINAL_METRICS_FILE" | tr -d ' ')" = 1
+IFS='|' read -r FINAL_CANDIDATE_COUNT FINAL_CANDIDATE_DIGEST FINAL_CANDIDATE_VALID \
+  < "$SEED_FINAL_METRICS_FILE"
+test "$FINAL_CANDIDATE_COUNT" = 1
+test "$FINAL_CANDIDATE_VALID" = true
+
+# No início de T_SEED, ainda em hold e imediatamente antes de extrair o ID,
+# reexecutar a MESMA consulta/canonicalização. Só count+digest sanitizados são
+# guardados em variáveis shell; o ID cru ainda não foi lido.
+PGSERVICE=ana-prod psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+  -v phone_number_id="$VITI_PHONE_NUMBER_ID" \
+  -v customer_phone_digits="$VITI_CUSTOMER_PHONE_DIGITS" \
+  -v hold_at="$T_HOLD_UTC" \
+  -f "$SEED_METRICS_SQL" > "$SEED_T_SEED_METRICS_FILE"
+test "$(wc -l < "$SEED_T_SEED_METRICS_FILE" | tr -d ' ')" = 1
+IFS='|' read -r T_SEED_CANDIDATE_COUNT T_SEED_CANDIDATE_DIGEST T_SEED_CANDIDATE_VALID \
+  < "$SEED_T_SEED_METRICS_FILE"
+test "$T_SEED_CANDIDATE_COUNT" = 1
+test "$T_SEED_CANDIDATE_VALID" = true
+test "$T_SEED_CANDIDATE_COUNT" = "$FINAL_CANDIDATE_COUNT"
+test "$T_SEED_CANDIDATE_DIGEST" = "$FINAL_CANDIDATE_DIGEST"
+
+# Só depois da cerca count+digest estável, extrair o ID cru para arquivo 0600.
+# A saída é redirecionada; não usar tee, less, set -x ou qualquer verbose.
+# A consulta não filtra processed_at: só received_at < T_HOLD.
+(cat > "$SEED_SELECT_SQL" <<'SQL'
+\set ON_ERROR_STOP on
+WITH p AS (
+  SELECT message_id, phone_number_id, conversation_key
+    FROM processed_messages
+   WHERE phone_number_id = :'phone_number_id'
+     AND conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+), o AS (
+  SELECT message_id, phone_number_id, conversation_key,
+         content_status, delivered_at, terminal_at
+    FROM inbound_event_outbox
+   WHERE phone_number_id = :'phone_number_id'
+     AND conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+     AND received_at < :'hold_at'::timestamptz
+), j AS (
+  SELECT p.message_id,
+         p.phone_number_id AS processed_phone_number_id,
+         o.phone_number_id AS outbox_phone_number_id,
+         p.conversation_key AS processed_conversation_key,
+         o.conversation_key AS outbox_conversation_key,
+         o.content_status, o.delivered_at, o.terminal_at
+    FROM p
+    JOIN o ON o.message_id = p.message_id
+), metrics AS (
+  SELECT count(DISTINCT message_id) AS candidate_count,
+         count(*) AS intersection_rows,
+         count(*) FILTER (WHERE
+           processed_phone_number_id IS DISTINCT FROM outbox_phone_number_id
+           OR processed_conversation_key IS DISTINCT FROM outbox_conversation_key
+         ) AS key_mismatch_rows,
+         count(*) FILTER (WHERE
+           content_status = 'pending'
+           OR delivered_at IS NULL
+           OR terminal_at IS NOT NULL
+         ) AS unstable_rows,
+         count(*) FILTER (WHERE
+           content_status <> 'pending'
+           AND delivered_at IS NOT NULL
+           AND terminal_at IS NULL
+         ) AS stable_rows
+    FROM j
+), candidates AS (
+  SELECT j.message_id
+    FROM j CROSS JOIN metrics
+   WHERE metrics.candidate_count = 1
+     AND metrics.key_mismatch_rows = 0
+     AND metrics.unstable_rows = 0
+     AND metrics.intersection_rows = metrics.stable_rows
+)
+SELECT message_id FROM candidates ORDER BY message_id;
+SQL
+)
+PGSERVICE=ana-prod psql -X -qAt -v ON_ERROR_STOP=1 \
+  -v phone_number_id="$VITI_PHONE_NUMBER_ID" \
+  -v customer_phone_digits="$VITI_CUSTOMER_PHONE_DIGITS" \
+  -v hold_at="$T_HOLD_UTC" \
+  -f "$SEED_SELECT_SQL" > "$SEED_ID_FILE"
+
+# Só contagem, validação de formato e digest técnico; nunca cat/echo do arquivo.
+SEED_COUNT="$(wc -l < "$SEED_ID_FILE" | tr -d ' ')"
+test "$SEED_COUNT" = 1
+
+# Fechamento da janela T_SEED → extração: o arquivo acabou de ser produzido,
+# mas ainda não houve conexão/seed LAB. Node recebe somente o caminho do arquivo
+# no argv, remove a única newline final do psql e imprime apenas o MD5 do ID.
+# O ID cru nunca é carregado em variável shell nem aparece na saída.
+EXTRACTED_CANDIDATE_MD5="$(node -e '
+  const fs = require("node:fs");
+  const crypto = require("node:crypto");
+  const bytes = fs.readFileSync(process.argv[1]);
+  if (
+    bytes.length < 1 ||
+    bytes[bytes.length - 1] !== 0x0a ||
+    bytes.subarray(0, bytes.length - 1).includes(0x0a) ||
+    bytes.subarray(0, bytes.length - 1).includes(0x0d)
+  ) process.exit(2);
+  process.stdout.write(
+    crypto.createHash("md5")
+      .update(bytes.subarray(0, bytes.length - 1))
+      .digest("hex")
+  );
+' "$SEED_ID_FILE")"
+test "$EXTRACTED_CANDIDATE_MD5" = "$T_SEED_CANDIDATE_DIGEST"
+
+# Este é outro digest, deliberadamente separado: SHA-256 dos bytes do arquivo
+# PROD, incluindo a newline, para a comparação posterior PROD-file ↔ LAB-file.
+SEED_FILE_SHA256="$(shasum -a 256 "$SEED_ID_FILE" | awk '{print $1}')"
+
+# O pipe leva o arquivo protegido ao stdin do psql LAB. O valor nunca aparece
+# no argv: cat recebe somente o caminho 0600 e COPY o ingere numa temp table.
+{
+  cat <<'SQL'
+\set ON_ERROR_STOP on
+BEGIN;
+CREATE TEMP TABLE seed_input (message_id text PRIMARY KEY);
+COPY seed_input (message_id) FROM STDIN;
+SQL
+  cat "$SEED_ID_FILE"
+  printf '%s\n' '\.'
+  cat <<'SQL'
+SELECT 1 / CASE WHEN (SELECT count(*) FROM seed_input) = 1 THEN 1 ELSE 0 END;
+WITH inserted AS (
+  INSERT INTO processed_messages (
+    message_id, phone_number_id, conversation_key, processed_at
+  )
+  SELECT message_id, :'phone_number_id',
+         concat(:'phone_number_id', ':', :'customer_phone_digits'),
+         :'seed_at'::timestamptz
+    FROM seed_input
+  ON CONFLICT (message_id) DO NOTHING
+  RETURNING 1
+)
+SELECT 1 / CASE WHEN count(*) = 1 THEN 1 ELSE 0 END FROM inserted;
+SELECT 1 / CASE WHEN count(*) = 1 THEN 1 ELSE 0 END
+  FROM processed_messages
+ WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits');
+COMMIT;
+SQL
+} | PGSERVICE=ana-lab psql -X -q -v ON_ERROR_STOP=1 \
+  -v phone_number_id="$VITI_PHONE_NUMBER_ID" \
+  -v customer_phone_digits="$VITI_CUSTOMER_PHONE_DIGITS" \
+  -v seed_at="$T_SEED_UTC"
+
+# Releitura LAB também vai para arquivo 0600. A igualdade é conferida por
+# contagem + SHA-256 do arquivo, mas o relatório compartilhado contém somente
+# esses campos.
+(cat > "$SEED_LAB_SELECT_SQL" <<'SQL'
+\set ON_ERROR_STOP on
+SELECT message_id FROM processed_messages
+ WHERE conversation_key = concat(:'phone_number_id', ':', :'customer_phone_digits')
+ ORDER BY message_id;
+SQL
+)
+PGSERVICE=ana-lab psql -X -qAt -v ON_ERROR_STOP=1 \
+  -v phone_number_id="$VITI_PHONE_NUMBER_ID" \
+  -v customer_phone_digits="$VITI_CUSTOMER_PHONE_DIGITS" \
+  -f "$SEED_LAB_SELECT_SQL" > "$SEED_LAB_ID_FILE"
+LAB_COUNT="$(wc -l < "$SEED_LAB_ID_FILE" | tr -d ' ')"
+LAB_FILE_SHA256="$(shasum -a 256 "$SEED_LAB_ID_FILE" | awk '{print $1}')"
+test "$LAB_COUNT" = 1
+test "$LAB_FILE_SHA256" = "$SEED_FILE_SHA256"
+printf 'seed_source_count=%s seed_file_sha256=%s lab_count=%s lab_file_sha256=%s\n' \
+  "$SEED_COUNT" "$SEED_FILE_SHA256" "$LAB_COUNT" "$LAB_FILE_SHA256"
+# Cleanup explícito no sucesso; o trap continua cobrindo falhas inesperadas.
+trap - HUP INT TERM
+cleanup
+trap - EXIT
+```
+
+O pipeline acima é uma alternativa protegida ao `-v seeded_message_id=...`:
+o ID não entra em shell history, `argv`, `ps`, `set -x`, terminal ou arquivo
+permissivo. O relatório final contém somente contagens e digests. Se a seleção
+retornar zero, mais de uma linha, digest divergente, conflito de PK ou qualquer
+erro de transação, abortar e manter o hold; nunca tentar completar o conjunto
+com outra tabela. A extração e a ingestão devem ocorrer ainda com o hold ativo,
+e o cleanup deve ser confirmado antes de qualquer próximo passo operacional.
+
+Os nomes dos digests são importantes: `FINAL_CANDIDATE_DIGEST` e
+`T_SEED_CANDIDATE_DIGEST` são o `candidate_set_digest` **MD5** da mesma
+canonicalização SQL e servem exclusivamente para comparar leitura final ↔
+`T_SEED`; eles não são o digest do arquivo. `SEED_FILE_SHA256` e
+`LAB_FILE_SHA256` são
+**SHA-256 dos bytes dos arquivos 0600**, incluindo a quebra de linha produzida
+por `psql`, e servem exclusivamente para comparar arquivo PROD ↔ arquivo LAB.
+Há ainda um terceiro vínculo, executado antes do psql LAB: o Node calcula
+`EXTRACTED_CANDIDATE_MD5` a partir dos bytes do arquivo recém-extraído, sem a
+única newline final, e o compara com `T_SEED_CANDIDATE_DIGEST`. Isso fecha a
+janela `T_SEED → extração` caso o conjunto mude entre a segunda leitura e a
+terceira query; só depois dessa comparação o ID atravessa o pipe protegido para
+o LAB. Não comparar esses três tipos de digest entre si, nem chamar essa
+sequência de transação atômica cross-storage. O gate em memória usa SHA-256 de
+uma representação JSON de fixtures apenas para provar a propriedade de
+cardinalidade/digest; seu valor não é apresentado como igual ao digest SQL ou
+ao digest de transporte.
+
 O `ON CONFLICT` não autoriza sobrescrever uma linha: se a inserção encontrar
 um ID global já presente com outra conversa ou se a contagem final não for
 `1`, abortar e investigar. Repetir a seleção PROD no instante `T_SEED`, ainda
-em hold, e validar `source_count = seeded_count = 1`; no LAB, a contagem da
-conversation key deve ser zero antes e um depois. O tombstone deve ser
-rechecado imediatamente antes da troca para LAB e durante a janela; não
-executar limpeza que o remova. A linha do snapshot atual tem aproximadamente
-duas semanas, portanto também há margem dentro da retenção, mas a escolha de
-`T_SEED` evita depender dessa idade histórica.
+em hold, já é feito pelo bloco `metrics.sql` do procedimento acima; comparar
+**cardinalidade e `candidate_set_digest`** com a leitura final imediatamente
+anterior ao transporte. Qualquer mudança, inclusive com a mesma cardinalidade
+e IDs diferentes, é `ABORTA`. Para o par atual, exigir
+`candidate_count = stable_rows = 1`; no LAB, a contagem da conversation key
+deve ser zero antes e um depois. O tombstone deve ser rechecado imediatamente
+antes da troca para LAB e durante a janela; não executar limpeza que o remova.
+A linha do snapshot atual tem aproximadamente duas semanas, portanto também há
+margem dentro da retenção, mas a escolha de `T_SEED` evita depender dessa idade
+histórica.
 
 ##### Prova temporal da semeadura
 
@@ -1407,20 +1937,64 @@ em `persistInboundAtomically` → `runAtomicInboundTransaction`; não se deve
 substituí-lo por um ledger novo nem testar o seed somente por contagem de
 histórico, que é retido/aparado.
 
-**Pré-condição de PII para a execução futura:** o diagnóstico legado do ramo
-`fresh = false` em `handleIncomingMessage` ainda interpola o `message.id` cru.
-Este desenho não altera código de produto. Antes de executar o cutover, um
-patch autorizado separado deve trocar esse campo por `messageIdHash` e passar
-seu smoke próprio; silenciar a linha apenas no smoke de path fidelity evita
-vazamento no artefato de teste, mas não corrige o runtime.
+**Verificação de PII no checkout atual (não prova deploy):** no HEAD desta
+branch, o ramo `fresh = false` de `src/messageHandler.ts` já registra somente
+`messageIdHash=technicalHash(message.id)`, sem interpolar o ID cru. Não há
+patch de runtime autorizado ou necessário nesta unidade. Essa é evidência
+estática do checkout, não prova do processo implantado; antes do cutover, ainda
+é obrigatório correlacionar SHA/PID reais e executar o smoke de PII autorizado.
+
+##### Limites da interseção e do smoke
+
+- A interseção cobre replay de `messages[]` de cliente que já foi processado
+  no PROD. Ela **não é um ledger universal da WABA** e não promete deduplicar
+  universalmente `smb_message_echoes` ou `statuses[]`.
+- Echo humano pode ocupar `processed_messages`, mas não cria
+  `inbound_event_outbox`; por isso fica deliberadamente fora do seed. Isso é
+  uma exclusão intencional, não uma falha da seleção.
+- No smoke `smoke:ana-lab-cross-storage-dedupe`, `erpWrite` é somente o
+  contador do `deliverInbound` injetado. Ele prova que o ID novo atravessou o
+  downstream uma vez na fixture; **não prova a write policy do LAB**. A policy
+  continua coberta pelos gates específicos de runtime/storage.
 
 ## 7. ATIVAÇÃO LAB — SOMENTE PROCEDIMENTO
 
 Ativar somente após `VITI_PROD_QUIESCENT=true` e resolução dos blockers. Esta
 seção descreve passos futuros; nenhum foi executado.
 
+### Hardening obrigatório de `T_SEED` → `T_LAB` (procedimento futuro)
+
+Durante toda a semeadura, o hold continua ativo e o router ainda não pode
+encaminhar para LAB. A ordem abaixo é obrigatória e prevalece sobre qualquer
+ordem abreviada da lista de ativação:
+
+1. Parar **somente** `receps-ia-lab` (`receps-ia` PROD, `RecepsERP` e todos os
+   serviços PROD permanecem intocados). Não fazer deploy nem restart de PROD.
+2. Com o LAB parado, confirmar marker/schema dedicado e executar o preflight
+   transacional da seção anterior. Todas as contagens da conversa canária e os
+   checks globais fail-closed precisam ser zero; qualquer estado desconhecido,
+   órfão ou sem chave de conversa aborta.
+3. Ainda sob hold e com o resultado zero registrado, extrair e transportar o
+   conjunto pelo procedimento protegido, e executar o `INSERT` do tombstone.
+   `T_SEED` é registrado neste instante.
+4. Reconsultar o LAB em leitura protegida e exigir **exatamente um** tombstone
+   para a conversation key, com cardinalidade e digest iguais aos da seleção
+   PROD. Qualquer conflito, digest divergente ou contagem diferente aborta.
+5. Só depois iniciar `receps-ia-lab`. Ler health, fingerprint e recoveries
+   locais, exigindo `runtimeMode=lab`, `writePolicy=disabled`, jobs globais
+   desligados e os três recoveries v2 verdes. Falha ou campo ausente mantém o
+   hold.
+6. Revalidar o tombstone após o LAB subir, sempre em leitura sem mutação. Só
+   depois dessa revalidação preparar a troca `hold → lab` e registrar `T_LAB`
+   quando a rota LAB estiver efetiva. Até lá não existe canário LAB.
+
+Os comandos concretos de parar/iniciar processo são apenas procedimento
+futuro autorizado; esta tarefa não executa nenhum deles e não altera PROD.
+
+### Efetivar a rota LAB após a sequência de seed
+
 1. Preparar a troca do router ERP de `hold` para `lab`, mantendo o mesmo
-   `phoneNumberId` fechado, o slug literal `studio-viti` e a URL canônica:
+  `phoneNumberId` fechado, o slug literal `studio-viti` e a URL canônica:
 
    ```text
    BOT_PROCESSOR_LAB_ROUTE_MODE=lab
@@ -1671,9 +2245,11 @@ gates futuros. Não declarar `VITI_PROD_QUIESCENT=true` nem GO nesta tarefa.
   as queries acima cobrem as convenções `conversation_key`/`conversationKey`
   e os campos ERP `phoneNumberId`/`customerPhone`. B é a interseção
   `processed_messages ∩ inbound_event_outbox` no PROD, com
-  `received_at < T_HOLD`, reconciliada um-para-um e semeada no LAB. O customer
-  atual falha A porque cinco superfícies têm uma linha; o conjunto B esperado
-  é uma linha.
+  `received_at < T_HOLD`, reconciliada por `candidate_count`, estado
+  estabilizado e digest entre as leituras, e semeada no LAB. Linhas sem par
+  ficam fora; estado instável ou mudança do conjunto aborta. O customer atual
+  falha A porque cinco superfícies têm uma linha; o conjunto B esperado é uma
+  linha.
 - **Definição da prova:** a entrada experimental é o inbound deliberado pelo
   customer controlado depois de `T_LAB`, identificado por `T_CANARY_SEND` e
   `messageIdHash`, e observado em `ERP router → LAB → storage LAB → resposta

@@ -7,6 +7,8 @@
  * a segurança operacional vem de hold + quiescência + conjunto estável. Se o
  * count da interseção mudar entre a leitura final e a seed, o cutover aborta.
  * Esse contexto é documentado aqui, mas não é exercitado por este smoke.
+ * O contador `erpWrite` abaixo é somente a chamada `deliverInbound` injetada:
+ * prova uma travessia downstream do ID novo, não a write policy do LAB.
  *
  * O primeiro caso representa o tombstone semeado em `processed_messages` do
  * LAB. O segundo representa um inbound novo. Todo storage é um store em
@@ -103,6 +105,7 @@ interface Counters {
   model: number;
   tools: number;
   whatsappOutbound: number;
+  /** Fixture-only traversal counter; not a LAB write-policy assertion. */
   erpWrite: number;
 }
 
@@ -222,6 +225,8 @@ function createInboundDeps(
     },
     deliverInbound: async () => {
       counters.deliverInbound += 1;
+      // `erpWrite` is deliberately just the injected downstream seam. It does
+      // not inspect or prove the LAB write policy; dedicated storage gates do.
       counters.erpWrite += 1;
       store.trace.push('deliverInbound:CALL');
       store.trace.push('ERP:WRITE');
@@ -337,7 +342,11 @@ async function main(): Promise<void> {
     assert.equal(counters.model, 0, 'tombstone não chama modelo');
     assert.equal(counters.tools, 0, 'tombstone não chama tools');
     assert.equal(counters.whatsappOutbound, 0, 'tombstone não envia WhatsApp outbound');
-    assert.equal(counters.erpWrite, 0, 'tombstone não faz ERP write');
+    assert.equal(
+      counters.erpWrite,
+      0,
+      'tombstone não chama deliverInbound fixture'
+    );
     assert.equal(store.history.length, 0, 'tombstone deixa history vazia');
     assert.equal(
       store.inboundEventOutbox.size,
@@ -404,7 +413,11 @@ async function main(): Promise<void> {
     assert.equal(counters.model, 1, 'inbound novo chama o modelo uma vez');
     assert.equal(counters.tools, 0, 'fixture novo não chama tools');
     assert.equal(counters.whatsappOutbound, 1, 'inbound novo envia uma resposta');
-    assert.equal(counters.erpWrite, 1, 'inbound novo faz um ERP write de entrega');
+    assert.equal(
+      counters.erpWrite,
+      1,
+      'contador erpWrite fixture registra uma travessia downstream'
+    );
     assert.equal(store.history.length, 1, 'store tem um history além do tombstone');
     assert.equal(
       store.inboundEventOutbox.size,
@@ -444,7 +457,11 @@ async function main(): Promise<void> {
     assert.equal(counters.model, 1, 'replay não chama modelo de novo');
     assert.equal(counters.tools, 0, 'replay não chama tools');
     assert.equal(counters.whatsappOutbound, 1, 'replay não envia de novo');
-    assert.equal(counters.erpWrite, 1, 'replay não faz ERP write de novo');
+    assert.equal(
+      counters.erpWrite,
+      1,
+      'replay não incrementa o contador deliverInbound fixture'
+    );
     assert.equal(
       handler.__hasBufferForTest(CONVERSATION_KEY),
       false,
