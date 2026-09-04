@@ -101,6 +101,7 @@ const conversationOrderDatabaseUrl = resolveConversationOrderDatabaseUrl();
 
 const conversationOrderPool = new Pool({
   connectionString: conversationOrderDatabaseUrl,
+  application_name: 'receps-ia-conversation-lock',
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
@@ -176,6 +177,11 @@ export function getConversationOrderPoolStatsForSmoke(): {
 /** Fecha somente o pool dedicado em processos de smoke que terminam no mesmo Node. */
 export async function closeConversationOrderPoolForSmoke(): Promise<void> {
   await conversationOrderPool.end();
+}
+
+/** Fecha o pool dedicado no encerramento gracioso do runtime. */
+export async function closeConversationOrderPoolForShutdown(): Promise<void> {
+  await closeConversationOrderPoolForSmoke();
 }
 
 export async function withConversationLock<T>(

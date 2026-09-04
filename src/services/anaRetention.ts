@@ -2,6 +2,17 @@ import type { PoolClient } from 'pg';
 import { Sentry } from '../observability/sentry';
 import { runtimeErrorKind } from '../observability/safeRuntime';
 import { pool } from './contextManager';
+import {
+  DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+  DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+  DEFAULT_MAINTENANCE_JITTER_MS,
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  readMaintenanceIntervalMs,
+  startMaintenanceScheduler,
+  type MaintenanceCycleResult,
+  type MaintenanceSchedulerHandle,
+} from './maintenanceScheduler';
 
 export const ANA_RETENTION_WINDOW_MS = 90 * 24 * 60 * 60_000;
 export const ANA_RETENTION_INTERVAL_MS = 6 * 60 * 60_000;
@@ -25,7 +36,7 @@ export interface AnaRetentionState {
 }
 
 interface RetentionRuntime {
-  timer: NodeJS.Timeout | null;
+  timer: MaintenanceSchedulerHandle | null;
   inFlight: Promise<AnaRetentionResult> | null;
   lastStartedAt: string | null;
   lastFinishedAt: string | null;
@@ -212,11 +223,33 @@ export function startAnaRetentionScheduler(
 ): boolean {
   const runtime = retentionRuntime();
   if (runtime.timer) return false;
-  runtime.timer = setInterval(() => {
-    void runAnaRetention(deps).catch(() => undefined);
-  }, intervalMs);
-  runtime.timer.unref();
-  return true;
+  const enabled =
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('ANA_RETENTION_SCHEDULER_ENABLED', true);
+  runtime.timer = startMaintenanceScheduler({
+    worker: 'ana-retention',
+    enabled,
+    run: async () => (await runAnaRetention(deps)) as MaintenanceCycleResult,
+    idleIntervalMs: readMaintenanceIntervalMs(
+      'ANA_RETENTION_IDLE_INTERVAL_MS',
+      intervalMs || DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+      { minimumMs: 10 * 60_000 }
+    ),
+    busyIntervalMs: intervalMs,
+    errorBackoffMaxMs: readMaintenanceIntervalMs(
+      'ANA_RETENTION_ERROR_BACKOFF_MAX_MS',
+      DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+      { minimumMs: 1_000 }
+    ),
+    jitterMs: readMaintenanceIntervalMs(
+      'MAINTENANCE_JITTER_MS',
+      DEFAULT_MAINTENANCE_JITTER_MS,
+      { minimumMs: 1_000, maximumMs: 5 * 60_000 }
+    ),
+    initialDelayMs: intervalMs,
+    errorKind: runtimeErrorKind,
+  });
+  return runtime.timer !== null;
 }
 
 export function getAnaRetentionState(): AnaRetentionState {
@@ -230,10 +263,15 @@ export function getAnaRetentionState(): AnaRetentionState {
   };
 }
 
+export function stopAnaRetentionScheduler(): void {
+  const runtime = retentionRuntime();
+  runtime.timer?.stop();
+  runtime.timer = null;
+}
+
 export function __resetAnaRetentionRuntimeForTest(): void {
   const runtime = retentionRuntime();
-  if (runtime.timer) clearInterval(runtime.timer);
-  runtime.timer = null;
+  stopAnaRetentionScheduler();
   runtime.inFlight = null;
   runtime.lastStartedAt = null;
   runtime.lastFinishedAt = null;

@@ -25,7 +25,10 @@ if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL não configurada.');
 }
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  application_name: 'receps-ia-history-migration',
+});
 
 async function main() {
   if (!fs.existsSync(HISTORY_FILE)) {

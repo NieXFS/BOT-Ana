@@ -12,6 +12,17 @@ import { isRenataVoiceEnabled } from '../voice/voiceConfig';
 import { deliverSalesReply } from '../voice/voiceDelivery';
 import { getAvailableSlots } from './calendarService';
 import { resolveDemoServiceId } from './demoScheduling';
+import { runtimeErrorKind } from '../observability/safeRuntime';
+import {
+  DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+  DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+  DEFAULT_MAINTENANCE_JITTER_MS,
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  readMaintenanceIntervalMs,
+  startMaintenanceScheduler,
+  type MaintenanceSchedulerHandle,
+} from './maintenanceScheduler';
 import {
   getOnboardingSessionResult,
   type OnboardingState,
@@ -811,11 +822,12 @@ const defaultTickDeps: FollowupTickDeps = {
  * (handoff/echo), tenant sem config ativa, ou brain != sales (defesa). Cada envio
  * é isolado — falha de um não derruba os outros. Retorna quantos toques enviou.
  */
-export async function runFollowupTick(
+async function runFollowupTickWithOutcome(
   deps: FollowupTickDeps = defaultTickDeps
-): Promise<number> {
+): Promise<{ sent: number; failedCount: number }> {
   const nowMs = deps.now();
   let sent = 0;
+  let failedCount = 0;
 
   const due = await deps.loadDue(nowMs);
   for (const row of due) {
@@ -928,20 +940,28 @@ export async function runFollowupTick(
       );
       sent += 1;
     } catch (err) {
-      Sentry.captureException(err, {
+      failedCount += 1;
+      Sentry.captureException(new Error('sales follow-up item failed'), {
         tags: {
           service: 'sales-followups',
           operation: 'tick-send',
           phoneNumberId: row.phoneNumberId,
+          error_kind: runtimeErrorKind(err),
         },
       });
     }
   }
 
-  return sent;
+  return { sent, failedCount };
 }
 
-let pollerHandle: NodeJS.Timeout | null = null;
+export async function runFollowupTick(
+  deps: FollowupTickDeps = defaultTickDeps
+): Promise<number> {
+  return (await runFollowupTickWithOutcome(deps)).sent;
+}
+
+let pollerHandle: MaintenanceSchedulerHandle | null = null;
 
 export interface FollowupPollIntervalObservability {
   warn: (message: string) => void;
@@ -1139,7 +1159,9 @@ export async function runFollowupPollerCycle(
     if (deps.logError) {
       deps.logError('❌ Erro no poller de follow-up:', error);
     } else {
-      console.error('❌ Erro no poller de follow-up:', error);
+      console.error(
+        `[sales-followups] falha no poller | error=${runtimeErrorKind(error)}`
+      );
     }
     return 'failed';
   }
@@ -1180,41 +1202,74 @@ export function startFollowupPoller(intervalMs?: number): number {
   pollerState = createFollowupPollerState();
   pollerIntervalMs = effectiveIntervalMs;
 
-  const runCycle = (): void => {
-    void runFollowupPollerCycle({
-      state: pollerState,
-      intervalMs: effectiveIntervalMs,
-      now: () => Date.now(),
-      tick: () => runFollowupTick(),
-      captureException: (error, context) =>
-        Sentry.captureException(error, context),
-      captureMessage: (message, context) =>
-        Sentry.captureMessage(message, context),
-    });
-  };
-
-  pollerHandle = setTimeout(() => {
-    runCycle();
-    pollerHandle = setInterval(runCycle, effectiveIntervalMs);
-    // Não segura o processo vivo só por causa do poller.
-    if (typeof pollerHandle.unref === 'function') pollerHandle.unref();
-  }, firstTickInMs);
-  console.log(
-    `⏱️ Poller de follow-up: intervalo de ${Math.round(effectiveIntervalMs / 60_000)}min, ` +
-      `primeiro tick em ${new Date(Date.now() + firstTickInMs).toISOString()} ` +
-      `(alinhado ao minuto :${String(offsetMin).padStart(2, '0')})`
+  const enabled =
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('SALES_FOLLOWUP_SWEEP_ENABLED', true);
+  const busyIntervalMs = readMaintenanceIntervalMs(
+    'SALES_FOLLOWUP_BUSY_INTERVAL_MS',
+    MIN_FOLLOWUP_POLL_MS,
+    { minimumMs: 1_000 }
   );
-  // Não segura o processo vivo só por causa do poller.
-  if (typeof pollerHandle.unref === 'function') pollerHandle.unref();
+  pollerHandle = startMaintenanceScheduler({
+    worker: 'sales-followup',
+    enabled,
+    run: async () => {
+      const result = await runFollowupTickWithOutcome();
+      return {
+        sent: result.sent,
+        failedCount: result.failedCount,
+        failed: result.failedCount > 0,
+        busy: result.sent > 0,
+      };
+    },
+    idleIntervalMs: readMaintenanceIntervalMs(
+      'SALES_FOLLOWUP_IDLE_INTERVAL_MS',
+      effectiveIntervalMs || DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+      { minimumMs: 10 * 60_000 }
+    ),
+    busyIntervalMs,
+    errorBackoffMaxMs: readMaintenanceIntervalMs(
+      'SALES_FOLLOWUP_ERROR_BACKOFF_MAX_MS',
+      MAX_FOLLOWUP_BACKOFF_MS || DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+      { minimumMs: 1_000 }
+    ),
+    jitterMs: readMaintenanceIntervalMs(
+      'MAINTENANCE_JITTER_MS',
+      DEFAULT_MAINTENANCE_JITTER_MS,
+      { minimumMs: 1_000, maximumMs: 5 * 60_000 }
+    ),
+    initialDelayMs: firstTickInMs,
+    errorKind: runtimeErrorKind,
+    onError: (error) => {
+      Sentry.captureException(new Error('sales follow-up sweep failed'), {
+        level: 'warning',
+        tags: {
+          service: 'sales-followups',
+          operation: 'poller',
+          error_kind: runtimeErrorKind(error),
+        },
+      });
+    },
+  });
+  if (pollerHandle) {
+    console.log(
+      `⏱️ Poller de follow-up: intervalo idle de ${Math.round(effectiveIntervalMs / 60_000)}min, ` +
+        `primeiro tick em ${new Date(Date.now() + firstTickInMs).toISOString()} ` +
+        `(alinhado ao minuto :${String(offsetMin).padStart(2, '0')})`
+    );
+  }
   return effectiveIntervalMs;
 }
 
 /** Seam de teste. */
-export function __stopFollowupPollerForTest(): void {
-  if (pollerHandle) {
-    clearInterval(pollerHandle);
-    pollerHandle = null;
-  }
+export function stopFollowupPoller(): void {
+  pollerHandle?.stop();
+  pollerHandle = null;
   pollerIntervalMs = null;
   resetFollowupPollerState(pollerState);
+}
+
+/** Seam de teste. */
+export function __stopFollowupPollerForTest(): void {
+  stopFollowupPoller();
 }

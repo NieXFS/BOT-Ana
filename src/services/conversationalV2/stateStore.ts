@@ -12,6 +12,17 @@ import type {
 import type { CopyVariantIdV2 } from './copyVariants';
 import { ensureProviderStatusV2Tables } from './providerStatus';
 import { parsePersistedFlowStateV2 } from './flowStateParser';
+import { Sentry } from '../../observability/sentry';
+import { runtimeErrorKind } from '../../observability/safeRuntime';
+import {
+  DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+  DEFAULT_MAINTENANCE_JITTER_MS,
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  readMaintenanceIntervalMs,
+  startMaintenanceScheduler,
+  type MaintenanceSchedulerHandle,
+} from '../maintenanceScheduler';
 
 export { parsePersistedFlowStateV2 } from './flowStateParser';
 
@@ -286,6 +297,8 @@ export interface ConversationalV2StateStore {
     unknownMarked: number;
     reconciled: number;
     successorsReady: number;
+    failed?: boolean;
+    failedCount?: number;
   }>;
 }
 
@@ -1261,9 +1274,12 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
     unknownMarked: number;
     reconciled: number;
     successorsReady: number;
+    failed?: boolean;
+    failedCount?: number;
   }> {
     let unknownMarked = 0;
     let reconciled = 0;
+    let failedCount = 0;
     for (const entry of this.outbox.values()) {
       if (
         entry.state === 'transport_started' &&
@@ -1279,11 +1295,18 @@ export class MemoryConversationalV2StateStore implements ConversationalV2StateSt
           reconciled += 1;
         } catch {
           // Fail-closed: permanece accepted_uncommitted; nunca há re-POST.
+          failedCount += 1;
         }
       }
     }
     const successorsReady = (await this.listReadySuccessors(100, now)).length;
-    return { unknownMarked, reconciled, successorsReady };
+    return {
+      unknownMarked,
+      reconciled,
+      successorsReady,
+      failed: failedCount > 0,
+      failedCount,
+    };
   }
 }
 
@@ -2392,6 +2415,7 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
     return reconciliation;
   },
   async sweep(now = new Date()) {
+    let failedCount = 0;
     const unknown = await pool.query(
       `UPDATE ana_v2_outbound_outbox
        SET state = 'transport_unknown', updated_at = $1
@@ -2414,6 +2438,7 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
         reconciled += 1;
       } catch {
         // Commit local será tentado no próximo sweep; transporte nunca repete.
+        failedCount += 1;
       }
     }
     const successorsReady = (await pgConversationalV2StateStore.listReadySuccessors(100, now)).length;
@@ -2421,11 +2446,13 @@ export const pgConversationalV2StateStore: ConversationalV2StateStore = {
       unknownMarked: unknown.rowCount ?? 0,
       reconciled,
       successorsReady,
+      failed: failedCount > 0,
+      failedCount,
     };
   },
 };
 
-let sweepTimer: NodeJS.Timeout | null = null;
+let sweepTimer: MaintenanceSchedulerHandle | null = null;
 let sweepActive = false;
 let sweepGeneration = 0;
 
@@ -2434,37 +2461,58 @@ export function startConversationalV2Sweep(
   requestedIntervalMs = CONVERSATIONAL_V2_SWEEP_INTERVAL_MS
 ): void {
   if (sweepActive) return;
-  sweepActive = true;
-  const generation = ++sweepGeneration;
-  let nextDelayMs = nextConversationalV2SweepDelayMs(
+  const enabled =
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('CONVERSATIONAL_V2_SWEEP_ENABLED', true);
+  const busyIntervalMs = readMaintenanceIntervalMs(
+    'CONVERSATIONAL_V2_SWEEP_BUSY_INTERVAL_MS',
     requestedIntervalMs,
-    true,
-    requestedIntervalMs
+    { minimumMs: 1_000 }
   );
-  const run = async (): Promise<void> => {
-    let succeeded = false;
-    try {
-      await store.sweep();
-      succeeded = true;
-    } catch {
-      // Recuperação fail-closed: o próximo ciclo recua exponencialmente.
-    }
-    if (!sweepActive || generation !== sweepGeneration) return;
-    nextDelayMs = nextConversationalV2SweepDelayMs(
-      nextDelayMs,
-      succeeded,
-      requestedIntervalMs
-    );
-    sweepTimer = setTimeout(() => void run(), nextDelayMs);
-    sweepTimer.unref?.();
-  };
-  // Uma execução imediata no boot; recorrência só depois de ela terminar.
-  void run();
+  sweepTimer = startMaintenanceScheduler({
+    worker: 'conversational-v2-outbox',
+    enabled,
+    run: () => store.sweep(),
+    idleIntervalMs: readMaintenanceIntervalMs(
+      'CONVERSATIONAL_V2_SWEEP_IDLE_INTERVAL_MS',
+      DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+      { minimumMs: 10 * 60_000 }
+    ),
+    busyIntervalMs,
+    errorBackoffMaxMs: readMaintenanceIntervalMs(
+      'CONVERSATIONAL_V2_SWEEP_ERROR_BACKOFF_MAX_MS',
+      CONVERSATIONAL_V2_SWEEP_MAX_BACKOFF_MS,
+      { minimumMs: 1_000 }
+    ),
+    jitterMs: readMaintenanceIntervalMs(
+      'MAINTENANCE_JITTER_MS',
+      DEFAULT_MAINTENANCE_JITTER_MS,
+      { minimumMs: 1_000, maximumMs: 5 * 60_000 }
+    ),
+    runImmediately: true,
+    errorKind: runtimeErrorKind,
+    onError: (error) => {
+      Sentry.captureException(new Error('conversational v2 sweep failed'), {
+        level: 'warning',
+        tags: {
+          service: 'conversational_v2',
+          operation: 'sweep',
+          error_kind: runtimeErrorKind(error),
+        },
+      });
+    },
+  });
+  sweepActive = sweepTimer !== null;
+  sweepGeneration += 1;
+}
+
+export function stopConversationalV2Sweep(): void {
+  sweepActive = false;
+  sweepGeneration += 1;
+  sweepTimer?.stop();
+  sweepTimer = null;
 }
 
 export function stopConversationalV2SweepForTest(): void {
-  sweepActive = false;
-  sweepGeneration += 1;
-  if (sweepTimer) clearTimeout(sweepTimer);
-  sweepTimer = null;
+  stopConversationalV2Sweep();
 }

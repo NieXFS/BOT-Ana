@@ -34,7 +34,9 @@ import {
   getLastMessageMeta,
   listConversations,
   getHistoryWithTimestamps,
+  pool,
 } from './services/contextManager';
+import { closeConversationOrderPoolForShutdown } from './services/conversationOrder';
 import { panelVisibleConversationContent } from './services/humanConversationContext';
 import { decideConversationActivity } from './services/conversationActivity';
 import { ERP_API_TOKEN } from './erpApiToken';
@@ -52,10 +54,12 @@ import { ensureAnaWave2Tables } from './services/anaWave2Store';
 import {
   reprocessQuarantinedInbound,
   startInboundOutboxSweep,
+  stopInboundOutboxSweep,
 } from './services/inboundOutbox';
 import {
   ensureSilentEscalationHoldTable,
   startSilentEscalationHoldSweep,
+  stopSilentEscalationHoldSweep,
 } from './services/silentEscalationHold';
 import {
   getQuestionReplyStatus,
@@ -65,6 +69,7 @@ import { purgeConversationData } from './services/privacyPurge';
 import {
   handleWhatsAppStatuses,
   startWhatsAppStatusCallbackSweep,
+  stopWhatsAppStatusCallbackSweep,
 } from './services/whatsappStatusHandler';
 import { isAnaConversationalV2Enabled } from './services/conversationalV2/featureFlag';
 import { questionReplyResultToHttp } from './services/questionReplyHttp';
@@ -77,7 +82,14 @@ import {
   getAnaRetentionState,
   runAnaRetention,
   startAnaRetentionScheduler,
+  stopAnaRetentionScheduler,
 } from './services/anaRetention';
+import { stopFollowupPoller } from './services/salesFollowups';
+import {
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  stopAllMaintenanceSchedulers,
+} from './services/maintenanceScheduler';
 
 interface CloudWebhookMetadata {
   phone_number_id?: string;
@@ -110,6 +122,11 @@ const VERIFY_TOKEN =
   process.env.WA_GLOBAL_VERIFY_TOKEN ?? process.env.WA_VERIFY_TOKEN ?? '';
 const LEGACY_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID ?? '';
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
+/** PM2 kill_timeout leaves a small margin after this graceful HTTP deadline. */
+export const HTTP_SHUTDOWN_GRACE_MS = 25_000;
+let runtimeReady = false;
+let httpServer: ReturnType<typeof app.listen> | null = null;
+let shuttingDown = false;
 
 type WebhookEchoHandler = typeof handleSmbMessageEchoes;
 let webhookEchoHandler: WebhookEchoHandler = handleSmbMessageEchoes;
@@ -465,8 +482,21 @@ app.post(
   }
 );
 
-app.get('/health', (_req: Request, res: Response) => {
+function sendLiveHealth(_req: Request, res: Response): void {
   res.json({ status: 'ok', ts: new Date().toISOString() });
+}
+
+// Liveness não consulta o Neon e pode ser sondado com alta frequência.
+app.get('/health/live', sendLiveHealth);
+// Compatibilidade com o monitor histórico; continua sendo liveness, não readiness.
+app.get('/health', sendLiveHealth);
+// Readiness só informa o estado do próprio processo. A saúde do banco é uma
+// verificação operacional separada, nunca embutida no endpoint de liveness.
+app.get('/health/ready', (_req: Request, res: Response) => {
+  res.status(runtimeReady ? 200 : 503).json({
+    status: runtimeReady ? 'ok' : 'starting',
+    ts: new Date().toISOString(),
+  });
 });
 
 /**
@@ -825,10 +855,12 @@ app.get('/internal/conversation-messages', (req: Request, res: Response) => {
 });
 
 async function boot(): Promise<void> {
+  if (shuttingDown) return;
   // Garante a tabela de idempotência e o schema da Onda 2 antes do tráfego.
   await ensureProcessedMessagesTable();
   await ensureAnaWave2Tables();
   await ensureSilentEscalationHoldTable();
+  if (shuttingDown) return;
   startSilentEscalationHoldSweep(async () => {
     const { sweepSilentEscalationHolds } = await import(
       './services/questionEscalation'
@@ -847,17 +879,26 @@ async function boot(): Promise<void> {
       startConversationalV2Sweep,
     } = await import('./services/conversationalV2/stateStore');
     await ensureConversationalV2Tables();
+    if (shuttingDown) return;
     startConversationalV2Sweep();
     const { startConversationalV2SuccessorSweep } = await import(
       './services/conversationalV2/successorProcessor'
     );
+    if (shuttingDown) return;
     startConversationalV2SuccessorSweep({
       process: reprocessDurableSuccessorBatchV2,
       fallback: deliverDurableSuccessorFallbackV2,
     });
   }
   // Falha de retenção é observada/sanitizada no serviço e nunca impede o boot.
-  await runAnaRetention().catch(() => undefined);
+  // O kill switch também cobre a execução inicial, não apenas o timer.
+  if (
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('ANA_RETENTION_SCHEDULER_ENABLED', true)
+  ) {
+    await runAnaRetention().catch(() => undefined);
+  }
+  if (shuttingDown) return;
   startAnaRetentionScheduler();
   startInboundOutboxSweep();
   startWhatsAppStatusCallbackSweep();
@@ -865,6 +906,7 @@ async function boot(): Promise<void> {
   // Workstream B (Renata): régua de follow-up. Garante a tabela e liga o poller
   // de 30min por default (só VENDA — o receptionist não escreve na tabela).
   await ensureSalesFollowupsTable();
+  if (shuttingDown) return;
   startFollowupPoller();
 
   // Voz da Renata: tabelas raw pg + checagem do ffmpeg antes de aceitar
@@ -893,12 +935,158 @@ async function boot(): Promise<void> {
         : `enabled (ready provider=${voiceConfig.provider})`;
   console.log(`🔊 Renata voice: ${voiceState}`);
 
-  app.listen(PORT, () => {
+  httpServer = app.listen(PORT, () => {
+    runtimeReady = true;
     console.log(`🚀 Receps-IA runtime rodando na porta ${PORT} | personas=Ana,Renata`);
   });
 }
 
+type ShutdownServer = {
+  close: (callback?: (error?: Error) => void) => void;
+  closeAllConnections?: () => void;
+};
+
+async function closeHttpServerForShutdown(
+  server: ShutdownServer | null
+): Promise<void> {
+  if (!server) return;
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      console.warn(
+        `[runtime] HTTP graceful shutdown deadline reached | graceMs=${HTTP_SHUTDOWN_GRACE_MS}`
+      );
+      try {
+        // Do not cut active requests at signal time. This is only the bounded
+        // last resort before PM2's kill_timeout is allowed to terminate us.
+        server.closeAllConnections?.();
+      } catch {
+        // The process is already on the termination path; keep pool cleanup moving.
+      }
+      finish();
+    }, HTTP_SHUTDOWN_GRACE_MS);
+    timeout.unref?.();
+
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+
+    try {
+      server.close((error) => {
+        if (
+          error &&
+          (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
+        ) {
+          console.warn(
+            `[runtime] HTTP close reported ${runtimeErrorKind(error)}`
+          );
+        }
+        finish();
+      });
+    } catch (error) {
+      console.warn(`[runtime] HTTP close threw ${runtimeErrorKind(error)}`);
+      finish();
+    }
+  });
+}
+
+function stopMaintenanceSchedulersImmediately(): void {
+  // The registry is the first and broadest boundary: it also covers optional
+  // V2 workers and future workers that use the common scheduler.
+  stopAllMaintenanceSchedulers();
+  stopSilentEscalationHoldSweep();
+  stopInboundOutboxSweep();
+  stopWhatsAppStatusCallbackSweep();
+  stopAnaRetentionScheduler();
+  stopFollowupPoller();
+}
+
+async function clearLoadedV2SchedulerReferences(): Promise<void> {
+  const v2Allowlist =
+    process.env.ANA_CONVERSATIONAL_V2_TENANT_SLUGS
+      ?.split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry && entry !== '*') ?? [];
+  if (v2Allowlist.length > 0) {
+    const [{ stopConversationalV2Sweep }, { stopConversationalV2SuccessorSweep }] =
+      await Promise.all([
+        import('./services/conversationalV2/stateStore'),
+        import('./services/conversationalV2/successorProcessor'),
+      ]);
+    stopConversationalV2Sweep();
+    stopConversationalV2SuccessorSweep();
+  }
+}
+
+async function cancelMaintenanceSchedulersForShutdown(): Promise<void> {
+  // This call is synchronous and happens before the first await that closes
+  // HTTP. In-flight cycles are allowed to finish, but cannot schedule again.
+  stopMaintenanceSchedulersImmediately();
+  try {
+    // Clear module-local handles after the registry has already cancelled them.
+    await clearLoadedV2SchedulerReferences();
+  } catch (error) {
+    console.warn(
+      `[runtime] V2 scheduler reference cleanup failed | error=${runtimeErrorKind(error)}`
+    );
+  }
+}
+
+export interface ShutdownSequenceDeps {
+  cancelSchedulers: () => void | Promise<void>;
+  closeHttp: () => Promise<void>;
+  closePools: () => Promise<void>;
+  log?: (message: string) => void;
+  exit?: (code: number) => void;
+}
+
+/** Pure phase seam used by the deterministic shutdown-order smoke. */
+export async function __runShutdownSequenceForTest(
+  deps: ShutdownSequenceDeps
+): Promise<void> {
+  await runShutdownSequence('SMOKE', deps);
+}
+
+async function runShutdownSequence(
+  signal: string,
+  deps: ShutdownSequenceDeps
+): Promise<void> {
+  runtimeReady = false;
+  const log = deps.log ?? ((message: string) => console.info(message));
+  log(`[runtime] encerramento iniciado | signal=${signal}`);
+
+  await deps.cancelSchedulers();
+  await deps.closeHttp();
+  await deps.closePools();
+  log('[runtime] encerramento concluído');
+  deps.exit?.(0);
+}
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  await runShutdownSequence(signal, {
+    cancelSchedulers: cancelMaintenanceSchedulersForShutdown,
+    closeHttp: () => closeHttpServerForShutdown(httpServer),
+    closePools: async () => {
+      await Promise.allSettled([
+        pool.end(),
+        closeConversationOrderPoolForShutdown(),
+      ]);
+    },
+    exit: (code) => process.exit(code),
+  });
+}
+
 if (process.env.RECEPS_IA_SKIP_BOOT !== '1') {
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+  process.once('SIGINT', () => void shutdown('SIGINT'));
   void boot().catch((err) => {
     Sentry.captureException(new Error('receps-ia boot failed'), {
       tags: {

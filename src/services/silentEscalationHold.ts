@@ -10,6 +10,17 @@ import {
   canonicalCustomerPhone,
 } from './conversationOrder';
 import type { UnderstandingFailureDivergenceV2 } from './conversationalV2/divergence';
+import {
+  DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+  DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+  DEFAULT_MAINTENANCE_JITTER_MS,
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  readMaintenanceIntervalMs,
+  startMaintenanceScheduler,
+  type MaintenanceCycleResult,
+  type MaintenanceSchedulerHandle,
+} from './maintenanceScheduler';
 
 export const SILENT_ESCALATION_SWEEP_INTERVAL_MS = 10 * 60_000;
 export const SILENT_ESCALATION_FAST_RETRY_DELAYS_MS = [100, 300] as const;
@@ -664,36 +675,67 @@ export async function persistSilentEscalationHold(input: {
   }
 }
 
-let sweepTimer: NodeJS.Timeout | null = null;
+let sweepTimer: MaintenanceSchedulerHandle | null = null;
 let lookupCountForTest = 0;
 let releaseCountForTest = 0;
 
 export function startSilentEscalationHoldSweep(
   sweep: () => Promise<unknown>
-): void {
-  if (sweepTimer) return;
-  sweepTimer = setInterval(() => {
-    sweep().catch((error) => {
+): boolean {
+  if (sweepTimer) return false;
+  const busyIntervalMs = readMaintenanceIntervalMs(
+    'SILENT_ESCALATION_BUSY_INTERVAL_MS',
+    SILENT_ESCALATION_SWEEP_INTERVAL_MS,
+    { minimumMs: 1_000 }
+  );
+  const enabled =
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('SILENT_ESCALATION_SWEEP_ENABLED', true);
+  sweepTimer = startMaintenanceScheduler({
+    worker: 'silent-escalation-hold',
+    enabled,
+    run: async () => (await sweep()) as MaintenanceCycleResult,
+    idleIntervalMs: readMaintenanceIntervalMs(
+      'SILENT_ESCALATION_IDLE_INTERVAL_MS',
+      DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+      { minimumMs: 10 * 60_000 }
+    ),
+    busyIntervalMs,
+    errorBackoffMaxMs: readMaintenanceIntervalMs(
+      'SILENT_ESCALATION_ERROR_BACKOFF_MAX_MS',
+      DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+      { minimumMs: 1_000 }
+    ),
+    jitterMs: readMaintenanceIntervalMs(
+      'MAINTENANCE_JITTER_MS',
+      DEFAULT_MAINTENANCE_JITTER_MS,
+      { minimumMs: 1_000, maximumMs: 5 * 60_000 }
+    ),
+    initialDelayMs: busyIntervalMs,
+    errorKind: runtimeErrorKind,
+    onError: (error) => {
       Sentry.captureException(new Error('silent escalation hold sweep failed'), {
         tags: {
           service: 'silent_escalation_hold',
           operation: 'sweep',
-          error_kind: error instanceof Error ? error.name : typeof error,
+          error_kind: runtimeErrorKind(error),
         },
       });
-    });
-  }, SILENT_ESCALATION_SWEEP_INTERVAL_MS);
-  sweepTimer.unref();
+    },
+  });
+  return sweepTimer !== null;
+}
+
+export function stopSilentEscalationHoldSweep(): void {
+  sweepTimer?.stop();
+  sweepTimer = null;
 }
 
 export function __resetSilentEscalationHoldForTest(): void {
   activeHoldCache.clear();
   lookupCountForTest = 0;
   releaseCountForTest = 0;
-  if (sweepTimer) {
-    clearInterval(sweepTimer);
-    sweepTimer = null;
-  }
+  stopSilentEscalationHoldSweep();
 }
 
 export function __silentHoldEventCountsForTest(): {

@@ -1,12 +1,22 @@
 import {
   CONVERSATIONAL_V2_SWEEP_INTERVAL_MS,
-  nextConversationalV2SweepDelayMs,
   pgConversationalV2StateStore,
   SUCCESSOR_REARM_DEBOUNCE_MS_V2,
   SUCCESSOR_MAX_REPROCESSES_V2,
   type ConversationalV2StateStore,
   type DurableSuccessorBatchV2,
 } from './stateStore';
+import { Sentry } from '../../observability/sentry';
+import { runtimeErrorKind } from '../../observability/safeRuntime';
+import {
+  DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+  DEFAULT_MAINTENANCE_JITTER_MS,
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  readMaintenanceIntervalMs,
+  startMaintenanceScheduler,
+  type MaintenanceSchedulerHandle,
+} from '../maintenanceScheduler';
 
 export { SUCCESSOR_REARM_DEBOUNCE_MS_V2 } from './stateStore';
 
@@ -75,7 +85,7 @@ export async function sweepSuccessorBatchesV2(
   return processed;
 }
 
-let successorSweepTimer: NodeJS.Timeout | null = null;
+let successorSweepTimer: MaintenanceSchedulerHandle | null = null;
 let successorSweepActive = false;
 let successorSweepGeneration = 0;
 
@@ -84,40 +94,58 @@ export function startConversationalV2SuccessorSweep(
   requestedIntervalMs = CONVERSATIONAL_V2_SWEEP_INTERVAL_MS
 ): void {
   if (successorSweepActive) return;
-  successorSweepActive = true;
-  const generation = ++successorSweepGeneration;
-  let nextDelayMs = nextConversationalV2SweepDelayMs(
+  const enabled =
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('CONVERSATIONAL_V2_SUCCESSOR_SWEEP_ENABLED', true);
+  const busyIntervalMs = readMaintenanceIntervalMs(
+    'CONVERSATIONAL_V2_SUCCESSOR_SWEEP_BUSY_INTERVAL_MS',
     requestedIntervalMs,
-    true,
-    requestedIntervalMs
+    { minimumMs: 1_000 }
   );
-  const run = async (): Promise<void> => {
-    let succeeded = false;
-    try {
-      await sweepSuccessorBatchesV2(deps);
-      succeeded = true;
-    } catch {
-      // Recuperação de crash permanece fail-closed e aplica backoff.
-    }
-    if (
-      !successorSweepActive ||
-      generation !== successorSweepGeneration
-    ) return;
-    nextDelayMs = nextConversationalV2SweepDelayMs(
-      nextDelayMs,
-      succeeded,
-      requestedIntervalMs
-    );
-    successorSweepTimer = setTimeout(() => void run(), nextDelayMs);
-    successorSweepTimer.unref?.();
-  };
-  // Uma execução imediata no boot; recorrência só depois de ela terminar.
-  void run();
+  successorSweepTimer = startMaintenanceScheduler({
+    worker: 'conversational-v2-successor',
+    enabled,
+    run: async () => ({ processed: await sweepSuccessorBatchesV2(deps) }),
+    idleIntervalMs: readMaintenanceIntervalMs(
+      'CONVERSATIONAL_V2_SUCCESSOR_SWEEP_IDLE_INTERVAL_MS',
+      DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+      { minimumMs: 10 * 60_000 }
+    ),
+    busyIntervalMs,
+    errorBackoffMaxMs: readMaintenanceIntervalMs(
+      'CONVERSATIONAL_V2_SUCCESSOR_SWEEP_ERROR_BACKOFF_MAX_MS',
+      6 * 60 * 60_000,
+      { minimumMs: 1_000 }
+    ),
+    jitterMs: readMaintenanceIntervalMs(
+      'MAINTENANCE_JITTER_MS',
+      DEFAULT_MAINTENANCE_JITTER_MS,
+      { minimumMs: 1_000, maximumMs: 5 * 60_000 }
+    ),
+    runImmediately: true,
+    errorKind: runtimeErrorKind,
+    onError: (error) => {
+      Sentry.captureException(new Error('conversational v2 successor sweep failed'), {
+        level: 'warning',
+        tags: {
+          service: 'conversational_v2',
+          operation: 'successor_sweep',
+          error_kind: runtimeErrorKind(error),
+        },
+      });
+    },
+  });
+  successorSweepActive = successorSweepTimer !== null;
+  successorSweepGeneration += 1;
+}
+
+export function stopConversationalV2SuccessorSweep(): void {
+  successorSweepActive = false;
+  successorSweepGeneration += 1;
+  successorSweepTimer?.stop();
+  successorSweepTimer = null;
 }
 
 export function stopConversationalV2SuccessorSweepForTest(): void {
-  successorSweepActive = false;
-  successorSweepGeneration += 1;
-  if (successorSweepTimer) clearTimeout(successorSweepTimer);
-  successorSweepTimer = null;
+  stopConversationalV2SuccessorSweep();
 }

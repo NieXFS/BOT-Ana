@@ -22,6 +22,16 @@ import type {
   InboundMessageType,
 } from './anaWave2Store';
 import { truncateForW1 } from './inboundContent';
+import {
+  DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+  DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+  DEFAULT_MAINTENANCE_JITTER_MS,
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  readMaintenanceIntervalMs,
+  startMaintenanceScheduler,
+  type MaintenanceSchedulerHandle,
+} from './maintenanceScheduler';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -479,24 +489,53 @@ export async function sweepInboundOutbox(
   return { attempted: messageIds.length, delivered };
 }
 
-let sweepTimer: NodeJS.Timeout | null = null;
+let sweepTimer: MaintenanceSchedulerHandle | null = null;
 
 export function startInboundOutboxSweep(
   deps: InboundOutboxDeps = defaultDeps
-): void {
-  if (sweepTimer) return;
-  sweepTimer = setInterval(() => {
-    sweepInboundOutbox(deps).catch((error) => {
+): boolean {
+  if (sweepTimer) return false;
+  const enabled =
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('INBOUND_OUTBOX_SWEEP_ENABLED', true);
+  const busyIntervalMs = readMaintenanceIntervalMs(
+    'INBOUND_OUTBOX_BUSY_INTERVAL_MS',
+    60_000,
+    { minimumMs: 1_000 }
+  );
+  sweepTimer = startMaintenanceScheduler({
+    worker: 'inbound-outbox',
+    enabled,
+    run: () => sweepInboundOutbox(deps),
+    idleIntervalMs: readMaintenanceIntervalMs(
+      'INBOUND_OUTBOX_IDLE_INTERVAL_MS',
+      DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+      { minimumMs: 10 * 60_000 }
+    ),
+    busyIntervalMs,
+    errorBackoffMaxMs: readMaintenanceIntervalMs(
+      'INBOUND_OUTBOX_ERROR_BACKOFF_MAX_MS',
+      DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+      { minimumMs: 1_000 }
+    ),
+    jitterMs: readMaintenanceIntervalMs(
+      'MAINTENANCE_JITTER_MS',
+      DEFAULT_MAINTENANCE_JITTER_MS,
+      { minimumMs: 1_000, maximumMs: 5 * 60_000 }
+    ),
+    initialDelayMs: busyIntervalMs,
+    errorKind: runtimeErrorKind,
+    onError: (error) => {
       Sentry.captureException(new Error('ana inbound outbox sweep failed'), {
         tags: {
           service: 'ana_inbound_outbox',
           operation: 'sweep',
-          error_kind: error instanceof Error ? error.name : typeof error,
+          error_kind: runtimeErrorKind(error),
         },
       });
-    });
-  }, OUTBOX_SWEEP_INTERVAL_MS);
-  sweepTimer.unref();
+    },
+  });
+  return sweepTimer !== null;
 }
 
 /** Fail-closed só na interseção contratada: escalada ativa conhecida + pendência. */
@@ -509,7 +548,11 @@ export async function shouldSuspendForPendingInbound(
   return store.hasPending(canonicalConversationKey(phoneNumberId, customerPhone));
 }
 
-export function __stopInboundOutboxSweepForTest(): void {
-  if (sweepTimer) clearInterval(sweepTimer);
+export function stopInboundOutboxSweep(): void {
+  sweepTimer?.stop();
   sweepTimer = null;
+}
+
+export function __stopInboundOutboxSweepForTest(): void {
+  stopInboundOutboxSweep();
 }

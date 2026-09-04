@@ -17,6 +17,16 @@ import {
   type ProviderStatusIngestResultV2,
   type ProviderStatusStoreV2,
 } from './conversationalV2/providerStatus';
+import {
+  DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+  DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+  DEFAULT_MAINTENANCE_JITTER_MS,
+  isMaintenanceWorkerEligible,
+  readMaintenanceBoolean,
+  readMaintenanceIntervalMs,
+  startMaintenanceScheduler,
+  type MaintenanceSchedulerHandle,
+} from './maintenanceScheduler';
 
 const RECEPS_INTERNAL_API_URL =
   process.env.RECEPS_INTERNAL_API_URL ?? 'http://localhost:3000';
@@ -28,6 +38,7 @@ const conversationalV2StatusEnabled =
     .some((entry) => Boolean(entry) && entry !== '*') ?? false;
 
 export const STATUS_CALLBACK_RETRY_DELAYS_MS = [50, 150, 450] as const;
+/** Compatibilidade histórica: o valor continua sendo o intervalo busy. */
 export const STATUS_CALLBACK_SWEEP_INTERVAL_MS = 60_000;
 export const WHATSAPP_STATUS_EVENTS = [
   'sent',
@@ -604,17 +615,24 @@ export async function sweepWhatsAppStatusCallbacks(
 ): Promise<{
   attempted: number;
   acknowledged: number;
+  failed?: boolean;
+  failedCount?: number;
   providerStatus?: { attempted: number; applied: number; unmatched: number };
 }> {
   const obligations = await deps.store.listPendingCallbacks(limit);
   let acknowledged = 0;
+  let failedCount = 0;
   for (const obligation of obligations) {
     const result = await attemptStatusCallbackOnce(
       obligation,
       deps,
       obligation.attempts + 1
     );
-    if (result.delivered) acknowledged += 1;
+    if (result.delivered) {
+      acknowledged += 1;
+    } else if (result.stillCurrent) {
+      failedCount += 1;
+    }
   }
   try {
     await deps.repairHumanHistory?.();
@@ -636,12 +654,17 @@ export async function sweepWhatsAppStatusCallbacks(
     reportV2ProviderFailure(appliedEvent);
   }
   v2ProviderStatusUnmatchedCount += providerStatus?.unmatched ?? 0;
-  return { attempted: obligations.length, acknowledged, providerStatus };
+  return {
+    attempted: obligations.length,
+    acknowledged,
+    failed: failedCount > 0,
+    failedCount,
+    providerStatus,
+  };
 }
 
 interface CallbackSweepRuntime {
-  timer: NodeJS.Timeout | null;
-  running: boolean;
+  timer: MaintenanceSchedulerHandle | null;
 }
 
 const CALLBACK_SWEEP_RUNTIME_KEY = Symbol.for(
@@ -654,37 +677,65 @@ function callbackSweepRuntime(): CallbackSweepRuntime {
     | CallbackSweepRuntime
     | undefined;
   if (existing) return existing;
-  const created = { timer: null, running: false };
+  const created = { timer: null };
   globals[CALLBACK_SWEEP_RUNTIME_KEY] = created;
   return created;
 }
 
 export function startWhatsAppStatusCallbackSweep(
   deps: WhatsAppStatusDeps = defaultDeps,
-  intervalMs = STATUS_CALLBACK_SWEEP_INTERVAL_MS
+  intervalMs?: number
 ): boolean {
   const runtime = callbackSweepRuntime();
   if (runtime.timer) return false;
-  runtime.timer = setInterval(() => {
-    if (runtime.running) return;
-    runtime.running = true;
-    void sweepWhatsAppStatusCallbacks(deps)
-      .catch((error) => {
-        Sentry.captureException(new Error('whatsapp status callback sweep failed'), {
-          level: 'warning',
-          tags: {
-            service: 'whatsapp_status_handler',
-            operation: 'callback_sweep',
-            error_kind: runtimeErrorKind(error),
-          },
-        });
-      })
-      .finally(() => {
-        runtime.running = false;
+  const enabled =
+    isMaintenanceWorkerEligible() &&
+    readMaintenanceBoolean('WHATSAPP_STATUS_SWEEP_ENABLED', true);
+  const busyIntervalMs = readMaintenanceIntervalMs(
+    'WHATSAPP_STATUS_BUSY_INTERVAL_MS',
+    intervalMs ?? STATUS_CALLBACK_SWEEP_INTERVAL_MS,
+    { minimumMs: 1_000 }
+  );
+  runtime.timer = startMaintenanceScheduler({
+    worker: 'whatsapp-status-callback',
+    enabled,
+    run: () => sweepWhatsAppStatusCallbacks(deps),
+    idleIntervalMs: readMaintenanceIntervalMs(
+      'WHATSAPP_STATUS_IDLE_INTERVAL_MS',
+      DEFAULT_MAINTENANCE_IDLE_INTERVAL_MS,
+      { minimumMs: 10 * 60_000 }
+    ),
+    busyIntervalMs,
+    errorBackoffMaxMs: readMaintenanceIntervalMs(
+      'WHATSAPP_STATUS_ERROR_BACKOFF_MAX_MS',
+      DEFAULT_MAINTENANCE_ERROR_BACKOFF_MAX_MS,
+      { minimumMs: 1_000 }
+    ),
+    jitterMs: readMaintenanceIntervalMs(
+      'MAINTENANCE_JITTER_MS',
+      DEFAULT_MAINTENANCE_JITTER_MS,
+      { minimumMs: 1_000, maximumMs: 5 * 60_000 }
+    ),
+    initialDelayMs: busyIntervalMs,
+    errorKind: runtimeErrorKind,
+    onError: (error) => {
+      Sentry.captureException(new Error('whatsapp status callback sweep failed'), {
+        level: 'warning',
+        tags: {
+          service: 'whatsapp_status_handler',
+          operation: 'callback_sweep',
+          error_kind: runtimeErrorKind(error),
+        },
       });
-  }, intervalMs);
-  runtime.timer.unref();
-  return true;
+    },
+  });
+  return runtime.timer !== null;
+}
+
+export function stopWhatsAppStatusCallbackSweep(): void {
+  const runtime = callbackSweepRuntime();
+  runtime.timer?.stop();
+  runtime.timer = null;
 }
 
 export function getWhatsAppStatusCountersForTest(): {
@@ -715,8 +766,5 @@ export function __setV2ProviderFailureObserverForTest(
 }
 
 export function __resetWhatsAppStatusCallbackSweepForTest(): void {
-  const runtime = callbackSweepRuntime();
-  if (runtime.timer) clearInterval(runtime.timer);
-  runtime.timer = null;
-  runtime.running = false;
+  stopWhatsAppStatusCallbackSweep();
 }

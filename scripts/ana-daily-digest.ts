@@ -36,6 +36,7 @@ const targetDay =
 const pool = new Pool({
   connectionString:
     process.env.RECEPS_IA_DIRECT_DATABASE_URL ?? process.env.DATABASE_URL,
+  application_name: 'receps-ia-daily-digest',
 });
 
 function anonKey(conversationKey: string): string {
