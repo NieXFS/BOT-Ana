@@ -24,6 +24,40 @@ ssh root@46.62.134.25 "cd ~/Receps-IA && git pull && npm install --no-audit --no
 - `npm run build` é só `tsc` (saída em `dist/`, `start` roda `dist/webhookServer.js`). **Confira o exit REAL e o `dist/` emitido** antes do restart.
 - **O reload/restart do PM2 não é opcional**: em 2026-07-20 um deploy fez pull+build sem restart e o processo rodou 1,5 dia com código velho enquanto o prompt (banco, hot-reload) já prometia features novas — a "assimetria fatal". Confira que o processo subiu DEPOIS do build.
 
+## Recuperações e custo do Neon (2026-09-04)
+
+- O caminho normal é orientado por evento: webhook de status, inbound outbox e
+  escalada persistem o fato e tentam a consequência no próprio fluxo. Sweeps
+  são somente recuperação de obrigações já gravadas; nunca devem descobrir o
+  trabalho por polling agressivo.
+- `src/services/maintenanceScheduler.ts` é a casca comum dos workers. Depois de
+  uma execução, resultado vazio agenda idle (default 30min, piso 10min),
+  trabalho encontrado agenda busy (base por worker), e erro aplica backoff
+  exponencial com teto. O próximo ciclo só nasce após o anterior terminar;
+  timer é `unref` e cancelável no shutdown.
+- No `SIGTERM`/`SIGINT`, o processo marca `/health/ready` como não pronto e
+  cancela o registro inteiro de schedulers antes de fechar o HTTP e os pools;
+  uma execução já em voo pode terminar, mas não agenda outro ciclo. O HTTP
+  deixa até 25s para requests ativos e o `ecosystem.config.cjs` mantém
+  `kill_timeout=30000` como último limite do PM2.
+- Apenas a instância com `PROCESS_ROLE=worker` e
+  `RUN_MAINTENANCE_WORKERS=true` inicia recuperações; o
+  `ecosystem.config.cjs` fixa o papel do processo combinado e o kill switch
+  permanece controlável pelo ambiente. Réplicas web usam `PROCESS_ROLE=web` e
+  `RUN_MAINTENANCE_WORKERS=false`. Cada worker ainda tem kill switch próprio no
+  `.env.example`.
+- Liveness é `/health/live` (alias histórico `/health`) e não consulta Neon;
+  `/health/ready` só informa que o próprio processo concluiu o boot. Saúde do
+  banco é uma verificação operacional separada e não deve ser sondada em loop.
+- O incidente e o inventário cross-repo ficam em
+  `RecepsERP/docs/incidents/2026-09-neon-compute-cost.md`. Não confundir
+  `dist/` antigo da VPS com a fonte desta regra: antes de publicar, conferir
+  SHA, build emitido, processo PM2 e o número de instâncias.
+- O reminder de appointments pertence ao ERP: o alvo permanente é a janela
+  read-only de 60 minutos com cron `7,37 * * * *`; a linha live observada em
+  2026-09-04 ainda é `*/10`. Publicar/verificar o código do ERP antes de
+  trocar o crontab; a mudança não autoriza deploy nesta fase.
+
 ## Assets binários
 `assets/renata-demo.mp4` (10,7MB) é o vídeo da escada de demonstração da Renata, **commitado de propósito**: o `video/` do repo Receps é gitignored, então o `git pull` é o único caminho que leva o arquivo pra VPS. O `boot()` não lê o asset; ele só é carregado no 1º `sendDemoVideo` (e aí fica ~11MB memoizado no processo). Env opcional `RENATA_DEMO_VIDEO_PATH` sobrepõe o caminho.
 
